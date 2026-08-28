@@ -33,6 +33,7 @@ mod native_websocket_batch;
 mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
+mod ops_bridge;
 mod persona_catalog;
 mod prevent_sleep;
 mod ptt_shortcut;
@@ -232,6 +233,7 @@ pub fn run() {
         .manage(native_relay_client::NativeRelayClient::default())
         .manage(observed_unread::ObservedUnreadStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
+        .manage(ops_bridge::OpsBridgeState::from_env())
         .setup(move |app| {
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
@@ -516,6 +518,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ops_bridge::ops_bridge_capabilities,
+            ops_bridge::ops_bridge_snapshot,
+            ops_bridge::ops_bridge_create_draft,
+            ops_bridge::ops_bridge_transition,
+            ops_bridge::ops_bridge_start_watch,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,
@@ -912,9 +919,15 @@ pub fn run() {
             if is_restart_request(code) {
                 restart_requested.store(true, Ordering::SeqCst);
             }
+            app_handle
+                .state::<ops_bridge::OpsBridgeState>()
+                .stop_watch();
             shut_down_app(app_handle, &run_shutdown_done);
         }
         RunEvent::Exit => {
+            app_handle
+                .state::<ops_bridge::OpsBridgeState>()
+                .stop_watch();
             shut_down_app(app_handle, &run_shutdown_done);
             app_handle.state::<ClipboardState>().release();
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
