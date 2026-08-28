@@ -10,6 +10,7 @@ import { Route as settingsRouteImport } from "./routes/settings";
 import { Route as remindersRouteImport } from "./routes/reminders";
 import { Route as pulseRouteImport } from "./routes/pulse";
 import { Route as projectsRouteImport } from "./routes/projects";
+import { Route as opsRouteImport } from "./routes/ops";
 import { Route as agentsRouteImport } from "./routes/agents";
 import { Route as indexRouteImport } from "./routes/index";
 import { Route as workflowsDotworkflowIdRouteImport } from "./routes/workflows.$workflowId";
@@ -41,6 +42,11 @@ const pulseRoute = pulseRouteImport.update({
 const projectsRoute = projectsRouteImport.update({
   id: "/projects",
   path: "/projects",
+  getParentRoute: () => rootRouteImport,
+} as any);
+const opsRoute = opsRouteImport.update({
+  id: "/ops",
+  path: "/ops",
   getParentRoute: () => rootRouteImport,
 } as any);
 const agentsRoute = agentsRouteImport.update({
@@ -83,6 +89,7 @@ const channelsDotchannelIdDotpostsDotpostIdRoute =
 export interface FileRoutesByFullPath {
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
+  "/ops": typeof opsRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
@@ -97,6 +104,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
+  "/ops": typeof opsRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
@@ -112,6 +120,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport;
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
+  "/ops": typeof opsRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
@@ -128,6 +137,7 @@ export interface FileRouteTypes {
   fullPaths:
     | "/"
     | "/agents"
+    | "/ops"
     | "/projects"
     | "/pulse"
     | "/reminders"
@@ -142,6 +152,7 @@ export interface FileRouteTypes {
   to:
     | "/"
     | "/agents"
+    | "/ops"
     | "/projects"
     | "/pulse"
     | "/reminders"
@@ -156,6 +167,7 @@ export interface FileRouteTypes {
     | "__root__"
     | "/"
     | "/agents"
+    | "/ops"
     | "/projects"
     | "/pulse"
     | "/reminders"
@@ -171,6 +183,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   indexRoute: typeof indexRoute;
   agentsRoute: typeof agentsRoute;
+  opsRoute: typeof opsRoute;
   projectsRoute: typeof projectsRoute;
   pulseRoute: typeof pulseRoute;
   remindersRoute: typeof remindersRoute;
@@ -218,6 +231,13 @@ declare module "@tanstack/react-router" {
       path: "/projects";
       fullPath: "/projects";
       preLoaderRoute: typeof projectsRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/ops": {
+      id: "/ops";
+      path: "/ops";
+      fullPath: "/ops";
+      preLoaderRoute: typeof opsRouteImport;
       parentRoute: typeof rootRouteImport;
     };
     "/agents": {
@@ -275,6 +295,7 @@ declare module "@tanstack/react-router" {
 const rootRouteChildren: RootRouteChildren = {
   indexRoute: indexRoute,
   agentsRoute: agentsRoute,
+  opsRoute: opsRoute,
   projectsRoute: projectsRoute,
   pulseRoute: pulseRoute,
   remindersRoute: remindersRoute,

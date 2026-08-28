@@ -1,4 +1,4 @@
-import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
+import { Activity, Bot, Folders, Inbox, PanelTop, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
@@ -18,6 +18,7 @@ type SidebarSelectedView =
   | "channel"
   | "messages"
   | "agents"
+  | "ops"
   | "workflows"
   | "pulse"
   | "projects";
@@ -42,6 +43,7 @@ type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
   onSelectHome: () => void;
+  onSelectOps: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
   onSelectWorkflows: () => void;
@@ -92,6 +94,7 @@ export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
   onSelectHome,
+  onSelectOps,
   onSelectProjects,
   onSelectPulse,
   onSelectWorkflows,
@@ -167,6 +170,20 @@ export function AppSidebarPrimaryMenu({
               <SidebarMenuLabel>Agents</SidebarMenuLabel>
             </SidebarMenuButton>
           </SidebarMenuItem>
+          <FeatureGate feature="nativeOpsRoom">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                data-testid="open-ops-view"
+                isActive={selectedView === "ops"}
+                onClick={onSelectOps}
+                tooltip="Ops"
+                type="button"
+              >
+                <PanelTop className="h-4 w-4" />
+                <SidebarMenuLabel>Ops</SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
           <FeatureGate feature="workflows">
             <SidebarMenuItem>
               <SidebarMenuButton

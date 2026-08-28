@@ -30,6 +30,12 @@
       "name": "Agent-managed profiles",
       "description": "Let agents manage their own relay name and avatar instead of restoring the desktop copy",
       "platforms": ["desktop"]
+    },
+    {
+      "id": "nativeOpsRoom",
+      "name": "Native Ops Room",
+      "description": "Local Orca and Codex operations, approvals, history, and voice coordination",
+      "platforms": ["desktop"]
     }
   ]
 }
