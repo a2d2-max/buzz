@@ -128,6 +128,47 @@ async fn spawn_fake_server(
     (port, requests, task)
 }
 
+async fn spawn_stalled_sse_then_recovery_server(
+    recovery_response: Vec<u8>,
+) -> (u16, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled SSE server");
+    let port = listener
+        .local_addr()
+        .expect("stalled SSE server address")
+        .port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    let task = tokio::spawn(async move {
+        let (mut stalled, _) = listener.accept().await.expect("accept stalled SSE request");
+        let first = read_request(&mut stalled).await;
+        recorded.lock().expect("record stalled request").push(first);
+        stalled
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .expect("write stalled SSE headers");
+        stalled.flush().await.expect("flush stalled SSE headers");
+
+        let (mut recovered, _) = listener
+            .accept()
+            .await
+            .expect("accept recovery SSE request");
+        let second = read_request(&mut recovered).await;
+        recorded
+            .lock()
+            .expect("record recovery request")
+            .push(second);
+        recovered
+            .write_all(&recovery_response)
+            .await
+            .expect("write recovery SSE response");
+    });
+    (port, requests, task)
+}
+
 fn request_body(request: &str) -> Value {
     let (_, body) = request
         .split_once("\r\n\r\n")
@@ -412,6 +453,54 @@ fn ops_bridge_backoff_is_bounded_at_five_seconds() {
     assert_eq!(backoff.next_delay(), Duration::from_secs(2));
     assert_eq!(backoff.next_delay(), Duration::from_secs(5));
     assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn ops_bridge_watcher_reconnects_after_post_header_sse_stall() {
+    let recovered_event = b"id: 1\nevent: health\ndata: {}\n\n";
+    let recovery_response = http_response("200 OK", "text/event-stream", recovered_event, &[]);
+    let (port, requests, server) = spawn_stalled_sse_then_recovery_server(recovery_response).await;
+    let temp = tempfile::tempdir().expect("temp token directory");
+    let token = temp.path().join("hub.token");
+    write_token(&token, &vec![b't'; 32], 0o600);
+    let client = Arc::new(OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client"));
+    let watcher = OpsBridgeWatcher::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+
+    assert!(watcher
+        .start_with_emitter(
+            client,
+            Arc::new(move |event| {
+                captured.lock().expect("record recovery event").push(event);
+            })
+        )
+        .expect("start stalled watcher"));
+
+    tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            if requests.lock().expect("read stalled requests").len() >= 2
+                && !events.lock().expect("read recovery events").is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stalled SSE watcher must reconnect after the read timeout and backoff");
+    watcher.stop();
+    server.await.expect("stalled SSE fake server exits");
+
+    assert_eq!(
+        requests.lock().expect("read final stalled requests").len(),
+        2
+    );
+    assert_eq!(
+        serde_json::to_value(&events.lock().expect("read final recovery events")[0])
+            .expect("serialize recovery invalidation"),
+        json!({"event_id": "1", "event_type": "health"})
+    );
 }
 
 #[tokio::test]

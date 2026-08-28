@@ -103,10 +103,13 @@ impl OpsBridgeClient {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|_| OpsBridgeError::ClientBuild)?;
-        // An SSE request is intentionally long-lived. Connects are still
-        // bounded at two seconds; each JSON request uses the five-second total
-        // timeout above.
-        let stream_client = common().build().map_err(|_| OpsBridgeError::ClientBuild)?;
+        // SSE connections are long-lived, so bound each silent read rather
+        // than the total lifetime. Reqwest resets this watchdog after every
+        // successful read, while a stalled peer enters watcher backoff.
+        let stream_client = common()
+            .read_timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|_| OpsBridgeError::ClientBuild)?;
         Ok(Self {
             config,
             request_client,
