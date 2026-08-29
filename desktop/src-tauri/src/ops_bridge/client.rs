@@ -8,21 +8,48 @@ use std::{
 use futures_util::StreamExt;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, IF_MATCH},
-    Method, Response, Url,
+    Method, Response, StatusCode, Url,
 };
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
 use zeroize::Zeroizing;
 
 use super::types::{
-    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsSelection,
-    OpsTransitionReceipt, OpsTransitionRequest, OpsTransitionWireRequest, VersionedResponse,
-    MAX_RESPONSE_BYTES, OPS_CONTRACT_VERSION,
+    OpsArtifactV1, OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest,
+    OpsPageModule, OpsPageRequest, OpsPageResult, OpsPageV1, OpsRepositoryStatusV1,
+    OpsResearchCardV1, OpsSelection, OpsTimelineItemV1, OpsTransitionReceipt, OpsTransitionRequest,
+    OpsTransitionWireRequest, VersionedResponse, MAX_RESPONSE_BYTES, MAX_SAFE_INTEGER_U64,
+    OPS_CONTRACT_VERSION,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TOKEN_BYTES: usize = 4096;
 const LAST_EVENT_ID: HeaderName = HeaderName::from_static("last-event-id");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CursorError {
+    error: CursorErrorCode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CursorErrorCode {
+    InvalidCursor,
+    StaleCursor,
+}
+
+fn parse_page<T>(body: &[u8]) -> Result<OpsPageV1<T>, OpsBridgeError>
+where
+    T: DeserializeOwned,
+{
+    let page: OpsPageV1<T> =
+        serde_json::from_slice(body).map_err(|_| OpsBridgeError::ResponseInvalidJson)?;
+    if page.contract_version() != OPS_CONTRACT_VERSION || page.revision > MAX_SAFE_INTEGER_U64 {
+        return Err(OpsBridgeError::ContractMismatch);
+    }
+    Ok(page)
+}
 
 /// Native-only configuration for the fixed loopback Ops hub.
 #[derive(Debug, Clone)]
@@ -51,6 +78,8 @@ pub(crate) enum OpsBridgeError {
     ResponseInvalidJson,
     ContractMismatch,
     InvalidRequest,
+    InvalidCursor,
+    StaleCursor,
     WatchState,
 }
 
@@ -71,6 +100,8 @@ impl std::fmt::Display for OpsBridgeError {
             Self::ResponseInvalidJson => "ops_bridge_invalid_json",
             Self::ContractMismatch => "ops_bridge_contract_mismatch",
             Self::InvalidRequest => "ops_bridge_invalid_request",
+            Self::InvalidCursor => "invalid_cursor",
+            Self::StaleCursor => "stale_cursor",
             Self::WatchState => "ops_bridge_watch_state",
         };
         formatter.write_str(code)
@@ -122,7 +153,9 @@ impl OpsBridgeClient {
     pub(crate) async fn capabilities(&self) -> Result<OpsBridgeCapabilities, OpsBridgeError> {
         let request =
             self.authenticated(&self.request_client, Method::GET, self.capabilities_url()?)?;
-        self.execute_json(request).await
+        let capabilities: OpsBridgeCapabilities = self.execute_json(request).await?;
+        capabilities.validate()?;
+        Ok(capabilities)
     }
 
     pub(crate) async fn snapshot(
@@ -146,6 +179,61 @@ impl OpsBridgeClient {
         }
         let request = self.authenticated(&self.request_client, Method::GET, url)?;
         self.execute_json(request).await
+    }
+
+    pub(crate) async fn page(
+        &self,
+        request: &OpsPageRequest,
+    ) -> Result<OpsPageResult, OpsBridgeError> {
+        request.validate()?;
+        let mut url = self.page_url(request.module())?;
+        {
+            let mut query = url.query_pairs_mut();
+            match request {
+                OpsPageRequest::Timeline { scope, .. } => {
+                    if let Some(channel) = &scope.channel {
+                        query.append_pair("channel", channel);
+                    }
+                    if let Some(thread) = &scope.thread {
+                        query.append_pair("thread", thread);
+                    }
+                    query.append_pair("sort", "occurred_at_desc");
+                }
+                OpsPageRequest::Artifacts { scope, .. } => {
+                    if let Some(work_item) = &scope.work_item {
+                        query.append_pair("work_item", work_item);
+                    }
+                    if let Some(representation) = &scope.representation {
+                        query.append_pair(
+                            "representation",
+                            match representation {
+                                super::types::OpsArtifactRepresentation::Rendered => "rendered",
+                                super::types::OpsArtifactRepresentation::Preview => "preview",
+                            },
+                        );
+                    }
+                    query.append_pair("sort", "created_at_desc");
+                }
+                OpsPageRequest::Research { scope, .. } => {
+                    if let Some(work_item) = &scope.work_item {
+                        query.append_pair("work_item", work_item);
+                    }
+                    query.append_pair("sort", "created_at_desc");
+                }
+                OpsPageRequest::Repositories { scope, .. } => {
+                    if let Some(project) = &scope.project {
+                        query.append_pair("project", project);
+                    }
+                    query.append_pair("sort", "display_name_asc");
+                }
+            }
+            query.append_pair("page_size", &request.page_size().to_string());
+            if let Some(cursor) = request.cursor() {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        let builder = self.authenticated(&self.request_client, Method::GET, url)?;
+        self.execute_page_json(builder, request.module()).await
     }
 
     pub(crate) async fn create_draft(
@@ -230,6 +318,64 @@ impl OpsBridgeClient {
             .await
             .map_err(|_| OpsBridgeError::Transport)?;
         ensure_success(&response)?;
+        let body = self.read_json_body(response).await?;
+        let value: T =
+            serde_json::from_slice(&body).map_err(|_| OpsBridgeError::ResponseInvalidJson)?;
+        if value.contract_version() != OPS_CONTRACT_VERSION {
+            return Err(OpsBridgeError::ContractMismatch);
+        }
+        Ok(value)
+    }
+
+    async fn execute_page_json(
+        &self,
+        request: reqwest::RequestBuilder,
+        module: OpsPageModule,
+    ) -> Result<OpsPageResult, OpsBridgeError> {
+        let response = request
+            .send()
+            .await
+            .map_err(|_| OpsBridgeError::Transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            if !matches!(status, StatusCode::BAD_REQUEST | StatusCode::CONFLICT) {
+                return Err(OpsBridgeError::HttpStatus);
+            }
+            let body = self
+                .read_json_body(response)
+                .await
+                .map_err(|_| OpsBridgeError::HttpStatus)?;
+            let error: CursorError =
+                serde_json::from_slice(&body).map_err(|_| OpsBridgeError::HttpStatus)?;
+            return match (status, error.error) {
+                (StatusCode::BAD_REQUEST, CursorErrorCode::InvalidCursor) => {
+                    Err(OpsBridgeError::InvalidCursor)
+                }
+                (StatusCode::CONFLICT, CursorErrorCode::StaleCursor) => {
+                    Err(OpsBridgeError::StaleCursor)
+                }
+                _ => Err(OpsBridgeError::HttpStatus),
+            };
+        }
+        let body = self.read_json_body(response).await?;
+        let result = match module {
+            OpsPageModule::Timeline => {
+                OpsPageResult::Timeline(parse_page::<OpsTimelineItemV1>(&body)?)
+            }
+            OpsPageModule::Artifacts => {
+                OpsPageResult::Artifacts(parse_page::<OpsArtifactV1>(&body)?)
+            }
+            OpsPageModule::Research => {
+                OpsPageResult::Research(parse_page::<OpsResearchCardV1>(&body)?)
+            }
+            OpsPageModule::Repositories => {
+                OpsPageResult::Repositories(parse_page::<OpsRepositoryStatusV1>(&body)?)
+            }
+        };
+        Ok(result)
+    }
+
+    async fn read_json_body(&self, response: Response) -> Result<Vec<u8>, OpsBridgeError> {
         if !is_json(response.headers()) {
             return Err(OpsBridgeError::ResponseContentType);
         }
@@ -248,12 +394,7 @@ impl OpsBridgeClient {
             }
             body.extend_from_slice(&chunk);
         }
-        let value: T =
-            serde_json::from_slice(&body).map_err(|_| OpsBridgeError::ResponseInvalidJson)?;
-        if value.contract_version() != OPS_CONTRACT_VERSION {
-            return Err(OpsBridgeError::ContractMismatch);
-        }
-        Ok(value)
+        Ok(body)
     }
 
     fn capabilities_url(&self) -> Result<Url, OpsBridgeError> {
@@ -262,6 +403,16 @@ impl OpsBridgeClient {
 
     fn snapshot_url(&self) -> Result<Url, OpsBridgeError> {
         self.fixed_url(&["ops-bridge", "v1", "snapshot"])
+    }
+
+    fn page_url(&self, module: OpsPageModule) -> Result<Url, OpsBridgeError> {
+        let segment = match module {
+            OpsPageModule::Timeline => "timeline",
+            OpsPageModule::Artifacts => "artifacts",
+            OpsPageModule::Research => "research",
+            OpsPageModule::Repositories => "repositories",
+        };
+        self.fixed_url(&["ops-bridge", "v1", segment])
     }
 
     fn drafts_url(&self) -> Result<Url, OpsBridgeError> {

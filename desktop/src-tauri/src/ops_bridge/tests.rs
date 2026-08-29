@@ -26,7 +26,7 @@ use super::{
 use crate::app_state::{build_app_state, AppState};
 use tauri::Manager;
 
-fn write_token(path: &Path, contents: &[u8], mode: u32) {
+pub(super) fn write_token(path: &Path, contents: &[u8], mode: u32) {
     std::fs::write(path, contents).expect("write fake token");
     #[cfg(unix)]
     {
@@ -36,7 +36,7 @@ fn write_token(path: &Path, contents: &[u8], mode: u32) {
     }
 }
 
-fn config(port: u16, token_file: &Path, max_response_bytes: usize) -> OpsBridgeConfig {
+pub(super) fn config(port: u16, token_file: &Path, max_response_bytes: usize) -> OpsBridgeConfig {
     OpsBridgeConfig {
         port,
         token_file: token_file.to_path_buf(),
@@ -44,7 +44,7 @@ fn config(port: u16, token_file: &Path, max_response_bytes: usize) -> OpsBridgeC
     }
 }
 
-fn http_response(
+pub(super) fn http_response(
     status: &str,
     content_type: &str,
     body: &[u8],
@@ -112,7 +112,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
     String::from_utf8(bytes).expect("fake request is utf-8")
 }
 
-async fn spawn_fake_server(
+pub(super) async fn spawn_fake_server(
     responses: Vec<Vec<u8>>,
 ) -> (u16, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -228,7 +228,7 @@ async fn ops_bridge_client_accepts_a_bounded_version_one_json_response() {
         "transitions": [],
         "modules": [
             {"name": "timeline", "schema_version": 1, "paged": false},
-            {"name": "future_module", "schema_version": 2, "paged": true}
+            {"name": "future_module", "schema_version": 2, "paged": true, "collection_revision": 8}
         ],
         "private_extension": {"must_not_cross": true}
     }))

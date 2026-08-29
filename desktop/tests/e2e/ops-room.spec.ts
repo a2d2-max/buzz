@@ -359,6 +359,105 @@ async function expectNativeOpsArgumentsAndNoMutations(page: Page) {
   expect(mutations).toEqual([]);
 }
 
+test("the strict Ops page mock stays configurable while UI consumption is disabled", async ({
+  page,
+}) => {
+  await page.addInitScript((storageKey) => {
+    window.localStorage.setItem(storageKey, "true");
+  }, LOCAL_OPS_STORAGE_KEY);
+  const timelinePage = {
+    contract_version: 1 as const,
+    revision: 31,
+    generated_at: "2026-08-30T00:03:00.000Z",
+    items: [
+      {
+        id: "event:paged-redacted",
+        timestamp: "2026-08-30T00:03:00.000Z",
+        kind: "status",
+        author: "Codex",
+        body: "Deterministic redacted page fixture",
+      },
+    ],
+    next_cursor: "opaque-redacted-next",
+  };
+  await installMockBridge(
+    page,
+    {
+      identityLost: true,
+      opsCapabilities: OPS_CAPABILITIES_FIXTURE,
+      opsSnapshot: OPS_SNAPSHOT_FIXTURE,
+      opsPages: { timeline: timelinePage },
+    },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await page.goto("/#/ops?view=room");
+
+  expect(
+    await page.evaluate(
+      () =>
+        (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+          (command) => command === "ops_bridge_page",
+        ).length,
+    ),
+  ).toBe(0);
+
+  const request = {
+    module: "timeline",
+    scope: {
+      channel: null,
+      thread: null,
+      sort: "occurred_at_desc",
+    },
+    page_size: 100,
+    cursor: null,
+  };
+  const result = await page.evaluate(async (pageRequest) => {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (!invoke) throw new Error("Tauri E2E invoke bridge unavailable");
+    return invoke("ops_bridge_page", { request: pageRequest });
+  }, request);
+  expect(result).toEqual(timelinePage);
+
+  const invalid = await page.evaluate(async (pageRequest) => {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (!invoke) throw new Error("Tauri E2E invoke bridge unavailable");
+    try {
+      await invoke("ops_bridge_page", {
+        request: {
+          ...pageRequest,
+          scope: { ...pageRequest.scope, sort: "created_at_desc" },
+        },
+      });
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }, request);
+  expect(invalid).toBe("ops_bridge_invalid_request");
+
+  const typedCursorError = await page.evaluate(async (pageRequest) => {
+    const config = window.__BUZZ_E2E__;
+    if (!config?.mock) throw new Error("Ops E2E config unavailable");
+    config.mock.opsPageErrors = { timeline: "stale_cursor" };
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (!invoke) throw new Error("Tauri E2E invoke bridge unavailable");
+    try {
+      await invoke("ops_bridge_page", { request: pageRequest });
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }, request);
+  expect(typedCursorError).toEqual({ error: "stale_cursor" });
+
+  const calls = await page.evaluate(
+    () => window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [],
+  );
+  expect(
+    calls.filter(({ command }) => command === "ops_bridge_page")[0]?.payload,
+  ).toEqual({ request });
+});
+
 test("an older snapshot remains visible with live watch compatibility disabled", async ({
   page,
 }) => {

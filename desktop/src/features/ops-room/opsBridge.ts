@@ -6,9 +6,13 @@ import {
   type OpsBridgeSnapshotV1,
   type OpsConnectionState,
   type OpsSelection,
+  opsArtifactSchema,
   opsCapabilitiesSchema,
   opsEventSequenceSchema,
+  opsRepositoryStatusSchema,
+  opsResearchCardSchema,
   opsSnapshotEnvelopeSchema,
+  opsTimelineItemSchema,
   looksLikeAbsolutePath,
   parseOpsModuleStates,
   parseOpsRoom,
@@ -37,6 +41,126 @@ const syncAckSchema = z
   })
   .strip();
 
+const opsPageModuleSchema = z.enum([
+  "timeline",
+  "artifacts",
+  "research",
+  "repositories",
+]);
+const opsPageRequestSchema = z.discriminatedUnion("module", [
+  z
+    .object({
+      module: z.literal("timeline"),
+      scope: z
+        .object({
+          channel: z.string().min(1).nullable(),
+          thread: z.string().min(1).nullable(),
+          sort: z.literal("occurred_at_desc"),
+        })
+        .strict(),
+      page_size: z.number().int().min(1).max(200),
+      cursor: z.string().min(1).max(4096).nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      module: z.literal("artifacts"),
+      scope: z
+        .object({
+          work_item: z.string().min(1).nullable(),
+          representation: z.enum(["rendered", "preview"]).nullable(),
+          sort: z.literal("created_at_desc"),
+        })
+        .strict(),
+      page_size: z.number().int().min(1).max(200),
+      cursor: z.string().min(1).max(4096).nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      module: z.literal("research"),
+      scope: z
+        .object({
+          work_item: z.string().min(1).nullable(),
+          sort: z.literal("created_at_desc"),
+        })
+        .strict(),
+      page_size: z.number().int().min(1).max(200),
+      cursor: z.string().min(1).max(4096).nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      module: z.literal("repositories"),
+      scope: z
+        .object({
+          project: z.string().min(1).nullable(),
+          sort: z.literal("display_name_asc"),
+        })
+        .strict(),
+      page_size: z.number().int().min(1).max(200),
+      cursor: z.string().min(1).max(4096).nullable(),
+    })
+    .strict(),
+]);
+
+const opsPageItemSchemas = {
+  timeline: opsTimelineItemSchema.strict(),
+  artifacts: opsArtifactSchema.strict(),
+  research: opsResearchCardSchema.strict(),
+  repositories: opsRepositoryStatusSchema.strict(),
+} as const;
+
+const opsPageErrorSchema = z
+  .object({ error: z.enum(["invalid_cursor", "stale_cursor"]) })
+  .strict();
+
+export type OpsPageModule = z.infer<typeof opsPageModuleSchema>;
+type OpsPageRequestBase = { page_size?: number; cursor?: string | null };
+export type OpsPageRequest =
+  | (OpsPageRequestBase & {
+      module: "timeline";
+      scope: {
+        channel: string | null;
+        thread: string | null;
+        sort: "occurred_at_desc";
+      };
+    })
+  | (OpsPageRequestBase & {
+      module: "artifacts";
+      scope: {
+        work_item: string | null;
+        representation: "rendered" | "preview" | null;
+        sort: "created_at_desc";
+      };
+    })
+  | (OpsPageRequestBase & {
+      module: "research";
+      scope: { work_item: string | null; sort: "created_at_desc" };
+    })
+  | (OpsPageRequestBase & {
+      module: "repositories";
+      scope: { project: string | null; sort: "display_name_asc" };
+    });
+
+export interface OpsPageV1<T = unknown> {
+  contract_version: 1;
+  revision: number;
+  generated_at: string;
+  items: T[];
+  next_cursor: string | null;
+}
+
+export class OpsPageError extends Error {
+  readonly code: "invalid_cursor" | "stale_cursor";
+
+  constructor(code: "invalid_cursor" | "stale_cursor") {
+    super(code);
+    this.name = "OpsPageError";
+    this.code = code;
+  }
+}
+
 const NOT_CONFIGURED_CODES = new Set([
   "ops_bridge_invalid_config",
   "ops_bridge_token_unavailable",
@@ -57,6 +181,8 @@ export class OpsBridgeContractError extends Error {
     this.name = "OpsBridgeContractError";
   }
 }
+
+class OpsPageRevisionMismatchError extends OpsBridgeContractError {}
 
 function errorMessage(error: unknown): string {
   if (typeof error === "string") return error;
@@ -156,6 +282,48 @@ function normalizeSelection(selection: OpsSelection) {
   return parsed.data;
 }
 
+function normalizePageRequest(request: OpsPageRequest) {
+  const parsed = opsPageRequestSchema.safeParse({
+    ...request,
+    page_size: request.page_size ?? 100,
+    cursor: request.cursor ?? null,
+  });
+  if (!parsed.success) throw new OpsBridgeContractError();
+  return parsed.data;
+}
+
+function parsePage(
+  value: unknown,
+  module: OpsPageModule,
+  expectedCollectionRevision: number,
+): OpsPageV1 {
+  requireVersionOne(value);
+  if (
+    !Number.isSafeInteger(expectedCollectionRevision) ||
+    expectedCollectionRevision < 0 ||
+    hasAbsolutePath(value)
+  ) {
+    throw new OpsBridgeContractError();
+  }
+  const schema = z
+    .object({
+      contract_version: z.literal(1),
+      revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      generated_at: z.string().min(1),
+      items: z.array(opsPageItemSchemas[module]),
+      next_cursor: z.string().min(1).max(4096).nullable(),
+    })
+    .strict();
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    throw new OpsBridgeContractError();
+  }
+  if (parsed.data.revision !== expectedCollectionRevision) {
+    throw new OpsPageRevisionMismatchError();
+  }
+  return parsed.data;
+}
+
 export function opsSnapshotQueryKey(selection: OpsSelection) {
   return [
     "ops",
@@ -191,6 +359,58 @@ export async function loadOpsSnapshot(
 ): Promise<OpsBridgeSnapshotV1> {
   const capabilities = await getOpsCapabilities();
   return getOpsSnapshot(selection, capabilities);
+}
+
+export async function getOpsPage(
+  request: OpsPageRequest,
+  expectedCollectionRevision: number,
+): Promise<OpsPageV1> {
+  const normalized = normalizePageRequest(request);
+  try {
+    const value = await invoke<unknown>("ops_bridge_page", {
+      request: normalized,
+    });
+    return parsePage(value, normalized.module, expectedCollectionRevision);
+  } catch (error) {
+    const parsed = opsPageErrorSchema.safeParse(error);
+    if (parsed.success) throw new OpsPageError(parsed.data.error);
+    throw error;
+  }
+}
+
+export async function loadOpsPageWithStaleRestart(
+  request: OpsPageRequest,
+  expectedCollectionRevision: number,
+): Promise<OpsPageV1> {
+  try {
+    return await getOpsPage(request, expectedCollectionRevision);
+  } catch (error) {
+    const staleCursor =
+      error instanceof OpsPageError &&
+      error.code === "stale_cursor" &&
+      request.cursor != null;
+    const racedFirstPage =
+      error instanceof OpsPageRevisionMismatchError && request.cursor == null;
+    if (!staleCursor && !racedFirstPage) {
+      throw error;
+    }
+  }
+
+  const capabilities = await getOpsCapabilities();
+  const module = capabilities.modules?.find(
+    (candidate) => candidate.name === request.module,
+  );
+  if (
+    !module?.paged ||
+    module.schema_version !== 1 ||
+    module.collection_revision === undefined
+  ) {
+    throw new OpsBridgeContractError();
+  }
+  return getOpsPage(
+    { ...request, cursor: null } as OpsPageRequest,
+    module.collection_revision,
+  );
 }
 
 export async function startOpsWatch(): Promise<

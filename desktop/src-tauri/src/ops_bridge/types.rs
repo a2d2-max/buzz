@@ -14,6 +14,7 @@ pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+pub(crate) const MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
 pub(crate) trait VersionedResponse {
     fn contract_version(&self) -> u8;
@@ -58,6 +59,8 @@ pub struct OpsModuleCapability {
     pub name: String,
     pub schema_version: u64,
     pub paged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_revision: Option<u64>,
 }
 
 /// Strict version 1 capability response returned to the webview.
@@ -77,6 +80,27 @@ impl VersionedResponse for OpsBridgeCapabilities {
     }
 }
 
+impl OpsBridgeCapabilities {
+    pub(crate) fn validate(&self) -> Result<(), OpsBridgeError> {
+        if let Some(modules) = &self.modules {
+            let mut names = std::collections::HashSet::with_capacity(modules.len());
+            for module in modules {
+                valid_value(&module.name, MAX_ID_BYTES)
+                    .map_err(|_| OpsBridgeError::ContractMismatch)?;
+                if (module.paged && module.collection_revision.is_none())
+                    || module
+                        .collection_revision
+                        .is_some_and(|revision| revision > MAX_SAFE_INTEGER_U64)
+                    || !names.insert(module.name.as_str())
+                {
+                    return Err(OpsBridgeError::ContractMismatch);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Optional snapshot selection. Only these three query fields can reach the hub.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +108,237 @@ pub struct OpsSelection {
     pub channel: Option<String>,
     pub thread: Option<String>,
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsPageModule {
+    Timeline,
+    Artifacts,
+    Research,
+    Repositories,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsTimelineSort {
+    OccurredAtDesc,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsCreatedAtSort {
+    CreatedAtDesc,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsRepositorySort {
+    DisplayNameAsc,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsArtifactRepresentation {
+    Rendered,
+    Preview,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsTimelineScope {
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub channel: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub thread: Option<String>,
+    pub sort: OpsTimelineSort,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsArtifactScope {
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub work_item: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub representation: Option<OpsArtifactRepresentation>,
+    pub sort: OpsCreatedAtSort,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsResearchScope {
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub work_item: Option<String>,
+    pub sort: OpsCreatedAtSort,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsRepositoryScope {
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub project: Option<String>,
+    pub sort: OpsRepositorySort,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "module", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpsPageRequest {
+    Timeline {
+        scope: OpsTimelineScope,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    Artifacts {
+        scope: OpsArtifactScope,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    Research {
+        scope: OpsResearchScope,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    Repositories {
+        scope: OpsRepositoryScope,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+}
+
+impl OpsPageRequest {
+    pub(crate) fn module(&self) -> OpsPageModule {
+        match self {
+            Self::Timeline { .. } => OpsPageModule::Timeline,
+            Self::Artifacts { .. } => OpsPageModule::Artifacts,
+            Self::Research { .. } => OpsPageModule::Research,
+            Self::Repositories { .. } => OpsPageModule::Repositories,
+        }
+    }
+
+    pub(crate) fn page_size(&self) -> u16 {
+        match self {
+            Self::Timeline { page_size, .. }
+            | Self::Artifacts { page_size, .. }
+            | Self::Research { page_size, .. }
+            | Self::Repositories { page_size, .. } => *page_size,
+        }
+    }
+
+    pub(crate) fn cursor(&self) -> Option<&str> {
+        match self {
+            Self::Timeline { cursor, .. }
+            | Self::Artifacts { cursor, .. }
+            | Self::Research { cursor, .. }
+            | Self::Repositories { cursor, .. } => cursor.as_deref(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OpsBridgeError> {
+        if !(1..=200).contains(&self.page_size()) {
+            return Err(OpsBridgeError::InvalidRequest);
+        }
+        valid_optional_value(self.cursor(), 4096).map_err(|_| OpsBridgeError::InvalidRequest)?;
+        match self {
+            Self::Timeline { scope, .. } => {
+                valid_optional_value(scope.channel.as_deref(), MAX_ID_BYTES)
+                    .and_then(|_| valid_optional_value(scope.thread.as_deref(), MAX_ID_BYTES))
+            }
+            Self::Artifacts { scope, .. } => {
+                valid_optional_value(scope.work_item.as_deref(), MAX_ID_BYTES)
+            }
+            Self::Research { scope, .. } => {
+                valid_optional_value(scope.work_item.as_deref(), MAX_ID_BYTES)
+            }
+            Self::Repositories { scope, .. } => {
+                valid_optional_value(scope.project.as_deref(), MAX_ID_BYTES)
+            }
+        }
+        .map_err(|_| OpsBridgeError::InvalidRequest)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsPageV1<T> {
+    pub contract_version: u8,
+    pub revision: u64,
+    pub generated_at: String,
+    pub items: Vec<T>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub next_cursor: Option<String>,
+}
+
+impl<T> VersionedResponse for OpsPageV1<T> {
+    fn contract_version(&self) -> u8 {
+        self.contract_version
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsTimelineItemV1 {
+    pub id: String,
+    pub timestamp: String,
+    pub kind: String,
+    pub author: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsArtifactV1 {
+    pub id: String,
+    pub work_item_id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    pub version: u64,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub source_event_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsResearchCardV1 {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsRepositoryStatusV1 {
+    pub id: String,
+    pub name: String,
+    pub branch: String,
+    pub clean: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ahead: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum OpsPageResult {
+    Timeline(OpsPageV1<OpsTimelineItemV1>),
+    Artifacts(OpsPageV1<OpsArtifactV1>),
+    Research(OpsPageV1<OpsResearchCardV1>),
+    Repositories(OpsPageV1<OpsRepositoryStatusV1>),
 }
 
 /// Hub health in the public snapshot contract.
@@ -395,6 +650,14 @@ where
     D: Deserializer<'de>,
 {
     deserialize_event_sequence(deserializer).map(Some)
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 fn valid_value(value: &str, max_bytes: usize) -> Result<(), ()> {

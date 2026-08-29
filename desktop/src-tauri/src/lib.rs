@@ -524,6 +524,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ops_bridge::ops_bridge_capabilities,
             ops_bridge::ops_bridge_snapshot,
+            ops_bridge::ops_bridge_page,
             ops_bridge::ops_bridge_create_draft,
             ops_bridge::ops_bridge_transition,
             ops_bridge::ops_bridge_start_watch,

@@ -144,6 +144,14 @@ type MockInstallRuntimeResult = {
   log_path?: string | null;
 };
 
+type MockOpsPage<T extends Record<string, unknown>> = {
+  contract_version: 1;
+  revision: number;
+  generated_at: string;
+  items: T[];
+  next_cursor: string | null;
+};
+
 type MockBridgeOptions = {
   /** Tauri window label exposed to the app. Defaults to the main window. */
   windowLabel?: string;
@@ -472,6 +480,51 @@ type MockBridgeOptions = {
   opsCapabilities?: Record<string, unknown>;
   /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
   opsSnapshot?: Record<string, unknown>;
+  /** Strict deterministic page fixtures keyed by the fixed Ops module enum. */
+  opsPages?: Partial<{
+    timeline: MockOpsPage<{
+      id: string;
+      timestamp: string;
+      kind: string;
+      author: string;
+      body: string;
+      source?: string;
+      outcome?: string | null;
+      details?: Record<string, unknown>;
+    }>;
+    artifacts: MockOpsPage<{
+      id: string;
+      work_item_id: string;
+      title: string;
+      kind: string;
+      status: string;
+      version: number;
+      source_event_id: string | null;
+      created_at: string;
+      updated_at: string;
+    }>;
+    research: MockOpsPage<{
+      id: string;
+      title: string;
+      status: string;
+      updated_at?: string;
+    }>;
+    repositories: MockOpsPage<{
+      id: string;
+      name: string;
+      branch: string;
+      clean: boolean;
+      ahead?: number;
+      behind?: number;
+    }>;
+  }>;
+  /** Typed cursor errors returned by the fixed page command. */
+  opsPageErrors?: Partial<
+    Record<
+      "timeline" | "artifacts" | "research" | "repositories",
+      "invalid_cursor" | "stale_cursor"
+    >
+  >;
   /**
    * Pending community deep links seeded into the mocked Rust-side queue.
    * The frontend drains these on boot into onboarding or an editable Add

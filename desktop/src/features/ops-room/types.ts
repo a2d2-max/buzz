@@ -25,6 +25,7 @@ const publicString = z
 const requiredPublicString = publicString.min(1);
 const nullablePublicString = publicString.nullable();
 const nonNegativeInteger = z.number().int().nonnegative();
+const safeNonNegativeInteger = nonNegativeInteger.max(Number.MAX_SAFE_INTEGER);
 export const opsEventSequenceSchema = z.string().regex(/^(?:0|[1-9][0-9]*)$/u);
 const publicDetails = z.record(z.string(), z.unknown()).default({});
 
@@ -46,8 +47,17 @@ export const opsModuleCapabilitySchema = z
     name: requiredPublicString,
     schema_version: nonNegativeInteger,
     paged: z.boolean(),
+    collection_revision: safeNonNegativeInteger.optional(),
   })
-  .strip();
+  .strip()
+  .superRefine((module, context) => {
+    if (module.paged && module.collection_revision === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "paged modules require exactly one collection revision",
+      });
+    }
+  });
 
 export const opsCapabilitiesSchema = z
   .object({

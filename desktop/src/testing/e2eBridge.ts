@@ -184,6 +184,52 @@ type MockHuddleSeed = {
   isCreator?: boolean;
 };
 
+type MockOpsPage<T extends Record<string, unknown>> = {
+  contract_version: 1;
+  revision: number;
+  generated_at: string;
+  items: T[];
+  next_cursor: string | null;
+};
+
+type MockOpsPages = {
+  timeline?: MockOpsPage<{
+    id: string;
+    timestamp: string;
+    kind: string;
+    author: string;
+    body: string;
+    source?: string;
+    outcome?: string | null;
+    details?: Record<string, unknown>;
+  }>;
+  artifacts?: MockOpsPage<{
+    id: string;
+    work_item_id: string;
+    title: string;
+    kind: string;
+    status: string;
+    version: number;
+    source_event_id: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+  research?: MockOpsPage<{
+    id: string;
+    title: string;
+    status: string;
+    updated_at?: string;
+  }>;
+  repositories?: MockOpsPage<{
+    id: string;
+    name: string;
+    branch: string;
+    clean: boolean;
+    ahead?: number;
+    behind?: number;
+  }>;
+};
+
 type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
@@ -547,6 +593,12 @@ type E2eConfig = {
     opsCapabilities?: Record<string, unknown>;
     /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
     opsSnapshot?: Record<string, unknown>;
+    /** Strict deterministic page fixtures keyed by the fixed Ops module enum. */
+    opsPages?: MockOpsPages;
+    /** Typed cursor errors returned by the fixed page command. */
+    opsPageErrors?: Partial<
+      Record<MockOpsPageModule, "invalid_cursor" | "stale_cursor">
+    >;
     /**
      * Global agent config returned by `get_global_agent_config`. Defaults to
      * an empty config (no provider, model, or env vars) if not specified.
@@ -1700,6 +1752,237 @@ const MOCK_OPS_SNAPSHOT = {
     },
   ],
 } as const;
+const MOCK_OPS_PAGES: Required<MockOpsPages> = {
+  timeline: {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  },
+  artifacts: {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  },
+  research: {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  },
+  repositories: {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  },
+};
+
+type MockOpsPageModule = keyof MockOpsPages;
+
+function isMockOpsRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasMockOpsKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const keys = Object.keys(value);
+  const allowed = new Set([...required, ...optional]);
+  return (
+    required.every((key) => key in value) &&
+    keys.every((key) => allowed.has(key))
+  );
+}
+
+function isMockOpsText(value: unknown, max = 65_536): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= max &&
+    ![...value].some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code <= 31 || code === 127;
+    })
+  );
+}
+
+function parseMockOpsPageRequest(payload: unknown): MockOpsPageModule {
+  if (!isMockOpsRecord(payload) || !hasMockOpsKeys(payload, ["request"])) {
+    throw new Error("ops_bridge_invalid_request");
+  }
+  const request = payload.request;
+  if (
+    !isMockOpsRecord(request) ||
+    !hasMockOpsKeys(request, ["module", "scope", "page_size", "cursor"]) ||
+    !["timeline", "artifacts", "research", "repositories"].includes(
+      String(request.module),
+    ) ||
+    !Number.isSafeInteger(request.page_size) ||
+    Number(request.page_size) < 1 ||
+    Number(request.page_size) > 200 ||
+    !(request.cursor === null || isMockOpsText(request.cursor, 4096)) ||
+    !isMockOpsRecord(request.scope)
+  ) {
+    throw new Error("ops_bridge_invalid_request");
+  }
+  const nullableText = (value: unknown) =>
+    value === null || isMockOpsText(value, 256);
+  const scope = request.scope;
+  const validScope = (() => {
+    switch (request.module) {
+      case "timeline":
+        return (
+          hasMockOpsKeys(scope, ["channel", "thread", "sort"]) &&
+          nullableText(scope.channel) &&
+          nullableText(scope.thread) &&
+          scope.sort === "occurred_at_desc"
+        );
+      case "artifacts":
+        return (
+          hasMockOpsKeys(scope, ["work_item", "representation", "sort"]) &&
+          nullableText(scope.work_item) &&
+          (scope.representation === null ||
+            scope.representation === "rendered" ||
+            scope.representation === "preview") &&
+          scope.sort === "created_at_desc"
+        );
+      case "research":
+        return (
+          hasMockOpsKeys(scope, ["work_item", "sort"]) &&
+          nullableText(scope.work_item) &&
+          scope.sort === "created_at_desc"
+        );
+      case "repositories":
+        return (
+          hasMockOpsKeys(scope, ["project", "sort"]) &&
+          nullableText(scope.project) &&
+          scope.sort === "display_name_asc"
+        );
+      default:
+        return false;
+    }
+  })();
+  if (!validScope) throw new Error("ops_bridge_invalid_request");
+  return request.module as MockOpsPageModule;
+}
+
+function validateMockOpsPage(
+  module: MockOpsPageModule,
+  value: unknown,
+): asserts value is MockOpsPage<Record<string, unknown>> {
+  if (
+    !isMockOpsRecord(value) ||
+    !hasMockOpsKeys(value, [
+      "contract_version",
+      "revision",
+      "generated_at",
+      "items",
+      "next_cursor",
+    ]) ||
+    value.contract_version !== 1 ||
+    !Number.isSafeInteger(value.revision) ||
+    Number(value.revision) < 0 ||
+    !isMockOpsText(value.generated_at) ||
+    !Array.isArray(value.items) ||
+    !(value.next_cursor === null || isMockOpsText(value.next_cursor, 4096))
+  ) {
+    throw new Error("ops_bridge_contract_mismatch");
+  }
+  const itemKeys = {
+    timeline: {
+      required: ["id", "timestamp", "kind", "author", "body"],
+      optional: ["source", "outcome", "details"],
+    },
+    artifacts: {
+      required: [
+        "id",
+        "work_item_id",
+        "title",
+        "kind",
+        "status",
+        "version",
+        "source_event_id",
+        "created_at",
+        "updated_at",
+      ],
+      optional: [],
+    },
+    research: {
+      required: ["id", "title", "status"],
+      optional: ["updated_at"],
+    },
+    repositories: {
+      required: ["id", "name", "branch", "clean"],
+      optional: ["ahead", "behind"],
+    },
+  } as const;
+  const keys = itemKeys[module];
+  if (
+    value.items.some(
+      (item) =>
+        !isMockOpsRecord(item) ||
+        !hasMockOpsKeys(item, keys.required, keys.optional) ||
+        !isValidMockOpsPageItem(module, item),
+    )
+  ) {
+    throw new Error("ops_bridge_contract_mismatch");
+  }
+}
+
+function isValidMockOpsPageItem(
+  module: MockOpsPageModule,
+  item: Record<string, unknown>,
+): boolean {
+  const safeCount = (value: unknown) =>
+    Number.isSafeInteger(value) && Number(value) >= 0;
+  switch (module) {
+    case "timeline":
+      return (
+        ["id", "timestamp", "kind", "author", "body"].every((key) =>
+          isMockOpsText(item[key]),
+        ) &&
+        (item.source === undefined || isMockOpsText(item.source)) &&
+        (item.outcome === undefined ||
+          item.outcome === null ||
+          isMockOpsText(item.outcome)) &&
+        (item.details === undefined || isMockOpsRecord(item.details))
+      );
+    case "artifacts":
+      return (
+        [
+          "id",
+          "work_item_id",
+          "title",
+          "kind",
+          "status",
+          "created_at",
+          "updated_at",
+        ].every((key) => isMockOpsText(item[key])) &&
+        safeCount(item.version) &&
+        (item.source_event_id === null || isMockOpsText(item.source_event_id))
+      );
+    case "research":
+      return (
+        ["id", "title", "status"].every((key) => isMockOpsText(item[key])) &&
+        (item.updated_at === undefined || isMockOpsText(item.updated_at))
+      );
+    case "repositories":
+      return (
+        ["id", "name", "branch"].every((key) => isMockOpsText(item[key])) &&
+        typeof item.clean === "boolean" &&
+        (item.ahead === undefined || safeCount(item.ahead)) &&
+        (item.behind === undefined || safeCount(item.behind))
+      );
+  }
+}
 const DEFAULT_MOCK_IDENTITY = {
   pubkey: "deadbeef".repeat(8),
   display_name: "npub1mock...",
@@ -11456,6 +11739,17 @@ export function maybeInstallE2eTauriMocks() {
         return structuredClone(
           activeConfig?.mock?.opsSnapshot ?? MOCK_OPS_SNAPSHOT,
         );
+      case "ops_bridge_page": {
+        const module = parseMockOpsPageRequest(payload);
+        const configuredError = activeConfig?.mock?.opsPageErrors?.[module];
+        if (configuredError) {
+          return Promise.reject({ error: configuredError });
+        }
+        const page =
+          activeConfig?.mock?.opsPages?.[module] ?? MOCK_OPS_PAGES[module];
+        validateMockOpsPage(module, page);
+        return structuredClone(page);
+      }
       case "ops_bridge_start_watch": {
         const started = !mockOpsWatchStarted;
         mockOpsWatchStarted = true;

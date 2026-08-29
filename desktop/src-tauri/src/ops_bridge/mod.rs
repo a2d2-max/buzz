@@ -8,9 +8,9 @@ use tauri::Emitter;
 use crate::app_state::AppState;
 use client::{OpsBridgeClient, OpsBridgeConfig, OpsBridgeError};
 use types::{
-    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsSelection,
-    OpsSyncAckRequest, OpsSyncAckResult, OpsTransitionReceipt, OpsTransitionRequest,
-    OpsWatchStartResult, DEFAULT_HUB_PORT, MAX_RESPONSE_BYTES,
+    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsPageRequest,
+    OpsPageResult, OpsSelection, OpsSyncAckRequest, OpsSyncAckResult, OpsTransitionReceipt,
+    OpsTransitionRequest, OpsWatchStartResult, DEFAULT_HUB_PORT, MAX_RESPONSE_BYTES,
 };
 use watch::OpsBridgeWatcher;
 
@@ -66,6 +66,33 @@ pub(crate) async fn ops_bridge_snapshot(
         .snapshot(&selection)
         .await
         .map_err(public_error)
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OpsPageErrorCode {
+    InvalidCursor,
+    StaleCursor,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum OpsPageCommandError {
+    Cursor { error: OpsPageErrorCode },
+    Bridge(String),
+}
+
+#[tauri::command]
+pub(crate) async fn ops_bridge_page(
+    request: OpsPageRequest,
+    state: tauri::State<'_, OpsBridgeState>,
+) -> Result<OpsPageResult, OpsPageCommandError> {
+    state
+        .client()
+        .map_err(page_error)?
+        .page(&request)
+        .await
+        .map_err(page_error)
 }
 
 #[tauri::command]
@@ -173,5 +200,20 @@ fn public_error(error: OpsBridgeError) -> String {
     error.to_string()
 }
 
+fn page_error(error: OpsBridgeError) -> OpsPageCommandError {
+    match error {
+        OpsBridgeError::InvalidCursor => OpsPageCommandError::Cursor {
+            error: OpsPageErrorCode::InvalidCursor,
+        },
+        OpsBridgeError::StaleCursor => OpsPageCommandError::Cursor {
+            error: OpsPageErrorCode::StaleCursor,
+        },
+        _ => OpsPageCommandError::Bridge(public_error(error)),
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/page_tests.rs"]
+mod page_tests;
 #[cfg(test)]
 mod tests;

@@ -102,6 +102,9 @@ beforeEach(() => {
           throw new Error(`unexpected invoke: ${command}`);
         }
         const response = responses.shift();
+        if (response?.reject !== undefined) {
+          throw response.reject;
+        }
         if (response instanceof Error || typeof response === "string") {
           throw response;
         }
@@ -192,7 +195,12 @@ describe("native Ops bridge contract", () => {
         ...capabilities,
         modules: [
           { name: "timeline", schema_version: 1, paged: false },
-          { name: "future_module", schema_version: 1, paged: true },
+          {
+            name: "future_module",
+            schema_version: 1,
+            paged: true,
+            collection_revision: 8,
+          },
         ],
       },
       validSnapshot({
@@ -339,6 +347,343 @@ describe("native Ops bridge contract", () => {
     await assert.rejects(
       bridge.getOpsCapabilities(),
       (error) => error?.name === "OpsBridgeContractError",
+    );
+  });
+
+  test("requires a safe collection revision when a module is paged", async () => {
+    responses.push({
+      ...capabilities,
+      modules: [{ name: "timeline", schema_version: 1, paged: true }],
+    });
+    await assert.rejects(bridge.getOpsCapabilities(), {
+      name: "OpsBridgeContractError",
+    });
+
+    responses.push({
+      ...capabilities,
+      modules: [
+        {
+          name: "timeline",
+          schema_version: 1,
+          paged: false,
+          collection_revision: 8,
+        },
+      ],
+    });
+    assert.equal(
+      (await bridge.getOpsCapabilities()).modules[0].collection_revision,
+      8,
+    );
+
+    responses.push({
+      ...capabilities,
+      modules: [
+        {
+          name: "timeline",
+          schema_version: 1,
+          paged: true,
+          collection_revision: Number.MAX_SAFE_INTEGER + 1,
+        },
+      ],
+    });
+    await assert.rejects(bridge.getOpsCapabilities(), {
+      name: "OpsBridgeContractError",
+    });
+  });
+
+  test("loads an exact timeline page with normalized native arguments", async () => {
+    responses.push({
+      contract_version: 1,
+      revision: 8,
+      generated_at: "2026-08-30T00:00:00.000Z",
+      items: [
+        {
+          id: "event:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          timestamp: "2026-08-30T00:00:00.000Z",
+          kind: "status",
+          author: "Codex",
+          body: "Paged status",
+          source: "codex_direct",
+          outcome: null,
+          details: { phase: "done" },
+        },
+      ],
+      next_cursor: "opaque-next",
+    });
+
+    const page = await bridge.getOpsPage(
+      {
+        module: "timeline",
+        scope: {
+          channel: null,
+          thread: "work:0123456789abcdef0123456789abcdef",
+          sort: "occurred_at_desc",
+        },
+      },
+      8,
+    );
+
+    assert.equal(page.items[0].body, "Paged status");
+    assert.deepEqual(calls, [
+      {
+        command: "ops_bridge_page",
+        args: {
+          request: {
+            module: "timeline",
+            scope: {
+              channel: null,
+              thread: "work:0123456789abcdef0123456789abcdef",
+              sort: "occurred_at_desc",
+            },
+            page_size: 100,
+            cursor: null,
+          },
+        },
+      },
+    ]);
+  });
+
+  test("validates exact page envelopes and each fixed module item shape", async () => {
+    const cases = [
+      {
+        module: "artifacts",
+        scope: {
+          work_item: null,
+          representation: "preview",
+          sort: "created_at_desc",
+        },
+        item: {
+          id: "artifact:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          work_item_id: "work:0123456789abcdef0123456789abcdef",
+          title: "Preview",
+          kind: "report",
+          status: "ready",
+          version: 1,
+          source_event_id: null,
+          created_at: "2026-08-30T00:00:00.000Z",
+          updated_at: "2026-08-30T00:00:00.000Z",
+        },
+      },
+      {
+        module: "research",
+        scope: { work_item: null, sort: "created_at_desc" },
+        item: {
+          id: "research:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          title: "Source review",
+          status: "complete",
+          updated_at: "2026-08-30T00:00:00.000Z",
+        },
+      },
+      {
+        module: "repositories",
+        scope: { project: null, sort: "display_name_asc" },
+        item: {
+          id: "repository:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          name: "buzz",
+          branch: "feat/native-ops-wrapper",
+          clean: true,
+          ahead: 0,
+          behind: 0,
+        },
+      },
+    ];
+
+    for (const { module, scope, item } of cases) {
+      responses.push({
+        contract_version: 1,
+        revision: 11,
+        generated_at: "2026-08-30T00:00:00.000Z",
+        items: [item],
+        next_cursor: null,
+      });
+      const page = await bridge.getOpsPage({ module, scope }, 11);
+      assert.deepEqual(page.items, [item]);
+    }
+
+    for (const invalid of [
+      {
+        contract_version: 1,
+        revision: 12,
+        generated_at: "2026-08-30T00:00:00.000Z",
+        items: [],
+        next_cursor: null,
+      },
+      {
+        contract_version: 1,
+        revision: 11,
+        generated_at: "2026-08-30T00:00:00.000Z",
+        items: [],
+        next_cursor: null,
+        extra: true,
+      },
+      {
+        contract_version: 1,
+        revision: 11,
+        generated_at: "2026-08-30T00:00:00.000Z",
+        items: [{ id: "event:bad", extra: true }],
+        next_cursor: null,
+      },
+    ]) {
+      responses.push(invalid);
+      await assert.rejects(
+        bridge.getOpsPage(
+          {
+            module: "timeline",
+            scope: {
+              channel: null,
+              thread: null,
+              sort: "occurred_at_desc",
+            },
+          },
+          11,
+        ),
+        (error) => error?.name === "OpsBridgeContractError",
+      );
+    }
+  });
+
+  test("does not retry an invalid cursor error", async () => {
+    responses.push({ reject: { error: "invalid_cursor" } });
+
+    await assert.rejects(
+      bridge.loadOpsPageWithStaleRestart(
+        {
+          module: "research",
+          scope: { work_item: null, sort: "created_at_desc" },
+          cursor: "invalid",
+        },
+        4,
+      ),
+      (error) =>
+        error?.name === "OpsPageError" && error?.code === "invalid_cursor",
+    );
+    assert.equal(calls.length, 1);
+  });
+
+  test("restarts a stale cursor once from a refreshed collection revision", async () => {
+    responses.push(
+      { reject: { error: "stale_cursor" } },
+      {
+        ...capabilities,
+        modules: [
+          {
+            name: "repositories",
+            schema_version: 1,
+            paged: true,
+            collection_revision: 12,
+          },
+        ],
+      },
+      {
+        contract_version: 1,
+        revision: 12,
+        generated_at: "2026-08-30T00:00:00.000Z",
+        items: [],
+        next_cursor: null,
+      },
+    );
+
+    await bridge.loadOpsPageWithStaleRestart(
+      {
+        module: "repositories",
+        scope: { project: null, sort: "display_name_asc" },
+        page_size: 25,
+        cursor: "stale",
+      },
+      11,
+    );
+
+    assert.deepEqual(
+      calls.map(({ command }) => command),
+      ["ops_bridge_page", "ops_bridge_capabilities", "ops_bridge_page"],
+    );
+    assert.equal(calls[2].args.request.cursor, null);
+    assert.equal(calls[2].args.request.page_size, 25);
+
+    calls.length = 0;
+    responses.push(
+      { reject: { error: "stale_cursor" } },
+      {
+        ...capabilities,
+        modules: [
+          {
+            name: "repositories",
+            schema_version: 1,
+            paged: true,
+            collection_revision: 13,
+          },
+        ],
+      },
+      { reject: { error: "stale_cursor" } },
+    );
+    await assert.rejects(
+      bridge.loadOpsPageWithStaleRestart(
+        {
+          module: "repositories",
+          scope: { project: null, sort: "display_name_asc" },
+          cursor: "stale-again",
+        },
+        12,
+      ),
+      (error) => error?.code === "stale_cursor",
+    );
+    assert.equal(calls.length, 3);
+  });
+
+  test("restarts a raced first page revision once and enforces safe revisions", async () => {
+    const emptyPage = (revision) => ({
+      contract_version: 1,
+      revision,
+      generated_at: "2026-08-30T00:00:00.000Z",
+      items: [],
+      next_cursor: null,
+    });
+    responses.push(
+      emptyPage(12),
+      {
+        ...capabilities,
+        modules: [
+          {
+            name: "timeline",
+            schema_version: 1,
+            paged: true,
+            collection_revision: 12,
+          },
+        ],
+      },
+      emptyPage(12),
+    );
+
+    await bridge.loadOpsPageWithStaleRestart(
+      {
+        module: "timeline",
+        scope: {
+          channel: null,
+          thread: null,
+          sort: "occurred_at_desc",
+        },
+      },
+      11,
+    );
+    assert.deepEqual(
+      calls.map(({ command }) => command),
+      ["ops_bridge_page", "ops_bridge_capabilities", "ops_bridge_page"],
+    );
+
+    responses.push(emptyPage(Number.MAX_SAFE_INTEGER + 1));
+    await assert.rejects(
+      bridge.getOpsPage(
+        {
+          module: "timeline",
+          scope: {
+            channel: null,
+            thread: null,
+            sort: "occurred_at_desc",
+          },
+        },
+        Number.MAX_SAFE_INTEGER,
+      ),
+      { name: "OpsBridgeContractError" },
     );
   });
 
