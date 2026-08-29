@@ -433,7 +433,13 @@ fn load_or_create_identity(data_dir: &std::path::Path) -> Result<ResolvedIdentit
     }
 
     let store = crate::secret_store::SecretStore::shared(keyring_service());
-    resolve_identity_with_store(store, &legacy_path, data_dir)
+    let mut resolved = resolve_identity_with_store(store, &legacy_path, data_dir)?;
+    // The debug file backend stores in a plain file — reporting
+    // "system-keyring" to the UI would be a lie.
+    if store.is_file_backed() && resolved.storage == IdentityStorage::SystemKeyring {
+        resolved.storage = IdentityStorage::LocalFile;
+    }
+    Ok(resolved)
 }
 
 /// Identity resolution over an [`IdentityKeyStore`] seam. Split from
@@ -871,7 +877,12 @@ pub(crate) fn persist_imported_identity(
     legacy_path: &std::path::Path,
     data_dir: &std::path::Path,
 ) -> Result<IdentityStorage, String> {
-    persist_imported_identity_impl(store, keys, legacy_path, data_dir)
+    let storage = persist_imported_identity_impl(store, keys, legacy_path, data_dir)?;
+    // See load_or_create_identity: the debug file backend reports local-file.
+    if store.is_file_backed() && storage == IdentityStorage::SystemKeyring {
+        return Ok(IdentityStorage::LocalFile);
+    }
+    Ok(storage)
 }
 
 /// Path of the migration-completed marker within `data_dir`.
