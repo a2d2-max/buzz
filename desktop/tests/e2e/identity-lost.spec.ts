@@ -181,6 +181,39 @@ test("local Ops guest boundary ignores global Nostr binding requests", async ({
   );
 });
 
+test("local Ops banner clears macOS traffic lights at the minimum window width", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 800, height: 500 });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "platform", { get: () => "MacIntel" });
+  });
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+  await enterLocalOpsGuestMode(page);
+
+  const label = page.getByText("Local Ops mode", { exact: true });
+  const restore = page.getByRole("button", { name: "Restore identity" });
+  await expect(label).toBeVisible();
+  await expect(restore).toBeVisible();
+  const labelBox = await label.boundingBox();
+  const restoreBox = await restore.boundingBox();
+  expect(labelBox).not.toBeNull();
+  expect(restoreBox).not.toBeNull();
+
+  // With native controls positioned at x:16, their visible right edge is
+  // approximately 72px. Both label text and the restore control must remain
+  // readable inside the minimum supported 800px-wide window.
+  expect(labelBox?.x ?? 0).toBeGreaterThanOrEqual(72);
+  expect((restoreBox?.x ?? 0) + (restoreBox?.width ?? 0)).toBeLessThanOrEqual(
+    800,
+  );
+});
+
 test("local Ops guest bridge rejects every signed external provider and audio command family", async ({
   page,
 }) => {

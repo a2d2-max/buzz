@@ -1,5 +1,9 @@
 import * as React from "react";
 
+import { macTrafficLightClearance } from "@/shared/layout/chromeLayout";
+import { cn } from "@/shared/lib/cn";
+import { isMacPlatform } from "@/shared/lib/platform";
+import { useIsFullscreen } from "@/shared/lib/useIsFullscreen";
 import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 import { OpsRoomScreen } from "./OpsRoomScreen";
@@ -9,6 +13,9 @@ type LocalOpsGuestAppProps = {
 };
 
 export function LocalOpsGuestApp({ onRestoreIdentity }: LocalOpsGuestAppProps) {
+  const isFullscreen = useIsFullscreen();
+  const clearsMacTrafficLights = isMacPlatform() && !isFullscreen;
+
   React.useLayoutEffect(() => {
     if (window.location.hash !== "#/ops") {
       window.location.hash = "/ops";
@@ -20,7 +27,12 @@ export function LocalOpsGuestApp({ onRestoreIdentity }: LocalOpsGuestAppProps) {
       <StartupWindowDragRegion />
       <aside
         aria-label="Local Ops mode"
-        className="flex min-w-0 flex-col gap-3 border-border/70 border-b bg-muted/40 px-5 py-3 sm:flex-row sm:items-center sm:justify-between"
+        className={cn(
+          "flex min-w-0 flex-col gap-3 border-border/70 border-b bg-muted/40 py-3 pr-5 sm:flex-row sm:items-center sm:justify-between",
+          clearsMacTrafficLights
+            ? macTrafficLightClearance.withoutLeadingRail
+            : "pl-5",
+        )}
       >
         <div className="min-w-0">
           <p className="text-sm font-semibold">Local Ops mode</p>
