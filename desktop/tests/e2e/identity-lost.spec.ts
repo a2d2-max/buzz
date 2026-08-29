@@ -29,7 +29,7 @@ async function enterLocalOpsGuestMode(page: import("@playwright/test").Page) {
   await page
     .getByRole("button", { name: "Continue in local Ops mode" })
     .click();
-  await expect(page).toHaveURL(/#\/ops$/);
+  await expect(page).toHaveURL(/#\/ops\?view=room$/);
 }
 
 async function guestCommandLog(page: import("@playwright/test").Page) {
@@ -320,8 +320,8 @@ test("local Ops guest mode persists without mutating identity recovery", async (
 
   await enterLocalOpsGuestMode(page);
 
-  await expect(page).toHaveURL(/#\/ops$/);
-  await expect(page.getByRole("heading", { name: "Ops Room" })).toBeVisible();
+  await expect(page).toHaveURL(/#\/ops\?view=room$/);
+  await expect(page.getByRole("heading", { name: "Agent Room" })).toBeVisible();
   await expect(page.getByText("Local Ops mode", { exact: true })).toBeVisible();
   await expect(
     page.getByText(
@@ -353,8 +353,8 @@ test("local Ops guest mode persists without mutating identity recovery", async (
   ).toEqual([]);
 
   await page.reload();
-  await expect(page).toHaveURL(/#\/ops$/);
-  await expect(page.getByRole("heading", { name: "Ops Room" })).toBeVisible();
+  await expect(page).toHaveURL(/#\/ops\?view=room$/);
+  await expect(page.getByRole("heading", { name: "Agent Room" })).toBeVisible();
   await expect(page.getByText("Local Ops mode", { exact: true })).toBeVisible();
   const commandsAfterReload = await guestCommandLog(page);
   expect(
