@@ -1,0 +1,21 @@
+{
+  "source": "native-tauri-accessibility-tree",
+  "runtime_commit": "7f6ab108339fe6cfad931eb7b3a2a6e1211f4a7b",
+  "viewport": {
+    "width": 390,
+    "height": 844,
+    "scale": 2
+  },
+  "accessibility": {
+    "tree_text": "App=buzz-desktop (pid <redacted>)\nWindow: \"\", App: buzz-desktop.\n\n0 standard window\n\t1 scroll area\n\t\t2 HTML content\n\t\t\t3 container Local Ops mode\n\t\t\t\t4 text Local Ops mode\n\t\t\t\t5 text Messaging, signed actions, and external actions are unavailable until you restore your identity.\n\t\t\t\t6 button Restore identity\n\t\t\t7 heading Agent Room\n\t\t\t8 container\n\t\t\t\t9 tab group Agent Room 화면\n\t\t\t\t\t10 tab 작업, Value: 0\n\t\t\t\t\t11 tab 세션, Value: 0\n\t\t\t\t\t12 tab (selected) 타임라인, Value: 1\n\t\t\t\t\t13 tab 컨텍스트, Value: 0\n\t\t\t\t14 container 활동 타임라인\n\t\t\t\t\t15 heading 활동 타임라인\n\t\t\t\t\t16 container\n\t\t\t\t\t\t17 container\n\t\t\t\t\t\t\t18 container, Text: 지시 오전 08:50\n\t\t\t\t\t\t\t19 text 사용자\n\t\t\t\t\t\t\t20 text 사용자\n\t\t\t\t\t\t\t21 text Continue the isolated native evidence implementation.\n\t\t\t\t\t\t\t22 summary 세부 정보, Value: 0\n\t\t\t\t\t\t23 container\n\t\t\t\t\t\t\t24 container, Text: 승인 오전 08:51\n\t\t\t\t\t\t\t25 text 마스터 코디네이터\n\t\t\t\t\t\t\t26 text 마스터 코디네이터\n\t\t\t\t\t\t\t27 text Review the isolated evidence contract.\n\t\t\t\t\t\t\t28 summary 세부 정보, Value: 0\n\t\t\t\t\t\t29 container\n\t\t\t\t\t\t\t30 container, Text: 위임 오전 08:52\n\t\t\t\t\t\t\t31 text 마스터 코디네이터\n\t\t\t\t\t\t\t32 text 마스터 코디네이터\n\t\t\t\t\t\t\t33 text @Claude Code에게 Unified Ops evidence 작업을 배정\n\t\t\t\t\t\t\t34 summary 세부 정보, Value: 0\n\t\t\t\t\t\t35 container\n\t\t\t\t\t\t\t36 container, Text: 진행 오전 08:53\n\t\t\t\t\t\t\t37 text Codex\n\t\t\t\t\t\t\t38 text Codex\n\t\t\t\t\t\t\t39 text working\n\t\t\t\t\t\t\t40 summary 세부 정보, Value: 0\n\t\t\t\t\t\t41 container\n\t\t\t\t\t\t\t42 container, Text: 질문 오전 08:54\n\t\t\t\t\t\t\t43 text 에이전트\n\t\t\t\t\t\t\t44 text 에이전트\n\t\t\t\t\t\t\t45 text Is the evidence boundary clear?\n\t\t\t\t\t\t\t46 summary 세부 정보, Value: 0\n\t\t\t\t\t\t47 container\n\t\t\t\t\t\t\t48 container, Text: 완료 Fixture contract verified 오전 08:55\n\t\t\t\t\t\t\t49 text Claude Code\n\t\t\t\t\t\t\t50 text Claude Code\n\t\t\t\t\t\t\t51 text 완료: Fixture contract verified\n\t\t\t\t\t\t\t52 summary 세부 정보, Value: 0\n\t\t\t\t\t\t53 container\n\t\t\t\t\t\t\t54 container, Text: 산출물 오전 08:56\n\t\t\t\t\t\t\t55 text Claude Code\n\t\t\t\t\t\t\t56 text Claude Code\n\t\t\t\t\t\t\t57 text 아티팩트: evidence-summary.md\n\t\t\t\t\t\t\t58 summary 세부 정보, Value: 0\n\t\t\t59 container Notifications alt+T\n\t60 close button\n\t61 full screen button, Secondary Actions: zoom the window\n\t62 minimize button\n\nThe focused UI element is 2 HTML content.",
+    "element_count": 63,
+    "coordinate_space": "window",
+    "truncation": {
+      "maxDepthReached": false,
+      "maxDepth": 64,
+      "truncated": false,
+      "maxNodes": 1200
+    },
+    "focused_element_id": 2
+  }
+}
