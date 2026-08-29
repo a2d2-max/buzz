@@ -23,6 +23,16 @@ function subscribe(listener: Listener) {
   };
 }
 
+function handleStorageChange(event: StorageEvent) {
+  if (event.key !== LOCAL_OPS_GUEST_STORAGE_KEY) return;
+  sessionEnabled = event.newValue === "true";
+  emitChange();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", handleStorageChange);
+}
+
 export function isLocalOpsGuestModeEnabled(): boolean {
   return (
     sessionEnabled || getStorageItem(LOCAL_OPS_GUEST_STORAGE_KEY) === "true"

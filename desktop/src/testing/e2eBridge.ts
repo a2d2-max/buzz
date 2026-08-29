@@ -11220,6 +11220,39 @@ export function maybeInstallE2eTauriMocks() {
     });
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
+    const recoveryBlockedCommands = new Set([
+      "sign_event",
+      "sign_nostr_identity_binding",
+      "grant_approval",
+      "deny_approval",
+      "ops_bridge_create_draft",
+      "ops_bridge_transition",
+      "start_huddle",
+      "join_huddle",
+      "reconnect_huddle_audio",
+      "start_stt_pipeline",
+      "push_audio_pcm",
+      "speak_agent_message",
+      "preview_pocket_voice",
+      "create_managed_agent",
+      "start_managed_agent",
+      "start_managed_agent_runtime",
+      "restart_managed_agent_runtime",
+      "mesh_start_node",
+    ]);
+    const recoveryIdentity = getActiveIdentity(activeConfig);
+    const identityInRecovery =
+      !recoveryIdentity &&
+      ((!mockIdentityLostCleared &&
+        activeConfig?.mock?.identityLost === true) ||
+        (!mockIdentityLockedCleared &&
+          activeConfig?.mock?.identityLocked === true));
+    if (identityInRecovery && recoveryBlockedCommands.has(command)) {
+      throw new Error(
+        "identity is in recovery mode; event signing is disabled until the identity is restored and Buzz is relaunched",
+      );
+    }
+
     switch (command) {
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;

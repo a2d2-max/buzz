@@ -408,6 +408,7 @@ pub async fn mesh_start_node(
     state: State<'_, AppState>,
     mut request: mesh_llm::StartMeshNodeRequest,
 ) -> CmdResult<mesh_llm::MeshNodeStatus> {
+    state.require_active_identity()?;
     let relay_url = relay::relay_ws_url_with_override(&state);
     request.relay_url = Some(relay_url.clone());
     if let Some(model_id) = request.model_id.as_mut() {

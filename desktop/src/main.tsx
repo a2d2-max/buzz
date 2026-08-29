@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { App } from "@/app/App";
 import { RootErrorBoundary } from "@/app/RootErrorBoundary";
 import { NostrBindConsentDialog } from "@/features/profile/ui/NostrBindConsentDialog";
+import { useLocalOpsGuestMode } from "@/features/onboarding/localOpsGuestMode";
 import "@fontsource-variable/inter/opsz.css";
 import "@fontsource-variable/inter/opsz-italic.css";
 import "@fontsource/jetbrains-mono/400.css";
@@ -94,7 +95,7 @@ function renderApp() {
                   <PoofBurstProvider>
                     <UpdaterProvider>
                       <App />
-                      <NostrBindConsentDialog />
+                      <IdentityBoundGlobalSurfaces />
                     </UpdaterProvider>
                     <Toaster />
                   </PoofBurstProvider>
@@ -106,6 +107,12 @@ function renderApp() {
       </RootErrorBoundary>
     </React.StrictMode>,
   );
+}
+
+function IdentityBoundGlobalSurfaces() {
+  const localOpsGuestMode = useLocalOpsGuestMode();
+  if (localOpsGuestMode) return null;
+  return <NostrBindConsentDialog />;
 }
 
 async function installE2eBridgeIfConfigured() {

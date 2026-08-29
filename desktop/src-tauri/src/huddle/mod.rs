@@ -175,6 +175,10 @@ pub fn get_voice_input_mode(state: State<'_, AppState>) -> Result<VoiceInputMode
     Ok(hs.voice_input_mode.clone())
 }
 
+fn require_huddle_command_identity(state: &AppState) -> Result<(), String> {
+    state.require_active_identity()
+}
+
 /// Start a new huddle in the given parent channel.
 ///
 /// Steps:
@@ -194,6 +198,7 @@ pub async fn start_huddle(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<HuddleJoinInfo, String> {
+    require_huddle_command_identity(&state)?;
     // Validate inputs at the Tauri boundary.
     if member_pubkeys.len() > MAX_HUDDLE_AGENTS {
         return Err(format!(
@@ -410,6 +415,7 @@ pub async fn join_huddle(
     huddle_thread_event_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<HuddleJoinInfo, String> {
+    require_huddle_command_identity(&state)?;
     // Transition to Connecting.
     let huddle_generation = {
         let mut hs = state.huddle()?;
@@ -748,6 +754,7 @@ pub fn push_audio_pcm(
     request: tauri::ipc::Request<'_>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    require_huddle_command_identity(&state)?;
     match request.body() {
         tauri::ipc::InvokeBody::Raw(bytes) => {
             if bytes.len() > MAX_AUDIO_BATCH_BYTES {
@@ -814,6 +821,7 @@ pub async fn speak_agent_message(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    require_huddle_command_identity(&state)?;
     eprintln!("buzz-desktop: tts stage=invoke status=started route_id={route_id}");
     // Truncate oversized messages — agents shouldn't monologue in a voice huddle.
     // Use char count (not byte length) to avoid panicking on multi-byte UTF-8.
@@ -929,4 +937,35 @@ pub async fn speak_agent_message(
     .inspect_err(|_| {
         eprintln!("buzz-desktop: tts stage=queue status=failed reason=closed route_id={route_id}")
     })
+}
+
+#[cfg(test)]
+mod recovery_command_tests {
+    use super::require_huddle_command_identity;
+    use crate::app_state::build_app_state;
+    use std::sync::atomic::Ordering;
+
+    fn recovery_state(lost: bool, locked: bool) -> crate::AppState {
+        let state = build_app_state();
+        state.identity_lost.store(lost, Ordering::Release);
+        state.keyring_locked.store(locked, Ordering::Release);
+        state
+    }
+
+    #[test]
+    fn huddle_commands_reject_lost_and_locked_identity_before_live_setup() {
+        for (lost, locked) in [(true, false), (false, true)] {
+            let state = recovery_state(lost, locked);
+            let error = require_huddle_command_identity(&state)
+                .expect_err("recovery identity must not reach live huddle setup");
+            assert!(error.contains("recovery mode"));
+        }
+    }
+
+    #[test]
+    fn huddle_commands_pass_recovery_gate_for_normal_identity() {
+        let state = recovery_state(false, false);
+        require_huddle_command_identity(&state)
+            .expect("normal identity may reach huddle validation and live setup");
+    }
 }

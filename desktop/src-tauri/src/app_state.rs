@@ -293,6 +293,14 @@ impl AppState {
             .map(|k| k.clone())
     }
 
+    /// Reject identity-dependent, externally observable commands while the
+    /// durable identity is unavailable. Read-only/local commands do not call
+    /// this guard; command boundaries that can sign, publish, deliver,
+    /// execute a provider, or open a live relay must call it before mutation.
+    pub fn require_active_identity(&self) -> Result<(), String> {
+        self.signing_keys().map(drop)
+    }
+
     /// Emit the current huddle state to the frontend via Tauri event.
     ///
     /// Acquires both locks (app_handle + huddle_state), clones a snapshot,

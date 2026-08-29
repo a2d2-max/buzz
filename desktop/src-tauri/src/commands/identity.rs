@@ -616,11 +616,7 @@ pub async fn sign_nostr_identity_binding(
         &expires_at,
     )?;
 
-    let keys = state
-        .keys
-        .lock()
-        .map_err(|error| error.to_string())?
-        .clone();
+    let keys = state.signing_keys()?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let event = build_nostr_identity_binding_event(
@@ -702,9 +698,30 @@ pub async fn nip44_decrypt_from_self(
 
 #[cfg(test)]
 mod nostr_identity_binding_tests {
-    use super::build_nostr_identity_binding_event;
-    use crate::nostr_bind;
+    use super::{build_nostr_identity_binding_event, sign_nostr_identity_binding};
+    use crate::{app_state::build_app_state, nostr_bind, AppState};
     use nostr::{JsonUtil, Keys};
+    use std::sync::atomic::Ordering;
+    use tauri::Manager;
+
+    fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .manage(build_app_state())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds")
+    }
+
+    async fn invoke_binding(state: tauri::State<'_, AppState>) -> Result<String, String> {
+        sign_nostr_identity_binding(
+            "550e8400-e29b-41d4-a716-446655440000".into(),
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi01234567".into(),
+            "123456".into(),
+            "https://example.com".into(),
+            "2999-01-01T00:00:00Z".into(),
+            state,
+        )
+        .await
+    }
 
     fn tag_values(event: &nostr::Event) -> Vec<Vec<String>> {
         event
@@ -782,6 +799,54 @@ mod nostr_identity_binding_tests {
         .unwrap_err();
 
         assert_eq!(error, "expires_at is expired");
+    }
+
+    #[tokio::test]
+    async fn sign_nostr_identity_binding_rejects_lost_identity() {
+        let app = mock_app();
+        app.state::<AppState>()
+            .identity_lost
+            .store(true, Ordering::Release);
+
+        let error = invoke_binding(app.state::<AppState>())
+            .await
+            .expect_err("lost recovery identity must not sign a binding");
+
+        assert!(error.contains("recovery mode"));
+    }
+
+    #[tokio::test]
+    async fn sign_nostr_identity_binding_rejects_locked_identity() {
+        let app = mock_app();
+        app.state::<AppState>()
+            .keyring_locked
+            .store(true, Ordering::Release);
+
+        let error = invoke_binding(app.state::<AppState>())
+            .await
+            .expect_err("locked recovery identity must not sign a binding");
+
+        assert!(error.contains("recovery mode"));
+    }
+
+    #[tokio::test]
+    async fn sign_nostr_identity_binding_signs_for_normal_identity() {
+        let app = mock_app();
+
+        let json = invoke_binding(app.state::<AppState>())
+            .await
+            .expect("normal identity may sign a binding");
+        let event = nostr::Event::from_json(json).expect("signed event json");
+
+        assert!(event.verify_signature());
+        assert_eq!(
+            event.pubkey,
+            app.state::<AppState>()
+                .keys
+                .lock()
+                .expect("keys lock")
+                .public_key(),
+        );
     }
 }
 

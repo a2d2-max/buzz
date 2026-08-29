@@ -4,6 +4,60 @@ import { nsecEncode } from "nostr-tools/nip19";
 
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
+const GUEST_FORBIDDEN_COMMANDS = [
+  "sign_event",
+  "sign_nostr_identity_binding",
+  "grant_approval",
+  "deny_approval",
+  "ops_bridge_create_draft",
+  "ops_bridge_transition",
+  "start_huddle",
+  "join_huddle",
+  "reconnect_huddle_audio",
+  "start_stt_pipeline",
+  "push_audio_pcm",
+  "speak_agent_message",
+  "preview_pocket_voice",
+  "create_managed_agent",
+  "start_managed_agent",
+  "start_managed_agent_runtime",
+  "restart_managed_agent_runtime",
+  "mesh_start_node",
+] as const;
+
+async function enterLocalOpsGuestMode(page: import("@playwright/test").Page) {
+  await page
+    .getByRole("button", { name: "Continue in local Ops mode" })
+    .click();
+  await expect(page).toHaveURL(/#\/ops$/);
+}
+
+async function guestCommandLog(page: import("@playwright/test").Page) {
+  return page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).map(({ command }) => command),
+  );
+}
+
+async function emitNostrBind(page: import("@playwright/test").Page) {
+  await page.evaluate(async () => {
+    await window.__TAURI_INTERNALS__?.invoke?.("plugin:event|emit", {
+      event: "deep-link-nostr-bind",
+      payload: {
+        action: "bind_nostr_identity",
+        audience: "buzz:nostr-identity",
+        challengeId: "550e8400-e29b-41d4-a716-446655440000",
+        expiresAt: "2099-01-01T00:00:00Z",
+        nonce: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi01234567",
+        origin: "https://admin.example.com",
+        protocol: "buzz-nostr-identity",
+        returnMode: "clipboard",
+        verificationCode: "123456",
+        version: "1",
+      },
+    });
+  });
+}
+
 test("normal first launch uses the already-persisted identity", async ({
   page,
 }) => {
@@ -56,7 +110,7 @@ test("lost boot opens onboarding gate directly on the key-import page", async ({
   await installMockBridge(
     page,
     { identityLost: true },
-    { skipOnboardingSeed: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
   );
   await page.goto("/");
 
@@ -86,20 +140,139 @@ test("local Ops guest entry is offered only for a lost identity", async ({
   await expect(localOpsButton).toBeVisible();
   await localOpsButton.focus();
   await expect(localOpsButton).toBeFocused();
+});
 
-  await page.evaluate(() => {
-    window.localStorage.removeItem("buzz-local-ops-guest.v1");
-  });
+test("normal key-import page never offers local Ops guest entry", async ({
+  page,
+}) => {
   await installMockBridge(
     page,
     { identityLost: false },
     { skipCommunitySeed: true, skipOnboardingSeed: true },
   );
-  await page.reload();
+  await page.goto("/?machineOnboarding=1");
+
+  await page.getByRole("button", { name: "Use an existing key" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Enter your private key" }),
+  ).toBeVisible();
 
   await expect(
     page.getByRole("button", { name: "Continue in local Ops mode" }),
   ).toHaveCount(0);
+});
+
+test("local Ops guest boundary ignores global Nostr binding requests", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+  await enterLocalOpsGuestMode(page);
+
+  await emitNostrBind(page);
+
+  await expect(page.getByTestId("nostr-bind-page")).toHaveCount(0);
+  expect(await guestCommandLog(page)).not.toContain(
+    "sign_nostr_identity_binding",
+  );
+});
+
+test("local Ops guest bridge rejects every signed external provider and audio command family", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+  await enterLocalOpsGuestMode(page);
+
+  const results = await page.evaluate(async (commands) => {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (!invoke) throw new Error("Tauri E2E invoke bridge unavailable");
+    return Promise.all(
+      commands.map(async (command) => {
+        try {
+          await invoke(command, {});
+          return { command, error: null };
+        } catch (error) {
+          return { command, error: String(error) };
+        }
+      }),
+    );
+  }, GUEST_FORBIDDEN_COMMANDS);
+
+  expect(results).toHaveLength(GUEST_FORBIDDEN_COMMANDS.length);
+  for (const result of results) {
+    expect(result.error, `${result.command} must reject`).toContain(
+      "identity is in recovery mode",
+    );
+  }
+});
+
+test("a restored durable identity clears a persisted local Ops guest preference", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+  await enterLocalOpsGuestMode(page);
+
+  await page.evaluate(
+    async (nsec) => {
+      await window.__TAURI_INTERNALS__?.invoke?.("import_identity", { nsec });
+    },
+    nsecEncode(hexToBytes(TEST_IDENTITIES.tyler.privateKey)),
+  );
+  await page.reload();
+
+  await expect(page.getByText("Local Ops mode", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        window.localStorage.getItem("buzz-local-ops-guest.v1"),
+      ),
+    )
+    .toBeNull();
+});
+
+test("clearing local Ops guest mode in another window removes the session fallback", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+  await enterLocalOpsGuestMode(page);
+
+  const secondPage = await page.context().newPage();
+  await installMockBridge(
+    secondPage,
+    { identityLost: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await secondPage.goto("/");
+  await expect(
+    secondPage.getByText("Local Ops mode", { exact: true }),
+  ).toBeVisible();
+  await secondPage.getByRole("button", { name: "Restore identity" }).click();
+
+  await expect(
+    page.getByRole("heading", { name: "Enter your private key" }),
+  ).toBeVisible();
+  await secondPage.close();
 });
 
 test("local Ops guest mode persists without mutating identity recovery", async ({
@@ -112,9 +285,7 @@ test("local Ops guest mode persists without mutating identity recovery", async (
   );
   await page.goto("/");
 
-  await page
-    .getByRole("button", { name: "Continue in local Ops mode" })
-    .click();
+  await enterLocalOpsGuestMode(page);
 
   await expect(page).toHaveURL(/#\/ops$/);
   await expect(page.getByRole("heading", { name: "Ops Room" })).toBeVisible();
@@ -139,29 +310,27 @@ test("local Ops guest mode persists without mutating identity recovery", async (
   );
   expect(recoveryIdentity).toMatchObject({ lost: true });
 
-  const mutationCommands = await page.evaluate(() => {
-    const blockedCommands = new Set([
-      "persist_current_identity",
-      "import_identity",
-      "sign_nostr_identity_binding",
-      "publish_project_owner_announcement",
-      "publish_project_pull_request_merged_status",
-      "update_persona_and_publish",
-      "send_channel_message",
-      "send_managed_agent_channel_message",
-      "start_identity_recovery_pairing",
-      "complete_identity_recovery_pairing",
-    ]);
-    return (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
-      .map(({ command }) => command)
-      .filter((command) => blockedCommands.has(command));
-  });
-  expect(mutationCommands).toEqual([]);
+  const commandsBeforeReload = await guestCommandLog(page);
+  expect(
+    commandsBeforeReload.filter((command) =>
+      GUEST_FORBIDDEN_COMMANDS.includes(
+        command as (typeof GUEST_FORBIDDEN_COMMANDS)[number],
+      ),
+    ),
+  ).toEqual([]);
 
   await page.reload();
   await expect(page).toHaveURL(/#\/ops$/);
   await expect(page.getByRole("heading", { name: "Ops Room" })).toBeVisible();
   await expect(page.getByText("Local Ops mode", { exact: true })).toBeVisible();
+  const commandsAfterReload = await guestCommandLog(page);
+  expect(
+    commandsAfterReload.filter((command) =>
+      GUEST_FORBIDDEN_COMMANDS.includes(
+        command as (typeof GUEST_FORBIDDEN_COMMANDS)[number],
+      ),
+    ),
+  ).toEqual([]);
 
   await page.getByRole("button", { name: "Restore identity" }).click();
   await expect(

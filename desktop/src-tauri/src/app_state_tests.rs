@@ -980,6 +980,41 @@ fn signing_keys_returns_err_when_keyring_locked() {
 }
 
 #[test]
+fn privileged_command_gate_allows_normal_identity() {
+    let state = build_app_state();
+
+    assert!(state.require_active_identity().is_ok());
+}
+
+#[test]
+fn privileged_command_gate_rejects_lost_identity() {
+    let state = build_app_state();
+    state
+        .identity_lost
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let error = state
+        .require_active_identity()
+        .expect_err("lost recovery must block privileged commands");
+
+    assert!(error.contains("recovery mode"));
+}
+
+#[test]
+fn privileged_command_gate_rejects_locked_identity() {
+    let state = build_app_state();
+    state
+        .keyring_locked
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let error = state
+        .require_active_identity()
+        .expect_err("locked recovery must block privileged commands");
+
+    assert!(error.contains("recovery mode"));
+}
+
+#[test]
 fn signing_keys_identity_lost_takes_priority_over_keyring_locked() {
     // When both flags are set, identity_lost is checked first and its error
     // message is returned (the ephemeral-key case is more specific).

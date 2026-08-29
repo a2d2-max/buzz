@@ -638,9 +638,8 @@ pub(crate) fn spawn_transcription_task(
     let spawned_gen = session_generation.load(Ordering::Acquire);
 
     let http_client = state.http_client.clone();
-    let keys = match state.keys.lock() {
-        Ok(k) => k.clone(),
-        Err(_) => return,
+    let Ok(keys) = state.signing_keys() else {
+        return;
     };
     let relay_base_url = crate::relay::relay_api_base_url_with_override(state);
 

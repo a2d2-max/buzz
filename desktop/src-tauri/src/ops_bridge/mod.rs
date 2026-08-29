@@ -4,6 +4,7 @@ mod watch;
 
 use std::{path::PathBuf, sync::Arc};
 
+use crate::app_state::AppState;
 use client::{OpsBridgeClient, OpsBridgeConfig, OpsBridgeError};
 use types::{
     OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsSelection,
@@ -65,9 +66,11 @@ pub(crate) async fn ops_bridge_snapshot(
 #[tauri::command]
 pub(crate) async fn ops_bridge_create_draft(
     request: OpsDraftRequest,
-    state: tauri::State<'_, OpsBridgeState>,
+    bridge_state: tauri::State<'_, OpsBridgeState>,
+    app_state: tauri::State<'_, AppState>,
 ) -> Result<OpsDraftReceipt, String> {
-    state
+    app_state.require_active_identity()?;
+    bridge_state
         .client()
         .map_err(public_error)?
         .create_draft(&request)
@@ -78,9 +81,11 @@ pub(crate) async fn ops_bridge_create_draft(
 #[tauri::command]
 pub(crate) async fn ops_bridge_transition(
     request: OpsTransitionRequest,
-    state: tauri::State<'_, OpsBridgeState>,
+    bridge_state: tauri::State<'_, OpsBridgeState>,
+    app_state: tauri::State<'_, AppState>,
 ) -> Result<OpsTransitionReceipt, String> {
-    state
+    app_state.require_active_identity()?;
+    bridge_state
         .client()
         .map_err(public_error)?
         .transition(&request)

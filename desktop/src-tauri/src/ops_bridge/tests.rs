@@ -12,12 +12,17 @@ use tokio::{
 
 use super::{
     client::{read_hub_token, validate_hub_endpoint, OpsBridgeClient, OpsBridgeConfig},
+    ops_bridge_create_draft, ops_bridge_transition,
     types::{
         OpsDraftRequest, OpsSelection, OpsTransitionAction, OpsTransitionOrigin,
         OpsTransitionRequest, OPS_CONTRACT_VERSION,
     },
     watch::{OpsBridgeWatcher, ReconnectBackoff},
+    OpsBridgeState,
 };
+use crate::app_state::{build_app_state, AppState};
+use std::sync::atomic::Ordering;
+use tauri::Manager;
 
 fn write_token(path: &Path, contents: &[u8], mode: u32) {
     std::fs::write(path, contents).expect("write fake token");
@@ -442,6 +447,101 @@ async fn ops_bridge_mutations_use_only_fixed_draft_and_transition_routes() {
         })
         .count();
     assert_eq!(actual_external_sends, 0);
+}
+
+fn command_app(
+    client: Result<Arc<OpsBridgeClient>, super::client::OpsBridgeError>,
+    lost: bool,
+    locked: bool,
+) -> tauri::App<tauri::test::MockRuntime> {
+    let state = build_app_state();
+    state.identity_lost.store(lost, Ordering::Release);
+    state.keyring_locked.store(locked, Ordering::Release);
+    tauri::test::mock_builder()
+        .manage(state)
+        .manage(OpsBridgeState {
+            client,
+            watcher: OpsBridgeWatcher::default(),
+        })
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app builds")
+}
+
+fn draft_request() -> OpsDraftRequest {
+    OpsDraftRequest::Message {
+        work_item_id: "work_1".to_owned(),
+        target_session_id: "sess_1".to_owned(),
+        text: "local draft".to_owned(),
+    }
+}
+
+fn transition_request() -> OpsTransitionRequest {
+    OpsTransitionRequest {
+        approval_id: "apr_1".to_owned(),
+        action: OpsTransitionAction::Approve,
+        expected_revision: 3,
+        origin: OpsTransitionOrigin::VisualControl,
+        targets: None,
+    }
+}
+
+#[tokio::test]
+async fn ops_bridge_mutations_reject_lost_and_locked_identity_before_client_access() {
+    for (lost, locked) in [(true, false), (false, true)] {
+        let app = command_app(
+            Err(super::client::OpsBridgeError::InvalidConfig),
+            lost,
+            locked,
+        );
+        let draft_error = ops_bridge_create_draft(
+            draft_request(),
+            app.state::<OpsBridgeState>(),
+            app.state::<AppState>(),
+        )
+        .await
+        .expect_err("recovery must reject Ops draft");
+        let transition_error = ops_bridge_transition(
+            transition_request(),
+            app.state::<OpsBridgeState>(),
+            app.state::<AppState>(),
+        )
+        .await
+        .expect_err("recovery must reject Ops transition");
+
+        assert!(draft_error.contains("recovery mode"));
+        assert!(transition_error.contains("recovery mode"));
+    }
+}
+
+#[tokio::test]
+async fn ops_bridge_mutation_allows_normal_identity() {
+    let receipt = serde_json::to_vec(&json!({
+        "contract_version": 1,
+        "approval": {"id": "apr_1", "revision": 3, "status": "pending_approval"}
+    }))
+    .expect("serialize fake receipt");
+    let (port, _, server) = spawn_fake_server(vec![http_response(
+        "200 OK",
+        "application/json",
+        &receipt,
+        &[],
+    )])
+    .await;
+    let temp = tempfile::tempdir().expect("temp token directory");
+    let token = temp.path().join("hub.token");
+    write_token(&token, &[b't'; 32], 0o600);
+    let client = OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client");
+    let app = command_app(Ok(Arc::new(client)), false, false);
+
+    let result = ops_bridge_create_draft(
+        draft_request(),
+        app.state::<OpsBridgeState>(),
+        app.state::<AppState>(),
+    )
+    .await;
+
+    assert!(result.is_ok());
+    server.await.expect("fake server exits");
 }
 
 #[test]
