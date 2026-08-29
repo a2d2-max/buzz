@@ -542,6 +542,50 @@ describe("native Ops bridge contract", () => {
     }
   });
 
+  test("rejects private paths in nested page object keys while accepting safe keys", async () => {
+    const timelinePage = (details) => ({
+      contract_version: 1,
+      revision: 11,
+      generated_at: "2026-08-30T00:00:00.000Z",
+      items: [
+        {
+          id: "event:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          timestamp: "2026-08-30T00:00:00.000Z",
+          kind: "status",
+          author: "Codex",
+          body: "Redacted details",
+          details,
+        },
+      ],
+      next_cursor: null,
+    });
+    const request = {
+      module: "timeline",
+      scope: { channel: null, thread: null, sort: "occurred_at_desc" },
+    };
+
+    for (const privatePath of [
+      "/Users/alice/private/token",
+      "C:\\Users\\alice\\private\\token",
+      "\\\\server\\share\\private\\token",
+      "file:///Users/alice/private/token",
+    ]) {
+      responses.push(timelinePage({ nested: { [privatePath]: true } }));
+      await assert.rejects(bridge.getOpsPage(request, 11), {
+        name: "OpsBridgeContractError",
+      });
+    }
+
+    const safeDetails = {
+      nested: { "/api/v1": true, "C:relative": true, "file:note": true },
+    };
+    responses.push(timelinePage(safeDetails));
+    assert.deepEqual(
+      (await bridge.getOpsPage(request, 11)).items[0].details,
+      safeDetails,
+    );
+  });
+
   test("does not retry an invalid cursor error", async () => {
     responses.push({ reject: { error: "invalid_cursor" } });
 

@@ -75,6 +75,7 @@ import {
   resetMediaCaches,
 } from "@/shared/lib/mediaUrl";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { containsAbsolutePath } from "@/features/ops-room/types";
 import {
   isValidLinkPreviewSnapshotCanonicalUrl,
   parseLinkPreviewSnapshots,
@@ -1892,7 +1893,8 @@ function validateMockOpsPage(
     Number(value.revision) < 0 ||
     !isMockOpsText(value.generated_at) ||
     !Array.isArray(value.items) ||
-    !(value.next_cursor === null || isMockOpsText(value.next_cursor, 4096))
+    !(value.next_cursor === null || isMockOpsText(value.next_cursor, 4096)) ||
+    containsAbsolutePath(value)
   ) {
     throw new Error("ops_bridge_contract_mismatch");
   }

@@ -19,6 +19,16 @@ export function looksLikeAbsolutePath(value: string): boolean {
   return ABSOLUTE_PATH.test(value);
 }
 
+export function containsAbsolutePath(value: unknown): boolean {
+  if (typeof value === "string") return looksLikeAbsolutePath(value);
+  if (Array.isArray(value)) return value.some(containsAbsolutePath);
+  if (!value || typeof value !== "object") return false;
+  return Object.entries(value).some(
+    ([key, nested]) =>
+      looksLikeAbsolutePath(key) || containsAbsolutePath(nested),
+  );
+}
+
 const publicString = z
   .string()
   .refine((value) => !looksLikeAbsolutePath(value), "absolute path is private");

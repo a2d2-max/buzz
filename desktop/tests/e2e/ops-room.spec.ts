@@ -376,6 +376,9 @@ test("the strict Ops page mock stays configurable while UI consumption is disabl
         kind: "status",
         author: "Codex",
         body: "Deterministic redacted page fixture",
+        details: {
+          nested: { "/api/v1": true, "C:relative": true, "file:note": true },
+        },
       },
     ],
     next_cursor: "opaque-redacted-next",
@@ -434,6 +437,40 @@ test("the strict Ops page mock stays configurable while UI consumption is disabl
     }
   }, request);
   expect(invalid).toBe("ops_bridge_invalid_request");
+
+  const privateKeyErrors = await page.evaluate(async (pageRequest) => {
+    const config = window.__BUZZ_E2E__;
+    const timeline = config?.mock?.opsPages?.timeline;
+    const item = timeline?.items[0];
+    if (!timeline || !item) throw new Error("Ops page fixture unavailable");
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (!invoke) throw new Error("Tauri E2E invoke bridge unavailable");
+    const errors: string[] = [];
+    for (const privatePath of [
+      "/Users/alice/private/token",
+      "C:\\Users\\alice\\private\\token",
+      "\\\\server\\share\\private\\token",
+      "file:///Users/alice/private/token",
+    ]) {
+      item.details = { nested: { [privatePath]: true } };
+      try {
+        await invoke("ops_bridge_page", { request: pageRequest });
+        errors.push("accepted");
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    item.details = {
+      nested: { "/api/v1": true, "C:relative": true, "file:note": true },
+    };
+    return errors;
+  }, request);
+  expect(privateKeyErrors).toEqual([
+    "ops_bridge_contract_mismatch",
+    "ops_bridge_contract_mismatch",
+    "ops_bridge_contract_mismatch",
+    "ops_bridge_contract_mismatch",
+  ]);
 
   const typedCursorError = await page.evaluate(async (pageRequest) => {
     const config = window.__BUZZ_E2E__;

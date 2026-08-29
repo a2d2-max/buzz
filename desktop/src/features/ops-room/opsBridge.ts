@@ -6,6 +6,7 @@ import {
   type OpsBridgeSnapshotV1,
   type OpsConnectionState,
   type OpsSelection,
+  containsAbsolutePath,
   opsArtifactSchema,
   opsCapabilitiesSchema,
   opsEventSequenceSchema,
@@ -13,7 +14,6 @@ import {
   opsResearchCardSchema,
   opsSnapshotEnvelopeSchema,
   opsTimelineItemSchema,
-  looksLikeAbsolutePath,
   parseOpsModuleStates,
   parseOpsRoom,
 } from "./types";
@@ -221,13 +221,6 @@ function requireVersionOne(
   }
 }
 
-function hasAbsolutePath(value: unknown): boolean {
-  if (typeof value === "string") return looksLikeAbsolutePath(value);
-  if (Array.isArray(value)) return value.some(hasAbsolutePath);
-  if (!value || typeof value !== "object") return false;
-  return Object.values(value).some(hasAbsolutePath);
-}
-
 function parseCapabilities(value: unknown): OpsBridgeCapabilitiesV1 {
   requireVersionOne(value);
   const parsed = opsCapabilitiesSchema.safeParse(value);
@@ -244,7 +237,7 @@ function parseSnapshot(
   capabilities: OpsBridgeCapabilitiesV1,
 ): OpsBridgeSnapshotV1 {
   requireVersionOne(value);
-  if (hasAbsolutePath(value)) throw new OpsBridgeContractError();
+  if (containsAbsolutePath(value)) throw new OpsBridgeContractError();
   const parsed = opsSnapshotEnvelopeSchema.safeParse(value);
   if (!parsed.success) throw new OpsBridgeContractError();
   try {
@@ -301,7 +294,7 @@ function parsePage(
   if (
     !Number.isSafeInteger(expectedCollectionRevision) ||
     expectedCollectionRevision < 0 ||
-    hasAbsolutePath(value)
+    containsAbsolutePath(value)
   ) {
     throw new OpsBridgeContractError();
   }
