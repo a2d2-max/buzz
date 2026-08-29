@@ -33,6 +33,9 @@ const MOBILE_TAB_LABELS: Record<MobileTab, string> = {
   timeline: "타임라인",
   context: "컨텍스트",
 };
+const DESKTOP_GRID_COLUMNS =
+  "minmax(160px, 0.85fr) minmax(176px, 0.9fr) minmax(288px, 1.75fr) minmax(192px, 1fr)";
+const DESKTOP_GRID_MINIMUM_WIDTH = 160 + 176 + 288 + 192 + 3 * 12;
 
 function useOpsResponsiveLayout(): OpsResponsiveLayout {
   const [layout, setLayout] = React.useState(() =>
@@ -77,7 +80,6 @@ type OpsRoomViewProps = {
   connectionState: ConnectionState;
   onRetry: () => void;
   onSelectChannel: (id: string) => void;
-  onSelectSession: (id: string) => void;
   onSelectThread: (id: string) => void;
   projection: OpsRoomProjection | null;
 };
@@ -86,7 +88,6 @@ export function OpsRoomView({
   connectionState,
   onRetry,
   onSelectChannel,
-  onSelectSession,
   onSelectThread,
   projection,
 }: OpsRoomViewProps) {
@@ -94,6 +95,20 @@ export function OpsRoomView({
   const reducedMotion = useReducedMotionPreference();
   const [mobileTab, setMobileTab] = React.useState<MobileTab>("timeline");
   const [contextOpen, setContextOpen] = React.useState(false);
+  const [selectedSessionId, setSelectedSessionId] = React.useState<
+    string | null
+  >(() => {
+    if (!projection) return null;
+    const canonicalThread = projection.workspace.selectedThreadId;
+    return (
+      projection.sessions.find(({ id }) => id === canonicalThread)?.id ??
+      projection.sessions[0]?.id ??
+      null
+    );
+  });
+  const previousThreadId = React.useRef(
+    projection?.workspace.selectedThreadId ?? null,
+  );
   const contextTriggerRef = React.useRef<HTMLButtonElement>(null);
   const contextDrawerRef = React.useRef<HTMLDivElement>(null);
 
@@ -140,6 +155,26 @@ export function OpsRoomView({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [closeContext, contextOpen]);
 
+  React.useEffect(() => {
+    const canonicalThread = projection?.workspace.selectedThreadId ?? null;
+    const canonicalThreadChanged = canonicalThread !== previousThreadId.current;
+    previousThreadId.current = canonicalThread;
+
+    setSelectedSessionId((currentId) => {
+      if (!projection) return null;
+      const matchingId = projection.sessions.find(
+        ({ id }) => id === canonicalThread,
+      )?.id;
+      if (canonicalThreadChanged) {
+        return matchingId ?? projection.sessions[0]?.id ?? null;
+      }
+      if (currentId && projection.sessions.some(({ id }) => id === currentId)) {
+        return currentId;
+      }
+      return matchingId ?? projection.sessions[0]?.id ?? null;
+    });
+  }, [projection]);
+
   const stateOnly = connectionState !== "ready" && connectionState !== "stale";
 
   return (
@@ -153,7 +188,15 @@ export function OpsRoomView({
       {stateOnly || !projection ? null : (
         <main className="min-h-0 min-w-0 flex-1 overflow-hidden p-3">
           {layout === "desktop" ? (
-            <div className="grid h-full min-h-0 grid-cols-[minmax(13rem,0.8fr)_minmax(14rem,0.9fr)_minmax(22rem,2fr)_minmax(15rem,1fr)] gap-3">
+            <div
+              className="grid h-full min-h-0 min-w-0 max-w-full gap-3 overflow-hidden"
+              data-minimum-width={DESKTOP_GRID_MINIMUM_WIDTH}
+              data-testid="ops-desktop-grid"
+              style={{
+                gridTemplateColumns: DESKTOP_GRID_COLUMNS,
+                maxWidth: "100%",
+              }}
+            >
               <MainPane>
                 <OpsWorkspaceNav
                   onSelectChannel={onSelectChannel}
@@ -163,8 +206,8 @@ export function OpsRoomView({
               </MainPane>
               <MainPane>
                 <OpsSessionTree
-                  onSelect={onSelectSession}
-                  selectedSessionId={projection.workspace.selectedThreadId}
+                  onSelect={setSelectedSessionId}
+                  selectedSessionId={selectedSessionId}
                   sessions={projection.sessions}
                 />
               </MainPane>
@@ -185,8 +228,8 @@ export function OpsRoomView({
                     workspace={projection.workspace}
                   />
                   <OpsSessionTree
-                    onSelect={onSelectSession}
-                    selectedSessionId={projection.workspace.selectedThreadId}
+                    onSelect={setSelectedSessionId}
+                    selectedSessionId={selectedSessionId}
                     sessions={projection.sessions}
                   />
                 </div>
@@ -239,8 +282,8 @@ export function OpsRoomView({
                   />
                 ) : mobileTab === "sessions" ? (
                   <OpsSessionTree
-                    onSelect={onSelectSession}
-                    selectedSessionId={projection.workspace.selectedThreadId}
+                    onSelect={setSelectedSessionId}
+                    selectedSessionId={selectedSessionId}
                     sessions={projection.sessions}
                   />
                 ) : mobileTab === "context" ? (
@@ -331,7 +374,6 @@ export function OpsRoomScreen() {
       connectionState={state}
       onRetry={() => void refetch()}
       onSelectChannel={selectChannel}
-      onSelectSession={selectThread}
       onSelectThread={selectThread}
       projection={projection}
     />

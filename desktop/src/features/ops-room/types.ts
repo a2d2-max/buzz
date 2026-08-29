@@ -145,7 +145,7 @@ export const opsWorkItemSchema = z
     project_id: nullablePublicString,
     title: requiredPublicString,
     status: requiredPublicString,
-    progress: z.number().nullable(),
+    progress: z.number().min(0).max(1).nullable(),
     last_activity_at: nullablePublicString,
     execution_provider: nullablePublicString,
     provider_model: nullablePublicString,

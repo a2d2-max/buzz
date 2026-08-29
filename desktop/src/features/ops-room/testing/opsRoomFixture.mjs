@@ -108,7 +108,7 @@ export function createOpsRoomFixture(overrides = {}) {
           project_id: "project:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           title: "네이티브 Agent Room",
           status: "in_progress",
-          progress: 72,
+          progress: 0.72,
           last_activity_at: "2026-08-29T08:05:00.000Z",
           execution_provider: "codex",
           provider_model: "gpt-5.6",

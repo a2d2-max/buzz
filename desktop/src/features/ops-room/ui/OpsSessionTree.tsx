@@ -30,12 +30,16 @@ export function OpsSessionTree({
   const refs = React.useRef(new Map<string, HTMLButtonElement>());
 
   React.useEffect(() => {
-    if (
-      selectedSessionId &&
-      sessions.some(({ id }) => id === selectedSessionId)
-    ) {
-      setRovingId(selectedSessionId);
-    }
+    setRovingId((currentId) => {
+      const selectedIsValid =
+        selectedSessionId !== null &&
+        sessions.some(({ id }) => id === selectedSessionId);
+      if (selectedIsValid) return selectedSessionId;
+      if (currentId && sessions.some(({ id }) => id === currentId)) {
+        return currentId;
+      }
+      return sessions[0]?.id ?? null;
+    });
   }, [selectedSessionId, sessions]);
 
   const moveFocus = (currentIndex: number, delta: number) => {

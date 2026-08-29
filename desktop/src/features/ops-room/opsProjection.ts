@@ -22,6 +22,8 @@ const MESSAGE_VERBS = {
 } as const;
 
 const DETAIL_KEYS = ["phase", "status", "summary", "tests"] as const;
+const TIMELINE_SUMMARY_LIMIT = 140;
+const TIMELINE_DISCLOSURE_LIMIT = 2_000;
 
 export interface OpsProjectedChannel {
   id: string;
@@ -56,8 +58,13 @@ export interface OpsProjectedTimelineItem {
   verb: string;
   outcome: string | null;
   sourceLabel: string;
+  summary: string;
   body: string;
   details: Array<{ label: string; value: string }>;
+}
+
+function boundedText(value: string, limit: number): string {
+  return value.length > limit ? `${value.slice(0, limit)}…` : value;
 }
 
 export interface OpsProjectedContext {
@@ -232,7 +239,8 @@ export function projectOpsRoom(
             ? message.details.outcome
             : null,
         sourceLabel: displaySource(message.details.source, message.author),
-        body: message.body,
+        summary: boundedText(message.body, TIMELINE_SUMMARY_LIMIT),
+        body: boundedText(message.body, TIMELINE_DISCLOSURE_LIMIT),
         details: projectedDetails(message.details),
       }))
       .sort(
@@ -246,7 +254,10 @@ export function projectOpsRoom(
             id: workItem.id,
             title: workItem.title,
             status: workItem.status,
-            progress: workItem.progress,
+            progress:
+              workItem.progress === null
+                ? null
+                : Math.max(0, Math.min(100, workItem.progress * 100)),
           }
         : null,
       provider,

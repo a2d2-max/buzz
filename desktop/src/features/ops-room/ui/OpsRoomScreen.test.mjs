@@ -68,7 +68,6 @@ function roomView(overrides = {}) {
     connectionState: "ready",
     onRetry() {},
     onSelectChannel() {},
-    onSelectSession() {},
     onSelectThread() {},
     projection,
     ...overrides,
@@ -85,6 +84,10 @@ describe("native Ops Room components", () => {
     assert.ok(screen.getAllByText("Codex sub").length >= 1);
     assert.ok(screen.getAllByText("완료").length >= 1);
     assert.ok(screen.getByText("gpt-5.6"));
+    assert.ok(screen.getByText("72%"));
+    const progress = screen.getByRole("progressbar", { name: "진행률 72%" });
+    assert.equal(progress.getAttribute("aria-valuenow"), "72");
+    assert.equal(progress.firstElementChild?.style.width, "72%");
     assert.equal(
       screen.queryAllByRole("button", {
         name: /deliver|send|execute|push|merge|publish|deploy/i,
@@ -115,6 +118,91 @@ describe("native Ops Room components", () => {
     assert.equal(selected, projection.sessions[1].id);
     fireEvent.keyDown(treeItems[1], { key: "ArrowUp" });
     assert.equal(document.activeElement, treeItems[0]);
+  });
+
+  test("resets roving focus to the first valid session when the tree swaps", () => {
+    const projection = projectOpsRoom(createOpsRoomFixture());
+    const view = render(
+      React.createElement(OpsSessionTree, {
+        onSelect() {},
+        selectedSessionId: projection.sessions[2].id,
+        sessions: projection.sessions,
+      }),
+    );
+    assert.equal(screen.getAllByRole("treeitem")[2].tabIndex, 0);
+
+    const nextSessions = projection.sessions
+      .slice(0, 2)
+      .map((session, index) => ({
+        ...session,
+        id: `next-${index}`,
+        parentSessionId: null,
+      }));
+    view.rerender(
+      React.createElement(OpsSessionTree, {
+        onSelect() {},
+        selectedSessionId: null,
+        sessions: nextSessions,
+      }),
+    );
+
+    const nextItems = screen.getAllByRole("treeitem");
+    assert.equal(nextItems[0].tabIndex, 0);
+    assert.equal(nextItems[1].tabIndex, -1);
+  });
+
+  test("keeps work-linked session selection local without changing the canonical thread", () => {
+    setWidth(1280);
+    let threadSelections = 0;
+    const projection = projectOpsRoom(createOpsRoomFixture());
+    const view = render(
+      roomView({
+        onSelectThread() {
+          threadSelections += 1;
+        },
+        projection,
+      }),
+    );
+    const canonicalThread = projection.workspace.selectedThreadId;
+    fireEvent.click(screen.getAllByRole("treeitem")[2]);
+    assert.equal(
+      screen.getAllByRole("treeitem")[2].getAttribute("aria-selected"),
+      "true",
+    );
+    assert.equal(threadSelections, 0);
+    assert.equal(projection.workspace.selectedThreadId, canonicalThread);
+
+    const nextProjection = {
+      ...projection,
+      sessions: [
+        {
+          ...projection.sessions[0],
+          id: "fresh-session",
+          parentSessionId: null,
+        },
+      ],
+      workspace: {
+        ...projection.workspace,
+        selectedThreadId: "work:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+    };
+    view.rerender(roomView({ projection: nextProjection }));
+    assert.equal(
+      screen.getByRole("treeitem").getAttribute("aria-selected"),
+      "true",
+    );
+  });
+
+  test("fits the four real panes inside a 1024px desktop viewport", () => {
+    setWidth(1024);
+    render(roomView());
+
+    const grid = screen.getByTestId("ops-desktop-grid");
+    const minimumWidth = Number(grid.dataset.minimumWidth);
+    assert.ok(minimumWidth > 0);
+    assert.ok(minimumWidth <= 1024 - 24);
+    assert.equal(grid.style.maxWidth, "100%");
+    assert.equal(screen.getAllByTestId("ops-main-pane").length, 4);
   });
 
   test("opens compact context as an accessible drawer and restores trigger focus", () => {
@@ -185,6 +273,16 @@ describe("native Ops Room components", () => {
     assert.ok(screen.getByText("Ops 계약 버전이 맞지 않습니다"));
     view.rerender(roomView({ connectionState: "contract_invalid" }));
     assert.ok(screen.getByText("Ops 데이터 계약을 확인할 수 없습니다"));
+  });
+
+  test("shows a bounded verb-object-outcome summary before timeline disclosure", () => {
+    setWidth(1280);
+    render(roomView());
+
+    const summaries = screen.getAllByTestId("ops-timeline-summary");
+    assert.ok(summaries.length > 0);
+    assert.match(summaries[0].textContent ?? "", /위임|구현|완료|검토|전달/);
+    assert.ok((summaries[0].textContent ?? "").length <= 141);
   });
 
   test("marks reduced-motion composition without waiting for animation", () => {

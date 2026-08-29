@@ -86,6 +86,30 @@ describe("Ops Room projection", () => {
     assert.deepEqual(projected.context.artifacts, []);
   });
 
+  test("converts the validated 0..1 work progress contract to a display percentage", () => {
+    const fixture = createOpsRoomFixture();
+    fixture.room.context.work_item.progress = 0.75;
+
+    const projected = projectOpsRoom(fixture);
+
+    assert.equal(projected.context.workItem.progress, 75);
+  });
+
+  test("projects a bounded default timeline summary while retaining bounded disclosure", () => {
+    const fixture = createOpsRoomFixture();
+    fixture.room.messages[0].body = "가".repeat(500);
+
+    const projected = projectOpsRoom(fixture);
+    const item = projected.timeline.find(
+      ({ id }) => id === "event:dddddddddddddddddddddddddddddddd",
+    );
+
+    assert.ok(item);
+    assert.equal(item.summary.length, 141);
+    assert.equal(item.summary.endsWith("…"), true);
+    assert.equal(item.body.length, 500);
+  });
+
   test("round-trips the room/channel/thread selection through the hash URL", () => {
     const hash = opsRoomHash({
       channel: "project:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

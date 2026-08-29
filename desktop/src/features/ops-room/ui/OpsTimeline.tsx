@@ -63,6 +63,12 @@ export function OpsTimeline({ items }: OpsTimelineProps) {
                     <span aria-hidden>·</span>
                     <span className="shrink-0">{item.sourceLabel}</span>
                   </div>
+                  <p
+                    className="mt-2 break-words text-sm leading-relaxed text-foreground [overflow-wrap:anywhere]"
+                    data-testid="ops-timeline-summary"
+                  >
+                    {item.summary}
+                  </p>
                   <details className="group mt-2">
                     <summary
                       className="flex cursor-pointer list-none items-center gap-1 rounded-md text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"

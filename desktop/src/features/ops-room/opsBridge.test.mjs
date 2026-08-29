@@ -226,6 +226,29 @@ describe("native Ops bridge contract", () => {
     );
   });
 
+  test("rejects work progress outside the canonical 0..1 contract", async () => {
+    const snapshot = validSnapshot();
+    snapshot.room.context.work_item = {
+      id: "work:0123456789abcdef0123456789abcdef",
+      project_id: null,
+      title: "Invalid progress",
+      status: "in_progress",
+      progress: 1.2,
+      last_activity_at: null,
+      execution_provider: null,
+      provider_model: null,
+      provider_effort: null,
+      revision: 1,
+      updated_at: "2026-08-29T00:00:00.000Z",
+    };
+    responses.push(capabilities, snapshot);
+
+    await assert.rejects(
+      bridge.loadOpsSnapshot({}),
+      (error) => error?.name === "OpsBridgeContractError",
+    );
+  });
+
   test("rejects absolute-path-looking public strings", async () => {
     const snapshot = validSnapshot();
     snapshot.room.threads[0].title = "/Users/alice/private/project";

@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { describe, test } from "node:test";
+import { JSDOM } from "jsdom";
+import React from "react";
 
 import {
   configureOpsWindow,
   opsLayoutForWidth,
   readOpsEvidenceSize,
+  useOpsWindowSize,
 } from "./opsWindowSize.ts";
 
 function sizeRecord(size) {
@@ -90,6 +93,135 @@ describe("native Ops window sizing", () => {
 
     assert.deepEqual(calls.at(-2), ["min", { width: 800, height: 500 }]);
     assert.deepEqual(calls.at(-1), ["size", { width: 800, height: 500 }]);
+  });
+
+  test("StrictMode stale setup cannot restore over the active evidence window", async () => {
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+      url: "http://localhost/#/ops?view=room",
+    });
+    Object.defineProperties(globalThis, {
+      document: { configurable: true, value: dom.window.document },
+      HTMLElement: { configurable: true, value: dom.window.HTMLElement },
+      navigator: { configurable: true, value: dom.window.navigator },
+      Node: { configurable: true, value: dom.window.Node },
+      window: { configurable: true, value: dom.window },
+    });
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    const { act, cleanup, render } = await import("@testing-library/react");
+    let resolveFirstMinimum;
+    let minimumCalls = 0;
+    let finalMinimum = null;
+    let finalSize = null;
+    const calls = [];
+    const nativeWindow = {
+      async setMinSize(size) {
+        const record = sizeRecord(size);
+        calls.push(["min", record]);
+        minimumCalls += 1;
+        if (minimumCalls === 1) {
+          await new Promise((resolve) => {
+            resolveFirstMinimum = resolve;
+          });
+        }
+        finalMinimum = record;
+      },
+      async setSize(size) {
+        const record = sizeRecord(size);
+        calls.push(["size", record]);
+        finalSize = record;
+      },
+    };
+
+    function Harness() {
+      useOpsWindowSize(nativeWindow, { width: 390, height: 844 });
+      return null;
+    }
+
+    const view = render(
+      React.createElement(React.StrictMode, null, React.createElement(Harness)),
+    );
+    await act(async () => Promise.resolve());
+    assert.deepEqual(finalMinimum, { width: 360, height: 500 });
+    assert.deepEqual(finalSize, { width: 390, height: 844 });
+
+    await act(async () => {
+      resolveFirstMinimum();
+      await Promise.resolve();
+    });
+    assert.deepEqual(finalMinimum, { width: 360, height: 500 });
+    assert.deepEqual(finalSize, { width: 390, height: 844 });
+
+    view.unmount();
+    await act(async () => Promise.resolve());
+    assert.deepEqual(calls.at(-2), ["min", { width: 800, height: 500 }]);
+    assert.deepEqual(calls.at(-1), ["size", { width: 800, height: 500 }]);
+    cleanup();
+    dom.window.close();
+  });
+
+  test("final StrictMode unmount waits for the active pending setup before restore", async () => {
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+      url: "http://localhost/#/ops?view=room",
+    });
+    Object.defineProperties(globalThis, {
+      document: { configurable: true, value: dom.window.document },
+      HTMLElement: { configurable: true, value: dom.window.HTMLElement },
+      navigator: { configurable: true, value: dom.window.navigator },
+      Node: { configurable: true, value: dom.window.Node },
+      window: { configurable: true, value: dom.window },
+    });
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    const { act, cleanup, render } = await import("@testing-library/react");
+    const pendingMinimums = [];
+    const calls = [];
+    const nativeWindow = {
+      setMinSize(size) {
+        const record = sizeRecord(size);
+        calls.push(["min", record]);
+        if (record.width !== 360) return Promise.resolve();
+        return new Promise((resolve) => pendingMinimums.push(resolve));
+      },
+      async setSize(size) {
+        calls.push(["size", sizeRecord(size)]);
+      },
+    };
+
+    function Harness() {
+      useOpsWindowSize(nativeWindow, { width: 390, height: 844 });
+      return null;
+    }
+
+    const view = render(
+      React.createElement(React.StrictMode, null, React.createElement(Harness)),
+    );
+    await act(async () => Promise.resolve());
+    assert.equal(pendingMinimums.length, 2);
+
+    view.unmount();
+    await act(async () => Promise.resolve());
+    assert.equal(
+      calls.some(([kind, size]) => kind === "min" && size.width === 800),
+      false,
+    );
+
+    await act(async () => {
+      pendingMinimums[0]();
+      await Promise.resolve();
+    });
+    assert.equal(
+      calls.some(([kind, size]) => kind === "min" && size.width === 800),
+      false,
+    );
+
+    await act(async () => {
+      pendingMinimums[1]();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    assert.deepEqual(calls.at(-2), ["min", { width: 800, height: 500 }]);
+    assert.deepEqual(calls.at(-1), ["size", { width: 800, height: 500 }]);
+    cleanup();
+    dom.window.close();
   });
 
   test("declares the two native window permissions", async () => {

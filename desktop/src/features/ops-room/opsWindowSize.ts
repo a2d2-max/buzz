@@ -12,7 +12,7 @@ export interface OpsEvidenceSize {
   height: number;
 }
 
-interface OpsWindowHandle {
+export interface OpsWindowHandle {
   setMinSize(size: LogicalSize): Promise<void>;
   setSize(size: LogicalSize): Promise<void>;
 }
@@ -50,49 +50,75 @@ function configuredEvidenceSize(): OpsEvidenceSize | null {
   );
 }
 
+async function applyOpsWindowConfiguration(
+  nativeWindow: OpsWindowHandle,
+  evidenceSize: OpsEvidenceSize | null,
+  isCurrent: () => boolean,
+): Promise<void> {
+  await nativeWindow
+    .setMinSize(new LogicalSize(OPS_MINIMUM.width, OPS_MINIMUM.height))
+    .catch(() => undefined);
+  if (!isCurrent() || !evidenceSize) return;
+  await nativeWindow
+    .setSize(new LogicalSize(evidenceSize.width, evidenceSize.height))
+    .catch(() => undefined);
+}
+
+async function restoreOpsWindow(nativeWindow: OpsWindowHandle): Promise<void> {
+  await nativeWindow
+    .setMinSize(new LogicalSize(DEFAULT_MINIMUM.width, DEFAULT_MINIMUM.height))
+    .catch(() => undefined);
+  await nativeWindow
+    .setSize(new LogicalSize(DEFAULT_MINIMUM.width, DEFAULT_MINIMUM.height))
+    .catch(() => undefined);
+}
+
 export async function configureOpsWindow(
   nativeWindow: OpsWindowHandle,
   evidenceSize: OpsEvidenceSize | null,
 ): Promise<() => Promise<void>> {
-  await nativeWindow
-    .setMinSize(new LogicalSize(OPS_MINIMUM.width, OPS_MINIMUM.height))
-    .catch(() => undefined);
-  if (evidenceSize) {
-    await nativeWindow
-      .setSize(new LogicalSize(evidenceSize.width, evidenceSize.height))
-      .catch(() => undefined);
-  }
-
-  return async () => {
-    await nativeWindow
-      .setMinSize(
-        new LogicalSize(DEFAULT_MINIMUM.width, DEFAULT_MINIMUM.height),
-      )
-      .catch(() => undefined);
-    await nativeWindow
-      .setSize(new LogicalSize(DEFAULT_MINIMUM.width, DEFAULT_MINIMUM.height))
-      .catch(() => undefined);
-  };
+  await applyOpsWindowConfiguration(nativeWindow, evidenceSize, () => true);
+  return () => restoreOpsWindow(nativeWindow);
 }
 
-export function useOpsWindowSize(): void {
-  React.useEffect(() => {
-    let disposed = false;
-    let restore: (() => Promise<void>) | null = null;
+export function useOpsWindowSize(
+  nativeWindowOverride?: OpsWindowHandle,
+  evidenceSizeOverride?: OpsEvidenceSize | null,
+): void {
+  const operationGenerationRef = React.useRef(0);
+  const hasEvidenceSizeOverride = evidenceSizeOverride !== undefined;
+  const evidenceWidth = evidenceSizeOverride?.width;
+  const evidenceHeight = evidenceSizeOverride?.height;
 
-    void configureOpsWindow(getCurrentWindow(), configuredEvidenceSize()).then(
-      (cleanup) => {
-        if (disposed) {
-          void cleanup();
-          return;
-        }
-        restore = cleanup;
-      },
+  React.useEffect(() => {
+    const nativeWindow = nativeWindowOverride ?? getCurrentWindow();
+    const evidenceSize = hasEvidenceSizeOverride
+      ? evidenceWidth === undefined || evidenceHeight === undefined
+        ? null
+        : { width: evidenceWidth, height: evidenceHeight }
+      : configuredEvidenceSize();
+    const setupGeneration = ++operationGenerationRef.current;
+
+    const setup = applyOpsWindowConfiguration(
+      nativeWindow,
+      evidenceSize,
+      () => operationGenerationRef.current === setupGeneration,
     );
 
     return () => {
-      disposed = true;
-      if (restore) void restore();
+      const cleanupGeneration = ++operationGenerationRef.current;
+      queueMicrotask(() => {
+        if (operationGenerationRef.current !== cleanupGeneration) return;
+        void setup.then(() => {
+          if (operationGenerationRef.current !== cleanupGeneration) return;
+          return restoreOpsWindow(nativeWindow);
+        });
+      });
     };
-  }, []);
+  }, [
+    evidenceHeight,
+    evidenceWidth,
+    hasEvidenceSizeOverride,
+    nativeWindowOverride,
+  ]);
 }
