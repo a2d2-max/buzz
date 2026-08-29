@@ -314,6 +314,7 @@ test-unit:
     #!/usr/bin/env bash
     set -euo pipefail
     ./scripts/test-ensure-local-relay-key.sh
+    ./scripts/test-instance-env-identity-backend.sh
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
         cargo nextest run -p buzz-voice --lib

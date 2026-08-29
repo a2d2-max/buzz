@@ -48,29 +48,36 @@ if git rev-parse --is-inside-work-tree &>/dev/null; then
         # tauri-plugin-single-instance or the app data directory.
         if [[ "${BUZZ_SHARE_IDENTITY:-0}" == "1" ]]; then
             KEYRING_SERVICE="buzz-desktop-dev"
-            # Debug builds store secrets in a per-service file (see
-            # desktop/src-tauri/src/secret_store.rs); prefer it over the
-            # legacy OS keychain item, which dev builds no longer write.
+            # Keep worktree identity sharing on the same backend selected by
+            # the debug app: file mode never invokes a credential service,
+            # while explicit keychain mode never consumes stale local files.
             SECRETS_FILE=""
             KEYRING_BLOB=""
-            case "$(uname -s)" in
-                Darwin)
-                    SECRETS_FILE="$HOME/Library/Application Support/xyz.block.buzz.app.dev/secrets.${KEYRING_SERVICE}.json"
-                    if [[ ! -f "$SECRETS_FILE" ]] && command -v security &>/dev/null; then
-                        KEYRING_BLOB="$(security find-generic-password -s "$KEYRING_SERVICE" -a secrets -w 2>/dev/null || true)"
-                    fi
-                    ;;
-                Linux)
-                    SECRETS_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/xyz.block.buzz.app.dev/secrets.${KEYRING_SERVICE}.json"
-                    if [[ ! -f "$SECRETS_FILE" ]] && command -v secret-tool &>/dev/null; then
-                        KEYRING_BLOB="$(secret-tool lookup service "$KEYRING_SERVICE" username secrets target default 2>/dev/null || true)"
-                    fi
-                    ;;
-            esac
-            # BUZZ_DEV_USE_KEYCHAIN=1 puts the app on the keychain, so the
-            # file may hold a stale identity — only prefer it in file mode.
-            if [[ "${BUZZ_DEV_USE_KEYCHAIN:-0}" != "1" && -f "$SECRETS_FILE" ]]; then
-                KEYRING_BLOB="$(cat "$SECRETS_FILE")"
+            if [[ "${BUZZ_DEV_USE_KEYCHAIN:-0}" == "1" ]]; then
+                case "$(uname -s)" in
+                    Darwin)
+                        if command -v security &>/dev/null; then
+                            KEYRING_BLOB="$(security find-generic-password -s "$KEYRING_SERVICE" -a secrets -w 2>/dev/null || true)"
+                        fi
+                        ;;
+                    Linux)
+                        if command -v secret-tool &>/dev/null; then
+                            KEYRING_BLOB="$(secret-tool lookup service "$KEYRING_SERVICE" username secrets target default 2>/dev/null || true)"
+                        fi
+                        ;;
+                esac
+            else
+                case "$(uname -s)" in
+                    Darwin)
+                        SECRETS_FILE="$HOME/Library/Application Support/xyz.block.buzz.app.dev/secrets.${KEYRING_SERVICE}.json"
+                        ;;
+                    Linux)
+                        SECRETS_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/xyz.block.buzz.app.dev/secrets.${KEYRING_SERVICE}.json"
+                        ;;
+                esac
+                if [[ -f "$SECRETS_FILE" ]]; then
+                    KEYRING_BLOB="$(cat "$SECRETS_FILE")"
+                fi
             fi
 
             KEYRING_IDENTITY="$(printf '%s' "$KEYRING_BLOB" | python3 -c 'import json, sys; value = json.load(sys.stdin).get("identity", ""); print(value if isinstance(value, str) else "")' 2>/dev/null || true)"
@@ -78,9 +85,9 @@ if git rev-parse --is-inside-work-tree &>/dev/null; then
             LEGACY_CANONICAL_KEY="$HOME/Library/Application Support/xyz.block.sprout.app.dev/identity.key"
 
             SHARED_IDENTITY="$KEYRING_IDENTITY"
-            if [[ -z "$SHARED_IDENTITY" && -f "$CANONICAL_KEY" ]]; then
+            if [[ "${BUZZ_DEV_USE_KEYCHAIN:-0}" != "1" && -z "$SHARED_IDENTITY" && -f "$CANONICAL_KEY" ]]; then
                 SHARED_IDENTITY="$(cat "$CANONICAL_KEY")"
-            elif [[ -z "$SHARED_IDENTITY" && -f "$LEGACY_CANONICAL_KEY" ]]; then
+            elif [[ "${BUZZ_DEV_USE_KEYCHAIN:-0}" != "1" && -z "$SHARED_IDENTITY" && -f "$LEGACY_CANONICAL_KEY" ]]; then
                 SHARED_IDENTITY="$(cat "$LEGACY_CANONICAL_KEY")"
             fi
 

@@ -89,8 +89,7 @@ fn blob_lockfile_path(service: &str) -> PathBuf {
     #[cfg(unix)]
     {
         // Use the real UID so distinct users get distinct lockfiles.
-        // SAFETY: getuid() is always safe on Unix — it never fails.
-        let uid = unsafe { libc::getuid() };
+        let uid = current_user_id();
         PathBuf::from(format!("/tmp/buzz-keychain-{uid}-{service}.lock"))
     }
     #[cfg(not(unix))]
@@ -99,6 +98,12 @@ fn blob_lockfile_path(service: &str) -> PathBuf {
         // used to derive the mutex name and for test assertions.
         std::env::temp_dir().join(format!("buzz-keychain-{service}.lock"))
     }
+}
+
+#[cfg(unix)]
+fn current_user_id() -> libc::uid_t {
+    // SAFETY: getuid() is always safe on Unix — it never fails.
+    unsafe { libc::getuid() }
 }
 
 /// Acquire an exclusive advisory file lock for the blob identified by `service`.
@@ -232,11 +237,77 @@ impl Drop for BlobLockGuard {
 /// deliberately no fallback to the old dev keychain item).
 #[cfg(all(debug_assertions, feature = "system-keyring"))]
 fn read_blob_raw_file(path: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("secrets file read {}: {e}", path.display())),
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
     }
+
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("secrets file open {}: {e}", path.display())),
+    };
+    secure_secret_file_permissions(&file, path)?;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("secrets file read {}: {e}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+#[cfg(all(debug_assertions, feature = "system-keyring", unix))]
+fn secure_secret_file_permissions(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("secrets file metadata {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "secrets path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let expected_uid = current_user_id();
+    if metadata.uid() != expected_uid {
+        return Err(format!(
+            "secrets file owner mismatch {}: expected uid {expected_uid}, got {}",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("secrets file chmod {}: {e}", path.display()))?;
+
+    let verified = file
+        .metadata()
+        .map_err(|e| format!("secrets file metadata verify {}: {e}", path.display()))?;
+    if verified.uid() != expected_uid || verified.mode() & 0o7777 != 0o600 {
+        return Err(format!(
+            "secrets file permissions verify failed {}: uid {}, mode {:o}",
+            path.display(),
+            verified.uid(),
+            verified.mode() & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(debug_assertions, feature = "system-keyring", not(unix)))]
+fn secure_secret_file_permissions(
+    _file: &std::fs::File,
+    _path: &std::path::Path,
+) -> Result<(), String> {
+    Ok(())
 }
 
 /// Atomically replace the file backend's blob: write a `0o600` sibling tmp
@@ -257,21 +328,36 @@ fn write_blob_raw_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), Strin
     let tmp = path.with_file_name(format!("{file_name}.tmp"));
 
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.read(true).write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = opts
         .open(&tmp)
         .map_err(|e| format!("secrets tmp open {}: {e}", tmp.display()))?;
+    secure_secret_file_permissions(&file, &tmp)?;
+    file.set_len(0)
+        .map_err(|e| format!("secrets tmp truncate {}: {e}", tmp.display()))?;
     file.write_all(bytes)
         .map_err(|e| format!("secrets tmp write: {e}"))?;
     file.sync_all()
         .map_err(|e| format!("secrets tmp fsync: {e}"))?;
-    drop(file);
-    std::fs::rename(&tmp, path).map_err(|e| format!("secrets file rename: {e}"))
+    #[cfg(unix)]
+    {
+        std::fs::rename(&tmp, path).map_err(|e| format!("secrets file rename: {e}"))?;
+        secure_secret_file_permissions(&file, path)?;
+        file.sync_all()
+            .map_err(|e| format!("secrets file fsync {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows does not permit renaming this file while the handle is open.
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| format!("secrets file rename: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Where a [`SecretStore`]'s blob physically lives. The `File` variant is
@@ -1567,6 +1653,53 @@ mod tests {
             let path = dir.path().join("secrets.buzz-test-file-perms.json");
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "secrets file must be 0o600");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn preexisting_world_readable_final_is_repaired_before_load() {
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, store) = tmp_store("buzz-test-file-repair-final");
+            let path = dir.path().join("secrets.buzz-test-file-repair-final.json");
+            std::fs::write(&path, br#"{"identity":"nsec1aaa"}"#).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            assert_eq!(
+                store.load("identity").unwrap(),
+                Some("nsec1aaa".to_string())
+            );
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "an existing final secrets file must be repaired before parsing"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn preexisting_world_readable_tmp_cannot_become_world_readable_final() {
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, store) = tmp_store("buzz-test-file-repair-tmp");
+            let final_path = dir.path().join("secrets.buzz-test-file-repair-tmp.json");
+            let tmp_path = dir
+                .path()
+                .join("secrets.buzz-test-file-repair-tmp.json.tmp");
+            std::fs::write(&tmp_path, b"stale").unwrap();
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            store.store("identity", "nsec1aaa").unwrap();
+
+            assert!(
+                !tmp_path.exists(),
+                "successful rename must consume the temp file"
+            );
+            let mode = std::fs::metadata(&final_path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "a pre-existing permissive temp file must not weaken the final file"
+            );
         }
 
         #[test]
