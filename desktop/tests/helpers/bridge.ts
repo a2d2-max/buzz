@@ -468,6 +468,10 @@ type MockBridgeOptions = {
   identityLocked?: boolean;
   /** Delay (ms) applied to identity import so specs can observe pending navigation. */
   identityImportDelayMs?: number;
+  /** Deterministic capabilities returned by the local Ops E2E bridge. */
+  opsCapabilities?: Record<string, unknown>;
+  /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
+  opsSnapshot?: Record<string, unknown>;
   /**
    * Pending community deep links seeded into the mocked Rust-side queue.
    * The frontend drains these on boot into onboarding or an editable Add

@@ -184,6 +184,7 @@ export default defineConfig({
         "**/agents-everywhere.live.spec.ts",
         "**/relay-restart.live.spec.ts",
         "**/parity-ancestor-island.spec.ts",
+        "**/ops-room.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],

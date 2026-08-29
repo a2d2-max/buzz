@@ -543,6 +543,10 @@ type E2eConfig = {
     identityLocked?: boolean;
     /** Delay (ms) applied to identity import so specs can observe pending navigation. */
     identityImportDelayMs?: number;
+    /** Deterministic capabilities returned by the local Ops E2E bridge. */
+    opsCapabilities?: Record<string, unknown>;
+    /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
+    opsSnapshot?: Record<string, unknown>;
     /**
      * Global agent config returned by `get_global_agent_config`. Defaults to
      * an empty config (no provider, model, or env vars) if not specified.
@@ -1510,6 +1514,191 @@ const SYSTEM_REACTION_TARGET_EVENT_ID = "e".repeat(64);
 const E2E_IDENTITY_OVERRIDE_STORAGE_KEY = "buzz:e2e-identity-override.v1";
 /** Stands in for `tauri.conf.json`'s version, which no mock IPC call can read. */
 const MOCK_APP_VERSION = "0.0.0-e2e";
+const MOCK_OPS_CAPABILITIES = {
+  contract_version: 1,
+  reads: ["snapshot", "events", "artifact"],
+  drafts: ["message", "internal_task", "provider_action"],
+  transitions: ["submit", "approve", "risk_confirm", "deliver", "reject"],
+} as const;
+const MOCK_OPS_SNAPSHOT = {
+  contract_version: 1,
+  revision: 7,
+  generated_at: "2026-08-29T08:00:00.000Z",
+  health: { hub: "ready", orca: "observed", codex: "ready" },
+  room: {
+    channels: [
+      {
+        id: "workspace:redacted",
+        project_id: "project:redacted",
+        label: "Redacted workspace",
+        count: 1,
+      },
+    ],
+    selected_channel_id: "workspace:redacted",
+    threads: [
+      {
+        id: "work:redacted",
+        type: "work",
+        work_item_id: "work:redacted",
+        session_id: null,
+        project_id: "project:redacted",
+        title: "Native Ops parity",
+        status: "in_progress",
+        provider: "codex",
+        updated_at: "2026-08-29T08:00:00.000Z",
+        session_count: 2,
+        approval_count: 1,
+        artifact_count: 1,
+      },
+    ],
+    selected_thread_id: "work:redacted",
+    messages: [
+      {
+        id: "event:completion-redacted",
+        kind: "completion",
+        timestamp: "2026-08-29T08:01:00.000Z",
+        role: "agent",
+        author: "Codex sub",
+        body: "Deterministic parity verification completed.",
+        details: { source: "codex_sub", outcome: "완료", tests: 3 },
+      },
+      {
+        id: "event:approval-redacted",
+        kind: "approval",
+        timestamp: "2026-08-29T08:02:00.000Z",
+        role: "system",
+        author: "Local Ops Hub",
+        body: "External delivery remains disabled in recovery mode.",
+        details: { source: "hub", outcome: "승인 필요" },
+      },
+    ],
+    context: {
+      work_item: {
+        id: "work:redacted",
+        project_id: "project:redacted",
+        title: "Native Ops parity",
+        status: "in_progress",
+        progress: 0.75,
+        last_activity_at: "2026-08-29T08:02:00.000Z",
+        execution_provider: "codex",
+        provider_model: "mock-model",
+        provider_effort: "high",
+        revision: 7,
+        updated_at: "2026-08-29T08:02:00.000Z",
+      },
+      provider_run: null,
+      sessions: [
+        {
+          id: "session:codex-direct-redacted",
+          work_item_id: "work:redacted",
+          project_id: "project:redacted",
+          parent_session_id: null,
+          title: "Codex direct",
+          agent: "Codex",
+          activity: "coordinating",
+          health: "active",
+          health_reason: null,
+          last_activity_at: "2026-08-29T08:02:00.000Z",
+          execution_provider: "codex",
+          provider_model: "mock-model",
+          provider_effort: "high",
+          revision: 7,
+          updated_at: "2026-08-29T08:02:00.000Z",
+        },
+        {
+          id: "session:codex-sub-redacted",
+          work_item_id: "work:redacted",
+          project_id: "project:redacted",
+          parent_session_id: "session:codex-direct-redacted",
+          title: "Codex sub",
+          agent: "Codex sub",
+          activity: "complete",
+          health: "ready",
+          health_reason: null,
+          last_activity_at: "2026-08-29T08:01:00.000Z",
+          execution_provider: "codex",
+          provider_model: "mock-model",
+          provider_effort: "medium",
+          revision: 7,
+          updated_at: "2026-08-29T08:01:00.000Z",
+        },
+      ],
+      approvals: [
+        {
+          id: "approval:redacted",
+          work_item_id: "work:redacted",
+          target_session_id: "session:codex-direct-redacted",
+          draft_text: "[redacted external draft]",
+          action_kind: "deliver",
+          status: "held",
+          hold_reason: "external_action_disabled",
+          risk_class: ["external"],
+          risk_targets: ["redacted-target"],
+          approved_at: null,
+          revision: 7,
+          updated_at: "2026-08-29T08:02:00.000Z",
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact:redacted",
+          work_item_id: "work:redacted",
+          title: "Parity report",
+          kind: "report",
+          status: "ready",
+          version: 1,
+          source_event_id: "event:completion-redacted",
+          created_at: "2026-08-29T08:01:00.000Z",
+          updated_at: "2026-08-29T08:01:00.000Z",
+        },
+      ],
+    },
+    diagnostics: { fixture: "deterministic-redacted" },
+  },
+  session_tree: [
+    {
+      id: "session:codex-direct-redacted",
+      source: "codex_direct",
+      parent_session_id: null,
+      work_item_id: "work:redacted",
+      title: "Codex direct",
+      activity: "coordinating",
+      health: "active",
+      last_activity_at: "2026-08-29T08:02:00.000Z",
+      child_ids: ["session:codex-sub-redacted"],
+    },
+    {
+      id: "session:codex-sub-redacted",
+      source: "codex_sub",
+      parent_session_id: "session:codex-direct-redacted",
+      work_item_id: "work:redacted",
+      title: "Codex sub",
+      activity: "complete",
+      health: "ready",
+      last_activity_at: "2026-08-29T08:01:00.000Z",
+      child_ids: [],
+    },
+  ],
+  checklist: [
+    {
+      id: "checklist:redacted",
+      work_item_id: "work:redacted",
+      title: "Verify responsive safety parity",
+      status: "done",
+      order: 1,
+    },
+  ],
+  decisions: [
+    {
+      id: "decision:redacted",
+      queue: "user_decision",
+      source: "approval",
+      title: "External action held",
+      question: "Restore identity before any external action.",
+      approval_id: "approval:redacted",
+    },
+  ],
+} as const;
 const DEFAULT_MOCK_IDENTITY = {
   pubkey: "deadbeef".repeat(8),
   display_name: "npub1mock...",
@@ -11197,6 +11386,7 @@ export function maybeInstallE2eTauriMocks() {
       sourceUrl: null;
     };
   }> = [];
+  let mockOpsWatchStarted = false;
   const handleMockCommand = async (
     command: string,
     payload: unknown,
@@ -11254,6 +11444,19 @@ export function maybeInstallE2eTauriMocks() {
     }
 
     switch (command) {
+      case "ops_bridge_capabilities":
+        return structuredClone(
+          activeConfig?.mock?.opsCapabilities ?? MOCK_OPS_CAPABILITIES,
+        );
+      case "ops_bridge_snapshot":
+        return structuredClone(
+          activeConfig?.mock?.opsSnapshot ?? MOCK_OPS_SNAPSHOT,
+        );
+      case "ops_bridge_start_watch": {
+        const started = !mockOpsWatchStarted;
+        mockOpsWatchStarted = true;
+        return { started };
+      }
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
         const delayMs = activeConfig?.mock?.huddleStateReadDelayMs ?? 0;
