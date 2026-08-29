@@ -22,9 +22,18 @@ interface OpsEvidenceEnvironment {
   VITE_OPS_EVIDENCE_HEIGHT?: string;
 }
 
-interface OpsWindowOperationQueue {
+interface OpsWindowCoordinator {
+  activeOwners: Map<symbol, number>;
+  currentOwner: symbol | null;
+  generation: number;
   tail: Promise<void> | null;
 }
+
+const OPS_WINDOW_COORDINATORS = new WeakMap<
+  OpsWindowHandle,
+  OpsWindowCoordinator
+>();
+let currentOpsWindowHandle: OpsWindowHandle | null = null;
 
 export function opsLayoutForWidth(width: number): OpsResponsiveLayout {
   if (width >= 1024) return "desktop";
@@ -54,6 +63,27 @@ function configuredEvidenceSize(): OpsEvidenceSize | null {
   );
 }
 
+function resolveOpsWindow(
+  nativeWindowOverride: OpsWindowHandle | undefined,
+): OpsWindowHandle {
+  if (nativeWindowOverride) return nativeWindowOverride;
+  currentOpsWindowHandle ??= getCurrentWindow();
+  return currentOpsWindowHandle;
+}
+
+function coordinatorFor(nativeWindow: OpsWindowHandle): OpsWindowCoordinator {
+  const existing = OPS_WINDOW_COORDINATORS.get(nativeWindow);
+  if (existing) return existing;
+  const coordinator: OpsWindowCoordinator = {
+    activeOwners: new Map(),
+    currentOwner: null,
+    generation: 0,
+    tail: null,
+  };
+  OPS_WINDOW_COORDINATORS.set(nativeWindow, coordinator);
+  return coordinator;
+}
+
 async function applyOpsWindowConfiguration(
   nativeWindow: OpsWindowHandle,
   evidenceSize: OpsEvidenceSize | null,
@@ -70,7 +100,7 @@ async function applyOpsWindowConfiguration(
 }
 
 function enqueueOpsWindowOperation(
-  queue: OpsWindowOperationQueue,
+  queue: OpsWindowCoordinator,
   operation: () => Promise<void>,
 ): Promise<void> {
   const queued = queue.tail
@@ -105,37 +135,64 @@ export function useOpsWindowSize(
   nativeWindowOverride?: OpsWindowHandle,
   evidenceSizeOverride?: OpsEvidenceSize | null,
 ): void {
-  const operationGenerationRef = React.useRef(0);
-  const operationQueueRef = React.useRef<OpsWindowOperationQueue>({
-    tail: null,
-  });
+  const ownerRef = React.useRef(Symbol("ops-window-owner"));
   const hasEvidenceSizeOverride = evidenceSizeOverride !== undefined;
   const evidenceWidth = evidenceSizeOverride?.width;
   const evidenceHeight = evidenceSizeOverride?.height;
 
   React.useEffect(() => {
-    const nativeWindow = nativeWindowOverride ?? getCurrentWindow();
+    const nativeWindow = resolveOpsWindow(nativeWindowOverride);
+    const coordinator = coordinatorFor(nativeWindow);
+    const owner = ownerRef.current;
     const evidenceSize = hasEvidenceSizeOverride
       ? evidenceWidth === undefined || evidenceHeight === undefined
         ? null
         : { width: evidenceWidth, height: evidenceHeight }
       : configuredEvidenceSize();
-    const setupGeneration = ++operationGenerationRef.current;
+    const setupGeneration = ++coordinator.generation;
+    coordinator.activeOwners.set(owner, setupGeneration);
+    coordinator.currentOwner = owner;
 
-    void enqueueOpsWindowOperation(operationQueueRef.current, () =>
+    void enqueueOpsWindowOperation(coordinator, () =>
       applyOpsWindowConfiguration(
         nativeWindow,
         evidenceSize,
-        () => operationGenerationRef.current === setupGeneration,
+        () =>
+          coordinator.currentOwner === owner &&
+          coordinator.activeOwners.get(owner) === setupGeneration,
       ),
     );
 
     return () => {
-      const cleanupGeneration = ++operationGenerationRef.current;
+      if (coordinator.activeOwners.get(owner) === setupGeneration) {
+        coordinator.activeOwners.delete(owner);
+      }
+      if (coordinator.currentOwner !== owner) return;
+
+      let nextOwner: symbol | null = null;
+      let nextGeneration = -1;
+      for (const [activeOwner, generation] of coordinator.activeOwners) {
+        if (generation > nextGeneration) {
+          nextOwner = activeOwner;
+          nextGeneration = generation;
+        }
+      }
+      coordinator.currentOwner = nextOwner;
+      if (nextOwner) return;
+
+      const cleanupGeneration = ++coordinator.generation;
       queueMicrotask(() => {
-        if (operationGenerationRef.current !== cleanupGeneration) return;
-        void enqueueOpsWindowOperation(operationQueueRef.current, () => {
-          if (operationGenerationRef.current !== cleanupGeneration) {
+        if (
+          coordinator.generation !== cleanupGeneration ||
+          coordinator.activeOwners.size > 0
+        ) {
+          return;
+        }
+        void enqueueOpsWindowOperation(coordinator, () => {
+          if (
+            coordinator.generation !== cleanupGeneration ||
+            coordinator.activeOwners.size > 0
+          ) {
             return Promise.resolve();
           }
           return restoreOpsWindow(nativeWindow);

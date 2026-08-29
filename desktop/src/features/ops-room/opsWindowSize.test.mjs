@@ -274,6 +274,142 @@ describe("native Ops window sizing", () => {
     dom.window.close();
   });
 
+  test("route re-entry stays configured when the prior hook cleanup resolves last", async () => {
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+      url: "http://localhost/#/ops?view=room",
+    });
+    Object.defineProperties(globalThis, {
+      document: { configurable: true, value: dom.window.document },
+      HTMLElement: { configurable: true, value: dom.window.HTMLElement },
+      navigator: { configurable: true, value: dom.window.navigator },
+      Node: { configurable: true, value: dom.window.Node },
+      window: { configurable: true, value: dom.window },
+    });
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    const { act, cleanup, render } = await import("@testing-library/react");
+    let deferFirstRestore = true;
+    let resolvePriorRestore;
+    let finalMinimum = null;
+    let finalSize = null;
+    const nativeWindow = {
+      async setMinSize(size) {
+        const record = sizeRecord(size);
+        if (record.width === 800 && deferFirstRestore) {
+          deferFirstRestore = false;
+          await new Promise((resolve) => {
+            resolvePriorRestore = resolve;
+          });
+        }
+        finalMinimum = record;
+      },
+      async setSize(size) {
+        finalSize = sizeRecord(size);
+      },
+    };
+
+    function FirstRoute() {
+      useOpsWindowSize(nativeWindow, { width: 390, height: 844 });
+      return null;
+    }
+
+    function ReenteredRoute() {
+      useOpsWindowSize(nativeWindow, { width: 736, height: 900 });
+      return null;
+    }
+
+    const first = render(React.createElement(FirstRoute));
+    await act(async () => {
+      for (let index = 0; index < 4; index += 1) await Promise.resolve();
+    });
+    first.unmount();
+    await act(async () => Promise.resolve());
+
+    const reentered = render(React.createElement(ReenteredRoute));
+    await act(async () => {
+      for (let index = 0; index < 4; index += 1) await Promise.resolve();
+    });
+    await act(async () => {
+      resolvePriorRestore();
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    });
+
+    assert.deepEqual(finalMinimum, { width: 360, height: 500 });
+    assert.deepEqual(finalSize, { width: 736, height: 900 });
+    reentered.unmount();
+    await act(async () => {
+      for (let index = 0; index < 4; index += 1) await Promise.resolve();
+    });
+    cleanup();
+    dom.window.close();
+  });
+
+  test("a pending setup on another native window does not block configuration", async () => {
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+      url: "http://localhost/#/ops?view=room",
+    });
+    Object.defineProperties(globalThis, {
+      document: { configurable: true, value: dom.window.document },
+      HTMLElement: { configurable: true, value: dom.window.HTMLElement },
+      navigator: { configurable: true, value: dom.window.navigator },
+      Node: { configurable: true, value: dom.window.Node },
+      window: { configurable: true, value: dom.window },
+    });
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    const { act, cleanup, render } = await import("@testing-library/react");
+    let resolveFirstWindow;
+    let deferFirstWindow = true;
+    const firstWindow = {
+      async setMinSize() {
+        if (!deferFirstWindow) return;
+        deferFirstWindow = false;
+        await new Promise((resolve) => {
+          resolveFirstWindow = resolve;
+        });
+      },
+      async setSize() {},
+    };
+    let secondMinimum = null;
+    let secondSize = null;
+    const secondWindow = {
+      async setMinSize(size) {
+        secondMinimum = sizeRecord(size);
+      },
+      async setSize(size) {
+        secondSize = sizeRecord(size);
+      },
+    };
+
+    function FirstWindowRoute() {
+      useOpsWindowSize(firstWindow, { width: 390, height: 844 });
+      return null;
+    }
+
+    function SecondWindowRoute() {
+      useOpsWindowSize(secondWindow, { width: 736, height: 900 });
+      return null;
+    }
+
+    const first = render(React.createElement(FirstWindowRoute));
+    const second = render(React.createElement(SecondWindowRoute));
+    await act(async () => {
+      for (let index = 0; index < 4; index += 1) await Promise.resolve();
+    });
+    assert.deepEqual(secondMinimum, { width: 360, height: 500 });
+    assert.deepEqual(secondSize, { width: 736, height: 900 });
+
+    await act(async () => {
+      resolveFirstWindow();
+      for (let index = 0; index < 4; index += 1) await Promise.resolve();
+    });
+    first.unmount();
+    second.unmount();
+    await act(async () => {
+      for (let index = 0; index < 4; index += 1) await Promise.resolve();
+    });
+    cleanup();
+    dom.window.close();
+  });
+
   test("declares the two native window permissions", async () => {
     const capabilities = JSON.parse(
       await readFile(
