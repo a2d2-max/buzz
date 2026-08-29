@@ -1,79 +1,339 @@
-import { PanelTop } from "lucide-react";
+import { PanelRightOpen, X } from "lucide-react";
+import * as React from "react";
 
-import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
+import { useOpsSnapshot } from "../hooks";
+import {
+  opsRoomHash,
+  parseOpsRoomHash,
+  projectOpsRoom,
+  type OpsRoomProjection,
+} from "../opsProjection";
+import {
+  opsLayoutForWidth,
+  type OpsResponsiveLayout,
+  useOpsWindowSize,
+} from "../opsWindowSize";
+import type {
+  OpsConnectionState as ConnectionState,
+  OpsSelection,
+} from "../types";
+import { OpsConnectionState } from "./OpsConnectionState";
+import { OpsContextPanel } from "./OpsContextPanel";
+import { OpsSessionTree } from "./OpsSessionTree";
+import { OpsTimeline } from "./OpsTimeline";
+import { OpsWorkspaceNav } from "./OpsWorkspaceNav";
 
-const OPS_REGIONS = [
-  { id: "ops-session-tree", label: "Session tree" },
-  { id: "ops-timeline", label: "Timeline" },
-  { id: "ops-context", label: "Context" },
-  { id: "ops-local-history-voice", label: "Local history / voice dock" },
-] as const;
+const INTERACTIVE_SIZE = { minHeight: 44, minWidth: 44 } as const;
+const MOBILE_TABS = ["workspace", "sessions", "timeline", "context"] as const;
+type MobileTab = (typeof MOBILE_TABS)[number];
 
-type OpsRegionProps = (typeof OPS_REGIONS)[number] & {
-  className?: string;
+const MOBILE_TAB_LABELS: Record<MobileTab, string> = {
+  workspace: "작업",
+  sessions: "세션",
+  timeline: "타임라인",
+  context: "컨텍스트",
 };
 
-function OpsRegion({ className = "", id, label }: OpsRegionProps) {
+function useOpsResponsiveLayout(): OpsResponsiveLayout {
+  const [layout, setLayout] = React.useState(() =>
+    opsLayoutForWidth(window.innerWidth),
+  );
+
+  React.useEffect(() => {
+    const update = () => setLayout(opsLayoutForWidth(window.innerWidth));
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+
+  return layout;
+}
+
+function useReducedMotionPreference(): boolean {
+  const [reduced, setReduced] = React.useState(
+    () =>
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+  );
+
+  React.useEffect(() => {
+    const query = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    if (!query) return;
+    const update = () => setReduced(query.matches);
+    query.addEventListener?.("change", update);
+    return () => query.removeEventListener?.("change", update);
+  }, []);
+
+  return reduced;
+}
+
+function MainPane({ children }: { children: React.ReactNode }) {
   return (
-    <section
-      aria-labelledby={`${id}-heading`}
-      className={`flex min-h-36 min-w-0 flex-col overflow-hidden rounded-xl border border-border/70 bg-background ${className}`}
-      data-testid={id}
-      id={id}
-    >
-      <h2
-        className="min-w-0 break-words border-border/60 border-b px-4 py-3 text-sm font-medium [overflow-wrap:anywhere]"
-        id={`${id}-heading`}
-      >
-        {label}
-      </h2>
-      <div className="min-h-0 min-w-0 flex-1 break-words [overflow-wrap:anywhere]" />
-    </section>
+    <div className="flex min-h-0 min-w-0" data-testid="ops-main-pane">
+      {children}
+    </div>
   );
 }
 
-export function OpsRoomScreen() {
-  const focusRegion = (id: string) => {
-    document.getElementById(id)?.scrollIntoView({ block: "nearest" });
-  };
+type OpsRoomViewProps = {
+  connectionState: ConnectionState;
+  onRetry: () => void;
+  onSelectChannel: (id: string) => void;
+  onSelectSession: (id: string) => void;
+  onSelectThread: (id: string) => void;
+  projection: OpsRoomProjection | null;
+};
+
+export function OpsRoomView({
+  connectionState,
+  onRetry,
+  onSelectChannel,
+  onSelectSession,
+  onSelectThread,
+  projection,
+}: OpsRoomViewProps) {
+  const layout = useOpsResponsiveLayout();
+  const reducedMotion = useReducedMotionPreference();
+  const [mobileTab, setMobileTab] = React.useState<MobileTab>("timeline");
+  const [contextOpen, setContextOpen] = React.useState(false);
+  const contextTriggerRef = React.useRef<HTMLButtonElement>(null);
+  const contextDrawerRef = React.useRef<HTMLDivElement>(null);
+
+  const closeContext = React.useCallback(() => {
+    setContextOpen(false);
+    contextTriggerRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  React.useEffect(() => {
+    if (!contextOpen) return;
+    contextDrawerRef.current?.focus({ preventScroll: true });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeContext();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const drawer = contextDrawerRef.current;
+      const focusable = drawer
+        ? Array.from(
+            drawer.querySelectorAll<HTMLElement>(
+              'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+            ),
+          )
+        : [];
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (!first || !last) {
+        event.preventDefault();
+        drawer?.focus({ preventScroll: true });
+      } else if (
+        document.activeElement === drawer ||
+        (!event.shiftKey && document.activeElement === last)
+      ) {
+        event.preventDefault();
+        first.focus({ preventScroll: true });
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus({ preventScroll: true });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [closeContext, contextOpen]);
+
+  const stateOnly = connectionState !== "ready" && connectionState !== "stale";
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      <TopChromeInsetHeader data-tauri-drag-region flush>
-        <header className="flex min-h-14 min-w-0 items-center gap-3 px-5 py-2">
-          <PanelTop className="h-5 w-5 shrink-0 text-muted-foreground" />
-          <h1 className="min-w-0 break-words text-base font-semibold [overflow-wrap:anywhere]">
-            Ops Room
-          </h1>
-        </header>
-      </TopChromeInsetHeader>
+    <div
+      className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden [overflow-wrap:anywhere]"
+      data-reduced-motion={reducedMotion ? "true" : "false"}
+      data-testid="ops-room-view"
+    >
+      <h1 className="sr-only">Agent Room</h1>
+      <OpsConnectionState onRetry={onRetry} state={connectionState} />
+      {stateOnly || !projection ? null : (
+        <main className="min-h-0 min-w-0 flex-1 overflow-hidden p-3">
+          {layout === "desktop" ? (
+            <div className="grid h-full min-h-0 grid-cols-[minmax(13rem,0.8fr)_minmax(14rem,0.9fr)_minmax(22rem,2fr)_minmax(15rem,1fr)] gap-3">
+              <MainPane>
+                <OpsWorkspaceNav
+                  onSelectChannel={onSelectChannel}
+                  onSelectThread={onSelectThread}
+                  workspace={projection.workspace}
+                />
+              </MainPane>
+              <MainPane>
+                <OpsSessionTree
+                  onSelect={onSelectSession}
+                  selectedSessionId={projection.workspace.selectedThreadId}
+                  sessions={projection.sessions}
+                />
+              </MainPane>
+              <MainPane>
+                <OpsTimeline items={projection.timeline} />
+              </MainPane>
+              <MainPane>
+                <OpsContextPanel context={projection.context} />
+              </MainPane>
+            </div>
+          ) : layout === "compact" ? (
+            <div className="grid h-full min-h-0 grid-cols-[minmax(15rem,0.9fr)_minmax(22rem,2fr)] gap-3">
+              <MainPane>
+                <div className="grid min-h-0 min-w-0 flex-1 grid-rows-2 gap-3">
+                  <OpsWorkspaceNav
+                    onSelectChannel={onSelectChannel}
+                    onSelectThread={onSelectThread}
+                    workspace={projection.workspace}
+                  />
+                  <OpsSessionTree
+                    onSelect={onSelectSession}
+                    selectedSessionId={projection.workspace.selectedThreadId}
+                    sessions={projection.sessions}
+                  />
+                </div>
+              </MainPane>
+              <MainPane>
+                <div className="relative flex min-h-0 min-w-0 flex-1">
+                  <OpsTimeline items={projection.timeline} />
+                  <button
+                    aria-label="컨텍스트 열기"
+                    className="absolute right-3 top-3 z-10 flex items-center justify-center rounded-lg border border-border bg-background/95 text-muted-foreground shadow-sm transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"
+                    data-ops-interactive
+                    onClick={() => setContextOpen(true)}
+                    ref={contextTriggerRef}
+                    style={INTERACTIVE_SIZE}
+                    type="button"
+                  >
+                    <PanelRightOpen className="h-4 w-4" />
+                  </button>
+                </div>
+              </MainPane>
+            </div>
+          ) : (
+            <div className="flex h-full min-h-0 flex-col gap-2">
+              <div
+                aria-label="Agent Room 화면"
+                className="grid grid-cols-4 gap-1 rounded-xl border border-border/70 bg-background p-1"
+                role="tablist"
+              >
+                {MOBILE_TABS.map((tab) => (
+                  <button
+                    aria-selected={mobileTab === tab}
+                    className="flex items-center justify-center rounded-lg px-1 text-xs font-medium transition-colors hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none aria-[selected=true]:bg-primary/10 aria-[selected=true]:text-primary"
+                    data-ops-interactive
+                    key={tab}
+                    onClick={() => setMobileTab(tab)}
+                    role="tab"
+                    style={INTERACTIVE_SIZE}
+                    type="button"
+                  >
+                    {MOBILE_TAB_LABELS[tab]}
+                  </button>
+                ))}
+              </div>
+              <MainPane>
+                {mobileTab === "workspace" ? (
+                  <OpsWorkspaceNav
+                    onSelectChannel={onSelectChannel}
+                    onSelectThread={onSelectThread}
+                    workspace={projection.workspace}
+                  />
+                ) : mobileTab === "sessions" ? (
+                  <OpsSessionTree
+                    onSelect={onSelectSession}
+                    selectedSessionId={projection.workspace.selectedThreadId}
+                    sessions={projection.sessions}
+                  />
+                ) : mobileTab === "context" ? (
+                  <OpsContextPanel context={projection.context} />
+                ) : (
+                  <OpsTimeline items={projection.timeline} />
+                )}
+              </MainPane>
+            </div>
+          )}
+        </main>
+      )}
 
-      <main className="buzz-content-scrollbar min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto p-3 sm:p-4">
-        <nav
-          aria-label="Ops Room regions"
-          className="mb-3 grid min-w-0 grid-cols-2 gap-2 md:hidden"
-        >
-          {OPS_REGIONS.map((region) => (
+      {layout === "compact" && contextOpen && projection ? (
+        <div className="fixed inset-0 z-50">
+          <button
+            aria-label="컨텍스트 바깥 영역 닫기"
+            className="absolute inset-0 bg-background/70 backdrop-blur-xs motion-reduce:transition-none"
+            data-ops-interactive
+            onClick={closeContext}
+            style={INTERACTIVE_SIZE}
+            tabIndex={-1}
+            type="button"
+          />
+          <div
+            aria-label="작업 컨텍스트"
+            aria-modal="true"
+            className="absolute inset-y-0 right-0 flex w-[min(25rem,88vw)] flex-col border-border border-l bg-background p-3 shadow-2xl outline-hidden transition-transform motion-reduce:transition-none"
+            ref={contextDrawerRef}
+            role="dialog"
+            tabIndex={-1}
+          >
             <button
-              className="flex min-h-11 min-w-11 items-center justify-center rounded-lg border border-border/70 px-3 py-2 text-center text-sm font-medium hover:bg-muted/60 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-              key={region.id}
-              onClick={() => focusRegion(region.id)}
+              aria-label="컨텍스트 닫기"
+              className="mb-2 ml-auto flex items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"
+              data-ops-interactive
+              onClick={closeContext}
+              style={INTERACTIVE_SIZE}
               type="button"
             >
-              <span className="min-w-0 break-words [overflow-wrap:anywhere]">
-                {region.label}
-              </span>
+              <X className="h-4 w-4" />
             </button>
-          ))}
-        </nav>
-
-        <div className="grid min-w-0 gap-3 md:h-full md:min-h-[28rem] md:grid-cols-[minmax(12rem,0.85fr)_minmax(0,2fr)_minmax(12rem,1fr)] md:grid-rows-[minmax(0,1fr)_minmax(9rem,auto)]">
-          <OpsRegion className="md:row-span-2 md:min-h-0" {...OPS_REGIONS[0]} />
-          <OpsRegion className="md:min-h-0" {...OPS_REGIONS[1]} />
-          <OpsRegion className="md:row-span-2 md:min-h-0" {...OPS_REGIONS[2]} />
-          <OpsRegion className="md:min-h-0" {...OPS_REGIONS[3]} />
+            <OpsContextPanel context={projection.context} />
+          </div>
         </div>
-      </main>
+      ) : null}
     </div>
+  );
+}
+
+function currentOpsSelection(): Required<OpsSelection> {
+  return parseOpsRoomHash(window.location.hash);
+}
+
+export function OpsRoomScreen() {
+  useOpsWindowSize();
+  const [selection, setSelection] = React.useState(currentOpsSelection);
+  const { refetch, snapshot, state } = useOpsSnapshot(selection);
+  const projection = React.useMemo(
+    () => (snapshot ? projectOpsRoom(snapshot) : null),
+    [snapshot],
+  );
+
+  React.useEffect(() => {
+    const syncFromHash = () => setSelection(currentOpsSelection());
+    window.addEventListener("hashchange", syncFromHash);
+    return () => window.removeEventListener("hashchange", syncFromHash);
+  }, []);
+
+  const select = React.useCallback((next: Required<OpsSelection>) => {
+    setSelection(next);
+    window.history.replaceState(null, "", opsRoomHash(next));
+  }, []);
+
+  const selectChannel = React.useCallback(
+    (channel: string) =>
+      select({ channel, thread: null, limit: selection.limit }),
+    [select, selection.limit],
+  );
+  const selectThread = React.useCallback(
+    (thread: string) =>
+      select({ channel: selection.channel, thread, limit: selection.limit }),
+    [select, selection.channel, selection.limit],
+  );
+
+  return (
+    <OpsRoomView
+      connectionState={state}
+      onRetry={() => void refetch()}
+      onSelectChannel={selectChannel}
+      onSelectSession={selectThread}
+      onSelectThread={selectThread}
+      projection={projection}
+    />
   );
 }

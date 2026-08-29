@@ -6,6 +6,7 @@ import { isMacPlatform } from "@/shared/lib/platform";
 import { useIsFullscreen } from "@/shared/lib/useIsFullscreen";
 import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
+import { ensureOpsRoomHash } from "../opsProjection";
 import { OpsRoomScreen } from "./OpsRoomScreen";
 
 type LocalOpsGuestAppProps = {
@@ -17,9 +18,8 @@ export function LocalOpsGuestApp({ onRestoreIdentity }: LocalOpsGuestAppProps) {
   const clearsMacTrafficLights = isMacPlatform() && !isFullscreen;
 
   React.useLayoutEffect(() => {
-    if (window.location.hash !== "#/ops") {
-      window.location.hash = "/ops";
-    }
+    const nextHash = ensureOpsRoomHash(window.location.hash);
+    if (window.location.hash !== nextHash) window.location.hash = nextHash;
   }, []);
 
   return (

@@ -24,6 +24,10 @@ const opsScreenSource = await readFile(
   new URL("./ui/OpsRoomScreen.tsx", import.meta.url),
   "utf8",
 );
+const opsProjectionSource = await readFile(
+  new URL("./opsProjection.ts", import.meta.url),
+  "utf8",
+);
 const routeSource = await readFile(
   new URL("../../app/routes/ops.tsx", import.meta.url),
   "utf8",
@@ -82,23 +86,23 @@ describe("native Ops Room route", () => {
     assert.match(routeTreeSource, /"\/ops": typeof opsRoute/);
   });
 
-  test("keeps the responsive shell limited to four labeled empty regions", () => {
-    const regionRecords = Array.from(
-      opsScreenSource.matchAll(/\{ id: "([^"]+)", label: "([^"]+)" \}/g),
-      (match) => ({ id: match[1], label: match[2] }),
-    );
-    assert.deepEqual(regionRecords, [
-      { id: "ops-session-tree", label: "Session tree" },
-      { id: "ops-timeline", label: "Timeline" },
-      { id: "ops-context", label: "Context" },
-      {
-        id: "ops-local-history-voice",
-        label: "Local history / voice dock",
-      },
-    ]);
+  test("composes the typed room leaves and keeps selection in the URL", () => {
+    for (const component of [
+      "OpsWorkspaceNav",
+      "OpsSessionTree",
+      "OpsTimeline",
+      "OpsContextPanel",
+      "OpsConnectionState",
+    ]) {
+      assert.match(opsScreenSource, new RegExp(`import.*${component}`));
+    }
     assert.match(opsScreenSource, /min-h-0 min-w-0 flex-1/);
     assert.match(opsScreenSource, /\[overflow-wrap:anywhere\]/);
-    assert.match(opsScreenSource, /md:grid-cols-\[minmax\(12rem,0\.85fr\)/);
-    assert.match(opsScreenSource, /min-h-11 min-w-11/);
+    assert.match(opsScreenSource, /opsRoomHash/);
+    assert.match(opsScreenSource, /parseOpsRoomHash/);
+    assert.match(
+      opsProjectionSource,
+      /new URLSearchParams\(\{ view: "room" \}\)/,
+    );
   });
 });
