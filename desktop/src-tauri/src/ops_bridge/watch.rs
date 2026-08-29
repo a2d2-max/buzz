@@ -10,6 +10,7 @@ use std::{
 use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::Emitter;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -271,6 +272,7 @@ struct WatchTask {
 /// Owns at most one app-lifetime Ops SSE watcher.
 pub(crate) struct OpsBridgeWatcher {
     task: Mutex<Option<WatchTask>>,
+    lifecycle: AsyncMutex<()>,
     running: Arc<AtomicBool>,
     sync: Arc<Mutex<WatchSyncState>>,
 }
@@ -279,6 +281,7 @@ impl Default for OpsBridgeWatcher {
     fn default() -> Self {
         Self {
             task: Mutex::new(None),
+            lifecycle: AsyncMutex::new(()),
             running: Arc::new(AtomicBool::new(false)),
             sync: Arc::new(Mutex::new(WatchSyncState::default())),
         }
@@ -286,7 +289,7 @@ impl Default for OpsBridgeWatcher {
 }
 
 impl OpsBridgeWatcher {
-    pub(crate) fn start(
+    pub(crate) async fn start(
         &self,
         app: tauri::AppHandle,
         client: Arc<OpsBridgeClient>,
@@ -294,22 +297,29 @@ impl OpsBridgeWatcher {
         let emitter: InvalidationEmitter = Arc::new(move |event| {
             let _ = app.emit(INVALIDATION_EVENT, event);
         });
-        self.start_with_emitter(client, emitter)
+        self.start_with_emitter(client, emitter).await
     }
 
-    pub(crate) fn start_with_emitter(
+    pub(crate) async fn start_with_emitter(
         &self,
         client: Arc<OpsBridgeClient>,
         emitter: InvalidationEmitter,
     ) -> Result<bool, OpsBridgeError> {
-        let mut task = self.task.lock().map_err(|_| OpsBridgeError::WatchState)?;
-        if self.running.swap(true, Ordering::SeqCst) {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.running.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        if let Some(existing) = task.take() {
+        let existing = self
+            .task
+            .lock()
+            .map_err(|_| OpsBridgeError::WatchState)?
+            .take();
+        if let Some(existing) = existing {
             existing.cancel.cancel();
             existing.handle.abort();
+            let _ = existing.handle.await;
         }
+        self.running.store(true, Ordering::SeqCst);
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let running = Arc::clone(&self.running);
@@ -318,17 +328,37 @@ impl OpsBridgeWatcher {
             let _running_guard = RunningGuard(running);
             watch_loop(client, emitter, task_cancel, sync).await;
         });
-        *task = Some(WatchTask { cancel, handle });
+        *self.task.lock().map_err(|_| OpsBridgeError::WatchState)? =
+            Some(WatchTask { cancel, handle });
         Ok(true)
     }
 
-    pub(crate) fn stop(&self) {
-        let Ok(mut task) = self.task.lock() else {
-            return;
-        };
-        if let Some(task) = task.take() {
+    pub(crate) async fn stop_async(&self) -> Result<(), OpsBridgeError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let task = self
+            .task
+            .lock()
+            .map_err(|_| OpsBridgeError::WatchState)?
+            .take();
+        if let Some(task) = task {
             task.cancel.cancel();
             task.handle.abort();
+            let _ = task.handle.await;
+        }
+        self.running.store(false, Ordering::SeqCst);
+        self.sync
+            .lock()
+            .map_err(|_| OpsBridgeError::WatchState)?
+            .reset();
+        Ok(())
+    }
+
+    pub(crate) fn stop_now(&self) {
+        if let Ok(mut task) = self.task.lock() {
+            if let Some(task) = task.take() {
+                task.cancel.cancel();
+                task.handle.abort();
+            }
         }
         self.running.store(false, Ordering::SeqCst);
         if let Ok(mut sync) = self.sync.lock() {

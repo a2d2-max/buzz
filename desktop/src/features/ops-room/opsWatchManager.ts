@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import { startOpsWatch, stopOpsWatch } from "./opsBridge";
@@ -148,7 +149,7 @@ export async function resetOpsWatchManager(): Promise<void> {
         // must not bypass native generation invalidation.
       }
     }
-    await stopOpsWatch();
+    if (isTauri()) await stopOpsWatch();
   })();
   resetPromise = pending;
   try {

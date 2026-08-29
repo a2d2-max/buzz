@@ -103,6 +103,19 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     queryKeyIdentity: string;
     state: OpsConnectionState;
   } | null>(null);
+  const mounted = React.useRef(true);
+  const invalidationVersion = React.useRef(0);
+  const drainedInvalidationVersion = React.useRef(0);
+  const pendingFullReload = React.useRef(false);
+  const pendingSync = React.useRef<{
+    generation: number;
+    ticket: number;
+  } | null>(null);
+  const failedSyncRefetch = React.useRef<{
+    generation: number;
+    ticket: number;
+  } | null>(null);
+  const invalidationDrain = React.useRef<Promise<void> | null>(null);
 
   const query = useQuery({
     queryKey,
@@ -135,6 +148,13 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     query.error,
     probeFailure,
   );
+
+  React.useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   React.useEffect(() => {
     if (!query.data) return;
@@ -202,15 +222,6 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     void query.refetch({ cancelRefetch: false });
   }, [focused, query.refetch, state]);
 
-  const invalidationVersion = React.useRef(0);
-  const drainedInvalidationVersion = React.useRef(0);
-  const pendingFullReload = React.useRef(false);
-  const pendingSync = React.useRef<{
-    generation: number;
-    ticket: number;
-  } | null>(null);
-  const invalidationDrain = React.useRef<Promise<void> | null>(null);
-
   const handleInvalidation = React.useCallback(
     (payload: OpsInvalidationPayload) => {
       invalidationVersion.current += 1;
@@ -243,14 +254,26 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
           }
           const result = await query.refetch({ cancelRefetch: false });
           drainedInvalidationVersion.current = targetVersion;
+          if (result.error) {
+            if (
+              sync &&
+              pendingSync.current?.ticket === sync.ticket &&
+              isOpsSyncCurrent(sync.generation, sync.ticket)
+            ) {
+              failedSyncRefetch.current = sync;
+            }
+            continue;
+          }
           if (
-            result.error ||
             !sync ||
             invalidationVersion.current !== targetVersion ||
             pendingSync.current?.ticket !== sync.ticket ||
             !isOpsSyncCurrent(sync.generation, sync.ticket)
           ) {
             continue;
+          }
+          if (failedSyncRefetch.current?.ticket === sync.ticket) {
+            failedSyncRefetch.current = null;
           }
           const appliedSequence = result.data?.event_sequence;
           if (appliedSequence === undefined) continue;
@@ -282,6 +305,40 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     },
     [query.refetch, queryClient, queryKeyIdentity],
   );
+
+  React.useEffect(() => {
+    const sync = failedSyncRefetch.current;
+    const recovered = query.data;
+    if (!sync || !recovered) return;
+    if (
+      pendingSync.current?.ticket !== sync.ticket ||
+      !isOpsSyncCurrent(sync.generation, sync.ticket)
+    ) {
+      failedSyncRefetch.current = null;
+      return;
+    }
+    const appliedSequence = recovered.event_sequence;
+    if (appliedSequence === undefined) return;
+    failedSyncRefetch.current = null;
+    void acknowledgeOpsSync(sync.generation, appliedSequence)
+      .then((ack) => {
+        if (
+          ack.accepted &&
+          pendingSync.current?.ticket === sync.ticket &&
+          isOpsSyncCurrent(sync.generation, sync.ticket)
+        ) {
+          completeOpsSync(sync.generation, sync.ticket);
+          pendingSync.current = null;
+        }
+      })
+      .catch((error) => {
+        if (!mounted.current) return;
+        setProbeFailureRecord({
+          queryKeyIdentity,
+          state: classifyOpsBridgeError(error),
+        });
+      });
+  }, [query.data, queryKeyIdentity]);
 
   React.useEffect(() => {
     if (!hasCanonicalSnapshot || watchState !== "enabled") return;

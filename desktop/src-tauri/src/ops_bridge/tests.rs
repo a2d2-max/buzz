@@ -2,7 +2,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
     },
     time::Duration,
 };
@@ -796,15 +796,78 @@ fn ops_bridge_sync_queue_is_bounded_and_reset_invalidates_old_generation() {
     assert!(after_reset.connection_generation > overflow_generation);
 }
 
-#[test]
-fn ops_bridge_stop_watch_command_is_idempotent() {
+#[tokio::test]
+async fn ops_bridge_stop_watch_command_is_idempotent() {
     let app = command_app(
         Err(super::client::OpsBridgeError::InvalidConfig),
         false,
         false,
     );
-    ops_bridge_stop_watch(app.state::<OpsBridgeState>());
-    ops_bridge_stop_watch(app.state::<OpsBridgeState>());
+    ops_bridge_stop_watch(app.state::<OpsBridgeState>())
+        .await
+        .expect("first stop");
+    ops_bridge_stop_watch(app.state::<OpsBridgeState>())
+        .await
+        .expect("idempotent second stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ops_bridge_stop_waits_for_active_task_quiescence_before_reset() {
+    let response = http_response(
+        "200 OK",
+        "text/event-stream",
+        b"id: 1\nevent: health\ndata: {}\n\n",
+        &[],
+    );
+    let (port, _requests, server) = spawn_fake_server(vec![response]).await;
+    let temp = tempfile::tempdir().expect("temp token directory");
+    let token = temp.path().join("hub.token");
+    write_token(&token, &vec![b't'; 32], 0o600);
+    let client = Arc::new(OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client"));
+    let watcher = Arc::new(OpsBridgeWatcher::default());
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let emissions = Arc::new(AtomicUsize::new(0));
+    let emitter_entered = Arc::clone(&entered);
+    let emitter_release = Arc::clone(&release);
+    let captured = Arc::clone(&emissions);
+
+    assert!(watcher
+        .start_with_emitter(
+            client,
+            Arc::new(move |_| {
+                captured.fetch_add(1, Ordering::SeqCst);
+                emitter_entered.wait();
+                emitter_release.wait();
+            }),
+        )
+        .await
+        .expect("start active watcher"));
+    tokio::task::spawn_blocking(move || entered.wait())
+        .await
+        .expect("observe active emitter");
+
+    let stopping_watcher = Arc::clone(&watcher);
+    let stopping = tokio::spawn(async move { stopping_watcher.stop_async().await });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!stopping.is_finished(), "stop must await the active task");
+
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .expect("release active emitter");
+    stopping
+        .await
+        .expect("join stop task")
+        .expect("stop active watcher");
+    let stopped_status = watcher.sync_status().expect("read stopped state");
+    let stopped_emissions = emissions.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        watcher.sync_status().expect("read quiescent state"),
+        stopped_status
+    );
+    assert_eq!(emissions.load(Ordering::SeqCst), stopped_emissions);
+    server.await.expect("fake server exits");
 }
 
 #[test]
@@ -867,6 +930,7 @@ async fn ops_bridge_watcher_reconnects_after_post_header_sse_stall() {
                 captured.lock().expect("record recovery event").push(event);
             })
         )
+        .await
         .expect("start stalled watcher"));
 
     tokio::time::timeout(Duration::from_secs(7), async {
@@ -906,7 +970,7 @@ async fn ops_bridge_watcher_reconnects_after_post_header_sse_stall() {
     })
     .await
     .expect("acknowledged recovery event is emitted");
-    watcher.stop();
+    watcher.stop_async().await.expect("stop stalled watcher");
     server.await.expect("stalled SSE fake server exits");
 
     assert_eq!(
@@ -951,9 +1015,11 @@ async fn ops_bridge_watcher_reconnect_before_ack_forces_sync_and_emits_no_sse_da
                 captured.lock().expect("record invalidation").push(event);
             })
         )
+        .await
         .expect("start watcher"));
     assert!(!watcher
         .start_with_emitter(client, Arc::new(|_| {}))
+        .await
         .expect("second watcher call is idempotent"));
 
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -974,7 +1040,7 @@ async fn ops_bridge_watcher_reconnect_before_ack_forces_sync_and_emits_no_sse_da
         .expect("ack targeted control refetch");
     assert!(ack.accepted);
     assert!(drained.is_empty());
-    watcher.stop();
+    watcher.stop_async().await.expect("stop watcher");
     server.await.expect("watch fake server exits");
 
     let events = events.lock().expect("read final invalidations");

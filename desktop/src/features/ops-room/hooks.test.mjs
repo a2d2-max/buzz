@@ -77,6 +77,7 @@ before(() => {
     document: dom.window.document,
     HTMLElement: dom.window.HTMLElement,
     IS_REACT_ACT_ENVIRONMENT: true,
+    isTauri: true,
     window: dom.window,
   });
   window.__TAURI_INTERNALS__ = {
@@ -609,6 +610,66 @@ test("a failed sync-required refetch stays suspended and sends no ACK", async ()
   client.clear();
 });
 
+test("a successful stale recovery acknowledges the still-current failed sync refetch", async () => {
+  enableFakeTimeouts();
+  queue(
+    "ops_bridge_capabilities",
+    capabilities,
+    capabilities,
+    capabilities,
+    capabilities,
+  );
+  queue(
+    "ops_bridge_snapshot",
+    snapshot(20),
+    snapshot(21),
+    new Error("ops_bridge_disconnected"),
+    snapshot(22),
+  );
+  queue("ops_bridge_start_watch", { started: true });
+  queue("ops_bridge_ack_sync", {
+    accepted: true,
+    connection_generation: 9,
+  });
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForRevision(view, 21);
+  const handler = callbacks.get(
+    opsCalls("plugin:event|listen")[0].args.handler,
+  );
+
+  await act(async () =>
+    handler({
+      event: "buzz://ops-invalidated",
+      id: 1,
+      payload: {
+        connection_generation: 9,
+        sync_required: true,
+        anchor_sequence: "21",
+        reason: "reconnect",
+        full_reload: true,
+      },
+    }),
+  );
+  await waitForState(view, "stale");
+  assert.equal(opsCalls("ops_bridge_ack_sync").length, 0);
+
+  await tick(2_000);
+  await waitForRevision(view, 22);
+  await waitForCallCount("ops_bridge_ack_sync", 1);
+  assert.deepEqual(opsCalls("ops_bridge_ack_sync"), [
+    {
+      command: "ops_bridge_ack_sync",
+      args: {
+        request: { generation: 9, applied_sequence: "22" },
+      },
+    },
+  ]);
+
+  view.unmount();
+  client.clear();
+});
+
 test("community reset stops native sync and suppresses an old in-flight ACK", async () => {
   let resolveSyncRefetch;
   const syncRefetch = new Promise((resolve) => {
@@ -683,6 +744,20 @@ test("community reset waits for an in-flight native start before stopping", asyn
   ]);
   view.unmount();
   client.clear();
+});
+
+test("browser reset skips the native stop command", async () => {
+  const tauriInternals = window.__TAURI_INTERNALS__;
+  const tauriRuntimeFlag = globalThis.isTauri;
+  delete window.__TAURI_INTERNALS__;
+  delete globalThis.isTauri;
+  try {
+    await assert.doesNotReject(resetOpsWatchManager());
+    assert.equal(opsCalls("ops_bridge_stop_watch").length, 0);
+  } finally {
+    window.__TAURI_INTERNALS__ = tauriInternals;
+    globalThis.isTauri = tauriRuntimeFlag;
+  }
 });
 
 test("a deferred selection B fetch never exposes selection A as ready or stale", async () => {

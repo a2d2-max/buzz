@@ -34,8 +34,12 @@ impl OpsBridgeState {
         self.client.clone()
     }
 
-    pub(crate) fn stop_watch(&self) {
-        self.watcher.stop();
+    pub(crate) async fn stop_watch(&self) -> Result<(), OpsBridgeError> {
+        self.watcher.stop_async().await
+    }
+
+    pub(crate) fn stop_watch_now(&self) {
+        self.watcher.stop_now();
     }
 }
 
@@ -96,13 +100,14 @@ pub(crate) async fn ops_bridge_transition(
 }
 
 #[tauri::command]
-pub(crate) fn ops_bridge_start_watch(
+pub(crate) async fn ops_bridge_start_watch(
     app: tauri::AppHandle,
     state: tauri::State<'_, OpsBridgeState>,
 ) -> Result<OpsWatchStartResult, String> {
     let started = state
         .watcher
         .start(app, state.client().map_err(public_error)?)
+        .await
         .map_err(public_error)?;
     let (connection_generation, sync_required, anchor_sequence) =
         state.watcher.sync_status().map_err(public_error)?;
@@ -115,8 +120,10 @@ pub(crate) fn ops_bridge_start_watch(
 }
 
 #[tauri::command]
-pub(crate) fn ops_bridge_stop_watch(state: tauri::State<'_, OpsBridgeState>) {
-    state.stop_watch();
+pub(crate) async fn ops_bridge_stop_watch(
+    state: tauri::State<'_, OpsBridgeState>,
+) -> Result<(), String> {
+    state.stop_watch().await.map_err(public_error)
 }
 
 #[tauri::command]

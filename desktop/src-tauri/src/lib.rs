@@ -927,13 +927,13 @@ pub fn run() {
             }
             app_handle
                 .state::<ops_bridge::OpsBridgeState>()
-                .stop_watch();
+                .stop_watch_now();
             shut_down_app(app_handle, &run_shutdown_done);
         }
         RunEvent::Exit => {
             app_handle
                 .state::<ops_bridge::OpsBridgeState>()
-                .stop_watch();
+                .stop_watch_now();
             shut_down_app(app_handle, &run_shutdown_done);
             app_handle.state::<ClipboardState>().release();
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
