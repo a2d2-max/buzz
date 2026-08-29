@@ -1,3 +1,4 @@
+mod artifacts;
 mod client;
 mod types;
 mod watch;
@@ -6,8 +7,11 @@ use std::{path::PathBuf, sync::Arc};
 use tauri::Emitter;
 
 use crate::app_state::AppState;
+pub(crate) use artifacts::OpsArtifactState;
 use client::{OpsBridgeClient, OpsBridgeConfig, OpsBridgeError};
 use types::{
+    OpsArtifactHandleChunk, OpsArtifactHandleReadRequest, OpsArtifactHandleReleaseRequest,
+    OpsArtifactHandleReleaseResult, OpsArtifactReadRequest, OpsArtifactReadResult,
     OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsPageRequest,
     OpsPageResult, OpsSelection, OpsSyncAckRequest, OpsSyncAckResult, OpsTransitionReceipt,
     OpsTransitionRequest, OpsWatchStartResult, DEFAULT_HUB_PORT, MAX_RESPONSE_BYTES,
@@ -93,6 +97,71 @@ pub(crate) async fn ops_bridge_page(
         .page(&request)
         .await
         .map_err(page_error)
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OpsArtifactErrorCode {
+    InvalidArtifactRequest,
+    ArtifactNotFound,
+    ArtifactVersionNotFound,
+    ArtifactReadDenied,
+    ArtifactIntegrityMismatch,
+    ArtifactTooLarge,
+    ArtifactMediaUnsupported,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum OpsArtifactCommandError {
+    Artifact { error: OpsArtifactErrorCode },
+    Bridge(String),
+}
+
+#[tauri::command]
+pub(crate) async fn ops_bridge_read_artifact(
+    request: OpsArtifactReadRequest,
+    bridge_state: tauri::State<'_, OpsBridgeState>,
+    artifact_state: tauri::State<'_, OpsArtifactState>,
+) -> Result<OpsArtifactReadResult, OpsArtifactCommandError> {
+    request.validate().map_err(artifact_error)?;
+    let client = bridge_state.client().map_err(artifact_error)?;
+    let store = artifact_state.store().map_err(artifact_error)?;
+    artifacts::read_verified_artifact(client, store, request)
+        .await
+        .map_err(artifact_error)
+}
+
+#[tauri::command]
+pub(crate) fn ops_bridge_read_artifact_handle(
+    request: OpsArtifactHandleReadRequest,
+    artifact_state: tauri::State<'_, OpsArtifactState>,
+) -> Result<OpsArtifactHandleChunk, OpsArtifactCommandError> {
+    request.validate().map_err(artifact_error)?;
+    artifact_state
+        .store()
+        .map_err(artifact_error)?
+        .read_at(
+            &request.handle,
+            request.offset,
+            request.length,
+            std::time::SystemTime::now(),
+        )
+        .map_err(artifact_error)
+}
+
+#[tauri::command]
+pub(crate) fn ops_bridge_release_artifact_handle(
+    request: OpsArtifactHandleReleaseRequest,
+    artifact_state: tauri::State<'_, OpsArtifactState>,
+) -> Result<OpsArtifactHandleReleaseResult, OpsArtifactCommandError> {
+    request.validate().map_err(artifact_error)?;
+    let released = artifact_state
+        .store()
+        .map_err(artifact_error)?
+        .release(&request.handle)
+        .map_err(artifact_error)?;
+    Ok(OpsArtifactHandleReleaseResult { released })
 }
 
 #[tauri::command]
@@ -212,6 +281,34 @@ fn page_error(error: OpsBridgeError) -> OpsPageCommandError {
     }
 }
 
+fn artifact_error(error: OpsBridgeError) -> OpsArtifactCommandError {
+    let code = match error {
+        OpsBridgeError::InvalidRequest | OpsBridgeError::InvalidArtifactRequest => {
+            Some(OpsArtifactErrorCode::InvalidArtifactRequest)
+        }
+        OpsBridgeError::ArtifactNotFound => Some(OpsArtifactErrorCode::ArtifactNotFound),
+        OpsBridgeError::ArtifactVersionNotFound => {
+            Some(OpsArtifactErrorCode::ArtifactVersionNotFound)
+        }
+        OpsBridgeError::ArtifactReadDenied => Some(OpsArtifactErrorCode::ArtifactReadDenied),
+        OpsBridgeError::ArtifactIntegrityMismatch => {
+            Some(OpsArtifactErrorCode::ArtifactIntegrityMismatch)
+        }
+        OpsBridgeError::ArtifactTooLarge => Some(OpsArtifactErrorCode::ArtifactTooLarge),
+        OpsBridgeError::ArtifactMediaUnsupported => {
+            Some(OpsArtifactErrorCode::ArtifactMediaUnsupported)
+        }
+        _ => None,
+    };
+    match code {
+        Some(error) => OpsArtifactCommandError::Artifact { error },
+        None => OpsArtifactCommandError::Bridge(public_error(error)),
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/artifact_tests.rs"]
+mod artifact_tests;
 #[cfg(test)]
 #[path = "tests/page_tests.rs"]
 mod page_tests;

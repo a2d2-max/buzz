@@ -234,8 +234,20 @@ pub fn run() {
         .manage(observed_unread::ObservedUnreadStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
         .manage(ops_bridge::OpsBridgeState::from_env())
+        .manage(ops_bridge::OpsArtifactState::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            match app_handle.path().app_cache_dir() {
+                Ok(artifact_cache) => {
+                    if let Err(error) = app_handle
+                        .state::<ops_bridge::OpsArtifactState>()
+                        .initialize(artifact_cache)
+                    {
+                        eprintln!("buzz-desktop: artifact cache unavailable: {error}");
+                    }
+                }
+                Err(error) => eprintln!("buzz-desktop: artifact cache unavailable: {error}"),
+            }
             #[cfg(target_os = "macos")]
             {
                 tray_menu::init(&app_handle)?;
@@ -525,6 +537,9 @@ pub fn run() {
             ops_bridge::ops_bridge_capabilities,
             ops_bridge::ops_bridge_snapshot,
             ops_bridge::ops_bridge_page,
+            ops_bridge::ops_bridge_read_artifact,
+            ops_bridge::ops_bridge_read_artifact_handle,
+            ops_bridge::ops_bridge_release_artifact_handle,
             ops_bridge::ops_bridge_create_draft,
             ops_bridge::ops_bridge_transition,
             ops_bridge::ops_bridge_start_watch,
@@ -929,12 +944,24 @@ pub fn run() {
             app_handle
                 .state::<ops_bridge::OpsBridgeState>()
                 .stop_watch_now();
+            if let Err(error) = app_handle
+                .state::<ops_bridge::OpsArtifactState>()
+                .shutdown_cleanup()
+            {
+                eprintln!("buzz-desktop: artifact cleanup failed: {error}");
+            }
             shut_down_app(app_handle, &run_shutdown_done);
         }
         RunEvent::Exit => {
             app_handle
                 .state::<ops_bridge::OpsBridgeState>()
                 .stop_watch_now();
+            if let Err(error) = app_handle
+                .state::<ops_bridge::OpsArtifactState>()
+                .shutdown_cleanup()
+            {
+                eprintln!("buzz-desktop: artifact cleanup failed: {error}");
+            }
             shut_down_app(app_handle, &run_shutdown_done);
             app_handle.state::<ClipboardState>().release();
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]

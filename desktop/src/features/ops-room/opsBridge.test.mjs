@@ -122,6 +122,208 @@ afterEach(() => {
 const bridge = await import("./opsBridge.ts");
 
 describe("native Ops bridge contract", () => {
+  test("reads an inline immutable artifact through the fixed typed command", async () => {
+    responses.push({
+      contract_version: 1,
+      artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+      version: 2,
+      representation: "preview",
+      mime: "text/markdown",
+      total_size: 8,
+      sha256: "a".repeat(64),
+      kind: "inline_text",
+      text: "# report",
+    });
+
+    assert.deepEqual(
+      await bridge.readOpsArtifact({
+        artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+        version: 2,
+        representation: "preview",
+      }),
+      {
+        contract_version: 1,
+        artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+        version: 2,
+        representation: "preview",
+        mime: "text/markdown",
+        total_size: 8,
+        sha256: "a".repeat(64),
+        kind: "inline_text",
+        text: "# report",
+      },
+    );
+    assert.deepEqual(calls, [
+      {
+        command: "ops_bridge_read_artifact",
+        args: {
+          request: {
+            artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+            version: 2,
+            representation: "preview",
+          },
+        },
+      },
+    ]);
+  });
+
+  test("rejects malformed artifact input before invoking native code", async () => {
+    for (const request of [
+      {
+        artifact_id: "/private/report.md",
+        version: 1,
+        representation: "preview",
+      },
+      {
+        artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+        version: 0,
+        representation: "preview",
+      },
+      {
+        artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+        version: 1,
+        representation: "raw",
+      },
+    ]) {
+      await assert.rejects(
+        bridge.readOpsArtifact(request),
+        (error) => error?.name === "OpsBridgeContractError",
+      );
+    }
+    assert.deepEqual(calls, []);
+  });
+
+  test("preserves only stable artifact read errors", async () => {
+    responses.push({ reject: { error: "artifact_read_denied" } });
+    await assert.rejects(
+      bridge.readOpsArtifact({
+        artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+        version: 1,
+        representation: "rendered",
+      }),
+      (error) =>
+        error instanceof bridge.OpsArtifactError &&
+        error.code === "artifact_read_denied",
+    );
+
+    responses.push({ reject: { error: "private_internal_error" } });
+    await assert.rejects(
+      bridge.readOpsArtifact({
+        artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+        version: 1,
+        representation: "rendered",
+      }),
+      (error) => !(error instanceof bridge.OpsArtifactError),
+    );
+  });
+
+  test("validates opaque handle reads and releases without accepting paths", async () => {
+    responses.push({
+      contract_version: 1,
+      handle: "artifact-handle:01234567-89ab-4def-8123-456789abcdef",
+      mime: "text/plain",
+      offset: 0,
+      next_offset: 3,
+      total_size: 3,
+      data_base64: "YWJj",
+      eof: true,
+    });
+    const chunk = await bridge.readOpsArtifactHandle({
+      handle: "artifact-handle:01234567-89ab-4def-8123-456789abcdef",
+      offset: 0,
+      length: 262_144,
+    });
+    assert.equal(chunk.data_base64, "YWJj");
+
+    responses.push({ released: true });
+    assert.deepEqual(
+      await bridge.releaseOpsArtifactHandle(
+        "artifact-handle:01234567-89ab-4def-8123-456789abcdef",
+      ),
+      { released: true },
+    );
+    assert.deepEqual(calls, [
+      {
+        command: "ops_bridge_read_artifact_handle",
+        args: {
+          request: {
+            handle: "artifact-handle:01234567-89ab-4def-8123-456789abcdef",
+            offset: 0,
+            length: 262_144,
+          },
+        },
+      },
+      {
+        command: "ops_bridge_release_artifact_handle",
+        args: {
+          request: {
+            handle: "artifact-handle:01234567-89ab-4def-8123-456789abcdef",
+          },
+        },
+      },
+    ]);
+
+    await assert.rejects(
+      bridge.readOpsArtifactHandle({
+        handle: "/tmp/private-artifact",
+        offset: 0,
+        length: 1,
+      }),
+      (error) => error?.name === "OpsBridgeContractError",
+    );
+    assert.equal(calls.length, 2);
+  });
+
+  test("rejects a non-terminal zero-progress handle chunk", async () => {
+    responses.push({
+      contract_version: 1,
+      handle: "artifact-handle:01234567-89ab-4def-8123-456789abcdef",
+      mime: "text/plain",
+      offset: 0,
+      next_offset: 0,
+      total_size: 3,
+      data_base64: "",
+      eof: false,
+    });
+    await assert.rejects(
+      bridge.readOpsArtifactHandle({
+        handle: "artifact-handle:01234567-89ab-4def-8123-456789abcdef",
+        offset: 0,
+        length: 3,
+      }),
+      (error) => error?.name === "OpsBridgeContractError",
+    );
+  });
+
+  test("rejects artifact identity and metadata drift from native", async () => {
+    const base = {
+      contract_version: 1,
+      artifact_id: "artifact:0123456789abcdef0123456789abcdef",
+      version: 1,
+      representation: "preview",
+      mime: "text/plain",
+      total_size: 3,
+      sha256: "b".repeat(64),
+      kind: "inline_text",
+      text: "abc",
+    };
+    for (const response of [
+      { ...base, artifact_id: "artifact:fedcba9876543210fedcba9876543210" },
+      { ...base, total_size: 4 },
+      { ...base, path: "/tmp/leak" },
+    ]) {
+      responses.push(response);
+      await assert.rejects(
+        bridge.readOpsArtifact({
+          artifact_id: base.artifact_id,
+          version: 1,
+          representation: "preview",
+        }),
+        (error) => error?.name === "OpsBridgeContractError",
+      );
+    }
+  });
+
   test("fetches and validates capabilities before the first snapshot with exact Tauri arguments", async () => {
     responses.push(capabilities, validSnapshot());
 

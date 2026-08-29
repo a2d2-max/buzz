@@ -14,9 +14,10 @@ use serde::{de::DeserializeOwned, Deserialize};
 use zeroize::Zeroizing;
 
 use super::types::{
-    OpsArtifactV1, OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest,
-    OpsPageModule, OpsPageRequest, OpsPageResult, OpsPageV1, OpsRepositoryStatusV1,
-    OpsResearchCardV1, OpsSelection, OpsTimelineItemV1, OpsTransitionReceipt, OpsTransitionRequest,
+    OpsArtifactChunkV1, OpsArtifactManifestV1, OpsArtifactReadRequest, OpsArtifactV1,
+    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsPageModule,
+    OpsPageRequest, OpsPageResult, OpsPageV1, OpsRepositoryStatusV1, OpsResearchCardV1,
+    OpsSelection, OpsTimelineItemV1, OpsTransitionReceipt, OpsTransitionRequest,
     OpsTransitionWireRequest, VersionedResponse, MAX_RESPONSE_BYTES, MAX_SAFE_INTEGER_U64,
     OPS_CONTRACT_VERSION,
 };
@@ -37,6 +38,24 @@ struct CursorError {
 enum CursorErrorCode {
     InvalidCursor,
     StaleCursor,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactErrorResponse {
+    error: ArtifactErrorCode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactErrorCode {
+    InvalidArtifactRequest,
+    ArtifactNotFound,
+    ArtifactVersionNotFound,
+    ArtifactReadDenied,
+    ArtifactIntegrityMismatch,
+    ArtifactTooLarge,
+    ArtifactMediaUnsupported,
 }
 
 fn parse_page<T>(body: &[u8]) -> Result<OpsPageV1<T>, OpsBridgeError>
@@ -81,6 +100,14 @@ pub(crate) enum OpsBridgeError {
     InvalidCursor,
     StaleCursor,
     WatchState,
+    InvalidArtifactRequest,
+    ArtifactNotFound,
+    ArtifactVersionNotFound,
+    ArtifactReadDenied,
+    ArtifactIntegrityMismatch,
+    ArtifactTooLarge,
+    ArtifactMediaUnsupported,
+    ArtifactHandleStore,
 }
 
 impl std::fmt::Display for OpsBridgeError {
@@ -103,6 +130,14 @@ impl std::fmt::Display for OpsBridgeError {
             Self::InvalidCursor => "invalid_cursor",
             Self::StaleCursor => "stale_cursor",
             Self::WatchState => "ops_bridge_watch_state",
+            Self::InvalidArtifactRequest => "invalid_artifact_request",
+            Self::ArtifactNotFound => "artifact_not_found",
+            Self::ArtifactVersionNotFound => "artifact_version_not_found",
+            Self::ArtifactReadDenied => "artifact_read_denied",
+            Self::ArtifactIntegrityMismatch => "artifact_integrity_mismatch",
+            Self::ArtifactTooLarge => "artifact_too_large",
+            Self::ArtifactMediaUnsupported => "artifact_media_unsupported",
+            Self::ArtifactHandleStore => "ops_bridge_artifact_handle_store",
         };
         formatter.write_str(code)
     }
@@ -234,6 +269,34 @@ impl OpsBridgeClient {
         }
         let builder = self.authenticated(&self.request_client, Method::GET, url)?;
         self.execute_page_json(builder, request.module()).await
+    }
+
+    pub(crate) async fn artifact_manifest(
+        &self,
+        request: &OpsArtifactReadRequest,
+    ) -> Result<OpsArtifactManifestV1, OpsBridgeError> {
+        request.validate()?;
+        let url = self.artifact_url(request, "manifest")?;
+        let builder = self.authenticated(&self.request_client, Method::GET, url)?;
+        self.execute_artifact_json(builder).await
+    }
+
+    pub(crate) async fn artifact_chunk(
+        &self,
+        request: &OpsArtifactReadRequest,
+        offset: u64,
+        length: u32,
+    ) -> Result<OpsArtifactChunkV1, OpsBridgeError> {
+        request.validate()?;
+        if offset > MAX_SAFE_INTEGER_U64 || !(1..=786_432).contains(&length) {
+            return Err(OpsBridgeError::InvalidRequest);
+        }
+        let mut url = self.artifact_url(request, "content")?;
+        url.query_pairs_mut()
+            .append_pair("offset", &offset.to_string())
+            .append_pair("length", &length.to_string());
+        let builder = self.authenticated(&self.request_client, Method::GET, url)?;
+        self.execute_artifact_json(builder).await
     }
 
     pub(crate) async fn create_draft(
@@ -375,6 +438,60 @@ impl OpsBridgeClient {
         Ok(result)
     }
 
+    async fn execute_artifact_json<T>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, OpsBridgeError>
+    where
+        T: DeserializeOwned + VersionedResponse,
+    {
+        let response = request
+            .send()
+            .await
+            .map_err(|_| OpsBridgeError::Transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = self
+                .read_json_body(response)
+                .await
+                .map_err(|_| OpsBridgeError::HttpStatus)?;
+            let decoded: ArtifactErrorResponse =
+                serde_json::from_slice(&body).map_err(|_| OpsBridgeError::HttpStatus)?;
+            return match (status, decoded.error) {
+                (StatusCode::BAD_REQUEST, ArtifactErrorCode::InvalidArtifactRequest) => {
+                    Err(OpsBridgeError::InvalidArtifactRequest)
+                }
+                (StatusCode::FORBIDDEN, ArtifactErrorCode::ArtifactReadDenied) => {
+                    Err(OpsBridgeError::ArtifactReadDenied)
+                }
+                (StatusCode::NOT_FOUND, ArtifactErrorCode::ArtifactNotFound) => {
+                    Err(OpsBridgeError::ArtifactNotFound)
+                }
+                (StatusCode::NOT_FOUND, ArtifactErrorCode::ArtifactVersionNotFound) => {
+                    Err(OpsBridgeError::ArtifactVersionNotFound)
+                }
+                (StatusCode::CONFLICT, ArtifactErrorCode::ArtifactIntegrityMismatch) => {
+                    Err(OpsBridgeError::ArtifactIntegrityMismatch)
+                }
+                (StatusCode::PAYLOAD_TOO_LARGE, ArtifactErrorCode::ArtifactTooLarge) => {
+                    Err(OpsBridgeError::ArtifactTooLarge)
+                }
+                (
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    ArtifactErrorCode::ArtifactMediaUnsupported,
+                ) => Err(OpsBridgeError::ArtifactMediaUnsupported),
+                _ => Err(OpsBridgeError::HttpStatus),
+            };
+        }
+        let body = self.read_json_body(response).await?;
+        let value: T =
+            serde_json::from_slice(&body).map_err(|_| OpsBridgeError::ResponseInvalidJson)?;
+        if value.contract_version() != OPS_CONTRACT_VERSION {
+            return Err(OpsBridgeError::ContractMismatch);
+        }
+        Ok(value)
+    }
+
     async fn read_json_body(&self, response: Response) -> Result<Vec<u8>, OpsBridgeError> {
         if !is_json(response.headers()) {
             return Err(OpsBridgeError::ResponseContentType);
@@ -413,6 +530,23 @@ impl OpsBridgeClient {
             OpsPageModule::Repositories => "repositories",
         };
         self.fixed_url(&["ops-bridge", "v1", segment])
+    }
+
+    fn artifact_url(
+        &self,
+        request: &OpsArtifactReadRequest,
+        operation: &'static str,
+    ) -> Result<Url, OpsBridgeError> {
+        self.fixed_url(&[
+            "ops-bridge",
+            "v1",
+            "artifacts",
+            &request.artifact_id,
+            "versions",
+            &request.version.to_string(),
+            request.representation.as_str(),
+            operation,
+        ])
     }
 
     fn drafts_url(&self) -> Result<Url, OpsBridgeError> {

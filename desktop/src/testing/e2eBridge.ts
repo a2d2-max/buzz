@@ -600,6 +600,20 @@ type E2eConfig = {
     opsPageErrors?: Partial<
       Record<MockOpsPageModule, "invalid_cursor" | "stale_cursor">
     >;
+    /** Strict native artifact read fixtures keyed by public artifact identity. */
+    opsArtifactReads?: Record<string, Record<string, unknown>>;
+    opsArtifactReadErrors?: Record<
+      string,
+      | "invalid_artifact_request"
+      | "artifact_not_found"
+      | "artifact_version_not_found"
+      | "artifact_read_denied"
+      | "artifact_integrity_mismatch"
+      | "artifact_too_large"
+      | "artifact_media_unsupported"
+    >;
+    /** Strict local-handle chunks keyed by opaque handle token. */
+    opsArtifactHandleChunks?: Record<string, Record<string, unknown>>;
     /**
      * Global agent config returned by `get_global_agent_config`. Defaults to
      * an empty config (no provider, model, or env vars) if not specified.
@@ -1695,7 +1709,7 @@ const MOCK_OPS_SNAPSHOT = {
       ],
       artifacts: [
         {
-          id: "artifact:redacted",
+          id: "artifact:0123456789abcdef0123456789abcdef",
           work_item_id: "work:redacted",
           title: "Parity report",
           kind: "report",
@@ -1873,6 +1887,73 @@ function parseMockOpsPageRequest(payload: unknown): MockOpsPageModule {
   })();
   if (!validScope) throw new Error("ops_bridge_invalid_request");
   return request.module as MockOpsPageModule;
+}
+
+const MOCK_ARTIFACT_ID = "artifact:0123456789abcdef0123456789abcdef";
+const MOCK_ARTIFACT_HANDLE =
+  "artifact-handle:01234567-89ab-4def-8123-456789abcdef";
+const MOCK_ARTIFACT_ERROR_CODES = new Set([
+  "invalid_artifact_request",
+  "artifact_not_found",
+  "artifact_version_not_found",
+  "artifact_read_denied",
+  "artifact_integrity_mismatch",
+  "artifact_too_large",
+  "artifact_media_unsupported",
+]);
+
+function parseMockArtifactReadRequest(payload: unknown) {
+  if (!isMockOpsRecord(payload) || !hasMockOpsKeys(payload, ["request"])) {
+    throw { error: "invalid_artifact_request" };
+  }
+  const request = payload.request;
+  if (
+    !isMockOpsRecord(request) ||
+    !hasMockOpsKeys(request, ["artifact_id", "version", "representation"]) ||
+    typeof request.artifact_id !== "string" ||
+    !/^artifact:[0-9a-f]{32}$/u.test(request.artifact_id) ||
+    !Number.isSafeInteger(request.version) ||
+    Number(request.version) < 1 ||
+    !["rendered", "preview"].includes(String(request.representation))
+  ) {
+    throw { error: "invalid_artifact_request" };
+  }
+  return request as {
+    artifact_id: string;
+    version: number;
+    representation: "rendered" | "preview";
+  };
+}
+
+function artifactFixtureKey(request: {
+  artifact_id: string;
+  version: number;
+  representation: string;
+}) {
+  return `${request.artifact_id}|${request.version}|${request.representation}`;
+}
+
+function parseMockArtifactHandleRequest(payload: unknown) {
+  if (!isMockOpsRecord(payload) || !hasMockOpsKeys(payload, ["request"])) {
+    throw { error: "invalid_artifact_request" };
+  }
+  const request = payload.request;
+  if (
+    !isMockOpsRecord(request) ||
+    !hasMockOpsKeys(request, ["handle", "offset", "length"]) ||
+    typeof request.handle !== "string" ||
+    !/^artifact-handle:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+      request.handle,
+    ) ||
+    !Number.isSafeInteger(request.offset) ||
+    Number(request.offset) < 0 ||
+    !Number.isSafeInteger(request.length) ||
+    Number(request.length) < 1 ||
+    Number(request.length) > 256 * 1024
+  ) {
+    throw { error: "invalid_artifact_request" };
+  }
+  return request as { handle: string; offset: number; length: number };
 }
 
 function validateMockOpsPage(
@@ -11751,6 +11832,74 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig?.mock?.opsPages?.[module] ?? MOCK_OPS_PAGES[module];
         validateMockOpsPage(module, page);
         return structuredClone(page);
+      }
+      case "ops_bridge_read_artifact": {
+        const request = parseMockArtifactReadRequest(payload);
+        const key = artifactFixtureKey(request);
+        const configuredError =
+          activeConfig?.mock?.opsArtifactReadErrors?.[key];
+        if (configuredError && MOCK_ARTIFACT_ERROR_CODES.has(configuredError)) {
+          return Promise.reject({ error: configuredError });
+        }
+        const configured = activeConfig?.mock?.opsArtifactReads?.[key];
+        if (configured) return structuredClone(configured);
+        if (
+          request.artifact_id !== MOCK_ARTIFACT_ID ||
+          request.version !== 1 ||
+          request.representation !== "preview"
+        ) {
+          return Promise.reject({ error: "artifact_not_found" });
+        }
+        return {
+          contract_version: 1,
+          artifact_id: MOCK_ARTIFACT_ID,
+          version: 1,
+          representation: "preview",
+          mime: "text/markdown",
+          total_size: 18,
+          sha256: "a".repeat(64),
+          kind: "inline_text",
+          text: "# Fixture artifact",
+        };
+      }
+      case "ops_bridge_read_artifact_handle": {
+        const request = parseMockArtifactHandleRequest(payload);
+        const configured =
+          activeConfig?.mock?.opsArtifactHandleChunks?.[request.handle];
+        if (configured) return structuredClone(configured);
+        if (request.handle !== MOCK_ARTIFACT_HANDLE) {
+          return Promise.reject({ error: "invalid_artifact_request" });
+        }
+        return {
+          contract_version: 1,
+          handle: MOCK_ARTIFACT_HANDLE,
+          mime: "text/plain",
+          offset: request.offset,
+          next_offset: request.offset,
+          total_size: request.offset,
+          data_base64: "",
+          eof: true,
+        };
+      }
+      case "ops_bridge_release_artifact_handle": {
+        if (
+          !isMockOpsRecord(payload) ||
+          !hasMockOpsKeys(payload, ["request"])
+        ) {
+          throw { error: "invalid_artifact_request" };
+        }
+        const request = payload.request;
+        if (
+          !isMockOpsRecord(request) ||
+          !hasMockOpsKeys(request, ["handle"]) ||
+          typeof request.handle !== "string" ||
+          !/^artifact-handle:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+            request.handle,
+          )
+        ) {
+          throw { error: "invalid_artifact_request" };
+        }
+        return { released: request.handle === MOCK_ARTIFACT_HANDLE };
       }
       case "ops_bridge_start_watch": {
         const started = !mockOpsWatchStarted;

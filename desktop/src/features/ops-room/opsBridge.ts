@@ -115,6 +115,99 @@ const opsPageErrorSchema = z
   .object({ error: z.enum(["invalid_cursor", "stale_cursor"]) })
   .strict();
 
+const artifactIdSchema = z.string().regex(/^artifact:[0-9a-f]{32}$/u);
+const artifactRepresentationSchema = z.enum(["rendered", "preview"]);
+const artifactMimeSchema = z.enum([
+  "text/markdown",
+  "text/plain",
+  "application/json",
+  "text/html",
+]);
+const artifactSha256Schema = z.string().regex(/^[0-9a-f]{64}$/u);
+const artifactHandleSchema = z
+  .string()
+  .regex(
+    /^artifact-handle:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  );
+const artifactReadRequestSchema = z
+  .object({
+    artifact_id: artifactIdSchema,
+    version: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+    representation: artifactRepresentationSchema,
+  })
+  .strict();
+const artifactReadBaseSchema = z.object({
+  contract_version: z.literal(1),
+  artifact_id: artifactIdSchema,
+  version: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  representation: artifactRepresentationSchema,
+  mime: artifactMimeSchema,
+  total_size: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(16 * 1024 * 1024),
+  sha256: artifactSha256Schema,
+});
+const artifactReadResultSchema = z.discriminatedUnion("kind", [
+  artifactReadBaseSchema
+    .extend({
+      kind: z.literal("inline_text"),
+      text: z.string(),
+    })
+    .strict(),
+  artifactReadBaseSchema
+    .extend({
+      kind: z.literal("opaque_handle"),
+      handle: artifactHandleSchema,
+      expires_at: z.string().datetime({ offset: false, precision: 3 }),
+    })
+    .strict(),
+]);
+const artifactHandleReadRequestSchema = z
+  .object({
+    handle: artifactHandleSchema,
+    offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    length: z
+      .number()
+      .int()
+      .min(1)
+      .max(256 * 1024),
+  })
+  .strict();
+const artifactHandleChunkSchema = z
+  .object({
+    contract_version: z.literal(1),
+    handle: artifactHandleSchema,
+    mime: artifactMimeSchema,
+    offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    next_offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    total_size: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(16 * 1024 * 1024),
+    data_base64: z.string(),
+    eof: z.boolean(),
+  })
+  .strict();
+const artifactReleaseResultSchema = z
+  .object({ released: z.boolean() })
+  .strict();
+const artifactErrorSchema = z
+  .object({
+    error: z.enum([
+      "invalid_artifact_request",
+      "artifact_not_found",
+      "artifact_version_not_found",
+      "artifact_read_denied",
+      "artifact_integrity_mismatch",
+      "artifact_too_large",
+      "artifact_media_unsupported",
+    ]),
+  })
+  .strict();
+
 export type OpsPageModule = z.infer<typeof opsPageModuleSchema>;
 type OpsPageRequestBase = { page_size?: number; cursor?: string | null };
 export type OpsPageRequest =
@@ -160,6 +253,22 @@ export class OpsPageError extends Error {
     this.code = code;
   }
 }
+
+export type OpsArtifactErrorCode = z.infer<typeof artifactErrorSchema>["error"];
+
+export class OpsArtifactError extends Error {
+  readonly code: OpsArtifactErrorCode;
+
+  constructor(code: OpsArtifactErrorCode) {
+    super(code);
+    this.name = "OpsArtifactError";
+    this.code = code;
+  }
+}
+
+export type OpsArtifactReadRequest = z.infer<typeof artifactReadRequestSchema>;
+export type OpsArtifactReadResult = z.infer<typeof artifactReadResultSchema>;
+export type OpsArtifactHandleChunk = z.infer<typeof artifactHandleChunkSchema>;
 
 const NOT_CONFIGURED_CODES = new Set([
   "ops_bridge_invalid_config",
@@ -317,6 +426,25 @@ function parsePage(
   return parsed.data;
 }
 
+function decodedBase64Length(value: string): number | null {
+  if (
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(
+      value,
+    )
+  ) {
+    return null;
+  }
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return value.length === 0 ? 0 : (value.length / 4) * 3 - padding;
+}
+
+function parseArtifactError(error: unknown): never {
+  const parsed = artifactErrorSchema.safeParse(error);
+  if (parsed.success) throw new OpsArtifactError(parsed.data.error);
+  throw error;
+}
+
 export function opsSnapshotQueryKey(selection: OpsSelection) {
   return [
     "ops",
@@ -404,6 +532,92 @@ export async function loadOpsPageWithStaleRestart(
     { ...request, cursor: null } as OpsPageRequest,
     module.collection_revision,
   );
+}
+
+export async function readOpsArtifact(
+  request: OpsArtifactReadRequest,
+): Promise<OpsArtifactReadResult> {
+  const normalized = artifactReadRequestSchema.safeParse(request);
+  if (!normalized.success) throw new OpsBridgeContractError();
+  try {
+    const value = await invoke<unknown>("ops_bridge_read_artifact", {
+      request: normalized.data,
+    });
+    const parsed = artifactReadResultSchema.safeParse(value);
+    if (!parsed.success) throw new OpsBridgeContractError();
+    const result = parsed.data;
+    if (
+      result.artifact_id !== normalized.data.artifact_id ||
+      result.version !== normalized.data.version ||
+      result.representation !== normalized.data.representation ||
+      (result.kind === "inline_text" &&
+        (result.total_size > 1024 * 1024 ||
+          new TextEncoder().encode(result.text).byteLength !==
+            result.total_size)) ||
+      (result.kind === "opaque_handle" &&
+        (Date.parse(result.expires_at) <= Date.now() ||
+          Date.parse(result.expires_at) > Date.now() + 15 * 60 * 1000 + 5_000))
+    ) {
+      throw new OpsBridgeContractError();
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof OpsBridgeContractError) throw error;
+    return parseArtifactError(error);
+  }
+}
+
+export async function readOpsArtifactHandle(request: {
+  handle: string;
+  offset: number;
+  length: number;
+}): Promise<OpsArtifactHandleChunk> {
+  const normalized = artifactHandleReadRequestSchema.safeParse(request);
+  if (!normalized.success) throw new OpsBridgeContractError();
+  try {
+    const value = await invoke<unknown>("ops_bridge_read_artifact_handle", {
+      request: normalized.data,
+    });
+    const parsed = artifactHandleChunkSchema.safeParse(value);
+    if (!parsed.success) throw new OpsBridgeContractError();
+    const chunk = parsed.data;
+    const decodedLength = decodedBase64Length(chunk.data_base64);
+    if (
+      chunk.handle !== normalized.data.handle ||
+      chunk.offset !== normalized.data.offset ||
+      chunk.next_offset < chunk.offset ||
+      (chunk.next_offset === chunk.offset &&
+        !(chunk.offset === chunk.total_size && chunk.eof)) ||
+      chunk.next_offset > chunk.total_size ||
+      chunk.next_offset - chunk.offset > normalized.data.length ||
+      decodedLength !== chunk.next_offset - chunk.offset ||
+      chunk.eof !== (chunk.next_offset === chunk.total_size)
+    ) {
+      throw new OpsBridgeContractError();
+    }
+    return chunk;
+  } catch (error) {
+    if (error instanceof OpsBridgeContractError) throw error;
+    return parseArtifactError(error);
+  }
+}
+
+export async function releaseOpsArtifactHandle(
+  handle: string,
+): Promise<{ released: boolean }> {
+  const parsedHandle = artifactHandleSchema.safeParse(handle);
+  if (!parsedHandle.success) throw new OpsBridgeContractError();
+  try {
+    const value = await invoke<unknown>("ops_bridge_release_artifact_handle", {
+      request: { handle: parsedHandle.data },
+    });
+    const parsed = artifactReleaseResultSchema.safeParse(value);
+    if (!parsed.success) throw new OpsBridgeContractError();
+    return parsed.data;
+  } catch (error) {
+    if (error instanceof OpsBridgeContractError) throw error;
+    return parseArtifactError(error);
+  }
 }
 
 export async function startOpsWatch(): Promise<

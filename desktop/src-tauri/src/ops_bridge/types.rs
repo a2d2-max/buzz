@@ -137,11 +137,202 @@ pub enum OpsRepositorySort {
     DisplayNameAsc,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpsArtifactRepresentation {
     Rendered,
     Preview,
+}
+
+impl OpsArtifactRepresentation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Rendered => "rendered",
+            Self::Preview => "preview",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsArtifactReadRequest {
+    pub artifact_id: String,
+    pub version: u64,
+    pub representation: OpsArtifactRepresentation,
+}
+
+impl OpsArtifactReadRequest {
+    pub(crate) fn validate(&self) -> Result<(), OpsBridgeError> {
+        if self.version == 0
+            || self.version > MAX_SAFE_INTEGER_U64
+            || !is_public_artifact_id(&self.artifact_id)
+        {
+            return Err(OpsBridgeError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsArtifactHandleReadRequest {
+    pub handle: String,
+    pub offset: u64,
+    pub length: u32,
+}
+
+impl OpsArtifactHandleReadRequest {
+    pub(crate) fn validate(&self) -> Result<(), OpsBridgeError> {
+        if !is_artifact_handle(&self.handle)
+            || self.offset > MAX_SAFE_INTEGER_U64
+            || !(1..=256 * 1024).contains(&self.length)
+        {
+            return Err(OpsBridgeError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsArtifactHandleReleaseRequest {
+    pub handle: String,
+}
+
+impl OpsArtifactHandleReleaseRequest {
+    pub(crate) fn validate(&self) -> Result<(), OpsBridgeError> {
+        if !is_artifact_handle(&self.handle) {
+            return Err(OpsBridgeError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpsArtifactProvenance {
+    pub classifier: OpsArtifactClassifier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OpsArtifactClassifier {
+    HubGuestSafeV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpsArtifactManifestV1 {
+    pub contract_version: u8,
+    pub artifact_id: String,
+    pub version: u64,
+    pub representation: OpsArtifactRepresentation,
+    pub total_size: u64,
+    pub sha256: String,
+    pub mime: String,
+    pub visibility: String,
+    pub guest_readable: bool,
+    pub provenance: OpsArtifactProvenance,
+    pub created_at: String,
+}
+
+impl VersionedResponse for OpsArtifactManifestV1 {
+    fn contract_version(&self) -> u8 {
+        self.contract_version
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpsArtifactChunkV1 {
+    pub contract_version: u8,
+    pub artifact_id: String,
+    pub version: u64,
+    pub representation: OpsArtifactRepresentation,
+    pub offset: u64,
+    pub next_offset: u64,
+    pub total_size: u64,
+    pub sha256: String,
+    pub mime: String,
+    pub data_base64: String,
+    pub eof: bool,
+}
+
+impl VersionedResponse for OpsArtifactChunkV1 {
+    fn contract_version(&self) -> u8 {
+        self.contract_version
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OpsArtifactReadResult {
+    InlineText {
+        contract_version: u8,
+        artifact_id: String,
+        version: u64,
+        representation: OpsArtifactRepresentation,
+        mime: String,
+        total_size: u64,
+        sha256: String,
+        text: String,
+    },
+    OpaqueHandle {
+        contract_version: u8,
+        artifact_id: String,
+        version: u64,
+        representation: OpsArtifactRepresentation,
+        mime: String,
+        total_size: u64,
+        sha256: String,
+        handle: String,
+        expires_at: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsArtifactHandleChunk {
+    pub contract_version: u8,
+    pub handle: String,
+    pub mime: String,
+    pub offset: u64,
+    pub next_offset: u64,
+    pub total_size: u64,
+    pub data_base64: String,
+    pub eof: bool,
+}
+
+impl OpsArtifactHandleChunk {
+    #[cfg(test)]
+    pub(crate) fn data_base64(&self) -> &str {
+        &self.data_base64
+    }
+    #[cfg(test)]
+    pub(crate) fn eof(&self) -> bool {
+        self.eof
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpsArtifactHandleReleaseResult {
+    pub released: bool,
+}
+
+pub(crate) fn is_public_artifact_id(value: &str) -> bool {
+    value.len() == 41
+        && value.starts_with("artifact:")
+        && value[9..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+pub(crate) fn is_artifact_handle(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("artifact-handle:") else {
+        return false;
+    };
+    uuid::Uuid::parse_str(uuid)
+        .is_ok_and(|parsed| parsed.get_version_num() == 4 && parsed.to_string() == uuid)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
