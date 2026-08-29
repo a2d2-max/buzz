@@ -1,6 +1,9 @@
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -14,14 +17,13 @@ use super::{
     client::{read_hub_token, validate_hub_endpoint, OpsBridgeClient, OpsBridgeConfig},
     ops_bridge_create_draft, ops_bridge_transition,
     types::{
-        OpsDraftRequest, OpsSelection, OpsTransitionAction, OpsTransitionOrigin,
+        OpsDraftRequest, OpsSelection, OpsSessionSource, OpsTransitionAction, OpsTransitionOrigin,
         OpsTransitionRequest, OPS_CONTRACT_VERSION,
     },
     watch::{OpsBridgeWatcher, ReconnectBackoff},
     OpsBridgeState,
 };
 use crate::app_state::{build_app_state, AppState};
-use std::sync::atomic::Ordering;
 use tauri::Manager;
 
 fn write_token(path: &Path, contents: &[u8], mode: u32) {
@@ -222,8 +224,8 @@ async fn ops_bridge_client_accepts_a_bounded_version_one_json_response() {
     let body = serde_json::to_vec(&json!({
         "contract_version": OPS_CONTRACT_VERSION,
         "reads": ["snapshot", "events", "artifact"],
-        "drafts": ["message", "internal_task", "provider_action"],
-        "transitions": ["submit", "approve", "risk_confirm", "deliver", "reject"]
+        "drafts": [],
+        "transitions": []
     }))
     .expect("serialize fake capabilities");
     let (port, requests, server) = spawn_fake_server(vec![http_response(
@@ -241,6 +243,8 @@ async fn ops_bridge_client_accepts_a_bounded_version_one_json_response() {
     let capabilities = client.capabilities().await.expect("version one response");
     assert_eq!(capabilities.contract_version, OPS_CONTRACT_VERSION);
     assert_eq!(capabilities.reads.len(), 3);
+    assert!(capabilities.drafts.is_empty());
+    assert!(capabilities.transitions.is_empty());
     server.await.expect("fake server exits");
 
     let requests = requests.lock().expect("read fake requests");
@@ -258,7 +262,17 @@ async fn ops_bridge_snapshot_constructs_only_the_typed_query_fields() {
         "generated_at": "2026-08-28T00:00:00.000Z",
         "health": {"hub": "ready", "orca": "ready", "codex": "ready"},
         "room": {},
-        "session_tree": [],
+        "session_tree": [{
+            "id": "claude_code:public-session",
+            "source": "claude_code",
+            "parent_session_id": null,
+            "work_item_id": null,
+            "title": "Claude Code session",
+            "activity": null,
+            "health": "ready",
+            "last_activity_at": null,
+            "child_ids": []
+        }],
         "checklist": [],
         "decisions": []
     }))
@@ -284,6 +298,10 @@ async fn ops_bridge_snapshot_constructs_only_the_typed_query_fields() {
         .await
         .expect("typed fake snapshot");
     assert_eq!(snapshot.revision, 7);
+    assert!(matches!(
+        snapshot.session_tree[0].source,
+        OpsSessionSource::ClaudeCode
+    ));
     server.await.expect("snapshot fake server exits");
 
     let requests = requests.lock().expect("read snapshot request");
@@ -483,6 +501,90 @@ fn transition_request() -> OpsTransitionRequest {
         origin: OpsTransitionOrigin::VisualControl,
         targets: None,
     }
+}
+
+fn deliver_request() -> OpsTransitionRequest {
+    OpsTransitionRequest {
+        approval_id: "apr_1".to_owned(),
+        action: OpsTransitionAction::Deliver,
+        expected_revision: 3,
+        origin: OpsTransitionOrigin::VisualControl,
+        targets: None,
+    }
+}
+
+#[tokio::test]
+async fn ops_bridge_delivery_is_disabled_before_identity_and_client_access() {
+    for (lost, locked) in [(true, false), (false, true), (false, false)] {
+        let app = command_app(
+            Err(super::client::OpsBridgeError::InvalidConfig),
+            lost,
+            locked,
+        );
+        let error = ops_bridge_transition(
+            deliver_request(),
+            app.state::<OpsBridgeState>(),
+            app.state::<AppState>(),
+        )
+        .await
+        .expect_err("deliver is disabled before identity and client lookup");
+
+        assert_eq!(error, "ops_bridge_external_action_disabled");
+    }
+}
+
+#[tokio::test]
+async fn ops_bridge_client_disables_delivery_before_token_access() {
+    let temp = tempfile::tempdir().expect("temp token directory");
+    let missing_token = temp.path().join("missing.token");
+    let client = OpsBridgeClient::new(config(7331, &missing_token, 4096)).expect("strict client");
+
+    let error = client
+        .transition(&deliver_request())
+        .await
+        .expect_err("deliver is disabled before token lookup");
+
+    assert_eq!(error, super::client::OpsBridgeError::ExternalActionDisabled);
+}
+
+#[tokio::test]
+async fn ops_bridge_client_disables_delivery_before_http_accept() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake delivery listener");
+    let port = listener.local_addr().expect("fake listener address").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let recorded_accepts = Arc::clone(&accepts);
+    let server = tokio::spawn(async move {
+        if let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+        {
+            recorded_accepts.fetch_add(1, Ordering::AcqRel);
+            let _ = read_request(&mut stream).await;
+            let receipt = serde_json::to_vec(&json!({
+                "contract_version": 1,
+                "approval": {"id": "apr_1", "revision": 3, "status": "delivered"}
+            }))
+            .expect("serialize fake delivery receipt");
+            stream
+                .write_all(&http_response("200 OK", "application/json", &receipt, &[]))
+                .await
+                .expect("write fake delivery response");
+        }
+    });
+    let temp = tempfile::tempdir().expect("temp token directory");
+    let token = temp.path().join("hub.token");
+    write_token(&token, &[b't'; 32], 0o600);
+    let client = OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client");
+
+    let error = client
+        .transition(&deliver_request())
+        .await
+        .expect_err("deliver is disabled before HTTP");
+    server.await.expect("fake delivery listener exits");
+
+    assert_eq!(error, super::client::OpsBridgeError::ExternalActionDisabled);
+    assert_eq!(accepts.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]

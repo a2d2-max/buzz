@@ -84,6 +84,7 @@ pub(crate) async fn ops_bridge_transition(
     bridge_state: tauri::State<'_, OpsBridgeState>,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<OpsTransitionReceipt, String> {
+    request.validate_initial_profile().map_err(public_error)?;
     app_state.require_active_identity()?;
     bridge_state
         .client()

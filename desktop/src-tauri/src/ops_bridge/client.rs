@@ -37,6 +37,7 @@ pub struct OpsBridgeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpsBridgeError {
+    ExternalActionDisabled,
     InvalidConfig,
     InvalidEndpoint,
     TokenUnavailable,
@@ -56,6 +57,7 @@ pub(crate) enum OpsBridgeError {
 impl std::fmt::Display for OpsBridgeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let code = match self {
+            Self::ExternalActionDisabled => "ops_bridge_external_action_disabled",
             Self::InvalidConfig => "ops_bridge_invalid_config",
             Self::InvalidEndpoint => "ops_bridge_invalid_endpoint",
             Self::TokenUnavailable => "ops_bridge_token_unavailable",
@@ -168,9 +170,7 @@ impl OpsBridgeClient {
         &self,
         request: &OpsTransitionRequest,
     ) -> Result<OpsTransitionReceipt, OpsBridgeError> {
-        request
-            .validate()
-            .map_err(|_| OpsBridgeError::InvalidRequest)?;
+        request.validate_initial_profile()?;
         let builder = self
             .authenticated(
                 &self.request_client,

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::client::OpsBridgeError;
+
 /// Version implemented by the native Ops bridge and its loopback hub contract.
 pub const OPS_CONTRACT_VERSION: u8 = 1;
 
@@ -93,6 +95,7 @@ pub enum OpsSessionSource {
     Orca,
     CodexDirect,
     CodexSub,
+    ClaudeCode,
 }
 
 /// Public session lineage node from the version 1 snapshot.
@@ -238,6 +241,13 @@ pub struct OpsTransitionRequest {
 }
 
 impl OpsTransitionRequest {
+    pub(crate) fn validate_initial_profile(&self) -> Result<(), OpsBridgeError> {
+        if matches!(self.action, OpsTransitionAction::Deliver) {
+            return Err(OpsBridgeError::ExternalActionDisabled);
+        }
+        self.validate().map_err(|_| OpsBridgeError::InvalidRequest)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ()> {
         if !valid_path_id(&self.approval_id) {
             return Err(());
