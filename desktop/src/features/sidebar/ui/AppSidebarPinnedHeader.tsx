@@ -173,6 +173,7 @@ export function AppSidebarPrimaryMenu({
           <FeatureGate feature="nativeOpsRoom">
             <SidebarMenuItem>
               <SidebarMenuButton
+                className="min-h-11 min-w-11 group-data-[collapsible=icon]:!size-11"
                 data-testid="open-ops-view"
                 isActive={selectedView === "ops"}
                 onClick={onSelectOps}
