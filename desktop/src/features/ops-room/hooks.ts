@@ -13,6 +13,7 @@ import {
   ensureOpsWatchManager,
   completeOpsSync,
   type OpsInvalidationPayload,
+  isOpsSyncCurrent,
   subscribeOpsInvalidations,
 } from "./opsWatchManager";
 import type {
@@ -201,34 +202,83 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     void query.refetch({ cancelRefetch: false });
   }, [focused, query.refetch, state]);
 
+  const invalidationVersion = React.useRef(0);
+  const drainedInvalidationVersion = React.useRef(0);
+  const pendingFullReload = React.useRef(false);
+  const pendingSync = React.useRef<{
+    generation: number;
+    ticket: number;
+  } | null>(null);
+  const invalidationDrain = React.useRef<Promise<void> | null>(null);
+
   const handleInvalidation = React.useCallback(
-    async (payload: OpsInvalidationPayload) => {
-      if (payload.full_reload === true) {
-        await queryClient.invalidateQueries({
-          queryKey: ["ops"],
-          refetchType: "none",
-        });
-      }
-      const result = await query.refetch({ cancelRefetch: false });
-      if (result.error || payload.sync_required !== true) return;
-      const generation = payload.connection_generation;
-      const appliedSequence = result.data?.event_sequence;
+    (payload: OpsInvalidationPayload) => {
+      invalidationVersion.current += 1;
+      if (payload.full_reload === true) pendingFullReload.current = true;
       if (
-        !Number.isSafeInteger(generation) ||
-        generation === undefined ||
-        appliedSequence === undefined
+        payload.sync_required === true &&
+        Number.isSafeInteger(payload.connection_generation) &&
+        Number.isSafeInteger(payload.sync_ticket)
       ) {
-        return;
+        pendingSync.current = {
+          generation: payload.connection_generation ?? 0,
+          ticket: payload.sync_ticket ?? 0,
+        };
       }
-      try {
-        const ack = await acknowledgeOpsSync(generation, appliedSequence);
-        if (ack.accepted) completeOpsSync(generation);
-      } catch (error) {
-        setProbeFailureRecord({
-          queryKeyIdentity,
-          state: classifyOpsBridgeError(error),
-        });
-      }
+      if (invalidationDrain.current) return;
+
+      const drain = (async () => {
+        while (
+          drainedInvalidationVersion.current < invalidationVersion.current
+        ) {
+          const targetVersion = invalidationVersion.current;
+          const fullReload = pendingFullReload.current;
+          pendingFullReload.current = false;
+          const sync = pendingSync.current;
+          if (fullReload) {
+            await queryClient.invalidateQueries({
+              queryKey: ["ops"],
+              refetchType: "none",
+            });
+          }
+          const result = await query.refetch({ cancelRefetch: false });
+          drainedInvalidationVersion.current = targetVersion;
+          if (
+            result.error ||
+            !sync ||
+            invalidationVersion.current !== targetVersion ||
+            pendingSync.current?.ticket !== sync.ticket ||
+            !isOpsSyncCurrent(sync.generation, sync.ticket)
+          ) {
+            continue;
+          }
+          const appliedSequence = result.data?.event_sequence;
+          if (appliedSequence === undefined) continue;
+          try {
+            const ack = await acknowledgeOpsSync(
+              sync.generation,
+              appliedSequence,
+            );
+            if (ack.accepted) {
+              completeOpsSync(sync.generation, sync.ticket);
+              if (pendingSync.current?.ticket === sync.ticket) {
+                pendingSync.current = null;
+              }
+            }
+          } catch (error) {
+            setProbeFailureRecord({
+              queryKeyIdentity,
+              state: classifyOpsBridgeError(error),
+            });
+          }
+        }
+      })();
+      invalidationDrain.current = drain;
+      void drain.finally(() => {
+        if (invalidationDrain.current === drain) {
+          invalidationDrain.current = null;
+        }
+      });
     },
     [query.refetch, queryClient, queryKeyIdentity],
   );

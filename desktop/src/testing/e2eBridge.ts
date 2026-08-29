@@ -11388,7 +11388,8 @@ export function maybeInstallE2eTauriMocks() {
     };
   }> = [];
   let mockOpsWatchStarted = false;
-  const mockOpsConnectionGeneration = 1;
+  let mockOpsConnectionGeneration = 1;
+  let mockOpsSyncRequired = false;
   let mockOpsAppliedSequence: string | null = null;
   const handleMockCommand = async (
     command: string,
@@ -11458,7 +11459,20 @@ export function maybeInstallE2eTauriMocks() {
       case "ops_bridge_start_watch": {
         const started = !mockOpsWatchStarted;
         mockOpsWatchStarted = true;
-        return { started };
+        if (started) mockOpsSyncRequired = true;
+        return {
+          started,
+          connection_generation: mockOpsConnectionGeneration,
+          sync_required: mockOpsSyncRequired,
+          anchor_sequence: null,
+        };
+      }
+      case "ops_bridge_stop_watch": {
+        mockOpsWatchStarted = false;
+        mockOpsConnectionGeneration += 1;
+        mockOpsSyncRequired = false;
+        mockOpsAppliedSequence = null;
+        return null;
       }
       case "ops_bridge_ack_sync": {
         const request = (payload as { request?: Record<string, unknown> })
@@ -11466,10 +11480,14 @@ export function maybeInstallE2eTauriMocks() {
         const generation = request?.generation;
         const appliedSequence = request?.applied_sequence;
         const accepted =
+          mockOpsSyncRequired &&
           generation === mockOpsConnectionGeneration &&
           typeof appliedSequence === "string" &&
           /^(?:0|[1-9][0-9]*)$/u.test(appliedSequence);
-        if (accepted) mockOpsAppliedSequence = appliedSequence;
+        if (accepted) {
+          mockOpsAppliedSequence = appliedSequence;
+          mockOpsSyncRequired = false;
+        }
         return {
           accepted,
           connection_generation: mockOpsConnectionGeneration,

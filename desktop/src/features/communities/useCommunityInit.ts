@@ -64,7 +64,7 @@ async function resetCommunityState({
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
-  resetOpsWatchManager();
+  await resetOpsWatchManager();
   if (isTauri() && isMacPlatform()) {
     void clearTrayAgentActivity();
   }

@@ -362,12 +362,38 @@ describe("native Ops bridge contract", () => {
   });
 
   test("starts the native watcher with the fixed command and no arguments", async () => {
-    responses.push({ started: true });
+    responses.push({
+      started: true,
+      connection_generation: 1,
+      sync_required: true,
+      anchor_sequence: null,
+    });
 
-    assert.deepEqual(await bridge.startOpsWatch(), { started: true });
+    assert.deepEqual(await bridge.startOpsWatch(), {
+      started: true,
+      connection_generation: 1,
+      sync_required: true,
+      anchor_sequence: null,
+    });
     assert.deepEqual(calls, [
       { command: "ops_bridge_start_watch", args: null },
     ]);
+  });
+
+  test("rejects a watcher start response without synchronization state", async () => {
+    responses.push({ started: true });
+
+    await assert.rejects(
+      bridge.startOpsWatch(),
+      (error) => error?.name === "OpsBridgeContractError",
+    );
+  });
+
+  test("stops the native watcher with the fixed command and no arguments", async () => {
+    responses.push(null);
+
+    await bridge.stopOpsWatch();
+    assert.deepEqual(calls, [{ command: "ops_bridge_stop_watch", args: null }]);
   });
 
   test("acknowledges only a generation-bound canonical snapshot watermark", async () => {

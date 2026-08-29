@@ -157,7 +157,20 @@ async function openLocalOpsRoom(page: Page, probeWatchStart: boolean) {
         invoke("ops_bridge_start_watch", null),
       ]);
     });
-    expect(watchResults).toEqual([{ started: true }, { started: false }]);
+    expect(watchResults).toEqual([
+      {
+        started: true,
+        connection_generation: 1,
+        sync_required: true,
+        anchor_sequence: null,
+      },
+      {
+        started: false,
+        connection_generation: 1,
+        sync_required: true,
+        anchor_sequence: null,
+      },
+    ]);
     await entry.click();
   } else {
     await page.goto("/#/ops?view=room");
@@ -292,6 +305,17 @@ async function expectReducedMotionComputed(page: Page) {
 }
 
 async function expectNativeOpsArgumentsAndNoMutations(page: Page) {
+  const synchronizedWatch = await page.evaluate(async () => {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (!invoke) throw new Error("Tauri E2E invoke bridge unavailable");
+    return invoke("ops_bridge_start_watch", null);
+  });
+  expect(synchronizedWatch).toEqual({
+    started: false,
+    connection_generation: 1,
+    sync_required: false,
+    anchor_sequence: null,
+  });
   const calls = await page.evaluate(
     () => window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [],
   );
@@ -304,9 +328,13 @@ async function expectNativeOpsArgumentsAndNoMutations(page: Page) {
   const starts = calls.filter(
     ({ command }) => command === "ops_bridge_start_watch",
   );
+  const acknowledgements = calls.filter(
+    ({ command }) => command === "ops_bridge_ack_sync",
+  );
   expect(capabilities.length).toBeGreaterThan(0);
   expect(snapshots.length).toBeGreaterThan(0);
   expect(starts.length).toBeGreaterThan(0);
+  expect(acknowledgements.length).toBeGreaterThan(0);
   for (const call of capabilities) expect(call.payload).toBeNull();
   for (const call of snapshots) {
     expect(call.payload).toEqual({
@@ -314,6 +342,11 @@ async function expectNativeOpsArgumentsAndNoMutations(page: Page) {
     });
   }
   for (const call of starts) expect(call.payload).toBeNull();
+  for (const call of acknowledgements) {
+    expect(call.payload).toEqual({
+      request: { generation: 1, applied_sequence: "19" },
+    });
+  }
 
   const mutations = calls.filter(({ command }) =>
     [
@@ -325,6 +358,44 @@ async function expectNativeOpsArgumentsAndNoMutations(page: Page) {
   );
   expect(mutations).toEqual([]);
 }
+
+test("an older snapshot remains visible with live watch compatibility disabled", async ({
+  page,
+}) => {
+  await page.addInitScript((storageKey) => {
+    window.localStorage.setItem(storageKey, "true");
+  }, LOCAL_OPS_STORAGE_KEY);
+  const legacySnapshot: Record<string, unknown> = {
+    ...OPS_SNAPSHOT_FIXTURE,
+  };
+  delete legacySnapshot.event_sequence;
+  await installMockBridge(
+    page,
+    {
+      identityLost: true,
+      opsCapabilities: OPS_CAPABILITIES_FIXTURE,
+      opsSnapshot: legacySnapshot,
+    },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+
+  await page.goto("/#/ops?view=room");
+  await expect(page.getByTestId("ops-watch-compatibility")).toBeVisible();
+  await expect(
+    page
+      .getByTestId("ops-workspace-nav")
+      .getByText("Configured native Ops parity", { exact: true }),
+  ).toBeVisible();
+  const commands = await page.evaluate(
+    () => window.__BUZZ_E2E_COMMANDS__ ?? [],
+  );
+  expect(
+    commands.filter((command) => command === "ops_bridge_start_watch"),
+  ).toEqual([]);
+  expect(
+    commands.filter((command) => command === "ops_bridge_ack_sync"),
+  ).toEqual([]);
+});
 
 for (const viewport of VIEWPORTS) {
   test(`Local Ops Room matches native safety and responsive parity at ${viewport.width}x${viewport.height}`, async ({

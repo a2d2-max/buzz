@@ -20,12 +20,13 @@ test("the canonical community reset inventory tears down the Ops watcher singlet
     communityInitSource.indexOf("async function resetCommunityState"),
     communityInitSource.indexOf("type CommunityInitResult"),
   );
-  assert.match(resetInventory, /resetOpsWatchManager\(\);/);
+  assert.match(resetInventory, /await resetOpsWatchManager\(\);/);
 });
 
 test("the Ops community reset clears pending generation-bound synchronization state", () => {
   const reset = watchManagerSource.slice(
-    watchManagerSource.indexOf("export function resetOpsWatchManager"),
+    watchManagerSource.indexOf("export async function resetOpsWatchManager"),
   );
   assert.match(reset, /pendingSyncGeneration\s*=\s*null/);
+  assert.match(reset, /await pending/);
 });

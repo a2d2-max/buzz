@@ -115,6 +115,11 @@ pub(crate) fn ops_bridge_start_watch(
 }
 
 #[tauri::command]
+pub(crate) fn ops_bridge_stop_watch(state: tauri::State<'_, OpsBridgeState>) {
+    state.stop_watch();
+}
+
+#[tauri::command]
 pub(crate) fn ops_bridge_ack_sync(
     request: OpsSyncAckRequest,
     app: tauri::AppHandle,

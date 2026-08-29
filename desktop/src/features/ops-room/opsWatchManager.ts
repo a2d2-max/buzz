@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 
-import { startOpsWatch } from "./opsBridge";
+import { startOpsWatch, stopOpsWatch } from "./opsBridge";
 
 export interface OpsInvalidationPayload {
   connection_generation?: number;
@@ -9,6 +9,7 @@ export interface OpsInvalidationPayload {
   reason?: string;
   full_reload?: boolean;
   setup_refresh?: boolean;
+  sync_ticket?: number;
 }
 
 type Subscriber = (payload: OpsInvalidationPayload) => void;
@@ -20,19 +21,30 @@ let stopListener: (() => void) | null = null;
 let generation = 0;
 let teardownTicket = 0;
 let pendingSyncGeneration: number | null = null;
+let pendingSyncTicket = 0;
+let resetPromise: Promise<void> | null = null;
 
 function broadcast(payload: OpsInvalidationPayload): void {
+  let delivered = payload;
   if (
     payload.sync_required === true &&
     Number.isSafeInteger(payload.connection_generation)
   ) {
     pendingSyncGeneration = payload.connection_generation ?? null;
+    pendingSyncTicket += 1;
+    delivered = { ...payload, sync_ticket: pendingSyncTicket };
   }
-  for (const subscriber of subscribers) subscriber(payload);
+  for (const subscriber of subscribers) subscriber(delivered);
 }
 
-export function completeOpsSync(generation: number): void {
-  if (pendingSyncGeneration === generation) pendingSyncGeneration = null;
+export function completeOpsSync(generation: number, ticket: number): void {
+  if (pendingSyncGeneration === generation && pendingSyncTicket === ticket) {
+    pendingSyncGeneration = null;
+  }
+}
+
+export function isOpsSyncCurrent(generation: number, ticket: number): boolean {
+  return pendingSyncGeneration === generation && pendingSyncTicket === ticket;
 }
 
 async function setup(expectedGeneration: number): Promise<void> {
@@ -55,7 +67,7 @@ async function setup(expectedGeneration: number): Promise<void> {
       broadcast({
         connection_generation: status.connection_generation,
         sync_required: true,
-        anchor_sequence: status.anchor_sequence,
+        anchor_sequence: status.anchor_sequence ?? undefined,
         reason: "resume",
         full_reload: true,
       });
@@ -75,6 +87,7 @@ async function setup(expectedGeneration: number): Promise<void> {
 }
 
 export async function ensureOpsWatchManager(): Promise<void> {
+  if (resetPromise) await resetPromise;
   if (stopListener) return;
   if (setupPromise) return setupPromise;
 
@@ -111,12 +124,36 @@ export function subscribeOpsInvalidations(subscriber: Subscriber): () => void {
  * Reset transient listener ownership during app/community teardown. The manager
  * retains no snapshot, selection, identity, or other community-scoped data.
  */
-export function resetOpsWatchManager(): void {
+export async function resetOpsWatchManager(): Promise<void> {
+  const activeReset = resetPromise;
   teardownTicket += 1;
   generation += 1;
   subscribers.clear();
   stopListener?.();
   stopListener = null;
+  const setupToSettle = setupPromise;
   setupPromise = null;
   pendingSyncGeneration = null;
+  pendingSyncTicket += 1;
+  if (activeReset) {
+    await activeReset;
+    return;
+  }
+  const pending = (async () => {
+    if (setupToSettle) {
+      try {
+        await setupToSettle;
+      } catch {
+        // Reset owns the terminal stop below, so a superseded setup failure
+        // must not bypass native generation invalidation.
+      }
+    }
+    await stopOpsWatch();
+  })();
+  resetPromise = pending;
+  try {
+    await pending;
+  } finally {
+    if (resetPromise === pending) resetPromise = null;
+  }
 }

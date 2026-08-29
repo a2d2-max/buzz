@@ -86,6 +86,16 @@ before(() => {
         return commandResponses.has(command) ? nextResponse(command) : 41;
       }
       if (command === "plugin:event|unlisten") return null;
+      if (command === "ops_bridge_stop_watch") return null;
+      if (command === "ops_bridge_start_watch") {
+        const response = await nextResponse(command);
+        return {
+          connection_generation: 1,
+          sync_required: false,
+          anchor_sequence: null,
+          ...response,
+        };
+      }
       return nextResponse(command);
     },
     transformCallback(callback) {
@@ -110,7 +120,7 @@ beforeEach(() => {
 afterEach(async () => {
   const { cleanup } = await import("@testing-library/react");
   cleanup();
-  resetOpsWatchManager();
+  await resetOpsWatchManager();
   mock.timers.reset();
 });
 
@@ -463,6 +473,56 @@ test("an invalidation event refetches the active snapshot and full_reload invali
   client.clear();
 });
 
+test("overlapping live invalidations drain through a follow-up canonical refetch", async () => {
+  let resolveFirstInvalidation;
+  const firstInvalidation = new Promise((resolve) => {
+    resolveFirstInvalidation = resolve;
+  });
+  queue(
+    "ops_bridge_capabilities",
+    capabilities,
+    capabilities,
+    capabilities,
+    capabilities,
+  );
+  queue(
+    "ops_bridge_snapshot",
+    snapshot(1),
+    snapshot(2),
+    firstInvalidation,
+    snapshot(4),
+  );
+  queue("ops_bridge_start_watch", { started: true });
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForRevision(view, 2);
+  const handler = callbacks.get(
+    opsCalls("plugin:event|listen")[0].args.handler,
+  );
+
+  await act(async () =>
+    handler({
+      event: "buzz://ops-invalidated",
+      id: 1,
+      payload: { event_id: "3", event_type: "health" },
+    }),
+  );
+  await waitForCallCount("ops_bridge_snapshot", 3);
+  await act(async () =>
+    handler({
+      event: "buzz://ops-invalidated",
+      id: 2,
+      payload: { event_id: "4", event_type: "approval" },
+    }),
+  );
+  await act(async () => resolveFirstInvalidation(snapshot(3)));
+  await waitForRevision(view, 4);
+
+  assert.equal(opsCalls("ops_bridge_snapshot").length, 4);
+  view.unmount();
+  client.clear();
+});
+
 test("sync-required refetch acknowledges the matching generation only after success", async () => {
   queue("ops_bridge_capabilities", capabilities, capabilities, capabilities);
   queue("ops_bridge_snapshot", snapshot(10), snapshot(11), snapshot(12));
@@ -545,6 +605,82 @@ test("a failed sync-required refetch stays suspended and sends no ACK", async ()
   await waitForState(view, "stale");
 
   assert.equal(opsCalls("ops_bridge_ack_sync").length, 0);
+  view.unmount();
+  client.clear();
+});
+
+test("community reset stops native sync and suppresses an old in-flight ACK", async () => {
+  let resolveSyncRefetch;
+  const syncRefetch = new Promise((resolve) => {
+    resolveSyncRefetch = resolve;
+  });
+  queue("ops_bridge_capabilities", capabilities, capabilities, capabilities);
+  queue("ops_bridge_snapshot", snapshot(30), snapshot(31), syncRefetch);
+  queue("ops_bridge_start_watch", { started: true });
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForRevision(view, 31);
+  const handler = callbacks.get(
+    opsCalls("plugin:event|listen")[0].args.handler,
+  );
+
+  await act(async () =>
+    handler({
+      event: "buzz://ops-invalidated",
+      id: 1,
+      payload: {
+        connection_generation: 12,
+        sync_required: true,
+        anchor_sequence: "31",
+        reason: "reconnect",
+        full_reload: true,
+      },
+    }),
+  );
+  await waitForCallCount("ops_bridge_snapshot", 3);
+  await act(async () => resetOpsWatchManager());
+
+  assert.deepEqual(opsCalls("ops_bridge_stop_watch"), [
+    { command: "ops_bridge_stop_watch", args: null },
+  ]);
+  await act(async () => resolveSyncRefetch(snapshot(32)));
+  await waitForRevision(view, 32);
+  assert.equal(opsCalls("ops_bridge_ack_sync").length, 0);
+
+  view.unmount();
+  client.clear();
+});
+
+test("community reset waits for an in-flight native start before stopping", async () => {
+  let resolveStart;
+  const startResponse = new Promise((resolve) => {
+    resolveStart = resolve;
+  });
+  queue("ops_bridge_capabilities", capabilities);
+  queue("ops_bridge_snapshot", snapshot(40));
+  queue("ops_bridge_start_watch", startResponse);
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForState(view, "ready");
+  await waitForCallCount("ops_bridge_start_watch", 1);
+
+  const resetting = resetOpsWatchManager();
+  await Promise.resolve();
+  assert.equal(opsCalls("ops_bridge_stop_watch").length, 0);
+  await act(async () => {
+    resolveStart({ started: true });
+    await resetting;
+  });
+
+  const lifecycleCommands = calls
+    .filter(({ command }) =>
+      ["ops_bridge_start_watch", "ops_bridge_stop_watch"].includes(command),
+    )
+    .map(({ command }) => command);
+  assert.deepEqual(lifecycleCommands, [
+    "ops_bridge_start_watch",
+    "ops_bridge_stop_watch",
+  ]);
   view.unmount();
   client.clear();
 });

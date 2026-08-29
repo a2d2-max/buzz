@@ -82,6 +82,7 @@ type OpsRoomViewProps = {
   onSelectChannel: (id: string) => void;
   onSelectThread: (id: string) => void;
   projection: OpsRoomProjection | null;
+  watchState: "enabled" | "disabled_compatibility";
 };
 
 export function OpsRoomView({
@@ -90,6 +91,7 @@ export function OpsRoomView({
   onSelectChannel,
   onSelectThread,
   projection,
+  watchState,
 }: OpsRoomViewProps) {
   const layout = useOpsResponsiveLayout();
   const reducedMotion = useReducedMotionPreference();
@@ -185,6 +187,16 @@ export function OpsRoomView({
     >
       <h1 className="sr-only">Agent Room</h1>
       <OpsConnectionState onRetry={onRetry} state={connectionState} />
+      {watchState === "disabled_compatibility" && projection ? (
+        <div
+          className="flex items-center gap-2 border-amber-500/30 border-b bg-amber-500/10 px-4 py-2 text-xs text-amber-800 dark:text-amber-200"
+          data-testid="ops-watch-compatibility"
+          role="status"
+        >
+          실시간 동기화를 사용할 수 없어 마지막으로 읽은 Ops 데이터를
+          표시합니다.
+        </div>
+      ) : null}
       {stateOnly || !projection ? null : (
         <main className="min-h-0 min-w-0 flex-1 overflow-hidden p-3">
           {layout === "desktop" ? (
@@ -341,7 +353,7 @@ function currentOpsSelection(): Required<OpsSelection> {
 export function OpsRoomScreen() {
   useOpsWindowSize();
   const [selection, setSelection] = React.useState(currentOpsSelection);
-  const { refetch, snapshot, state } = useOpsSnapshot(selection);
+  const { refetch, snapshot, state, watchState } = useOpsSnapshot(selection);
   const projection = React.useMemo(
     () => (snapshot ? projectOpsRoom(snapshot) : null),
     [snapshot],
@@ -376,6 +388,7 @@ export function OpsRoomScreen() {
       onSelectChannel={selectChannel}
       onSelectThread={selectThread}
       projection={projection}
+      watchState={watchState}
     />
   );
 }

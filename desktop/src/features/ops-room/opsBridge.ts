@@ -25,9 +25,9 @@ const selectionSchema = z
 const watchStartSchema = z
   .object({
     started: z.boolean(),
-    connection_generation: z.number().int().nonnegative().optional(),
-    sync_required: z.boolean().optional(),
-    anchor_sequence: opsEventSequenceSchema.optional(),
+    connection_generation: z.number().int().nonnegative(),
+    sync_required: z.boolean(),
+    anchor_sequence: opsEventSequenceSchema.nullable(),
   })
   .strip();
 const syncAckSchema = z
@@ -200,6 +200,10 @@ export async function startOpsWatch(): Promise<
   const parsed = watchStartSchema.safeParse(value);
   if (!parsed.success) throw new OpsBridgeContractError();
   return parsed.data;
+}
+
+export async function stopOpsWatch(): Promise<void> {
+  await invoke<void>("ops_bridge_stop_watch", null as never);
 }
 
 export async function acknowledgeOpsSync(

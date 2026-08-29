@@ -352,7 +352,6 @@ pub struct OpsWatchStartResult {
     pub started: bool,
     pub connection_generation: u64,
     pub sync_required: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_sequence: Option<String>,
 }
 

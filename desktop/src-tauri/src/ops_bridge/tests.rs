@@ -15,7 +15,7 @@ use tokio::{
 
 use super::{
     client::{read_hub_token, validate_hub_endpoint, OpsBridgeClient, OpsBridgeConfig},
-    ops_bridge_create_draft, ops_bridge_transition,
+    ops_bridge_create_draft, ops_bridge_stop_watch, ops_bridge_transition,
     types::{
         OpsBridgeSnapshot, OpsDraftRequest, OpsSelection, OpsSessionSource, OpsSyncAckRequest,
         OpsTransitionAction, OpsTransitionOrigin, OpsTransitionRequest, OPS_CONTRACT_VERSION,
@@ -788,12 +788,23 @@ fn ops_bridge_sync_queue_is_bounded_and_reset_invalidates_old_generation() {
 
     let overflow_generation = overflow[0].connection_generation;
     sync.reset();
-    let after_reset = sync.begin_connection();
-    assert!(after_reset.connection_generation > overflow_generation);
     let (stale, _) = sync
         .ack(overflow_generation, "257")
-        .expect("old community ack is harmless");
+        .expect("stopped community rejects old ack immediately");
     assert!(!stale.accepted);
+    let after_reset = sync.begin_connection();
+    assert!(after_reset.connection_generation > overflow_generation);
+}
+
+#[test]
+fn ops_bridge_stop_watch_command_is_idempotent() {
+    let app = command_app(
+        Err(super::client::OpsBridgeError::InvalidConfig),
+        false,
+        false,
+    );
+    ops_bridge_stop_watch(app.state::<OpsBridgeState>());
+    ops_bridge_stop_watch(app.state::<OpsBridgeState>());
 }
 
 #[test]
