@@ -1,4 +1,3 @@
-import { listen } from "@tauri-apps/api/event";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
@@ -8,8 +7,11 @@ import {
   hasInvalidOpsModule,
   loadOpsSnapshot,
   opsSnapshotQueryKey,
-  startOpsWatch,
 } from "./opsBridge";
+import {
+  ensureOpsWatchManager,
+  subscribeOpsInvalidations,
+} from "./opsWatchManager";
 import type {
   OpsBridgeSnapshotV1,
   OpsConnectionState,
@@ -18,11 +20,7 @@ import type {
 
 const READY_PROBE_MS = 10_000;
 const RECOVERY_POLL_MS = 2_000;
-const OPS_INVALIDATED_EVENT = "buzz://ops-invalidated";
-
-interface OpsInvalidationPayload {
-  full_reload?: boolean;
-}
+export { resetOpsWatchManager } from "./opsWatchManager";
 
 export interface UseOpsSnapshotResult {
   state: OpsConnectionState;
@@ -91,11 +89,17 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     () => opsSnapshotQueryKey(normalizedSelection),
     [normalizedSelection],
   );
+  const queryKeyIdentity = JSON.stringify(queryKey);
   const activeQueryKey = React.useRef(queryKey);
   activeQueryKey.current = queryKey;
-  const lastGoodSnapshot = React.useRef<OpsBridgeSnapshotV1 | null>(null);
-  const [probeFailure, setProbeFailure] =
-    React.useState<OpsConnectionState | null>(null);
+  const lastGoodSnapshot = React.useRef<{
+    queryKeyIdentity: string;
+    snapshot: OpsBridgeSnapshotV1;
+  } | null>(null);
+  const [probeFailureRecord, setProbeFailureRecord] = React.useState<{
+    queryKeyIdentity: string;
+    state: OpsConnectionState;
+  } | null>(null);
 
   const query = useQuery({
     queryKey,
@@ -105,8 +109,18 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     staleTime: Number.POSITIVE_INFINITY,
   });
 
-  if (query.data) lastGoodSnapshot.current = query.data;
-  const snapshot = query.data ?? lastGoodSnapshot.current;
+  if (query.data) {
+    lastGoodSnapshot.current = { queryKeyIdentity, snapshot: query.data };
+  }
+  const snapshot =
+    query.data ??
+    (lastGoodSnapshot.current?.queryKeyIdentity === queryKeyIdentity
+      ? lastGoodSnapshot.current.snapshot
+      : null);
+  const probeFailure =
+    probeFailureRecord?.queryKeyIdentity === queryKeyIdentity
+      ? probeFailureRecord.state
+      : null;
   const hasCanonicalSnapshot = snapshot !== null;
   const state = lifecycleState(
     snapshot,
@@ -116,8 +130,11 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
   );
 
   React.useEffect(() => {
-    if (query.data) setProbeFailure(null);
-  }, [query.data]);
+    if (!query.data) return;
+    setProbeFailureRecord((failure) =>
+      failure?.queryKeyIdentity === queryKeyIdentity ? null : failure,
+    );
+  }, [query.data, queryKeyIdentity]);
 
   React.useEffect(() => {
     if (!focused) return;
@@ -130,7 +147,12 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
           await getOpsCapabilities();
           if (!cancelled) timer = setTimeout(probe, READY_PROBE_MS);
         } catch (error) {
-          if (!cancelled) setProbeFailure(classifyOpsBridgeError(error));
+          if (!cancelled) {
+            setProbeFailureRecord({
+              queryKeyIdentity,
+              state: classifyOpsBridgeError(error),
+            });
+          }
         }
       };
       timer = setTimeout(probe, READY_PROBE_MS);
@@ -139,12 +161,14 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
         const result = await query.refetch({ cancelRefetch: false });
         if (!cancelled && result.error) {
           const failure = classifyOpsBridgeError(result.error);
-          setProbeFailure(failure);
+          setProbeFailureRecord({ queryKeyIdentity, state: failure });
           if (failure === "disconnected") {
             timer = setTimeout(recover, RECOVERY_POLL_MS);
           }
         } else if (!cancelled) {
-          setProbeFailure(null);
+          setProbeFailureRecord((failure) =>
+            failure?.queryKeyIdentity === queryKeyIdentity ? null : failure,
+          );
         }
       };
       timer = setTimeout(recover, RECOVERY_POLL_MS);
@@ -154,7 +178,7 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
       cancelled = true;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [focused, query.refetch, state]);
+  }, [focused, query.refetch, queryKeyIdentity, state]);
 
   const wasFocused = React.useRef(focused);
   React.useEffect(() => {
@@ -171,43 +195,40 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     void query.refetch({ cancelRefetch: false });
   }, [focused, query.refetch, state]);
 
-  const watchInstalled = React.useRef(false);
-  React.useEffect(() => {
-    if (!hasCanonicalSnapshot || watchInstalled.current) return;
-    watchInstalled.current = true;
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-
-    void (async () => {
-      try {
-        await startOpsWatch();
-        const stop = await listen<OpsInvalidationPayload>(
-          OPS_INVALIDATED_EVENT,
-          (event) => {
-            if (event.payload?.full_reload === true) {
-              void queryClient.invalidateQueries({ queryKey: ["ops"] });
-              return;
-            }
-            void queryClient.invalidateQueries({
-              queryKey: activeQueryKey.current,
-              exact: true,
-            });
-          },
-        );
-        if (disposed) void stop();
-        else unlisten = stop;
-      } catch (error) {
-        watchInstalled.current = false;
-        if (!disposed) setProbeFailure(classifyOpsBridgeError(error));
+  const handleInvalidation = React.useCallback(
+    (payload: { full_reload?: boolean }) => {
+      if (payload.full_reload === true) {
+        void queryClient.invalidateQueries({ queryKey: ["ops"] });
+        return;
       }
-    })();
+      void queryClient.invalidateQueries({
+        queryKey: activeQueryKey.current,
+        exact: true,
+      });
+    },
+    [queryClient],
+  );
 
+  React.useEffect(() => {
+    if (!hasCanonicalSnapshot) return;
+    return subscribeOpsInvalidations(handleInvalidation);
+  }, [handleInvalidation, hasCanonicalSnapshot]);
+
+  React.useEffect(() => {
+    if (!hasCanonicalSnapshot || state !== "ready") return;
+    let disposed = false;
+    void ensureOpsWatchManager().catch((error) => {
+      if (!disposed) {
+        setProbeFailureRecord({
+          queryKeyIdentity,
+          state: classifyOpsBridgeError(error),
+        });
+      }
+    });
     return () => {
       disposed = true;
-      unlisten?.();
-      watchInstalled.current = false;
     };
-  }, [hasCanonicalSnapshot, queryClient]);
+  }, [hasCanonicalSnapshot, queryKeyIdentity, state]);
 
   const refetch = React.useCallback(async () => {
     await query.refetch({ cancelRefetch: false });

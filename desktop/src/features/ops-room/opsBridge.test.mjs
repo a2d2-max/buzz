@@ -237,6 +237,33 @@ describe("native Ops bridge contract", () => {
     );
   });
 
+  test("rejects additional Unix workspace and system absolute paths", async () => {
+    for (const path of [
+      "/workspace/private/project",
+      "/mnt/private/project",
+      "/srv/private/project",
+      "/usr/local/bin/private-tool",
+    ]) {
+      const snapshot = validSnapshot();
+      snapshot.room.threads[0].title = path;
+      responses.push(capabilities, snapshot);
+      await assert.rejects(
+        bridge.loadOpsSnapshot({}),
+        (error) => error?.name === "OpsBridgeContractError",
+      );
+    }
+  });
+
+  test("accepts slash-prefixed public routes and prose", async () => {
+    for (const text of ["/api/v1", "/help", "/ship when ready"]) {
+      const snapshot = validSnapshot();
+      snapshot.room.threads[0].title = text;
+      responses.push(capabilities, snapshot);
+      const result = await bridge.loadOpsSnapshot({});
+      assert.equal(result.room.threads[0].title, text);
+    }
+  });
+
   test("classifies a missing, non-numeric, or non-v1 version as version mismatch", async () => {
     for (const response of [
       { reads: [], drafts: [], transitions: [] },

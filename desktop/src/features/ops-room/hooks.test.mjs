@@ -80,7 +80,9 @@ before(() => {
   window.__TAURI_INTERNALS__ = {
     async invoke(command, args) {
       calls.push({ command, args });
-      if (command === "plugin:event|listen") return 41;
+      if (command === "plugin:event|listen") {
+        return commandResponses.has(command) ? nextResponse(command) : 41;
+      }
       if (command === "plugin:event|unlisten") return null;
       return nextResponse(command);
     },
@@ -106,12 +108,13 @@ beforeEach(() => {
 afterEach(async () => {
   const { cleanup } = await import("@testing-library/react");
   cleanup();
+  resetOpsWatchManager();
   mock.timers.reset();
 });
 
 after(() => dom.window.close());
 
-const { useOpsSnapshot } = await import("./hooks.ts");
+const { resetOpsWatchManager, useOpsSnapshot } = await import("./hooks.ts");
 
 function wrapper(client) {
   return ({ children }) =>
@@ -131,11 +134,26 @@ async function mount(selection = {}) {
   return { client, view };
 }
 
+async function mountSelectable(initialSelection = {}) {
+  const { renderHook } = await import("@testing-library/react");
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, gcTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  const view = renderHook((selection) => useOpsSnapshot(selection), {
+    initialProps: initialSelection,
+    wrapper: wrapper(client),
+  });
+  return { client, view };
+}
+
 async function waitForState(view, state) {
   const { act } = await import("@testing-library/react");
   for (let attempt = 0; attempt < 40; attempt += 1) {
     await act(async () => {
       if (fakeTimersEnabled) mock.timers.tick(0);
+      else await new Promise((resolve) => setTimeout(resolve, 0));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -149,12 +167,27 @@ async function waitForRevision(view, revision) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     await act(async () => {
       if (fakeTimersEnabled) mock.timers.tick(0);
+      else await new Promise((resolve) => setTimeout(resolve, 0));
       await Promise.resolve();
       await Promise.resolve();
     });
     if (view.result.current.snapshot?.revision === revision) return;
   }
   assert.equal(view.result.current.snapshot?.revision, revision);
+}
+
+async function waitForCallCount(command, expected) {
+  const { act } = await import("@testing-library/react");
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await act(async () => {
+      if (fakeTimersEnabled) mock.timers.tick(0);
+      else await new Promise((resolve) => setTimeout(resolve, 0));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    if (opsCalls(command).length === expected) return;
+  }
+  assert.equal(opsCalls(command).length, expected);
 }
 
 function enableFakeTimeouts() {
@@ -172,14 +205,14 @@ function opsCalls(command) {
 }
 
 test("first valid snapshot becomes ready, then starts one watcher and one invalidation listener", async () => {
-  queue("ops_bridge_capabilities", capabilities);
-  queue("ops_bridge_snapshot", snapshot(1));
+  queue("ops_bridge_capabilities", capabilities, capabilities);
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
   queue("ops_bridge_start_watch", { started: true });
 
   const { client, view } = await mount({ channel: "all" });
-  await waitForState(view, "ready");
+  await waitForRevision(view, 2);
 
-  assert.equal(view.result.current.snapshot.revision, 1);
+  assert.equal(view.result.current.snapshot.revision, 2);
   assert.equal(opsCalls("ops_bridge_start_watch").length, 1);
   assert.equal(opsCalls("plugin:event|listen").length, 1);
   assert.deepEqual(opsCalls("ops_bridge_capabilities")[0].args, null);
@@ -191,21 +224,188 @@ test("first valid snapshot becomes ready, then starts one watcher and one invali
   client.clear();
 });
 
-test("an invalidation event refetches the active snapshot and full_reload invalidates the Ops prefix", async () => {
+test("watch setup installs the listener before native start and immediately refetches the active snapshot", async () => {
+  queue("ops_bridge_capabilities", capabilities, capabilities);
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
+  queue("ops_bridge_start_watch", { started: true });
+
+  const { client, view } = await mount({});
+  await waitForRevision(view, 2);
+
+  assert.deepEqual(
+    calls
+      .filter((call) =>
+        [
+          "ops_bridge_capabilities",
+          "ops_bridge_snapshot",
+          "plugin:event|listen",
+          "ops_bridge_start_watch",
+        ].includes(call.command),
+      )
+      .map((call) => call.command),
+    [
+      "ops_bridge_capabilities",
+      "ops_bridge_snapshot",
+      "plugin:event|listen",
+      "ops_bridge_start_watch",
+      "ops_bridge_capabilities",
+      "ops_bridge_snapshot",
+    ],
+  );
+  view.unmount();
+  client.clear();
+});
+
+test("a transient listener failure retries setup after snapshot recovery without starting native early", async () => {
+  enableFakeTimeouts();
   queue("ops_bridge_capabilities", capabilities, capabilities, capabilities);
   queue("ops_bridge_snapshot", snapshot(1), snapshot(2), snapshot(3));
+  queue("plugin:event|listen", new Error("listen unavailable"), 42);
+  queue("ops_bridge_start_watch", { started: true });
+
+  const { client, view } = await mount({});
+  await waitForState(view, "stale");
+  assert.equal(opsCalls("ops_bridge_start_watch").length, 0);
+  await tick(2_000);
+  await waitForRevision(view, 3);
+
+  assert.equal(opsCalls("plugin:event|listen").length, 2);
+  assert.equal(opsCalls("ops_bridge_start_watch").length, 1);
+  assert.equal(view.result.current.state, "ready");
+  view.unmount();
+  client.clear();
+});
+
+test("a transient native start failure cleans the listener and retries after snapshot recovery", async () => {
+  enableFakeTimeouts();
+  queue("ops_bridge_capabilities", capabilities, capabilities, capabilities);
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2), snapshot(3));
+  queue("ops_bridge_start_watch", new Error("ops_bridge_disconnected"), {
+    started: true,
+  });
+
+  const { client, view } = await mount({});
+  await waitForState(view, "stale");
+  assert.equal(opsCalls("plugin:event|unlisten").length, 1);
+  await tick(2_000);
+  await waitForRevision(view, 3);
+
+  assert.equal(opsCalls("plugin:event|listen").length, 2);
+  assert.equal(opsCalls("ops_bridge_start_watch").length, 2);
+  assert.equal(view.result.current.state, "ready");
+  view.unmount();
+  client.clear();
+});
+
+test("two hooks under StrictMode share one native start and one listener", async () => {
+  queue(
+    "ops_bridge_capabilities",
+    capabilities,
+    capabilities,
+    capabilities,
+    capabilities,
+  );
+  queue(
+    "ops_bridge_snapshot",
+    snapshot(1),
+    snapshot(1),
+    snapshot(1),
+    snapshot(1),
+  );
+  queue("ops_bridge_start_watch", { started: true });
+  const { renderHook } = await import("@testing-library/react");
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, gcTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  const view = renderHook(() => [useOpsSnapshot({}), useOpsSnapshot({})], {
+    wrapper: ({ children }) =>
+      React.createElement(
+        React.StrictMode,
+        null,
+        React.createElement(QueryClientProvider, { client }, children),
+      ),
+  });
+  const firstHook = {
+    result: {
+      get current() {
+        return view.result.current[0];
+      },
+    },
+  };
+  await waitForState(firstHook, "ready");
+  await waitForCallCount("ops_bridge_start_watch", 1);
+  await waitForCallCount("plugin:event|listen", 1);
+
+  assert.equal(opsCalls("ops_bridge_start_watch").length, 1);
+  assert.equal(opsCalls("plugin:event|listen").length, 1);
+  view.unmount();
+  await Promise.resolve();
+  assert.equal(opsCalls("plugin:event|unlisten").length, 1);
+  client.clear();
+});
+
+test("community reset tears down the singleton and the next mount installs it afresh", async () => {
+  queue(
+    "ops_bridge_capabilities",
+    capabilities,
+    capabilities,
+    capabilities,
+    capabilities,
+  );
+  queue(
+    "ops_bridge_snapshot",
+    snapshot(1),
+    snapshot(2),
+    snapshot(3),
+    snapshot(4),
+  );
+  queue("ops_bridge_start_watch", { started: true }, { started: true });
+  const { act } = await import("@testing-library/react");
+
+  const first = await mount({ channel: "project:a" });
+  await waitForRevision(first.view, 2);
+  await act(async () => resetOpsWatchManager());
+  assert.equal(opsCalls("plugin:event|unlisten").length, 1);
+  first.view.unmount();
+  first.client.clear();
+
+  const second = await mount({ channel: "project:b" });
+  await waitForRevision(second.view, 4);
+  assert.equal(opsCalls("plugin:event|listen").length, 2);
+  assert.equal(opsCalls("ops_bridge_start_watch").length, 2);
+  second.view.unmount();
+  second.client.clear();
+});
+
+test("an invalidation event refetches the active snapshot and full_reload invalidates the Ops prefix", async () => {
+  queue(
+    "ops_bridge_capabilities",
+    capabilities,
+    capabilities,
+    capabilities,
+    capabilities,
+  );
+  queue(
+    "ops_bridge_snapshot",
+    snapshot(1),
+    snapshot(2),
+    snapshot(3),
+    snapshot(4),
+  );
   queue("ops_bridge_start_watch", { started: true });
   const { act } = await import("@testing-library/react");
   const { client, view } = await mount({});
-  await waitForState(view, "ready");
+  await waitForRevision(view, 2);
   const eventCall = opsCalls("plugin:event|listen")[0];
   const handler = callbacks.get(eventCall.args.handler);
 
   await act(async () =>
     handler({ event: "buzz://ops-invalidated", id: 1, payload: {} }),
   );
-  await waitForRevision(view, 2);
-  assert.equal(view.result.current.snapshot.revision, 2);
+  await waitForRevision(view, 3);
+  assert.equal(view.result.current.snapshot.revision, 3);
 
   client.setQueryData(["ops", "other"], { revision: 1 });
   await act(async () =>
@@ -215,11 +415,70 @@ test("an invalidation event refetches the active snapshot and full_reload invali
       payload: { full_reload: true },
     }),
   );
-  await waitForRevision(view, 3);
-  assert.equal(view.result.current.snapshot.revision, 3);
+  await waitForRevision(view, 4);
+  assert.equal(view.result.current.snapshot.revision, 4);
   assert.equal(client.getQueryState(["ops", "other"]).isInvalidated, true);
   assert.equal(opsCalls("ops_bridge_start_watch").length, 1);
   assert.equal(opsCalls("plugin:event|listen").length, 1);
+
+  view.unmount();
+  client.clear();
+});
+
+test("a deferred selection B fetch never exposes selection A as ready or stale", async () => {
+  let rejectSelectionB;
+  const selectionB = new Promise((_, reject) => {
+    rejectSelectionB = reject;
+  });
+  queue("ops_bridge_capabilities", capabilities, capabilities, capabilities);
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2), selectionB);
+  queue("ops_bridge_start_watch", { started: true });
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mountSelectable({ channel: "project:a" });
+  await waitForRevision(view, 2);
+
+  await act(async () => view.rerender({ channel: "project:b" }));
+  await waitForCallCount("ops_bridge_snapshot", 3);
+  assert.equal(view.result.current.state, "loading");
+  assert.equal(view.result.current.snapshot, null);
+
+  await act(async () => rejectSelectionB(new Error("ops_bridge_disconnected")));
+  await waitForState(view, "disconnected");
+  assert.equal(view.result.current.snapshot, null);
+
+  view.unmount();
+  client.clear();
+});
+
+test("a terminal probe failure from selection A does not classify deferred selection B", async () => {
+  enableFakeTimeouts();
+  let rejectSelectionB;
+  const selectionB = new Promise((_, reject) => {
+    rejectSelectionB = reject;
+  });
+  queue(
+    "ops_bridge_capabilities",
+    capabilities,
+    capabilities,
+    "ops_bridge_token_permissions",
+    capabilities,
+  );
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2), selectionB);
+  queue("ops_bridge_start_watch", { started: true });
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mountSelectable({ channel: "project:a" });
+  await waitForRevision(view, 2);
+  await tick(10_000);
+  await waitForState(view, "not_configured");
+
+  await act(async () => view.rerender({ channel: "project:b" }));
+  await waitForCallCount("ops_bridge_snapshot", 3);
+  assert.equal(view.result.current.state, "loading");
+  assert.equal(view.result.current.snapshot, null);
+
+  await act(async () => rejectSelectionB(new Error("ops_bridge_disconnected")));
+  await waitForState(view, "disconnected");
+  assert.equal(view.result.current.snapshot, null);
 
   view.unmount();
   client.clear();
@@ -246,8 +505,9 @@ test("a disconnected first fetch retries capabilities and snapshot after exactly
     "ops_bridge_capabilities",
     new Error("ops_bridge_disconnected"),
     capabilities,
+    capabilities,
   );
-  queue("ops_bridge_snapshot", snapshot(1));
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
   queue("ops_bridge_start_watch", { started: true });
 
   const { client, view } = await mount({});
@@ -258,8 +518,9 @@ test("a disconnected first fetch retries capabilities and snapshot after exactly
   assert.equal(opsCalls("ops_bridge_capabilities").length, 2);
   await waitForState(view, "ready");
 
-  assert.equal(opsCalls("ops_bridge_capabilities").length, 2);
-  assert.equal(opsCalls("ops_bridge_snapshot").length, 1);
+  await waitForRevision(view, 2);
+  assert.equal(opsCalls("ops_bridge_capabilities").length, 3);
+  assert.equal(opsCalls("ops_bridge_snapshot").length, 2);
   view.unmount();
   client.clear();
 });
@@ -269,29 +530,30 @@ test("the ten-second health probe moves ready to stale and the two-second recove
   queue(
     "ops_bridge_capabilities",
     capabilities,
+    capabilities,
     new Error("ops_bridge_disconnected"),
     capabilities,
   );
-  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2), snapshot(3));
   queue("ops_bridge_start_watch", { started: true });
 
   const { client, view } = await mount({});
-  await waitForState(view, "ready");
+  await waitForRevision(view, 2);
   await tick(9_999);
   assert.equal(view.result.current.state, "ready");
-  assert.equal(opsCalls("ops_bridge_capabilities").length, 1);
+  assert.equal(opsCalls("ops_bridge_capabilities").length, 2);
 
   await tick(1);
-  assert.equal(opsCalls("ops_bridge_capabilities").length, 2);
+  assert.equal(opsCalls("ops_bridge_capabilities").length, 3);
   await waitForState(view, "stale");
-  assert.equal(view.result.current.snapshot.revision, 1);
-  assert.equal(opsCalls("ops_bridge_snapshot").length, 1);
+  assert.equal(view.result.current.snapshot.revision, 2);
+  assert.equal(opsCalls("ops_bridge_snapshot").length, 2);
 
   await tick(1_999);
   assert.equal(view.result.current.state, "stale");
   await tick(1);
   await waitForState(view, "ready");
-  assert.equal(view.result.current.snapshot.revision, 2);
+  assert.equal(view.result.current.snapshot.revision, 3);
 
   view.unmount();
   client.clear();
@@ -302,50 +564,51 @@ test("a terminal setup error during stale recovery stops the two-second poll", a
   queue(
     "ops_bridge_capabilities",
     capabilities,
+    capabilities,
     new Error("ops_bridge_disconnected"),
     "ops_bridge_token_permissions",
   );
-  queue("ops_bridge_snapshot", snapshot(1));
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
   queue("ops_bridge_start_watch", { started: true });
 
   const { client, view } = await mount({});
-  await waitForState(view, "ready");
+  await waitForRevision(view, 2);
   await tick(10_000);
   await waitForState(view, "stale");
   await tick(2_000);
   await waitForState(view, "not_configured");
   await tick(10_000);
 
-  assert.equal(opsCalls("ops_bridge_capabilities").length, 3);
-  assert.equal(view.result.current.snapshot.revision, 1);
+  assert.equal(opsCalls("ops_bridge_capabilities").length, 4);
+  assert.equal(view.result.current.snapshot.revision, 2);
   view.unmount();
   client.clear();
 });
 
 test("blur pauses timers, focus refetches once, and unmount removes the listener and timers", async () => {
   enableFakeTimeouts();
-  queue("ops_bridge_capabilities", capabilities, capabilities);
-  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
+  queue("ops_bridge_capabilities", capabilities, capabilities, capabilities);
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2), snapshot(3));
   queue("ops_bridge_start_watch", { started: true });
   const { act } = await import("@testing-library/react");
   const { client, view } = await mount({});
-  await waitForState(view, "ready");
+  await waitForRevision(view, 2);
 
   focused = false;
   await act(async () => window.dispatchEvent(new window.Event("blur")));
   await tick(30_000);
-  assert.equal(opsCalls("ops_bridge_capabilities").length, 1);
+  assert.equal(opsCalls("ops_bridge_capabilities").length, 2);
 
   focused = true;
   await act(async () => window.dispatchEvent(new window.Event("focus")));
   await waitForState(view, "ready");
-  assert.equal(view.result.current.snapshot.revision, 2);
-  assert.equal(opsCalls("ops_bridge_capabilities").length, 2);
+  assert.equal(view.result.current.snapshot.revision, 3);
+  assert.equal(opsCalls("ops_bridge_capabilities").length, 3);
 
   view.unmount();
   await Promise.resolve();
   assert.equal(opsCalls("plugin:event|unlisten").length, 1);
   await tick(30_000);
-  assert.equal(opsCalls("ops_bridge_capabilities").length, 2);
+  assert.equal(opsCalls("ops_bridge_capabilities").length, 3);
   client.clear();
 });

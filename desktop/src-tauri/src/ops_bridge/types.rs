@@ -48,6 +48,18 @@ pub enum OpsTransitionAction {
     Reject,
 }
 
+/// Versioned optional module advertised by the Ops hub.
+///
+/// The module name remains a public contract string so a version-one hub can
+/// advertise a future optional module without making the native bridge reject
+/// the entire response. The renderer validates modules it understands.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpsModuleCapability {
+    pub name: String,
+    pub schema_version: u64,
+    pub paged: bool,
+}
+
 /// Strict version 1 capability response returned to the webview.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpsBridgeCapabilities {
@@ -55,6 +67,8 @@ pub struct OpsBridgeCapabilities {
     pub reads: Vec<OpsReadCapability>,
     pub drafts: Vec<OpsDraftCapability>,
     pub transitions: Vec<OpsTransitionAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modules: Option<Vec<OpsModuleCapability>>,
 }
 
 impl VersionedResponse for OpsBridgeCapabilities {
@@ -123,6 +137,20 @@ pub struct OpsBridgeSnapshot {
     pub session_tree: Vec<OpsSessionNode>,
     pub checklist: Vec<serde_json::Value>,
     pub decisions: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_routing: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repositories: Option<Vec<serde_json::Value>>,
 }
 
 impl VersionedResponse for OpsBridgeSnapshot {

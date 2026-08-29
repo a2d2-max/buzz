@@ -225,7 +225,12 @@ async fn ops_bridge_client_accepts_a_bounded_version_one_json_response() {
         "contract_version": OPS_CONTRACT_VERSION,
         "reads": ["snapshot", "events", "artifact"],
         "drafts": [],
-        "transitions": []
+        "transitions": [],
+        "modules": [
+            {"name": "timeline", "schema_version": 1, "paged": false},
+            {"name": "future_module", "schema_version": 2, "paged": true}
+        ],
+        "private_extension": {"must_not_cross": true}
     }))
     .expect("serialize fake capabilities");
     let (port, requests, server) = spawn_fake_server(vec![http_response(
@@ -245,6 +250,10 @@ async fn ops_bridge_client_accepts_a_bounded_version_one_json_response() {
     assert_eq!(capabilities.reads.len(), 3);
     assert!(capabilities.drafts.is_empty());
     assert!(capabilities.transitions.is_empty());
+    let renderer_value = serde_json::to_value(&capabilities).expect("serialize capabilities");
+    assert_eq!(renderer_value["modules"][0]["name"], "timeline");
+    assert_eq!(renderer_value["modules"][1]["name"], "future_module");
+    assert!(renderer_value.get("private_extension").is_none());
     server.await.expect("fake server exits");
 
     let requests = requests.lock().expect("read fake requests");
@@ -274,7 +283,15 @@ async fn ops_bridge_snapshot_constructs_only_the_typed_query_fields() {
             "child_ids": []
         }],
         "checklist": [],
-        "decisions": []
+        "decisions": [],
+        "timeline": [{"id": "event:one", "body": "renderer validates me"}],
+        "approvals": [],
+        "artifacts": [],
+        "connections": [],
+        "workflow_routing": {"default_provider": "codex"},
+        "research": [{"id": "research:one", "title": "Local evidence"}],
+        "repositories": [{"id": "repo:one", "status": "clean"}],
+        "private_extension": {"must_not_cross": true}
     }))
     .expect("serialize fake snapshot");
     let (port, requests, server) = spawn_fake_server(vec![http_response(
@@ -302,6 +319,14 @@ async fn ops_bridge_snapshot_constructs_only_the_typed_query_fields() {
         snapshot.session_tree[0].source,
         OpsSessionSource::ClaudeCode
     ));
+    let renderer_value = serde_json::to_value(&snapshot).expect("serialize snapshot");
+    assert_eq!(renderer_value["timeline"][0]["id"], "event:one");
+    assert_eq!(
+        renderer_value["workflow_routing"]["default_provider"],
+        "codex"
+    );
+    assert_eq!(renderer_value["repositories"][0]["id"], "repo:one");
+    assert!(renderer_value.get("private_extension").is_none());
     server.await.expect("snapshot fake server exits");
 
     let requests = requests.lock().expect("read snapshot request");
