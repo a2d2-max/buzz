@@ -70,6 +70,110 @@ test("lost boot opens onboarding gate directly on the key-import page", async ({
   });
 });
 
+test("local Ops guest entry is offered only for a lost identity", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  const localOpsButton = page.getByRole("button", {
+    name: "Continue in local Ops mode",
+  });
+  await expect(localOpsButton).toBeVisible();
+  await localOpsButton.focus();
+  await expect(localOpsButton).toBeFocused();
+
+  await page.evaluate(() => {
+    window.localStorage.removeItem("buzz-local-ops-guest.v1");
+  });
+  await installMockBridge(
+    page,
+    { identityLost: false },
+    { skipCommunitySeed: true, skipOnboardingSeed: true },
+  );
+  await page.reload();
+
+  await expect(
+    page.getByRole("button", { name: "Continue in local Ops mode" }),
+  ).toHaveCount(0);
+});
+
+test("local Ops guest mode persists without mutating identity recovery", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page
+    .getByRole("button", { name: "Continue in local Ops mode" })
+    .click();
+
+  await expect(page).toHaveURL(/#\/ops$/);
+  await expect(page.getByRole("heading", { name: "Ops Room" })).toBeVisible();
+  await expect(page.getByText("Local Ops mode", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(
+      "Messaging, signed actions, and external actions are unavailable until you restore your identity.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Restore identity" }),
+  ).toBeVisible();
+
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem("buzz-local-ops-guest.v1"),
+    ),
+  ).toBe("true");
+  const recoveryIdentity = await page.evaluate(() =>
+    window.__TAURI_INTERNALS__?.invoke?.("get_identity"),
+  );
+  expect(recoveryIdentity).toMatchObject({ lost: true });
+
+  const mutationCommands = await page.evaluate(() => {
+    const blockedCommands = new Set([
+      "persist_current_identity",
+      "import_identity",
+      "sign_nostr_identity_binding",
+      "publish_project_owner_announcement",
+      "publish_project_pull_request_merged_status",
+      "update_persona_and_publish",
+      "send_channel_message",
+      "send_managed_agent_channel_message",
+      "start_identity_recovery_pairing",
+      "complete_identity_recovery_pairing",
+    ]);
+    return (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+      .map(({ command }) => command)
+      .filter((command) => blockedCommands.has(command));
+  });
+  expect(mutationCommands).toEqual([]);
+
+  await page.reload();
+  await expect(page).toHaveURL(/#\/ops$/);
+  await expect(page.getByRole("heading", { name: "Ops Room" })).toBeVisible();
+  await expect(page.getByText("Local Ops mode", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Restore identity" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Enter your private key" }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem("buzz-local-ops-guest.v1"),
+    ),
+  ).toBeNull();
+});
+
 test("lost boot keeps the pairing-code action stable while generating", async ({
   page,
 }) => {
