@@ -243,6 +243,21 @@ describe("native Ops bridge contract", () => {
       "/mnt/private/project",
       "/srv/private/project",
       "/usr/local/bin/private-tool",
+      "/Library/Application Support/private",
+      "/Applications/Buzz.app/private",
+      "/System/Library/private",
+      "/bin/private",
+      "/sbin",
+      "/lib/private",
+      "/lib64/private",
+      "/proc/self/environ",
+      "/run/secrets/token",
+      "/dev",
+      "/sys/private",
+      "/boot/private",
+      "/media/private",
+      "/nix/store/private",
+      "/snap/private",
     ]) {
       const snapshot = validSnapshot();
       snapshot.room.threads[0].title = path;
