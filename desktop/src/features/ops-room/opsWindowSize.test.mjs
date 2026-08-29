@@ -141,15 +141,19 @@ describe("native Ops window sizing", () => {
       React.createElement(React.StrictMode, null, React.createElement(Harness)),
     );
     await act(async () => Promise.resolve());
-    assert.deepEqual(finalMinimum, { width: 360, height: 500 });
-    assert.deepEqual(finalSize, { width: 390, height: 844 });
+    assert.equal(finalMinimum, null);
+    assert.equal(finalSize, null);
 
     await act(async () => {
       resolveFirstMinimum();
-      await Promise.resolve();
+      for (let index = 0; index < 4; index += 1) await Promise.resolve();
     });
     assert.deepEqual(finalMinimum, { width: 360, height: 500 });
     assert.deepEqual(finalSize, { width: 390, height: 844 });
+    assert.equal(
+      calls.some(([kind, size]) => kind === "min" && size.width === 800),
+      false,
+    );
 
     view.unmount();
     await act(async () => Promise.resolve());
@@ -195,7 +199,7 @@ describe("native Ops window sizing", () => {
       React.createElement(React.StrictMode, null, React.createElement(Harness)),
     );
     await act(async () => Promise.resolve());
-    assert.equal(pendingMinimums.length, 2);
+    assert.equal(pendingMinimums.length, 1);
 
     view.unmount();
     await act(async () => Promise.resolve());
@@ -206,20 +210,66 @@ describe("native Ops window sizing", () => {
 
     await act(async () => {
       pendingMinimums[0]();
-      await Promise.resolve();
-    });
-    assert.equal(
-      calls.some(([kind, size]) => kind === "min" && size.width === 800),
-      false,
-    );
-
-    await act(async () => {
-      pendingMinimums[1]();
-      await Promise.resolve();
-      await Promise.resolve();
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
     });
     assert.deepEqual(calls.at(-2), ["min", { width: 800, height: 500 }]);
     assert.deepEqual(calls.at(-1), ["size", { width: 800, height: 500 }]);
+    cleanup();
+    dom.window.close();
+  });
+
+  test("final restore wins when the stale first StrictMode setup resolves last", async () => {
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+      url: "http://localhost/#/ops?view=room",
+    });
+    Object.defineProperties(globalThis, {
+      document: { configurable: true, value: dom.window.document },
+      HTMLElement: { configurable: true, value: dom.window.HTMLElement },
+      navigator: { configurable: true, value: dom.window.navigator },
+      Node: { configurable: true, value: dom.window.Node },
+      window: { configurable: true, value: dom.window },
+    });
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    const { act, cleanup, render } = await import("@testing-library/react");
+    let resolveStaleMinimum;
+    let minimumCalls = 0;
+    let finalMinimum = null;
+    let finalSize = null;
+    const nativeWindow = {
+      async setMinSize(size) {
+        const record = sizeRecord(size);
+        minimumCalls += 1;
+        if (minimumCalls === 1) {
+          await new Promise((resolve) => {
+            resolveStaleMinimum = resolve;
+          });
+        }
+        finalMinimum = record;
+      },
+      async setSize(size) {
+        finalSize = sizeRecord(size);
+      },
+    };
+
+    function Harness() {
+      useOpsWindowSize(nativeWindow, { width: 390, height: 844 });
+      return null;
+    }
+
+    const view = render(
+      React.createElement(React.StrictMode, null, React.createElement(Harness)),
+    );
+    await act(async () => Promise.resolve());
+    view.unmount();
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      resolveStaleMinimum();
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    });
+
+    assert.deepEqual(finalMinimum, { width: 800, height: 500 });
+    assert.deepEqual(finalSize, { width: 800, height: 500 });
     cleanup();
     dom.window.close();
   });

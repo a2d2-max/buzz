@@ -22,6 +22,10 @@ interface OpsEvidenceEnvironment {
   VITE_OPS_EVIDENCE_HEIGHT?: string;
 }
 
+interface OpsWindowOperationQueue {
+  tail: Promise<void> | null;
+}
+
 export function opsLayoutForWidth(width: number): OpsResponsiveLayout {
   if (width >= 1024) return "desktop";
   if (width >= 640) return "compact";
@@ -55,6 +59,7 @@ async function applyOpsWindowConfiguration(
   evidenceSize: OpsEvidenceSize | null,
   isCurrent: () => boolean,
 ): Promise<void> {
+  if (!isCurrent()) return;
   await nativeWindow
     .setMinSize(new LogicalSize(OPS_MINIMUM.width, OPS_MINIMUM.height))
     .catch(() => undefined);
@@ -62,6 +67,21 @@ async function applyOpsWindowConfiguration(
   await nativeWindow
     .setSize(new LogicalSize(evidenceSize.width, evidenceSize.height))
     .catch(() => undefined);
+}
+
+function enqueueOpsWindowOperation(
+  queue: OpsWindowOperationQueue,
+  operation: () => Promise<void>,
+): Promise<void> {
+  const queued = queue.tail
+    ? queue.tail.then(operation, operation)
+    : operation();
+  const settled = queued.catch(() => undefined);
+  queue.tail = settled;
+  void settled.finally(() => {
+    if (queue.tail === settled) queue.tail = null;
+  });
+  return settled;
 }
 
 async function restoreOpsWindow(nativeWindow: OpsWindowHandle): Promise<void> {
@@ -86,6 +106,9 @@ export function useOpsWindowSize(
   evidenceSizeOverride?: OpsEvidenceSize | null,
 ): void {
   const operationGenerationRef = React.useRef(0);
+  const operationQueueRef = React.useRef<OpsWindowOperationQueue>({
+    tail: null,
+  });
   const hasEvidenceSizeOverride = evidenceSizeOverride !== undefined;
   const evidenceWidth = evidenceSizeOverride?.width;
   const evidenceHeight = evidenceSizeOverride?.height;
@@ -99,18 +122,22 @@ export function useOpsWindowSize(
       : configuredEvidenceSize();
     const setupGeneration = ++operationGenerationRef.current;
 
-    const setup = applyOpsWindowConfiguration(
-      nativeWindow,
-      evidenceSize,
-      () => operationGenerationRef.current === setupGeneration,
+    void enqueueOpsWindowOperation(operationQueueRef.current, () =>
+      applyOpsWindowConfiguration(
+        nativeWindow,
+        evidenceSize,
+        () => operationGenerationRef.current === setupGeneration,
+      ),
     );
 
     return () => {
       const cleanupGeneration = ++operationGenerationRef.current;
       queueMicrotask(() => {
         if (operationGenerationRef.current !== cleanupGeneration) return;
-        void setup.then(() => {
-          if (operationGenerationRef.current !== cleanupGeneration) return;
+        void enqueueOpsWindowOperation(operationQueueRef.current, () => {
+          if (operationGenerationRef.current !== cleanupGeneration) {
+            return Promise.resolve();
+          }
           return restoreOpsWindow(nativeWindow);
         });
       });
