@@ -438,7 +438,7 @@ test("the strict Ops page mock stays configurable while UI consumption is disabl
   }, request);
   expect(invalid).toBe("ops_bridge_invalid_request");
 
-  const privateKeyErrors = await page.evaluate(async (pageRequest) => {
+  const privatePathErrors = await page.evaluate(async (pageRequest) => {
     const config = window.__BUZZ_E2E__;
     const timeline = config?.mock?.opsPages?.timeline;
     const item = timeline?.items[0];
@@ -446,31 +446,37 @@ test("the strict Ops page mock stays configurable while UI consumption is disabl
     const invoke = window.__TAURI_INTERNALS__?.invoke;
     if (!invoke) throw new Error("Tauri E2E invoke bridge unavailable");
     const errors: string[] = [];
+    const invokeWithDetails = async (details: Record<string, unknown>) => {
+      item.details = details;
+      try {
+        await invoke("ops_bridge_page", { request: pageRequest });
+        return "accepted";
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    };
     for (const privatePath of [
       "/Users/alice/private/token",
       "C:\\Users\\alice\\private\\token",
       "\\\\server\\share\\private\\token",
       "file:///Users/alice/private/token",
+      "FILE:///Users/alice/private/token",
+      "FiLe:///Users/alice/private/token",
     ]) {
-      item.details = { nested: { [privatePath]: true } };
-      try {
-        await invoke("ops_bridge_page", { request: pageRequest });
-        errors.push("accepted");
-      } catch (error) {
-        errors.push(error instanceof Error ? error.message : String(error));
-      }
+      errors.push(
+        await invokeWithDetails({ nested: { [privatePath]: true } }),
+        await invokeWithDetails({ nested: { value: privatePath } }),
+      );
     }
     item.details = {
       nested: { "/api/v1": true, "C:relative": true, "file:note": true },
     };
     return errors;
   }, request);
-  expect(privateKeyErrors).toEqual([
-    "ops_bridge_contract_mismatch",
-    "ops_bridge_contract_mismatch",
-    "ops_bridge_contract_mismatch",
-    "ops_bridge_contract_mismatch",
-  ]);
+  expect(privatePathErrors).toHaveLength(12);
+  expect(new Set(privatePathErrors)).toEqual(
+    new Set(["ops_bridge_contract_mismatch"]),
+  );
 
   const typedCursorError = await page.evaluate(async (pageRequest) => {
     const config = window.__BUZZ_E2E__;

@@ -13,7 +13,7 @@ export const OPS_MODULE_NAMES = [
 export type OpsModuleName = (typeof OPS_MODULE_NAMES)[number];
 
 const ABSOLUTE_PATH =
-  /^(?:file:\/\/|[A-Za-z]:[\\/]|\\\\|\/(?:Users|Volumes|Library|Applications|System|home|root|private|tmp|var|etc|opt|workspace|mnt|srv|usr|bin|sbin|lib|lib64|proc|run|dev|sys|boot|media|nix|snap)(?:\/|$))/;
+  /^(?:file:\/\/|[A-Za-z]:[\\/]|\\\\|\/(?:Users|Volumes|Library|Applications|System|home|root|private|tmp|var|etc|opt|workspace|mnt|srv|usr|bin|sbin|lib|lib64|proc|run|dev|sys|boot|media|nix|snap)(?:\/|$))/i;
 
 export function looksLikeAbsolutePath(value: string): boolean {
   return ABSOLUTE_PATH.test(value);

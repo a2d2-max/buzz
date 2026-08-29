@@ -569,11 +569,18 @@ describe("native Ops bridge contract", () => {
       "C:\\Users\\alice\\private\\token",
       "\\\\server\\share\\private\\token",
       "file:///Users/alice/private/token",
+      "FILE:///Users/alice/private/token",
+      "FiLe:///Users/alice/private/token",
     ]) {
-      responses.push(timelinePage({ nested: { [privatePath]: true } }));
-      await assert.rejects(bridge.getOpsPage(request, 11), {
-        name: "OpsBridgeContractError",
-      });
+      for (const details of [
+        { nested: { [privatePath]: true } },
+        { nested: { value: privatePath } },
+      ]) {
+        responses.push(timelinePage(details));
+        await assert.rejects(bridge.getOpsPage(request, 11), {
+          name: "OpsBridgeContractError",
+        });
+      }
     }
 
     const safeDetails = {
