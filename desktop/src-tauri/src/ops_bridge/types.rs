@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use super::client::OpsBridgeError;
 
@@ -131,6 +131,12 @@ pub struct OpsSessionNode {
 pub struct OpsBridgeSnapshot {
     pub contract_version: u8,
     pub revision: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_event_sequence",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub event_sequence: Option<String>,
     pub generated_at: String,
     pub health: OpsHealth,
     pub room: serde_json::Value,
@@ -344,6 +350,52 @@ impl VersionedResponse for OpsTransitionReceipt {
 #[derive(Debug, Clone, Serialize)]
 pub struct OpsWatchStartResult {
     pub started: bool,
+    pub connection_generation: u64,
+    pub sync_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_sequence: Option<String>,
+}
+
+/// Generation-bound acknowledgement sent only after a canonical refetch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsSyncAckRequest {
+    pub generation: u64,
+    #[serde(deserialize_with = "deserialize_event_sequence")]
+    pub applied_sequence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpsSyncAckResult {
+    pub accepted: bool,
+    pub connection_generation: u64,
+}
+
+pub(crate) fn parse_event_sequence(value: &str) -> Result<u64, ()> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(());
+    }
+    value.parse::<u64>().map_err(|_| ())
+}
+
+fn deserialize_event_sequence<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_event_sequence(&value)
+        .map(|_| value)
+        .map_err(|_| D::Error::custom("invalid decimal event sequence"))
+}
+
+fn deserialize_optional_event_sequence<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_event_sequence(deserializer).map(Some)
 }
 
 fn valid_value(value: &str, max_bytes: usize) -> Result<(), ()> {

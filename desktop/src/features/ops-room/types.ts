@@ -25,6 +25,7 @@ const publicString = z
 const requiredPublicString = publicString.min(1);
 const nullablePublicString = publicString.nullable();
 const nonNegativeInteger = z.number().int().nonnegative();
+export const opsEventSequenceSchema = z.string().regex(/^(?:0|[1-9][0-9]*)$/u);
 const publicDetails = z.record(z.string(), z.unknown()).default({});
 
 const draftCapabilitySchema = z.enum([
@@ -420,6 +421,7 @@ export interface OpsBridgeSnapshotV1 {
   session_tree: OpsSessionNodeV1[];
   checklist: Array<z.infer<typeof opsChecklistItemSchema>>;
   decisions: Array<z.infer<typeof opsDecisionSchema>>;
+  event_sequence?: string;
   module_states: OpsModuleStates;
 }
 
@@ -433,6 +435,7 @@ export const opsSnapshotEnvelopeSchema = z
     session_tree: z.array(opsSessionNodeSchema),
     checklist: z.array(opsChecklistItemSchema),
     decisions: z.array(opsDecisionSchema),
+    event_sequence: opsEventSequenceSchema.optional(),
   })
   .passthrough();
 

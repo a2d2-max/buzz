@@ -3,6 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 import { startOpsWatch } from "./opsBridge";
 
 export interface OpsInvalidationPayload {
+  connection_generation?: number;
+  sync_required?: boolean;
+  anchor_sequence?: string;
+  reason?: string;
   full_reload?: boolean;
   setup_refresh?: boolean;
 }
@@ -15,10 +19,20 @@ let setupPromise: Promise<void> | null = null;
 let stopListener: (() => void) | null = null;
 let generation = 0;
 let teardownTicket = 0;
-let nativeWatchStarted = false;
+let pendingSyncGeneration: number | null = null;
 
 function broadcast(payload: OpsInvalidationPayload): void {
+  if (
+    payload.sync_required === true &&
+    Number.isSafeInteger(payload.connection_generation)
+  ) {
+    pendingSyncGeneration = payload.connection_generation ?? null;
+  }
   for (const subscriber of subscribers) subscriber(payload);
+}
+
+export function completeOpsSync(generation: number): void {
+  if (pendingSyncGeneration === generation) pendingSyncGeneration = null;
 }
 
 async function setup(expectedGeneration: number): Promise<void> {
@@ -32,9 +46,21 @@ async function setup(expectedGeneration: number): Promise<void> {
   }
 
   try {
-    if (!nativeWatchStarted) {
-      await startOpsWatch();
-      nativeWatchStarted = true;
+    const status = await startOpsWatch();
+    if (
+      status.sync_required === true &&
+      status.connection_generation !== undefined &&
+      pendingSyncGeneration !== status.connection_generation
+    ) {
+      broadcast({
+        connection_generation: status.connection_generation,
+        sync_required: true,
+        anchor_sequence: status.anchor_sequence,
+        reason: "resume",
+        full_reload: true,
+      });
+    } else if (status.sync_required !== true) {
+      broadcast({ setup_refresh: true });
     }
   } catch (error) {
     void stop();
@@ -46,7 +72,6 @@ async function setup(expectedGeneration: number): Promise<void> {
     return;
   }
   stopListener = () => void stop();
-  broadcast({ setup_refresh: true });
 }
 
 export async function ensureOpsWatchManager(): Promise<void> {
@@ -93,5 +118,5 @@ export function resetOpsWatchManager(): void {
   stopListener?.();
   stopListener = null;
   setupPromise = null;
-  nativeWatchStarted = false;
+  pendingSyncGeneration = null;
 }

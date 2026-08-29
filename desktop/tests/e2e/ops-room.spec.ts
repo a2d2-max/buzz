@@ -22,6 +22,7 @@ const OPS_CAPABILITIES_FIXTURE = {
 const OPS_SNAPSHOT_FIXTURE = {
   contract_version: 1,
   revision: 19,
+  event_sequence: "19",
   generated_at: "2026-08-30T00:00:00.000Z",
   health: { hub: "ready", orca: "observed", codex: "ready" },
   room: {

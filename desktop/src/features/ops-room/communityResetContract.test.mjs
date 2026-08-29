@@ -6,6 +6,10 @@ const communityInitSource = await readFile(
   new URL("../communities/useCommunityInit.ts", import.meta.url),
   "utf8",
 );
+const watchManagerSource = await readFile(
+  new URL("./opsWatchManager.ts", import.meta.url),
+  "utf8",
+);
 
 test("the canonical community reset inventory tears down the Ops watcher singleton", () => {
   assert.match(
@@ -17,4 +21,11 @@ test("the canonical community reset inventory tears down the Ops watcher singlet
     communityInitSource.indexOf("type CommunityInitResult"),
   );
   assert.match(resetInventory, /resetOpsWatchManager\(\);/);
+});
+
+test("the Ops community reset clears pending generation-bound synchronization state", () => {
+  const reset = watchManagerSource.slice(
+    watchManagerSource.indexOf("export function resetOpsWatchManager"),
+  );
+  assert.match(reset, /pendingSyncGeneration\s*=\s*null/);
 });

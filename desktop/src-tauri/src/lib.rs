@@ -527,6 +527,7 @@ pub fn run() {
             ops_bridge::ops_bridge_create_draft,
             ops_bridge::ops_bridge_transition,
             ops_bridge::ops_bridge_start_watch,
+            ops_bridge::ops_bridge_ack_sync,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,

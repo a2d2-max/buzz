@@ -7,6 +7,7 @@ import {
   type OpsConnectionState,
   type OpsSelection,
   opsCapabilitiesSchema,
+  opsEventSequenceSchema,
   opsSnapshotEnvelopeSchema,
   looksLikeAbsolutePath,
   parseOpsModuleStates,
@@ -21,7 +22,20 @@ const selectionSchema = z
   })
   .strict();
 
-const watchStartSchema = z.object({ started: z.boolean() }).strip();
+const watchStartSchema = z
+  .object({
+    started: z.boolean(),
+    connection_generation: z.number().int().nonnegative().optional(),
+    sync_required: z.boolean().optional(),
+    anchor_sequence: opsEventSequenceSchema.optional(),
+  })
+  .strip();
+const syncAckSchema = z
+  .object({
+    accepted: z.boolean(),
+    connection_generation: z.number().int().nonnegative(),
+  })
+  .strip();
 
 const NOT_CONFIGURED_CODES = new Set([
   "ops_bridge_invalid_config",
@@ -117,6 +131,9 @@ function parseSnapshot(
       session_tree: parsed.data.session_tree,
       checklist: parsed.data.checklist,
       decisions: parsed.data.decisions,
+      ...(parsed.data.event_sequence === undefined
+        ? {}
+        : { event_sequence: parsed.data.event_sequence }),
       module_states: parseOpsModuleStates(
         value as Record<string, unknown>,
         capabilities,
@@ -176,9 +193,29 @@ export async function loadOpsSnapshot(
   return getOpsSnapshot(selection, capabilities);
 }
 
-export async function startOpsWatch(): Promise<{ started: boolean }> {
+export async function startOpsWatch(): Promise<
+  z.infer<typeof watchStartSchema>
+> {
   const value = await invoke<unknown>("ops_bridge_start_watch", null as never);
   const parsed = watchStartSchema.safeParse(value);
+  if (!parsed.success) throw new OpsBridgeContractError();
+  return parsed.data;
+}
+
+export async function acknowledgeOpsSync(
+  generation: number,
+  appliedSequence: string,
+): Promise<{ accepted: boolean; connection_generation: number }> {
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new OpsBridgeContractError();
+  }
+  if (!opsEventSequenceSchema.safeParse(appliedSequence).success) {
+    throw new OpsBridgeContractError();
+  }
+  const value = await invoke<unknown>("ops_bridge_ack_sync", {
+    request: { generation, applied_sequence: appliedSequence },
+  });
+  const parsed = syncAckSchema.safeParse(value);
   if (!parsed.success) throw new OpsBridgeContractError();
   return parsed.data;
 }

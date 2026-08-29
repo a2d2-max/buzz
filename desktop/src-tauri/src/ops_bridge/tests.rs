@@ -17,10 +17,10 @@ use super::{
     client::{read_hub_token, validate_hub_endpoint, OpsBridgeClient, OpsBridgeConfig},
     ops_bridge_create_draft, ops_bridge_transition,
     types::{
-        OpsDraftRequest, OpsSelection, OpsSessionSource, OpsTransitionAction, OpsTransitionOrigin,
-        OpsTransitionRequest, OPS_CONTRACT_VERSION,
+        OpsBridgeSnapshot, OpsDraftRequest, OpsSelection, OpsSessionSource, OpsSyncAckRequest,
+        OpsTransitionAction, OpsTransitionOrigin, OpsTransitionRequest, OPS_CONTRACT_VERSION,
     },
-    watch::{OpsBridgeWatcher, ReconnectBackoff},
+    watch::{OpsBridgeWatcher, ReconnectBackoff, WatchSyncState},
     OpsBridgeState,
 };
 use crate::app_state::{build_app_state, AppState};
@@ -268,6 +268,7 @@ async fn ops_bridge_snapshot_constructs_only_the_typed_query_fields() {
     let body = serde_json::to_vec(&json!({
         "contract_version": 1,
         "revision": 7,
+        "event_sequence": "12",
         "generated_at": "2026-08-28T00:00:00.000Z",
         "health": {"hub": "ready", "orca": "ready", "codex": "ready"},
         "room": {},
@@ -315,6 +316,7 @@ async fn ops_bridge_snapshot_constructs_only_the_typed_query_fields() {
         .await
         .expect("typed fake snapshot");
     assert_eq!(snapshot.revision, 7);
+    assert_eq!(snapshot.event_sequence.as_deref(), Some("12"));
     assert!(matches!(
         snapshot.session_tree[0].source,
         OpsSessionSource::ClaudeCode
@@ -682,6 +684,158 @@ fn ops_bridge_backoff_is_bounded_at_five_seconds() {
     assert_eq!(backoff.next_delay(), Duration::from_secs(5));
 }
 
+#[test]
+fn ops_bridge_sync_suspends_initial_and_reconnect_events_until_matching_ack() {
+    let mut sync = WatchSyncState::default();
+    let initial = sync.begin_connection();
+    assert_eq!(initial.connection_generation, 1);
+    assert!(initial.sync_required);
+    assert_eq!(initial.reason.as_deref(), Some("initial"));
+    assert!(sync.observe("1", "health").expect("queue event").is_empty());
+
+    let (ack, drained) = sync.ack(1, "0").expect("ack initial sync");
+    assert!(ack.accepted);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].event_id.as_deref(), Some("1"));
+    assert_eq!(sync.last_event_id().as_deref(), Some("1"));
+
+    let reconnect = sync.begin_connection();
+    assert_eq!(reconnect.connection_generation, 2);
+    assert_eq!(reconnect.reason.as_deref(), Some("reconnect"));
+    assert!(sync
+        .observe("2", "approval")
+        .expect("queue event")
+        .is_empty());
+    let (stale, stale_events) = sync.ack(1, "2").expect("reject stale ack safely");
+    assert!(!stale.accepted);
+    assert!(stale_events.is_empty());
+    assert_eq!(sync.last_event_id().as_deref(), Some("1"));
+
+    let (ack, drained) = sync.ack(2, "1").expect("ack reconnect sync");
+    assert!(ack.accepted);
+    assert_eq!(drained[0].event_id.as_deref(), Some("2"));
+}
+
+#[test]
+fn ops_bridge_sync_ignores_duplicates_and_forces_refetch_on_forward_gap() {
+    let mut sync = WatchSyncState::default();
+    let generation = sync.begin_connection().connection_generation;
+    sync.ack(generation, "10").expect("seed canonical anchor");
+
+    assert!(sync
+        .observe("10", "health")
+        .expect("ignore duplicate")
+        .is_empty());
+    assert!(sync
+        .observe("9", "health")
+        .expect("ignore old event")
+        .is_empty());
+    let live = sync.observe("11", "health").expect("emit contiguous event");
+    assert_eq!(live[0].event_id.as_deref(), Some("11"));
+
+    let gap = sync.observe("13", "approval").expect("convert gap to sync");
+    assert_eq!(gap.len(), 1);
+    assert!(gap[0].sync_required);
+    assert_eq!(gap[0].reason.as_deref(), Some("gap"));
+    assert!(gap[0].connection_generation > generation);
+    assert_eq!(sync.last_event_id().as_deref(), Some("11"));
+}
+
+#[test]
+fn ops_bridge_sync_control_resets_stale_100_and_keeps_event_12() {
+    let mut sync = WatchSyncState::default();
+    let initial = sync.begin_connection().connection_generation;
+    sync.ack(initial, "100").expect("seed stale anchor");
+
+    let reconnect = sync.begin_connection();
+    assert_eq!(reconnect.anchor_sequence.as_deref(), Some("100"));
+    let control = sync
+        .observe("11", "snapshot.required")
+        .expect("accept targeted reset control");
+    assert_eq!(
+        control[0].connection_generation,
+        reconnect.connection_generation
+    );
+    assert_eq!(control[0].anchor_sequence.as_deref(), Some("11"));
+    assert_eq!(control[0].reason.as_deref(), Some("control"));
+    assert!(sync
+        .observe("12", "health")
+        .expect("queue post-reset event")
+        .is_empty());
+
+    let (_, drained) = sync
+        .ack(reconnect.connection_generation, "11")
+        .expect("ack refetched watermark");
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].event_id.as_deref(), Some("12"));
+    assert_eq!(sync.last_event_id().as_deref(), Some("12"));
+}
+
+#[test]
+fn ops_bridge_sync_queue_is_bounded_and_reset_invalidates_old_generation() {
+    let mut sync = WatchSyncState::default();
+    let generation = sync.begin_connection().connection_generation;
+    for sequence in 1..=256 {
+        assert!(sync
+            .observe(&sequence.to_string(), "health")
+            .expect("bounded queued event")
+            .is_empty());
+    }
+    let overflow = sync.observe("257", "health").expect("overflow enters sync");
+    assert_eq!(overflow.len(), 1);
+    assert_eq!(overflow[0].reason.as_deref(), Some("queue_overflow"));
+    assert!(overflow[0].connection_generation > generation);
+
+    let overflow_generation = overflow[0].connection_generation;
+    sync.reset();
+    let after_reset = sync.begin_connection();
+    assert!(after_reset.connection_generation > overflow_generation);
+    let (stale, _) = sync
+        .ack(overflow_generation, "257")
+        .expect("old community ack is harmless");
+    assert!(!stale.accepted);
+}
+
+#[test]
+fn ops_bridge_sync_rejects_malformed_and_overflowing_decimal_ids() {
+    let mut sync = WatchSyncState::default();
+    sync.begin_connection();
+    for invalid in ["", "01", "+1", "1.0", "18446744073709551616"] {
+        assert!(sync.observe(invalid, "health").is_err());
+    }
+}
+
+#[test]
+fn ops_bridge_snapshot_watermark_is_optional_but_strict_decimal_when_present() {
+    let base = json!({
+        "contract_version": 1,
+        "revision": 1,
+        "generated_at": "2026-08-30T00:00:00.000Z",
+        "health": {"hub": "ready", "orca": "ready", "codex": "ready"},
+        "room": {},
+        "session_tree": [],
+        "checklist": [],
+        "decisions": []
+    });
+    assert!(serde_json::from_value::<OpsBridgeSnapshot>(base.clone()).is_ok());
+
+    let mut valid = base.clone();
+    valid["event_sequence"] = json!("12");
+    assert_eq!(
+        serde_json::from_value::<OpsBridgeSnapshot>(valid)
+            .expect("strict decimal watermark")
+            .event_sequence
+            .as_deref(),
+        Some("12")
+    );
+
+    for invalid in [json!(null), json!(12), json!(""), json!("01"), json!("+1")] {
+        let mut snapshot = base.clone();
+        snapshot["event_sequence"] = invalid;
+        assert!(serde_json::from_value::<OpsBridgeSnapshot>(snapshot).is_err());
+    }
+}
+
 #[tokio::test]
 async fn ops_bridge_watcher_reconnects_after_post_header_sse_stall() {
     let recovered_event = b"id: 1\nevent: health\ndata: {}\n\n";
@@ -716,6 +870,31 @@ async fn ops_bridge_watcher_reconnects_after_post_header_sse_stall() {
     })
     .await
     .expect("stalled SSE watcher must reconnect after the read timeout and backoff");
+    let (_, drained) = watcher
+        .ack_sync(&OpsSyncAckRequest {
+            generation: 2,
+            applied_sequence: "0".to_owned(),
+        })
+        .expect("ack recovered connection");
+    events
+        .lock()
+        .expect("record drained recovery events")
+        .extend(drained);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if events
+                .lock()
+                .expect("read acknowledged events")
+                .iter()
+                .any(|event| event.event_id.as_deref() == Some("1"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("acknowledged recovery event is emitted");
     watcher.stop();
     server.await.expect("stalled SSE fake server exits");
 
@@ -724,14 +903,21 @@ async fn ops_bridge_watcher_reconnects_after_post_header_sse_stall() {
         2
     );
     assert_eq!(
-        serde_json::to_value(&events.lock().expect("read final recovery events")[0])
-            .expect("serialize recovery invalidation"),
-        json!({"event_id": "1", "event_type": "health"})
+        serde_json::to_value(
+            events
+                .lock()
+                .expect("read final recovery events")
+                .iter()
+                .find(|event| event.event_id.as_deref() == Some("1"))
+                .expect("recovery invalidation"),
+        )
+        .expect("serialize recovery invalidation"),
+        json!({"event_id": "1", "event_type": "health", "connection_generation": 2})
     );
 }
 
 #[tokio::test]
-async fn ops_bridge_watcher_is_singleton_replays_last_id_and_emits_no_sse_data() {
+async fn ops_bridge_watcher_reconnect_before_ack_forces_sync_and_emits_no_sse_data() {
     let first = b"id: 41\nevent: approval\ndata: {\"private\":\"ignored\"}\n\n";
     let second = b"id: 42\nevent: snapshot.required\ndata: {\"reason\":\"too_old\"}\n\n";
     let responses = vec![
@@ -761,35 +947,65 @@ async fn ops_bridge_watcher_is_singleton_replays_last_id_and_emits_no_sse_data()
 
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if events.lock().expect("read invalidations").len() >= 2 {
+            if events.lock().expect("read invalidations").len() >= 3 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("watcher delivered two invalidations");
+    .expect("watcher delivered reconnect and control synchronization events");
+    let (ack, drained) = watcher
+        .ack_sync(&OpsSyncAckRequest {
+            generation: 2,
+            applied_sequence: "42".to_owned(),
+        })
+        .expect("ack targeted control refetch");
+    assert!(ack.accepted);
+    assert!(drained.is_empty());
     watcher.stop();
     server.await.expect("watch fake server exits");
 
     let events = events.lock().expect("read final invalidations");
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert_eq!(
         serde_json::to_value(&events[0]).expect("serialize first invalidation"),
-        json!({"event_id": "41", "event_type": "approval"})
+        json!({
+            "connection_generation": 1,
+            "sync_required": true,
+            "full_reload": true,
+            "reason": "initial"
+        })
     );
     assert_eq!(
         serde_json::to_value(&events[1]).expect("serialize reload invalidation"),
-        json!({"event_id": "42", "event_type": "snapshot.required", "full_reload": true})
+        json!({
+            "connection_generation": 2,
+            "sync_required": true,
+            "full_reload": true,
+            "reason": "reconnect"
+        })
     );
+    assert_eq!(
+        serde_json::to_value(&events[2]).expect("serialize control invalidation"),
+        json!({
+            "connection_generation": 2,
+            "sync_required": true,
+            "anchor_sequence": "42",
+            "full_reload": true,
+            "reason": "control"
+        })
+    );
+    assert!(serde_json::to_string(&*events)
+        .expect("serialize sanitized events")
+        .find("private")
+        .is_none());
     drop(events);
 
     let requests = requests.lock().expect("read watch requests");
     assert_eq!(requests.len(), 2);
     assert!(!requests[0].to_ascii_lowercase().contains("last-event-id:"));
-    assert!(requests[1]
-        .to_ascii_lowercase()
-        .contains("\r\nlast-event-id: 41\r\n"));
+    assert!(!requests[1].to_ascii_lowercase().contains("last-event-id:"));
     assert_eq!(
         requests
             .iter()

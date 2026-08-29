@@ -3,6 +3,7 @@ import * as React from "react";
 
 import {
   classifyOpsBridgeError,
+  acknowledgeOpsSync,
   getOpsCapabilities,
   hasInvalidOpsModule,
   loadOpsSnapshot,
@@ -10,6 +11,8 @@ import {
 } from "./opsBridge";
 import {
   ensureOpsWatchManager,
+  completeOpsSync,
+  type OpsInvalidationPayload,
   subscribeOpsInvalidations,
 } from "./opsWatchManager";
 import type {
@@ -27,6 +30,7 @@ export interface UseOpsSnapshotResult {
   snapshot: OpsBridgeSnapshotV1 | null;
   error: unknown;
   refetch: () => Promise<void>;
+  watchState: "enabled" | "disabled_compatibility";
 }
 
 function currentWindowFocus(): boolean {
@@ -90,8 +94,6 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     [normalizedSelection],
   );
   const queryKeyIdentity = JSON.stringify(queryKey);
-  const activeQueryKey = React.useRef(queryKey);
-  activeQueryKey.current = queryKey;
   const lastGoodSnapshot = React.useRef<{
     queryKeyIdentity: string;
     snapshot: OpsBridgeSnapshotV1;
@@ -122,6 +124,10 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
       ? probeFailureRecord.state
       : null;
   const hasCanonicalSnapshot = snapshot !== null;
+  const watchState =
+    snapshot?.event_sequence === undefined
+      ? "disabled_compatibility"
+      : "enabled";
   const state = lifecycleState(
     snapshot,
     query.isPending,
@@ -196,26 +202,50 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
   }, [focused, query.refetch, state]);
 
   const handleInvalidation = React.useCallback(
-    (payload: { full_reload?: boolean }) => {
+    async (payload: OpsInvalidationPayload) => {
       if (payload.full_reload === true) {
-        void queryClient.invalidateQueries({ queryKey: ["ops"] });
+        await queryClient.invalidateQueries({
+          queryKey: ["ops"],
+          refetchType: "none",
+        });
+      }
+      const result = await query.refetch({ cancelRefetch: false });
+      if (result.error || payload.sync_required !== true) return;
+      const generation = payload.connection_generation;
+      const appliedSequence = result.data?.event_sequence;
+      if (
+        !Number.isSafeInteger(generation) ||
+        generation === undefined ||
+        appliedSequence === undefined
+      ) {
         return;
       }
-      void queryClient.invalidateQueries({
-        queryKey: activeQueryKey.current,
-        exact: true,
-      });
+      try {
+        const ack = await acknowledgeOpsSync(generation, appliedSequence);
+        if (ack.accepted) completeOpsSync(generation);
+      } catch (error) {
+        setProbeFailureRecord({
+          queryKeyIdentity,
+          state: classifyOpsBridgeError(error),
+        });
+      }
     },
-    [queryClient],
+    [query.refetch, queryClient, queryKeyIdentity],
   );
 
   React.useEffect(() => {
-    if (!hasCanonicalSnapshot) return;
+    if (!hasCanonicalSnapshot || watchState !== "enabled") return;
     return subscribeOpsInvalidations(handleInvalidation);
-  }, [handleInvalidation, hasCanonicalSnapshot]);
+  }, [handleInvalidation, hasCanonicalSnapshot, watchState]);
 
   React.useEffect(() => {
-    if (!hasCanonicalSnapshot || state !== "ready") return;
+    if (
+      !hasCanonicalSnapshot ||
+      state !== "ready" ||
+      watchState !== "enabled"
+    ) {
+      return;
+    }
     let disposed = false;
     void ensureOpsWatchManager().catch((error) => {
       if (!disposed) {
@@ -228,11 +258,11 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     return () => {
       disposed = true;
     };
-  }, [hasCanonicalSnapshot, queryKeyIdentity, state]);
+  }, [hasCanonicalSnapshot, queryKeyIdentity, state, watchState]);
 
   const refetch = React.useCallback(async () => {
     await query.refetch({ cancelRefetch: false });
   }, [query.refetch]);
 
-  return { state, snapshot, error: query.error, refetch };
+  return { state, snapshot, error: query.error, refetch, watchState };
 }

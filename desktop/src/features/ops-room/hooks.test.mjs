@@ -22,7 +22,7 @@ const capabilities = {
   transitions: [],
 };
 
-function snapshot(revision = 1) {
+function snapshot(revision = 1, overrides = {}) {
   return {
     contract_version: 1,
     revision,
@@ -45,6 +45,8 @@ function snapshot(revision = 1) {
     session_tree: [],
     checklist: [],
     decisions: [],
+    event_sequence: String(revision),
+    ...overrides,
   };
 }
 
@@ -361,7 +363,20 @@ test("community reset tears down the singleton and the next mount installs it af
     snapshot(3),
     snapshot(4),
   );
-  queue("ops_bridge_start_watch", { started: true }, { started: true });
+  queue(
+    "ops_bridge_start_watch",
+    { started: true },
+    {
+      started: false,
+      connection_generation: 9,
+      sync_required: true,
+      anchor_sequence: "3",
+    },
+  );
+  queue("ops_bridge_ack_sync", {
+    accepted: true,
+    connection_generation: 9,
+  });
   const { act } = await import("@testing-library/react");
 
   const first = await mount({ channel: "project:a" });
@@ -375,8 +390,31 @@ test("community reset tears down the singleton and the next mount installs it af
   await waitForRevision(second.view, 4);
   assert.equal(opsCalls("plugin:event|listen").length, 2);
   assert.equal(opsCalls("ops_bridge_start_watch").length, 2);
+  assert.deepEqual(opsCalls("ops_bridge_ack_sync"), [
+    {
+      command: "ops_bridge_ack_sync",
+      args: { request: { generation: 9, applied_sequence: "4" } },
+    },
+  ]);
   second.view.unmount();
   second.client.clear();
+});
+
+test("an older snapshot stays readable with an explicit disabled compatibility watch state", async () => {
+  queue("ops_bridge_capabilities", capabilities);
+  queue("ops_bridge_snapshot", snapshot(1, { event_sequence: undefined }));
+
+  const { client, view } = await mount({});
+  await waitForState(view, "ready");
+
+  assert.equal(view.result.current.snapshot.revision, 1);
+  assert.equal(view.result.current.watchState, "disabled_compatibility");
+  assert.equal(opsCalls("plugin:event|listen").length, 0);
+  assert.equal(opsCalls("ops_bridge_start_watch").length, 0);
+  assert.equal(opsCalls("ops_bridge_ack_sync").length, 0);
+
+  view.unmount();
+  client.clear();
 });
 
 test("an invalidation event refetches the active snapshot and full_reload invalidates the Ops prefix", async () => {
@@ -421,6 +459,92 @@ test("an invalidation event refetches the active snapshot and full_reload invali
   assert.equal(opsCalls("ops_bridge_start_watch").length, 1);
   assert.equal(opsCalls("plugin:event|listen").length, 1);
 
+  view.unmount();
+  client.clear();
+});
+
+test("sync-required refetch acknowledges the matching generation only after success", async () => {
+  queue("ops_bridge_capabilities", capabilities, capabilities, capabilities);
+  queue("ops_bridge_snapshot", snapshot(10), snapshot(11), snapshot(12));
+  queue("ops_bridge_start_watch", { started: true });
+  queue("ops_bridge_ack_sync", {
+    accepted: true,
+    connection_generation: 100,
+  });
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForRevision(view, 11);
+  const handler = callbacks.get(
+    opsCalls("plugin:event|listen")[0].args.handler,
+  );
+
+  await act(async () =>
+    handler({
+      event: "buzz://ops-invalidated",
+      id: 1,
+      payload: {
+        connection_generation: 100,
+        sync_required: true,
+        anchor_sequence: "11",
+        reason: "control",
+        full_reload: true,
+      },
+    }),
+  );
+  await waitForRevision(view, 12);
+  await waitForCallCount("ops_bridge_ack_sync", 1);
+
+  assert.ok(
+    calls.findIndex(
+      (call) =>
+        call.command === "ops_bridge_snapshot" &&
+        opsCalls("ops_bridge_snapshot").indexOf(call) === 2,
+    ) < calls.findIndex((call) => call.command === "ops_bridge_ack_sync"),
+  );
+  assert.deepEqual(opsCalls("ops_bridge_ack_sync"), [
+    {
+      command: "ops_bridge_ack_sync",
+      args: {
+        request: { generation: 100, applied_sequence: "12" },
+      },
+    },
+  ]);
+  view.unmount();
+  client.clear();
+});
+
+test("a failed sync-required refetch stays suspended and sends no ACK", async () => {
+  queue("ops_bridge_capabilities", capabilities, capabilities, capabilities);
+  queue(
+    "ops_bridge_snapshot",
+    snapshot(20),
+    snapshot(21),
+    new Error("ops_bridge_disconnected"),
+  );
+  queue("ops_bridge_start_watch", { started: true });
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForRevision(view, 21);
+  const handler = callbacks.get(
+    opsCalls("plugin:event|listen")[0].args.handler,
+  );
+
+  await act(async () =>
+    handler({
+      event: "buzz://ops-invalidated",
+      id: 1,
+      payload: {
+        connection_generation: 9,
+        sync_required: true,
+        anchor_sequence: "21",
+        reason: "reconnect",
+        full_reload: true,
+      },
+    }),
+  );
+  await waitForState(view, "stale");
+
+  assert.equal(opsCalls("ops_bridge_ack_sync").length, 0);
   view.unmount();
   client.clear();
 });

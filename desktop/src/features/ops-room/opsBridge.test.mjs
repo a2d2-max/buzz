@@ -148,6 +148,20 @@ describe("native Ops bridge contract", () => {
 
     assert.equal(result.module_states.timeline.status, "unavailable");
     assert.equal(result.module_states.repositories.status, "unavailable");
+    assert.equal(result.event_sequence, undefined);
+  });
+
+  test("decodes only a strict decimal snapshot event watermark", async () => {
+    responses.push(capabilities, validSnapshot({ event_sequence: "12" }));
+    assert.equal((await bridge.loadOpsSnapshot({})).event_sequence, "12");
+
+    for (const event_sequence of [12, "", "01", "+1", "1.0", " 1"]) {
+      responses.push(capabilities, validSnapshot({ event_sequence }));
+      await assert.rejects(
+        bridge.loadOpsSnapshot({}),
+        (error) => error?.name === "OpsBridgeContractError",
+      );
+    }
   });
 
   test("marks an advertised optional module contract-invalid when its payload is absent or invalid", async () => {
@@ -353,6 +367,21 @@ describe("native Ops bridge contract", () => {
     assert.deepEqual(await bridge.startOpsWatch(), { started: true });
     assert.deepEqual(calls, [
       { command: "ops_bridge_start_watch", args: null },
+    ]);
+  });
+
+  test("acknowledges only a generation-bound canonical snapshot watermark", async () => {
+    responses.push({ accepted: true, connection_generation: 7 });
+
+    assert.deepEqual(await bridge.acknowledgeOpsSync(7, "12"), {
+      accepted: true,
+      connection_generation: 7,
+    });
+    assert.deepEqual(calls, [
+      {
+        command: "ops_bridge_ack_sync",
+        args: { request: { generation: 7, applied_sequence: "12" } },
+      },
     ]);
   });
 });

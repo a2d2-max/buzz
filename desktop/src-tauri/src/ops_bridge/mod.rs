@@ -3,13 +3,14 @@ mod types;
 mod watch;
 
 use std::{path::PathBuf, sync::Arc};
+use tauri::Emitter;
 
 use crate::app_state::AppState;
 use client::{OpsBridgeClient, OpsBridgeConfig, OpsBridgeError};
 use types::{
     OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsSelection,
-    OpsTransitionReceipt, OpsTransitionRequest, OpsWatchStartResult, DEFAULT_HUB_PORT,
-    MAX_RESPONSE_BYTES,
+    OpsSyncAckRequest, OpsSyncAckResult, OpsTransitionReceipt, OpsTransitionRequest,
+    OpsWatchStartResult, DEFAULT_HUB_PORT, MAX_RESPONSE_BYTES,
 };
 use watch::OpsBridgeWatcher;
 
@@ -103,7 +104,27 @@ pub(crate) fn ops_bridge_start_watch(
         .watcher
         .start(app, state.client().map_err(public_error)?)
         .map_err(public_error)?;
-    Ok(OpsWatchStartResult { started })
+    let (connection_generation, sync_required, anchor_sequence) =
+        state.watcher.sync_status().map_err(public_error)?;
+    Ok(OpsWatchStartResult {
+        started,
+        connection_generation,
+        sync_required,
+        anchor_sequence,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn ops_bridge_ack_sync(
+    request: OpsSyncAckRequest,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, OpsBridgeState>,
+) -> Result<OpsSyncAckResult, String> {
+    let (result, events) = state.watcher.ack_sync(&request).map_err(public_error)?;
+    for event in events {
+        let _ = app.emit("buzz://ops-invalidated", event);
+    }
+    Ok(result)
 }
 
 fn native_config() -> Result<OpsBridgeConfig, OpsBridgeError> {

@@ -1523,6 +1523,7 @@ const MOCK_OPS_CAPABILITIES = {
 const MOCK_OPS_SNAPSHOT = {
   contract_version: 1,
   revision: 7,
+  event_sequence: "7",
   generated_at: "2026-08-29T08:00:00.000Z",
   health: { hub: "ready", orca: "observed", codex: "ready" },
   room: {
@@ -11387,6 +11388,8 @@ export function maybeInstallE2eTauriMocks() {
     };
   }> = [];
   let mockOpsWatchStarted = false;
+  const mockOpsConnectionGeneration = 1;
+  let mockOpsAppliedSequence: string | null = null;
   const handleMockCommand = async (
     command: string,
     payload: unknown,
@@ -11456,6 +11459,22 @@ export function maybeInstallE2eTauriMocks() {
         const started = !mockOpsWatchStarted;
         mockOpsWatchStarted = true;
         return { started };
+      }
+      case "ops_bridge_ack_sync": {
+        const request = (payload as { request?: Record<string, unknown> })
+          .request;
+        const generation = request?.generation;
+        const appliedSequence = request?.applied_sequence;
+        const accepted =
+          generation === mockOpsConnectionGeneration &&
+          typeof appliedSequence === "string" &&
+          /^(?:0|[1-9][0-9]*)$/u.test(appliedSequence);
+        if (accepted) mockOpsAppliedSequence = appliedSequence;
+        return {
+          accepted,
+          connection_generation: mockOpsConnectionGeneration,
+          applied_sequence: mockOpsAppliedSequence,
+        };
       }
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
