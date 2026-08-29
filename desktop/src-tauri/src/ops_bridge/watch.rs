@@ -262,7 +262,7 @@ impl WatchSyncState {
     }
 }
 
-type InvalidationEmitter = Arc<dyn Fn(OpsInvalidationEvent) + Send + Sync + 'static>;
+pub(crate) type InvalidationEmitter = Arc<dyn Fn(OpsInvalidationEvent) + Send + Sync + 'static>;
 
 struct WatchTask {
     cancel: CancellationToken,
@@ -366,14 +366,21 @@ impl OpsBridgeWatcher {
         }
     }
 
-    pub(crate) fn ack_sync(
+    pub(crate) async fn ack_sync_with_emitter(
         &self,
         request: &OpsSyncAckRequest,
-    ) -> Result<(OpsSyncAckResult, Vec<OpsInvalidationEvent>), OpsBridgeError> {
-        self.sync
+        emitter: InvalidationEmitter,
+    ) -> Result<OpsSyncAckResult, OpsBridgeError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let (result, events) = self
+            .sync
             .lock()
             .map_err(|_| OpsBridgeError::WatchState)?
-            .ack(request.generation, &request.applied_sequence)
+            .ack(request.generation, &request.applied_sequence)?;
+        for event in events {
+            emitter(event);
+        }
+        Ok(result)
     }
 
     pub(crate) fn sync_status(&self) -> Result<(u64, bool, Option<String>), OpsBridgeError> {
@@ -549,6 +556,77 @@ impl SseDecoder {
             _ => {}
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::{atomic::AtomicUsize, Barrier};
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_waits_for_ack_emission_quiescence() {
+        let watcher = Arc::new(OpsBridgeWatcher::default());
+        let generation = {
+            let mut sync = watcher.sync.lock().expect("lock watcher sync state");
+            let generation = sync.begin_connection().connection_generation;
+            assert!(sync
+                .observe("1", "health")
+                .expect("queue acknowledged event")
+                .is_empty());
+            generation
+        };
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let emissions = Arc::new(AtomicUsize::new(0));
+        let emitter_entered = Arc::clone(&entered);
+        let emitter_release = Arc::clone(&release);
+        let emitted = Arc::clone(&emissions);
+        let acknowledging_watcher = Arc::clone(&watcher);
+        let acknowledging = tokio::spawn(async move {
+            acknowledging_watcher
+                .ack_sync_with_emitter(
+                    &OpsSyncAckRequest {
+                        generation,
+                        applied_sequence: "0".to_owned(),
+                    },
+                    Arc::new(move |_| {
+                        emitter_entered.wait();
+                        emitter_release.wait();
+                        emitted.fetch_add(1, Ordering::SeqCst);
+                    }),
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .expect("observe active ACK emitter");
+
+        let stopping_watcher = Arc::clone(&watcher);
+        let stopping = tokio::spawn(async move { stopping_watcher.stop_async().await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !stopping.is_finished(),
+            "stop must await ACK emission quiescence"
+        );
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .expect("release ACK emitter");
+        let ack = acknowledging
+            .await
+            .expect("join ACK task")
+            .expect("acknowledge queued event");
+        assert!(ack.accepted);
+        stopping
+            .await
+            .expect("join stop task")
+            .expect("stop watcher");
+        let stopped_emissions = emissions.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(stopped_emissions, 1);
+        assert_eq!(emissions.load(Ordering::SeqCst), stopped_emissions);
     }
 }
 

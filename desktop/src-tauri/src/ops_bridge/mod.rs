@@ -127,16 +127,21 @@ pub(crate) async fn ops_bridge_stop_watch(
 }
 
 #[tauri::command]
-pub(crate) fn ops_bridge_ack_sync(
+pub(crate) async fn ops_bridge_ack_sync(
     request: OpsSyncAckRequest,
     app: tauri::AppHandle,
     state: tauri::State<'_, OpsBridgeState>,
 ) -> Result<OpsSyncAckResult, String> {
-    let (result, events) = state.watcher.ack_sync(&request).map_err(public_error)?;
-    for event in events {
-        let _ = app.emit("buzz://ops-invalidated", event);
-    }
-    Ok(result)
+    state
+        .watcher
+        .ack_sync_with_emitter(
+            &request,
+            Arc::new(move |event| {
+                let _ = app.emit("buzz://ops-invalidated", event);
+            }),
+        )
+        .await
+        .map_err(public_error)
 }
 
 fn native_config() -> Result<OpsBridgeConfig, OpsBridgeError> {

@@ -945,16 +945,23 @@ async fn ops_bridge_watcher_reconnects_after_post_header_sse_stall() {
     })
     .await
     .expect("stalled SSE watcher must reconnect after the read timeout and backoff");
-    let (_, drained) = watcher
-        .ack_sync(&OpsSyncAckRequest {
-            generation: 2,
-            applied_sequence: "0".to_owned(),
-        })
+    let ack_events = Arc::clone(&events);
+    let ack = watcher
+        .ack_sync_with_emitter(
+            &OpsSyncAckRequest {
+                generation: 2,
+                applied_sequence: "0".to_owned(),
+            },
+            Arc::new(move |event| {
+                ack_events
+                    .lock()
+                    .expect("record drained recovery event")
+                    .push(event);
+            }),
+        )
+        .await
         .expect("ack recovered connection");
-    events
-        .lock()
-        .expect("record drained recovery events")
-        .extend(drained);
+    assert!(ack.accepted);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if events
@@ -1032,14 +1039,23 @@ async fn ops_bridge_watcher_reconnect_before_ack_forces_sync_and_emits_no_sse_da
     })
     .await
     .expect("watcher delivered reconnect and control synchronization events");
-    let (ack, drained) = watcher
-        .ack_sync(&OpsSyncAckRequest {
-            generation: 2,
-            applied_sequence: "42".to_owned(),
-        })
+    let ack_events = Arc::clone(&events);
+    let ack = watcher
+        .ack_sync_with_emitter(
+            &OpsSyncAckRequest {
+                generation: 2,
+                applied_sequence: "42".to_owned(),
+            },
+            Arc::new(move |event| {
+                ack_events
+                    .lock()
+                    .expect("record drained control event")
+                    .push(event);
+            }),
+        )
+        .await
         .expect("ack targeted control refetch");
     assert!(ack.accepted);
-    assert!(drained.is_empty());
     watcher.stop_async().await.expect("stop watcher");
     server.await.expect("watch fake server exits");
 
