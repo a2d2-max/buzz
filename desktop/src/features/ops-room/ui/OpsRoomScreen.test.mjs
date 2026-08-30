@@ -44,7 +44,8 @@ const { cleanup, fireEvent, render, screen } = await import(
 );
 const { projectOpsRoom } = await import("../opsProjection.ts");
 const { OpsSessionTree } = await import("./OpsSessionTree.tsx");
-const { OpsRoomView } = await import("./OpsRoomScreen.tsx");
+const { OpsRoomView, opsGlobalStateNoticeMessages, opsWorkRouteMode } =
+  await import("./OpsRoomScreen.tsx");
 
 afterEach(() => {
   cleanup();
@@ -75,6 +76,62 @@ function roomView(overrides = {}) {
 }
 
 describe("native Ops Room components", () => {
+  test("global notices omit not-requested modules and never label pending as retry", () => {
+    assert.equal(typeof opsGlobalStateNoticeMessages, "function");
+    assert.deepEqual(
+      opsGlobalStateNoticeMessages({
+        audit: { status: "retry_required", refreshed: true },
+        evidence: { status: "pending" },
+        search: { status: "not_requested" },
+      }),
+      ["Evidence is loading.", "Audit changed again. Retry required."],
+    );
+  });
+
+  test("direct Work outer branch distinguishes lifecycle, updating, and true empty", () => {
+    assert.equal(typeof opsWorkRouteMode, "function");
+    assert.equal(opsWorkRouteMode(null, [], { status: "pending" }), "pending");
+    assert.equal(
+      opsWorkRouteMode(null, [], { status: "unavailable" }),
+      "unavailable",
+    );
+    assert.equal(
+      opsWorkRouteMode(null, [], { status: "contract_invalid" }),
+      "contract_invalid",
+    );
+    assert.equal(
+      opsWorkRouteMode(null, [], { status: "retry_required", refreshed: true }),
+      "retry_required",
+    );
+    assert.equal(
+      opsWorkRouteMode(null, [{ id: "work:a" }], {
+        status: "ready",
+        items: [{ id: "work:a" }],
+        revision: 2,
+        refreshed: false,
+      }),
+      "updating",
+    );
+    assert.equal(
+      opsWorkRouteMode(null, [], {
+        status: "ready",
+        items: [],
+        revision: 2,
+        refreshed: false,
+      }),
+      "empty",
+    );
+    assert.equal(
+      opsWorkRouteMode("work:a", [{ id: "work:a" }], {
+        status: "ready",
+        items: [{ id: "work:a" }],
+        revision: 2,
+        refreshed: false,
+      }),
+      "selected",
+    );
+  });
+
   test("renders the four-column desktop room with canonical work and no action controls", () => {
     setWidth(1280);
     render(roomView());

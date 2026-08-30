@@ -389,6 +389,22 @@ export function resetDormantOpsPageStates(): void {
   publishDormantStateSnapshot();
 }
 
+/** Publishes complete-collection validation failures into the existing mutation-disable authority. */
+export function markDormantOpsModuleContractInvalid(
+  module: DormantOpsModuleName,
+  capabilities: OpsBridgeCapabilitiesV1,
+): void {
+  const capability = capabilities.modules?.find(
+    (candidate) => candidate.name === module,
+  );
+  const key = capabilityKey(capability);
+  const authoritativeKey = authoritativeDormantCapabilityKeys.get(module);
+  if (authoritativeKey !== undefined && authoritativeKey !== key) return;
+  authoritativeDormantCapabilityKeys.set(module, key);
+  prepareDormantState(module, key);
+  setDormantState(module, key, { status: "contract_invalid" });
+}
+
 export class OpsPageError extends Error {
   readonly code: "invalid_cursor" | "stale_cursor" | "unavailable";
 

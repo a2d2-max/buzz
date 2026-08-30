@@ -77,6 +77,11 @@ import {
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { containsAbsolutePath } from "@/features/ops-room/types";
 import {
+  dormantPageItemSchemas,
+  dormantPageRequestSchema,
+  type DormantOpsModuleName,
+} from "@/features/ops-room/opsDormantContracts";
+import {
   isValidLinkPreviewSnapshotCanonicalUrl,
   parseLinkPreviewSnapshots,
 } from "@/shared/lib/linkPreviewSnapshot";
@@ -193,7 +198,7 @@ type MockOpsPage<T extends Record<string, unknown>> = {
   next_cursor: string | null;
 };
 
-type MockOpsPages = {
+type LegacyMockOpsPages = {
   timeline?: MockOpsPage<{
     id: string;
     timestamp: string;
@@ -230,6 +235,11 @@ type MockOpsPages = {
     behind?: number;
   }>;
 };
+
+type MockOpsPageModule = keyof LegacyMockOpsPages | DormantOpsModuleName;
+type MockOpsPages = Partial<
+  Record<MockOpsPageModule, MockOpsPage<Record<string, unknown>>>
+>;
 
 type E2eConfig = {
   mode?: "mock" | "relay";
@@ -596,9 +606,21 @@ type E2eConfig = {
     opsSnapshot?: Record<string, unknown>;
     /** Strict deterministic page fixtures keyed by the fixed Ops module enum. */
     opsPages?: MockOpsPages;
+    /** Cursor-indexed strict fixtures; use `first` for the null cursor. */
+    opsPagesByCursor?: Partial<
+      Record<
+        MockOpsPageModule,
+        Record<string, MockOpsPage<Record<string, unknown>>>
+      >
+    >;
+    /** Deliberately malformed client-contract fixtures, never prevalidated. */
+    opsRawPages?: Partial<Record<MockOpsPageModule, unknown>>;
     /** Typed cursor errors returned by the fixed page command. */
     opsPageErrors?: Partial<
-      Record<MockOpsPageModule, "invalid_cursor" | "stale_cursor">
+      Record<
+        MockOpsPageModule,
+        "invalid_cursor" | "stale_cursor" | "unavailable"
+      >
     >;
     /** Strict native artifact read fixtures keyed by public artifact identity. */
     opsArtifactReads?: Record<string, Record<string, unknown>>;
@@ -1769,6 +1791,16 @@ const MOCK_OPS_SNAPSHOT = {
     },
   ],
 } as const;
+function emptyMockOpsPage(): MockOpsPage<Record<string, unknown>> {
+  return {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  };
+}
+
 const MOCK_OPS_PAGES: Required<MockOpsPages> = {
   timeline: {
     contract_version: 1,
@@ -1798,9 +1830,15 @@ const MOCK_OPS_PAGES: Required<MockOpsPages> = {
     items: [],
     next_cursor: null,
   },
+  work_items: emptyMockOpsPage(),
+  sessions: emptyMockOpsPage(),
+  checklist_items: emptyMockOpsPage(),
+  decisions: emptyMockOpsPage(),
+  approval_index: emptyMockOpsPage(),
+  evidence: emptyMockOpsPage(),
+  audit: emptyMockOpsPage(),
+  search: emptyMockOpsPage(),
 };
-
-type MockOpsPageModule = keyof MockOpsPages;
 
 function isMockOpsRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -1831,7 +1869,10 @@ function isMockOpsText(value: unknown, max = 65_536): value is string {
   );
 }
 
-function parseMockOpsPageRequest(payload: unknown): MockOpsPageModule {
+function parseMockOpsPageRequest(payload: unknown): {
+  cursor: string | null;
+  module: MockOpsPageModule;
+} {
   if (!isMockOpsRecord(payload) || !hasMockOpsKeys(payload, ["request"])) {
     throw new Error("ops_bridge_invalid_request");
   }
@@ -1839,9 +1880,7 @@ function parseMockOpsPageRequest(payload: unknown): MockOpsPageModule {
   if (
     !isMockOpsRecord(request) ||
     !hasMockOpsKeys(request, ["module", "scope", "page_size", "cursor"]) ||
-    !["timeline", "artifacts", "research", "repositories"].includes(
-      String(request.module),
-    ) ||
+    !Object.hasOwn(MOCK_OPS_PAGES, String(request.module)) ||
     !Number.isSafeInteger(request.page_size) ||
     Number(request.page_size) < 1 ||
     Number(request.page_size) > 200 ||
@@ -1854,6 +1893,12 @@ function parseMockOpsPageRequest(payload: unknown): MockOpsPageModule {
     value === null || isMockOpsText(value, 256);
   const scope = request.scope;
   const validScope = (() => {
+    if (
+      Object.hasOwn(dormantPageItemSchemas, String(request.module)) &&
+      dormantPageRequestSchema.safeParse(request).success
+    ) {
+      return true;
+    }
     switch (request.module) {
       case "timeline":
         return (
@@ -1888,7 +1933,10 @@ function parseMockOpsPageRequest(payload: unknown): MockOpsPageModule {
     }
   })();
   if (!validScope) throw new Error("ops_bridge_invalid_request");
-  return request.module as MockOpsPageModule;
+  return {
+    cursor: request.cursor as string | null,
+    module: request.module as MockOpsPageModule,
+  };
 }
 
 const MOCK_ARTIFACT_ID = "artifact:0123456789abcdef0123456789abcdef";
@@ -1981,6 +2029,13 @@ function validateMockOpsPage(
   ) {
     throw new Error("ops_bridge_contract_mismatch");
   }
+  if (Object.hasOwn(dormantPageItemSchemas, module)) {
+    const schema = dormantPageItemSchemas[module as DormantOpsModuleName];
+    if (value.items.some((item) => !schema.safeParse(item).success)) {
+      throw new Error("ops_bridge_contract_mismatch");
+    }
+    return;
+  }
   const itemKeys = {
     timeline: {
       required: ["id", "timestamp", "kind", "author", "body"],
@@ -2009,7 +2064,7 @@ function validateMockOpsPage(
       optional: ["ahead", "behind"],
     },
   } as const;
-  const keys = itemKeys[module];
+  const keys = itemKeys[module as keyof typeof itemKeys];
   if (
     value.items.some(
       (item) =>
@@ -2066,6 +2121,8 @@ function isValidMockOpsPageItem(
         (item.ahead === undefined || safeCount(item.ahead)) &&
         (item.behind === undefined || safeCount(item.behind))
       );
+    default:
+      return false;
   }
 }
 const DEFAULT_MOCK_IDENTITY = {
@@ -11825,13 +11882,23 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig?.mock?.opsSnapshot ?? MOCK_OPS_SNAPSHOT,
         );
       case "ops_bridge_page": {
-        const module = parseMockOpsPageRequest(payload);
+        const { cursor, module } = parseMockOpsPageRequest(payload);
         const configuredError = activeConfig?.mock?.opsPageErrors?.[module];
         if (configuredError) {
           return Promise.reject({ error: configuredError });
         }
+        if (
+          activeConfig?.mock?.opsRawPages &&
+          Object.hasOwn(activeConfig.mock.opsRawPages, module)
+        ) {
+          return structuredClone(activeConfig.mock.opsRawPages[module]);
+        }
+        const cursorFixture =
+          activeConfig?.mock?.opsPagesByCursor?.[module]?.[cursor ?? "first"];
         const page =
-          activeConfig?.mock?.opsPages?.[module] ?? MOCK_OPS_PAGES[module];
+          cursorFixture ??
+          activeConfig?.mock?.opsPages?.[module] ??
+          MOCK_OPS_PAGES[module];
         validateMockOpsPage(module, page);
         return structuredClone(page);
       }

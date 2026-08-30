@@ -5,6 +5,18 @@ import {
   artifactRepresentationForKind,
   type OpsArtifactSelection,
 } from "../artifactReader";
+import { classifyOpsBridgeError } from "../opsBridge";
+import { dormantPageRequestSchema } from "../opsDormantContracts";
+import {
+  opsGlobalBoundaryMode,
+  useOpsGlobalCollections,
+  type OpsGlobalCollectionStates,
+} from "../opsGlobalCollections";
+import {
+  opsSearchRequest,
+  reconcileOpsWorkSelection,
+} from "../opsGlobalProjection";
+import type { CompleteOpsCollectionRequest } from "../opsPagedCollection";
 import { useOpsSnapshot } from "../hooks";
 import { projectOpsRoom, type OpsRoomProjection } from "../opsProjection";
 import {
@@ -30,6 +42,11 @@ import {
 } from "../opsRouteState";
 import { OpsArtifactsView } from "./OpsArtifactsView";
 import { OpsWorkspaceScreen } from "./OpsWorkspaceScreen";
+import {
+  OpsCollectionState,
+  OpsHomeView,
+  OpsWorkView,
+} from "./OpsHomeWorkViews";
 
 const INTERACTIVE_SIZE = { minHeight: 44, minWidth: 44 } as const;
 const MOBILE_TABS = ["workspace", "sessions", "timeline", "context"] as const;
@@ -44,6 +61,135 @@ const MOBILE_TAB_LABELS: Record<MobileTab, string> = {
 const DESKTOP_GRID_COLUMNS =
   "minmax(160px, 0.85fr) minmax(176px, 0.9fr) minmax(288px, 1.75fr) minmax(192px, 1fr)";
 const DESKTOP_GRID_MINIMUM_WIDTH = 160 + 176 + 288 + 192 + 3 * 12;
+
+const GLOBAL_STATE_LABELS = {
+  work_items: "Work",
+  sessions: "Sessions",
+  checklist_items: "Plan",
+  decisions: "Decisions",
+  approval_index: "Approvals",
+  evidence: "Evidence",
+  audit: "Audit",
+  search: "Search",
+} as const;
+
+export function opsGlobalStateNoticeMessages(
+  states: OpsGlobalCollectionStates,
+): string[] {
+  return Object.entries(GLOBAL_STATE_LABELS).flatMap(([module, label]) => {
+    const state = states[module as keyof OpsGlobalCollectionStates];
+    if (
+      !state ||
+      state.status === "not_requested" ||
+      state.status === "ready"
+    ) {
+      return [];
+    }
+    if (state.status === "pending") return [`${label} is loading.`];
+    if (state.status === "unavailable") return [`${label} is unavailable.`];
+    if (state.status === "contract_invalid") {
+      return [`${label} contract is invalid.`];
+    }
+    return [`${label} changed again. Retry required.`];
+  });
+}
+
+export function opsWorkRouteMode(
+  selectedWorkId: string | null,
+  workItems: readonly { id: string }[],
+  state: OpsGlobalCollectionStates["work_items"],
+):
+  | "contract_invalid"
+  | "empty"
+  | "pending"
+  | "retry_required"
+  | "selected"
+  | "unavailable"
+  | "updating" {
+  if (state && state.status !== "ready") {
+    return state.status === "not_requested" ? "pending" : state.status;
+  }
+  if (workItems.length === 0) return "empty";
+  return selectedWorkId ? "selected" : "updating";
+}
+
+function OpsGlobalStateNotices({
+  pending,
+  states,
+}: {
+  pending: boolean;
+  states: OpsGlobalCollectionStates;
+}) {
+  if (pending) {
+    return (
+      <p
+        className="border-border border-b px-4 py-2 text-xs text-muted-foreground"
+        role="status"
+      >
+        Loading complete local collections…
+      </p>
+    );
+  }
+  const notices = opsGlobalStateNoticeMessages(states);
+  if (notices.length === 0) return null;
+  return (
+    <div
+      aria-label="Collection status"
+      className="flex flex-wrap gap-x-4 gap-y-1 border-border border-b px-4 py-2 text-xs text-amber-300"
+      role="status"
+    >
+      {notices.map((notice) => (
+        <span key={notice}>{notice}</span>
+      ))}
+    </div>
+  );
+}
+
+function OpsGlobalRouteBoundary({
+  children,
+  connectionState,
+  onRetry,
+  pending,
+  states,
+}: {
+  children: React.ReactNode;
+  connectionState: ConnectionState;
+  onRetry: () => void;
+  pending: boolean;
+  states: OpsGlobalCollectionStates;
+}) {
+  const mode = opsGlobalBoundaryMode(connectionState, pending, states);
+  if (mode === "connection") {
+    return <OpsConnectionState onRetry={onRetry} state={connectionState} />;
+  }
+  if (mode === "loading") {
+    return <OpsConnectionState onRetry={onRetry} state="loading" />;
+  }
+  const allUnavailable = Object.keys(GLOBAL_STATE_LABELS).every(
+    (module) =>
+      states[module as keyof OpsGlobalCollectionStates]?.status ===
+      "unavailable",
+  );
+  if (!pending && allUnavailable) {
+    return (
+      <div className="flex min-h-56 flex-1 flex-col items-center justify-center px-6 text-center">
+        <h2 className="text-base font-semibold">Hub 준비 전</h2>
+        <p className="mt-2 text-sm text-muted-foreground">
+          Home·Work data unavailable
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {connectionState === "stale" ? (
+        <OpsConnectionState onRetry={onRetry} state="stale" />
+      ) : null}
+      <OpsGlobalStateNotices pending={pending} states={states} />
+      {children}
+    </div>
+  );
+}
 
 function useOpsResponsiveLayout(): OpsResponsiveLayout {
   const [layout, setLayout] = React.useState(() =>
@@ -424,6 +570,25 @@ export function OpsRoomScreen({
     () => (snapshot ? projectOpsRoom(snapshot) : null),
     [snapshot],
   );
+  const globalActive = routeState.view === "home" || routeState.view === "work";
+  const [selectedWorkId, setSelectedWorkId] = React.useState<string | null>(
+    null,
+  );
+  const [searchRequest, setSearchRequest] =
+    React.useState<CompleteOpsCollectionRequest<"search"> | null>(null);
+  const global = useOpsGlobalCollections({
+    active: globalActive,
+    invalidationRevision: 0,
+    searchRequest,
+    selectedWorkId,
+  });
+
+  React.useEffect(() => {
+    if (global.states.work_items?.status !== "ready") return;
+    setSelectedWorkId((current) =>
+      reconcileOpsWorkSelection(current, global.collections.workItems),
+    );
+  }, [global.collections.workItems, global.states.work_items?.status]);
 
   React.useEffect(() => {
     const sync = () => setRouteState(navigation.readOpsState());
@@ -469,6 +634,14 @@ export function OpsRoomScreen({
     window.addEventListener("resize", update);
     return () => window.removeEventListener("resize", update);
   }, []);
+  const globalConnectionState = global.error
+    ? classifyOpsBridgeError(global.error)
+    : state;
+  const workRouteMode = opsWorkRouteMode(
+    selectedWorkId,
+    global.collections.workItems,
+    global.states.work_items,
+  );
   const content =
     routeState.view === "artifacts" ? (
       <OpsArtifactsView connectionState={state} disabled={mutationsDisabled} />
@@ -481,6 +654,76 @@ export function OpsRoomScreen({
         projection={projection}
         watchState={watchState}
       />
+    ) : routeState.view === "home" ? (
+      <OpsGlobalRouteBoundary
+        connectionState={globalConnectionState}
+        onRetry={() => {
+          void Promise.allSettled([refetch(), global.refetch()]);
+        }}
+        pending={global.pending}
+        states={global.states}
+      >
+        <OpsHomeView
+          collections={global.collections}
+          onOpenWork={(id) => {
+            setSelectedWorkId(id);
+            navigation.pushOpsState({ ...routeState, view: "work" });
+          }}
+          refreshed={global.refreshed}
+          states={global.states}
+        />
+      </OpsGlobalRouteBoundary>
+    ) : routeState.view === "work" ? (
+      <OpsGlobalRouteBoundary
+        connectionState={globalConnectionState}
+        onRetry={() => {
+          void Promise.allSettled([refetch(), global.refetch()]);
+        }}
+        pending={global.pending}
+        states={global.states}
+      >
+        {workRouteMode === "selected" && selectedWorkId ? (
+          <OpsWorkView
+            collections={global.collections}
+            layout={layout}
+            mutationsDisabled={mutationsDisabled}
+            onSearch={(scope) => {
+              const request = opsSearchRequest(scope.q, scope.kind, scope.work);
+              const validated = dormantPageRequestSchema.safeParse({
+                ...request,
+                cursor: null,
+                page_size: 100,
+              });
+              if (!validated.success) return false;
+              setSearchRequest(request);
+              return true;
+            }}
+            onSelectWork={(id) => {
+              setSelectedWorkId(id);
+              setSearchRequest(null);
+            }}
+            selectedWorkId={selectedWorkId}
+            states={global.states}
+          />
+        ) : workRouteMode === "updating" ? (
+          <p className="p-6 text-sm text-muted-foreground">
+            Work selection is updating.
+          </p>
+        ) : workRouteMode === "empty" ? (
+          <p className="p-6 text-sm text-muted-foreground">
+            No work is active.
+          </p>
+        ) : (
+          <OpsCollectionState
+            label="Work"
+            state={
+              global.states.work_items?.status === "not_requested"
+                ? { status: "pending" }
+                : (global.states.work_items ?? { status: "pending" })
+            }
+          />
+        )}
+      </OpsGlobalRouteBoundary>
     ) : (
       <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
         {routeState.view} is available as a read-only Ops section.

@@ -4,6 +4,14 @@ import type {
   OpsSessionNodeV1,
 } from "./types";
 
+export {
+  opsGlobalQueryIdentity,
+  opsSearchRequest,
+  projectOpsHome,
+  projectOpsWork,
+  reconcileOpsWorkSelection,
+} from "./opsGlobalProjection";
+
 const SOURCE_LABELS = {
   orca: "Orca",
   codex_direct: "Codex",

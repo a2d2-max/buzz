@@ -241,6 +241,29 @@ const publicValueCorpus = JSON.parse(
   ),
 );
 
+test("complete-collection validation reuses the dormant mutation-disable authority", () => {
+  assert.equal(typeof bridge.markDormantOpsModuleContractInvalid, "function");
+  bridge.resetDormantOpsPageStates();
+  const advertised = {
+    contract_version: 1,
+    reads: ["snapshot", "events", "artifact"],
+    drafts: [],
+    transitions: [],
+    modules: [
+      {
+        name: "work_items",
+        schema_version: 1,
+        paged: true,
+        collection_revision: 9,
+      },
+    ],
+  };
+  bridge.markDormantOpsModuleContractInvalid("work_items", advertised);
+  assert.deepEqual(bridge.getDormantOpsPageStates().work_items, {
+    status: "contract_invalid",
+  });
+});
+
 describe("dormant Ops DTO, request, and envelope contracts", () => {
   test("accepts every exact DTO and rejects unknown fields, closed values, null drift, and bounds", () => {
     for (const { module, scope, item, invalid } of cases) {

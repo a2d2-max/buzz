@@ -186,6 +186,7 @@ export default defineConfig({
         "**/parity-ancestor-island.spec.ts",
         "**/ops-room.spec.ts",
         "**/raou-primary.spec.ts",
+        "**/raou-home-work.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],
