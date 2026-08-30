@@ -22,6 +22,7 @@ type Props = {
   onOpenSettings?: () => void;
   onOpenWorkflows?: () => void;
   onSelect: (view: OpsView) => void;
+  showLegacyNativeLinks?: boolean;
   view: OpsView;
 };
 
@@ -60,24 +61,20 @@ function NativeLinks({
     { label: "Workflows", open: onOpenWorkflows },
     { label: "Settings", open: onOpenSettings },
   ];
-  return (
-    <>
-      {links.map(({ label, open }) => (
-        <button
-          className="min-h-11 shrink-0 rounded-lg px-3 text-left text-sm hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-          data-ops-interactive
-          disabled={!open}
-          key={label}
-          onClick={open}
-          style={TARGET}
-          title={open ? undefined : "Restore identity to open this Buzz screen"}
-          type="button"
-        >
-          {label}
-        </button>
-      ))}
-    </>
-  );
+  return links.map(({ label, open }) => (
+    <button
+      className="min-h-11 shrink-0 rounded-lg px-3 text-left text-sm hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+      data-ops-interactive
+      disabled={!open}
+      key={label}
+      onClick={open}
+      style={TARGET}
+      title={open ? undefined : "Restore identity to open this Buzz screen"}
+      type="button"
+    >
+      {label}
+    </button>
+  ));
 }
 
 export function OpsSecondaryNav({
@@ -87,6 +84,7 @@ export function OpsSecondaryNav({
   onOpenSettings,
   onOpenWorkflows,
   onSelect,
+  showLegacyNativeLinks = false,
   view,
 }: Props) {
   const [open, setOpen] = React.useState(false);
@@ -147,37 +145,43 @@ export function OpsSecondaryNav({
   if (layout === "desktop")
     return (
       <nav
-        aria-label="Ops sections"
+        aria-label="RAOU sections"
         className="flex h-full w-44 shrink-0 flex-col gap-1 border-border/60 border-r p-2"
       >
         <p className="px-3 py-2 text-xs font-semibold text-muted-foreground">
           Sections
         </p>
         <NavLinks onSelect={onSelect} view={view} />
-        <p className="mt-2 border-border/60 border-t px-3 pt-3 text-xs font-semibold text-muted-foreground">
-          Buzz
-        </p>
-        <NativeLinks
-          onOpenAgents={onOpenAgents}
-          onOpenProjects={onOpenProjects}
-          onOpenSettings={onOpenSettings}
-          onOpenWorkflows={onOpenWorkflows}
-        />
+        {showLegacyNativeLinks ? (
+          <>
+            <p className="mt-2 border-border/60 border-t px-3 pt-3 text-xs font-semibold text-muted-foreground">
+              Buzz
+            </p>
+            <NativeLinks
+              onOpenAgents={onOpenAgents}
+              onOpenProjects={onOpenProjects}
+              onOpenSettings={onOpenSettings}
+              onOpenWorkflows={onOpenWorkflows}
+            />
+          </>
+        ) : null}
       </nav>
     );
   if (layout === "compact")
     return (
       <nav
-        aria-label="Ops sections"
+        aria-label="RAOU sections"
         className="flex min-w-0 gap-1 overflow-x-auto border-border/60 border-b p-2"
       >
         <NavLinks onSelect={onSelect} view={view} />
-        <NativeLinks
-          onOpenAgents={onOpenAgents}
-          onOpenProjects={onOpenProjects}
-          onOpenSettings={onOpenSettings}
-          onOpenWorkflows={onOpenWorkflows}
-        />
+        {showLegacyNativeLinks ? (
+          <NativeLinks
+            onOpenAgents={onOpenAgents}
+            onOpenProjects={onOpenProjects}
+            onOpenSettings={onOpenSettings}
+            onOpenWorkflows={onOpenWorkflows}
+          />
+        ) : null}
       </nav>
     );
   return (
@@ -214,12 +218,14 @@ export function OpsSecondaryNav({
                 }}
                 view={view}
               />
-              <NativeLinks
-                onOpenAgents={onOpenAgents}
-                onOpenProjects={onOpenProjects}
-                onOpenSettings={onOpenSettings}
-                onOpenWorkflows={onOpenWorkflows}
-              />
+              {showLegacyNativeLinks ? (
+                <NativeLinks
+                  onOpenAgents={onOpenAgents}
+                  onOpenProjects={onOpenProjects}
+                  onOpenSettings={onOpenSettings}
+                  onOpenWorkflows={onOpenWorkflows}
+                />
+              ) : null}
             </div>
           </div>
         </div>

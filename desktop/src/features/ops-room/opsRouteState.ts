@@ -25,6 +25,7 @@ export type OpsNavigationPort = {
   openProjects?: () => void;
   openWorkflows?: () => void;
   openSettings?: () => void;
+  showLegacyNativeLinks?: boolean;
   readOpsState: () => OpsRouteState;
 };
 

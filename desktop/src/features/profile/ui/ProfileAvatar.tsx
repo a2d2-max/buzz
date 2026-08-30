@@ -5,7 +5,7 @@ import { useAvatarPresentation } from "@/features/profile/avatarPresentationStor
 import { parseAnimatedAvatarUrl } from "@/shared/lib/animatedAvatar";
 import { cn } from "@/shared/lib/cn";
 import { getInitials } from "@/shared/lib/initials";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { Avatar, AvatarFallback, AvatarImage } from "@/shared/ui/avatar";
 import { Spinner } from "@/shared/ui/spinner";
 
@@ -46,7 +46,7 @@ export function ProfileAvatar({
 
   // Compute the live (proxied) source. Failures are tracked per resolved URL so
   // the poster and hover animation can recover independently.
-  const liveSrc = baseUrl ? rewriteRelayUrl(baseUrl) : null;
+  const liveSrc = useRewrittenRelayUrl(baseUrl);
   const [failedSrc, setFailedSrc] = React.useState<string | null>(null);
   const liveFailed = liveSrc !== null && failedSrc === liveSrc;
 

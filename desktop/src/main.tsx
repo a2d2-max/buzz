@@ -1,7 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { App } from "@/app/App";
+import { App, isLegacyCompatibilityAdapterActive } from "@/app/App";
 import { RootErrorBoundary } from "@/app/RootErrorBoundary";
+import { applyRaouDocumentTheme } from "@/app/raouDocumentTheme";
 import { NostrBindConsentDialog } from "@/features/profile/ui/NostrBindConsentDialog";
 import { useLocalOpsGuestMode } from "@/features/onboarding/localOpsGuestMode";
 import "@fontsource-variable/inter/opsz.css";
@@ -80,38 +81,44 @@ function configureDevE2eBridgeFromUrl() {
 }
 
 function renderApp() {
+  const legacyCompatibility = isLegacyCompatibilityAdapterActive();
+  if (!legacyCompatibility) applyRaouDocumentTheme();
+  const app = legacyCompatibility ? (
+    <RootErrorBoundary>
+      <CommunitiesProvider>
+        <CommunityOnboardingProvider enabled={huddleWindowChannelId() === null}>
+          <ThemeProvider defaultTheme="buzz">
+            <TooltipProvider>
+              <EmojiBurstProvider>
+                <PoofBurstProvider>
+                  <UpdaterProvider>
+                    <App />
+                    <LegacyIdentityBoundGlobalSurfaces />
+                  </UpdaterProvider>
+                  <Toaster />
+                </PoofBurstProvider>
+              </EmojiBurstProvider>
+            </TooltipProvider>
+          </ThemeProvider>
+        </CommunityOnboardingProvider>
+      </CommunitiesProvider>
+    </RootErrorBoundary>
+  ) : (
+    <RootErrorBoundary>
+      <TooltipProvider>
+        <App />
+      </TooltipProvider>
+    </RootErrorBoundary>
+  );
+
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-    <React.StrictMode>
-      {/* block/buzz#5078 — catch any uncaught render error so a WebKit
-          SecurityError from localStorage can't blank the whole window. */}
-      <RootErrorBoundary>
-        <CommunitiesProvider>
-          <CommunityOnboardingProvider
-            enabled={huddleWindowChannelId() === null}
-          >
-            <ThemeProvider defaultTheme="buzz">
-              <TooltipProvider>
-                <EmojiBurstProvider>
-                  <PoofBurstProvider>
-                    <UpdaterProvider>
-                      <App />
-                      <IdentityBoundGlobalSurfaces />
-                    </UpdaterProvider>
-                    <Toaster />
-                  </PoofBurstProvider>
-                </EmojiBurstProvider>
-              </TooltipProvider>
-            </ThemeProvider>
-          </CommunityOnboardingProvider>
-        </CommunitiesProvider>
-      </RootErrorBoundary>
-    </React.StrictMode>,
+    <React.StrictMode>{app}</React.StrictMode>,
   );
 }
 
-function IdentityBoundGlobalSurfaces() {
+function LegacyIdentityBoundGlobalSurfaces() {
   const localOpsGuestMode = useLocalOpsGuestMode();
-  if (localOpsGuestMode) return null;
+  if (!isLegacyCompatibilityAdapterActive() || localOpsGuestMode) return null;
   return <NostrBindConsentDialog />;
 }
 
@@ -137,7 +144,9 @@ async function bootstrap() {
   initializeFontSizePreference();
   startLocalStorageSweep();
   await installE2eBridgeIfConfigured();
-  await migrateLegacyCommunityStorageBeforeRender();
+  if (isLegacyCompatibilityAdapterActive()) {
+    await migrateLegacyCommunityStorageBeforeRender();
+  }
   renderApp();
 }
 

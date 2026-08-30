@@ -85,24 +85,7 @@ test("cycles mobile Sections focus in both Tab directions and closes on Escape",
   assert.ok(document.activeElement === trigger);
 });
 
-test("opens authenticated native screens and disables them for a guest", () => {
-  const opened = [];
-  const authenticated = render(
-    React.createElement(OpsSecondaryNav, {
-      layout: "desktop",
-      onOpenAgents: () => opened.push("agents"),
-      onOpenProjects: () => opened.push("projects"),
-      onOpenSettings: () => opened.push("settings"),
-      onOpenWorkflows: () => opened.push("workflows"),
-      onSelect() {},
-      view: "room",
-    }),
-  );
-  for (const label of ["Agents", "Projects", "Workflows", "Settings"])
-    fireEvent.click(screen.getByRole("button", { name: label }));
-  assert.deepEqual(opened, ["agents", "projects", "workflows", "settings"]);
-  authenticated.unmount();
-
+test("the primary local workspace exposes only RAOU sections", () => {
   render(
     React.createElement(OpsSecondaryNav, {
       layout: "desktop",
@@ -110,6 +93,37 @@ test("opens authenticated native screens and disables them for a guest", () => {
       view: "room",
     }),
   );
+
+  assert.ok(screen.getByRole("navigation", { name: "RAOU sections" }));
   for (const label of ["Agents", "Projects", "Workflows", "Settings"])
-    assert.equal(screen.getByRole("button", { name: label }).disabled, true);
+    assert.equal(screen.queryByRole("button", { name: label }), null);
+  assert.equal(screen.queryByText("Buzz", { exact: true }), null);
+});
+
+test("the compatibility adapter can still expose legacy native links", () => {
+  const opened = [];
+  render(
+    React.createElement(OpsSecondaryNav, {
+      layout: "desktop",
+      onOpenAgents() {
+        opened.push("agents");
+      },
+      onOpenProjects() {
+        opened.push("projects");
+      },
+      onOpenSettings() {
+        opened.push("settings");
+      },
+      onOpenWorkflows() {
+        opened.push("workflows");
+      },
+      onSelect() {},
+      showLegacyNativeLinks: true,
+      view: "room",
+    }),
+  );
+
+  for (const label of ["Agents", "Projects", "Workflows", "Settings"])
+    fireEvent.click(screen.getByRole("button", { name: label }));
+  assert.deepEqual(opened, ["agents", "projects", "workflows", "settings"]);
 });

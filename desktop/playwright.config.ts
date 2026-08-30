@@ -185,6 +185,7 @@ export default defineConfig({
         "**/relay-restart.live.spec.ts",
         "**/parity-ancestor-island.spec.ts",
         "**/ops-room.spec.ts",
+        "**/raou-primary.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],

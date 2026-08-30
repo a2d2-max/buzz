@@ -6,7 +6,7 @@ import type { TimelineReaction } from "@/features/messages/types";
 import { recordQuickReactionEmoji } from "@/features/messages/ui/useQuickReactionEmojis";
 import { cn } from "@/shared/lib/cn";
 import { emojiDisplayName } from "@/shared/lib/emojiName";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { AnimatedCount } from "@/shared/ui/AnimatedCount";
 import {
   isPositiveEmojiParticle,
@@ -77,12 +77,13 @@ function EmojiGlyph({
   className?: string;
 }) {
   const displayName = emojiDisplayName(reaction.emoji);
+  const mediaUrl = useRewrittenRelayUrl(reaction.emojiUrl ?? null);
   if (reaction.emojiUrl) {
     return (
       <img
         alt={reaction.emoji}
         title={displayName}
-        src={rewriteRelayUrl(reaction.emojiUrl)}
+        src={mediaUrl ?? reaction.emojiUrl}
         className={cn(
           "inline-block object-contain align-text-bottom",
           className,

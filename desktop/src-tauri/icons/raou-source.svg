@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="RAOU circuit mark">
+  <rect width="1024" height="1024" rx="212" fill="#101315"/>
+  <g fill="none" stroke="#C8FF45" stroke-linecap="square" stroke-linejoin="round" stroke-width="48">
+    <path d="M220 292h214l106 110h264"/>
+    <path d="M220 512h584"/>
+    <path d="M220 732h214l106-110h264"/>
+    <path d="M712 360v304M792 360v304"/>
+  </g>
+  <g fill="#C8FF45">
+    <circle cx="190" cy="292" r="34"/>
+    <circle cx="190" cy="512" r="34"/>
+    <circle cx="190" cy="732" r="34"/>
+  </g>
+</svg>

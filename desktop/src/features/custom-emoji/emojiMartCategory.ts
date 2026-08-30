@@ -1,5 +1,8 @@
+import * as React from "react";
+
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useMediaRewriteRevision } from "@/shared/lib/useMediaRewriteRevision";
 
 /**
  * Build the emoji-mart `custom` prop from the community custom emoji palette.
@@ -21,4 +24,14 @@ export function buildCustomEmojiCategory(customEmoji: CustomEmoji[]) {
       })),
     },
   ];
+}
+
+/** Keep an already-open emoji-mart palette current as media discovery moves. */
+export function useReactiveCustomEmojiCategory(customEmoji: CustomEmoji[]) {
+  const mediaRewriteRevision = useMediaRewriteRevision();
+  return React.useMemo(() => {
+    // rewriteRelayUrl reads module state; revision invalidates this memo.
+    void mediaRewriteRevision;
+    return buildCustomEmojiCategory(customEmoji);
+  }, [customEmoji, mediaRewriteRevision]);
 }

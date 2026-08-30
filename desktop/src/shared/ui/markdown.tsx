@@ -19,7 +19,7 @@ import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext"
 import { cn } from "@/shared/lib/cn";
 import { parseEntityLink } from "@/shared/lib/entityLink";
 import { parseSupportedLinkPreview } from "@/shared/lib/linkPreview";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { AttachmentGroup } from "@/shared/ui/attachment";
 import { ConfigNudgeCard } from "@/shared/ui/config-nudge-attachment";
@@ -1483,14 +1483,15 @@ export function createMarkdownComponents(
     hr: () => <hr className="border-border/80" />,
     img: function MarkdownImage({ alt, src }) {
       const { imetaByUrl } = useMarkdownRuntime();
+      const resolvedSrc = useRewrittenRelayUrl(src ?? null) ?? src;
       const entry = src ? imetaByUrl?.get(src) : undefined;
+      const resolvedThumbSrc =
+        useRewrittenRelayUrl(entry?.thumb ?? null) ?? entry?.thumb;
       const isVideo = src ? isVideoMedia(src, entry?.m) : false;
       if (!interactive) {
         const fallbackLabel = isVideo ? "Video attachment" : "Image attachment";
         return <span>{alt?.trim() || fallbackLabel}</span>;
       }
-
-      const resolvedSrc = src ? rewriteRelayUrl(src) : src;
       if (isVideo && src && resolvedSrc) {
         return (
           <span
@@ -1516,7 +1517,7 @@ export function createMarkdownComponents(
             dim={entry?.dim}
             resolvedSrc={resolvedSrc}
             src={src}
-            thumbSrc={entry?.thumb ? rewriteRelayUrl(entry.thumb) : undefined}
+            thumbSrc={resolvedThumbSrc}
           />
         </span>
       );
@@ -1535,11 +1536,9 @@ export function createMarkdownComponents(
       // (the img component returns block-level wrappers for lightbox/video).
       const childArray = React.Children.toArray(children);
       const { imageChildren } = classifyChildren(childArray);
-
       if (isImageOnlyParagraph(childArray)) {
         return <ImageMosaic>{imageChildren}</ImageMosaic>;
       }
-
       if (hasBlockMedia(childArray)) {
         return <div>{children}</div>;
       }
@@ -1620,8 +1619,9 @@ export function createMarkdownComponents(
         mentionNode
       );
     },
-    emoji: ({ src, alt }: { src?: string; alt?: string }) => {
-      const resolvedSrc = src ? rewriteRelayUrl(src) : src;
+    emoji: function MarkdownEmoji(props: { src?: string; alt?: string }) {
+      const { src, alt } = props;
+      const resolvedSrc = useRewrittenRelayUrl(src ?? null) ?? src;
       if (!resolvedSrc) {
         return <span>{alt}</span>;
       }

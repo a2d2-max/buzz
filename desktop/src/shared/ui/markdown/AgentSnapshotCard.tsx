@@ -4,6 +4,7 @@ import { Bot, Download, Loader2, Users } from "lucide-react";
 import { invokeTauri } from "@/shared/api/tauri";
 import { fetchSnapshotBytes } from "@/shared/api/tauriMedia";
 import { cn } from "@/shared/lib/cn";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import {
   Attachment,
   AttachmentAction,
@@ -72,6 +73,7 @@ export function AgentSnapshotCard({
   });
   const inFlightRef = React.useRef(false);
   const [thumbError, setThumbError] = React.useState(false);
+  const resolvedThumb = useRewrittenRelayUrl(thumb ?? null);
 
   async function handleImport() {
     if (inFlightRef.current) return; // prevent double-click
@@ -107,7 +109,7 @@ export function AgentSnapshotCard({
 
   const isFetching = importState.phase === "fetching";
   const SnapshotIcon = snapshotKind === "team" ? Users : Bot;
-  const showThumb = !!thumb && !thumbError;
+  const showThumb = !!resolvedThumb && !thumbError;
   const formattedSize =
     size == null
       ? null
@@ -140,14 +142,14 @@ export function AgentSnapshotCard({
               alt=""
               aria-hidden="true"
               className="pointer-events-none absolute inset-0 h-full w-full scale-150 object-cover"
-              src={thumb}
+              src={resolvedThumb ?? undefined}
               referrerPolicy="no-referrer"
             />
             <img
               alt=""
               className="relative h-full w-full object-cover"
               data-testid="agent-snapshot-card-thumb"
-              src={thumb}
+              src={resolvedThumb ?? undefined}
               referrerPolicy="no-referrer"
               onError={() => setThumbError(true)}
             />

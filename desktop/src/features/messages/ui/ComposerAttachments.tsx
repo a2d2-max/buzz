@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import {
   shortHash,
   type UploadingAttachmentPreview,
@@ -134,6 +134,8 @@ function ComposerSnapshotCard({
   snapshotKind: SnapshotKind;
 }) {
   const [thumbError, setThumbError] = React.useState(false);
+  const resolvedAttachmentUrl =
+    useRewrittenRelayUrl(attachment.url) ?? attachment.url;
   const isAgentPng =
     snapshotKind === "agent" &&
     attachment.filename?.toLowerCase().endsWith(".agent.png");
@@ -173,12 +175,12 @@ function ComposerSnapshotCard({
                 alt=""
                 aria-hidden="true"
                 className="pointer-events-none absolute inset-0 h-full w-full scale-150 object-cover"
-                src={rewriteRelayUrl(attachment.url)}
+                src={resolvedAttachmentUrl}
               />
               <img
                 alt=""
                 className="relative h-full w-full object-cover"
-                src={rewriteRelayUrl(attachment.url)}
+                src={resolvedAttachmentUrl}
                 onError={() => setThumbError(true)}
               />
             </>
@@ -277,14 +279,13 @@ const MediaAttachmentItem = React.forwardRef<
         ? `Video attachment ${hash}`
         : `Attachment ${hash}`
       : attachment.filename?.trim() || `Attachment ${hash}`);
-  const thumbUrl = attachment.thumb
-    ? rewriteRelayUrl(attachment.thumb)
-    : rewriteRelayUrl(attachment.url);
-  const videoPosterUrl = attachment.image
-    ? rewriteRelayUrl(attachment.image)
-    : attachment.thumb
-      ? rewriteRelayUrl(attachment.thumb)
-      : undefined;
+  const resolvedAttachmentUrl =
+    useRewrittenRelayUrl(attachment.url) ?? attachment.url;
+  const rawThumbUrl = attachment.thumb ?? attachment.url;
+  const thumbUrl = useRewrittenRelayUrl(rawThumbUrl) ?? rawThumbUrl;
+  const rawVideoPosterUrl = attachment.image ?? attachment.thumb ?? null;
+  const videoPosterUrl =
+    useRewrittenRelayUrl(rawVideoPosterUrl) ?? rawVideoPosterUrl ?? undefined;
 
   // Only Buzz-hosted uploads have a content hash. URL-only provider media
   // must remain externally hosted instead of being copied into storage by the
@@ -418,7 +419,7 @@ const MediaAttachmentItem = React.forwardRef<
               {mode === "edit" && !isVideo ? (
                 <ComposerImageEditor
                   alt={mediaLabel}
-                  src={rewriteRelayUrl(attachment.url)}
+                  src={resolvedAttachmentUrl}
                   sourceUrl={attachment.url}
                   sourceType={attachment.type}
                   onCancel={handleEditorCancel}
@@ -428,7 +429,7 @@ const MediaAttachmentItem = React.forwardRef<
               ) : isVideo ? (
                 // biome-ignore lint/a11y/useMediaCaption: user-uploaded video, no captions available
                 <video
-                  src={rewriteRelayUrl(attachment.url)}
+                  src={resolvedAttachmentUrl}
                   controls
                   className={cn(
                     "relative max-h-[90vh] max-w-[90vw] rounded-lg",
@@ -442,7 +443,7 @@ const MediaAttachmentItem = React.forwardRef<
                     "relative max-h-[90vh] max-w-[90vw] rounded-lg object-contain",
                     isSpoilered && "blur-2xl brightness-75",
                   )}
-                  src={rewriteRelayUrl(attachment.url)}
+                  src={resolvedAttachmentUrl}
                 />
               )}
               {mode === "view" && isSpoilered ? (

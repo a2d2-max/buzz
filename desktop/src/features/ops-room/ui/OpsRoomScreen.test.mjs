@@ -271,6 +271,8 @@ describe("native Ops Room components", () => {
     assert.ok(screen.getByText("Local Ops Hub가 설정되지 않았습니다"));
     view.rerender(roomView({ connectionState: "version_mismatch" }));
     assert.ok(screen.getByText("Ops 계약 버전이 맞지 않습니다"));
+    assert.match(document.body.textContent, /RAOU.*Hub/);
+    assert.equal(document.body.textContent.includes("Buzz"), false);
     view.rerender(roomView({ connectionState: "contract_invalid" }));
     assert.ok(screen.getByText("Ops 데이터 계약을 확인할 수 없습니다"));
   });

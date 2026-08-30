@@ -3,7 +3,7 @@ import * as React from "react";
 import { parseAnimatedAvatarUrl } from "@/shared/lib/animatedAvatar";
 import { cn } from "@/shared/lib/cn";
 import { getInitials } from "@/shared/lib/initials";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { Avatar, AvatarFallback, AvatarImage } from "@/shared/ui/avatar";
 
 type UserAvatarSize = "xs" | "sm" | "md";
@@ -56,11 +56,12 @@ export function UserAvatar({
   // the animation.
   const animated = parseAnimatedAvatarUrl(avatarUrl);
   const [isHovered, setIsHovered] = React.useState(false);
-  const src = animated
-    ? rewriteRelayUrl(isHovered ? animated.animationUrl : animated.posterUrl)
-    : avatarUrl
-      ? rewriteRelayUrl(avatarUrl)
-      : null;
+  const selectedUrl = animated
+    ? isHovered
+      ? animated.animationUrl
+      : animated.posterUrl
+    : avatarUrl;
+  const src = useRewrittenRelayUrl(selectedUrl);
 
   return (
     <Avatar

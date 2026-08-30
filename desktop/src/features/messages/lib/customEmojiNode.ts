@@ -1,6 +1,6 @@
 import { mergeAttributes, Node, nodeInputRule } from "@tiptap/core";
 
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { rewriteRelayUrl, subscribeMediaRewrite } from "@/shared/lib/mediaUrl";
 import { escapeRegExp } from "@/shared/lib/mentionPattern";
 
 /**
@@ -23,6 +23,8 @@ import { escapeRegExp } from "@/shared/lib/mentionPattern";
  */
 
 export const CUSTOM_EMOJI_NODE_NAME = "customEmoji";
+const CUSTOM_EMOJI_IMAGE_CLASS =
+  "mx-px inline-block h-[1.25em] w-auto max-w-none align-middle";
 
 export interface CustomEmojiNodeOptions {
   /** Resolve a (lowercased) shortcode to its image URL. */
@@ -195,9 +197,44 @@ export const CustomEmojiNode = Node.create<CustomEmojiNodeOptions>({
         "data-shortcode": shortcode,
         draggable: "false",
         // Match the message-view <img data-custom-emoji> sizing exactly.
-        class: "mx-px inline-block h-[1.25em] w-auto max-w-none align-middle",
+        class: CUSTOM_EMOJI_IMAGE_CLASS,
       }),
     ];
+  },
+
+  addNodeView() {
+    const options = this.options;
+    return ({ node }) => {
+      const dom = document.createElement("img");
+      let currentNode = node;
+
+      const render = () => {
+        const shortcode = String(currentNode.attrs.shortcode ?? "");
+        const rawSrc =
+          options.resolveUrl(shortcode.toLowerCase()) ??
+          String(currentNode.attrs.src ?? "");
+        dom.src = rawSrc ? rewriteRelayUrl(rawSrc) : "";
+        dom.alt = `:${shortcode}:`;
+        dom.title = `:${shortcode}:`;
+        dom.dataset.customEmoji = "";
+        dom.dataset.shortcode = shortcode;
+        dom.draggable = false;
+        dom.className = CUSTOM_EMOJI_IMAGE_CLASS;
+      };
+
+      const unsubscribe = subscribeMediaRewrite(render);
+      render();
+      return {
+        dom,
+        update(nextNode) {
+          if (nextNode.type !== currentNode.type) return false;
+          currentNode = nextNode;
+          render();
+          return true;
+        },
+        destroy: unsubscribe,
+      };
+    };
   },
 
   // Plain-text projection of the node: the literal shortcode. Powers

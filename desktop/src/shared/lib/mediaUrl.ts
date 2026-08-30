@@ -66,12 +66,23 @@ const relayOriginListeners = new Set<() => void>();
 /** `useSyncExternalStore` listeners for media-proxy port changes. */
 const mediaProxyPortListeners = new Set<() => void>();
 
+/** Consolidated revision store for any derived media URL. */
+let mediaRewriteRevision = 0;
+const mediaRewriteListeners = new Set<() => void>();
+
+function notifyMediaRewriteListeners(): void {
+  mediaRewriteRevision += 1;
+  for (const listener of mediaRewriteListeners) listener();
+}
+
 function notifyRelayOriginListeners(): void {
   for (const listener of relayOriginListeners) listener();
+  notifyMediaRewriteListeners();
 }
 
 function notifyMediaProxyPortListeners(): void {
   for (const listener of mediaProxyPortListeners) listener();
+  notifyMediaRewriteListeners();
 }
 
 /**
@@ -125,6 +136,19 @@ export function subscribeMediaProxyPort(listener: () => void): () => void {
   return () => {
     mediaProxyPortListeners.delete(listener);
   };
+}
+
+/** Subscribe to any origin, proxy-port, or cache-generation rewrite change. */
+export function subscribeMediaRewrite(listener: () => void): () => void {
+  mediaRewriteListeners.add(listener);
+  return () => {
+    mediaRewriteListeners.delete(listener);
+  };
+}
+
+/** Monotonic snapshot for memoized media derivations and imperative views. */
+export function getMediaRewriteRevision(): number {
+  return mediaRewriteRevision;
 }
 
 const POLL_INTERVAL_MS = 100;
@@ -244,13 +268,6 @@ export function ensureRelayOriginFetch(): void {
   }
 }
 
-/** Eagerly fetch the port at module load so it's ready by first render. */
-// The try/catch inside fetchProxyPort handles non-Tauri environments gracefully
-// (invoke will throw, we retry until timeout, then give up — no side effects).
-if (typeof window !== "undefined") {
-  portPromise = fetchProxyPort();
-}
-
 /**
  * Reset module-level caches so the next render re-fetches the proxy port
  * and relay origin for the new community.
@@ -263,14 +280,18 @@ if (typeof window !== "undefined") {
 export function resetMediaCaches(): void {
   cacheGeneration += 1;
   const hadCachedPort = cachedPort !== null;
+  const hadCachedRelayOrigin = cachedRelayOrigin !== null;
   cachedPort = null;
   portPromise = null;
   if (hadCachedPort) {
     notifyMediaProxyPortListeners();
   }
-  if (cachedRelayOrigin !== null) {
+  if (hadCachedRelayOrigin) {
     cachedRelayOrigin = null;
     notifyRelayOriginListeners();
+  }
+  if (!hadCachedPort && !hadCachedRelayOrigin) {
+    notifyMediaRewriteListeners();
   }
 }
 
@@ -307,7 +328,10 @@ export function mediaProxyUrl(port: number, mediaPath: string): string {
  * to go through the local streaming proxy. External Blossom URLs and
  * non-Blossom URLs are returned unchanged.
  *
- * Falls back to buzz-media:// if the proxy port isn't available yet.
+ * Returns the original URL while relay classification and the proxy port are
+ * still resolving. This preserves external Blossom URLs for consumers that do
+ * not subscribe to the stores, while subscribed relay consumers re-render to
+ * the proxy URL when the demand-started lookup completes.
  */
 export function rewriteRelayUrl(url: string): string {
   const m = RELAY_MEDIA_RE.exec(url);
@@ -335,5 +359,5 @@ export function rewriteRelayUrl(url: string): string {
     ensureRelayOriginFetch();
   }
 
-  return `buzz-media://localhost/media/${m[1]}`;
+  return url;
 }

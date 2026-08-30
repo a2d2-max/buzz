@@ -2,13 +2,13 @@ import * as React from "react";
 import { ChevronDown } from "lucide-react";
 
 import { cn } from "@/shared/lib/cn";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { useAgentSessionTranscriptVariant } from "../agentSessionTranscriptContext";
 import type { AgentActivityAction } from "../agentSessionTypes";
 import type {
   CompactFileEditSummary,
   CompactToolKind,
 } from "../agentSessionToolSummary";
-import { resolveToolImageSrc } from "../agentSessionUtils";
 import {
   ActivityRowLabel,
   splitActivityRowLabel,
@@ -36,14 +36,15 @@ export function CompactToolSummaryRow({
   preview: string | null;
   thumbnailSrc: string | null;
 }) {
-  const [thumbnailFailed, setThumbnailFailed] = React.useState(false);
+  const [failedThumbnailSrc, setFailedThumbnailSrc] = React.useState<
+    string | null
+  >(null);
   const variant = useAgentSessionTranscriptVariant();
   const isCompactPreview = variant === "compactPreview";
   const mutedTone = compactSummaryTone();
-  const resolvedThumbnail = React.useMemo(() => {
-    if (!thumbnailSrc || thumbnailFailed) return null;
-    return resolveToolImageSrc(thumbnailSrc);
-  }, [thumbnailFailed, thumbnailSrc]);
+  const rewrittenThumbnail = useRewrittenRelayUrl(thumbnailSrc);
+  const resolvedThumbnail =
+    rewrittenThumbnail === failedThumbnailSrc ? null : rewrittenThumbnail;
   const actionLabel = fileEditSummary
     ? null
     : getCompactToolActionLabel(action, kind, label, preview);
@@ -76,7 +77,7 @@ export function CompactToolSummaryRow({
           className="h-5 w-auto max-w-12 shrink-0 rounded-sm object-cover"
           decoding="async"
           loading="lazy"
-          onError={() => setThumbnailFailed(true)}
+          onError={() => setFailedThumbnailSrc(resolvedThumbnail)}
           src={resolvedThumbnail}
           title={preview ?? undefined}
         />

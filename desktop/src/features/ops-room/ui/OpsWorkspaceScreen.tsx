@@ -27,6 +27,15 @@ export function OpsWorkspaceScreen({
         onOpenSettings={navigation.openSettings}
         onOpenWorkflows={navigation.openWorkflows}
         onSelect={(view) => navigation.pushOpsState({ ...state, view })}
+        showLegacyNativeLinks={
+          navigation.showLegacyNativeLinks ||
+          Boolean(
+            navigation.openAgents ||
+              navigation.openProjects ||
+              navigation.openSettings ||
+              navigation.openWorkflows,
+          )
+        }
         view={state.view}
       />
       <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">

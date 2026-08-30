@@ -113,7 +113,9 @@ export function resolveSnapshotCard(
     snapshotKind,
     // Agent PNG snapshots carry the avatar card image. Team PNG snapshots use
     // a transport placeholder, so render the team icon instead of that image.
-    thumb: isPng ? rewriteRelayUrl(href) : undefined,
+    // Keep the canonical URL in this pure resolver. AgentSnapshotCard owns the
+    // reactive media rewrite so cold relay discovery can update the thumbnail.
+    thumb: isPng ? href : undefined,
   };
 }
 

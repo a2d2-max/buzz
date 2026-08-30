@@ -10,6 +10,7 @@ import {
   rankShortcodeMatchesFirst,
 } from "@/shared/lib/emojiSearch";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useMediaRewriteRevision } from "@/shared/lib/useMediaRewriteRevision";
 import type { AutocompleteEdit } from "./useRichTextEditor";
 
 export type EmojiSuggestion = {
@@ -48,6 +49,7 @@ function detectEmojiQuery(
 }
 
 export function useEmojiAutocomplete(customEmoji: CustomEmoji[] = []) {
+  const mediaRewriteRevision = useMediaRewriteRevision();
   const [emojiQuery, setEmojiQuery] = React.useState<string | null>(null);
   const [emojiStartIndex, setEmojiStartIndex] = React.useState(0);
   const [emojiSelectedIndex, setEmojiSelectedIndex] = React.useState(0);
@@ -73,6 +75,9 @@ export function useEmojiAutocomplete(customEmoji: CustomEmoji[] = []) {
   }, []);
 
   React.useEffect(() => {
+    // The URL snapshot is derived from module state, so revision is the
+    // explicit invalidation input even though rewriteRelayUrl reads it.
+    void mediaRewriteRevision;
     if (emojiQuery === null) {
       setSuggestions([]);
       return;
@@ -148,7 +153,7 @@ export function useEmojiAutocomplete(customEmoji: CustomEmoji[] = []) {
     return () => {
       cancelled = true;
     };
-  }, [emojiQuery]);
+  }, [emojiQuery, mediaRewriteRevision]);
 
   const isEmojiAutocompleteOpen = emojiQuery !== null && suggestions.length > 0;
 

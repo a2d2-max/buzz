@@ -23,7 +23,7 @@ const STATE_COPY: Record<
   },
   version_mismatch: {
     title: "Ops 계약 버전이 맞지 않습니다",
-    description: "Buzz와 Hub의 Ops 계약 버전을 맞춘 뒤 다시 여세요.",
+    description: "RAOU와 Local Ops Hub의 계약 버전을 맞춘 뒤 다시 여세요.",
   },
   contract_invalid: {
     title: "Ops 데이터 계약을 확인할 수 없습니다",

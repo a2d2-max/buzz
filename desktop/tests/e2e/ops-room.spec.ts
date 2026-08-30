@@ -79,7 +79,7 @@ for (const viewport of [
     ).toBeVisible();
     if (viewport.name === "desktop") {
       const rail = await page
-        .getByRole("navigation", { name: "Ops sections" })
+        .getByRole("navigation", { name: "RAOU sections" })
         .boundingBox();
       const artifacts = await page
         .getByTestId("ops-artifacts-view")

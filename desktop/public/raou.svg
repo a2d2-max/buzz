@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="RAOU">
+  <rect width="512" height="512" rx="106" fill="#101315"/>
+  <g fill="none" stroke="#C8FF45" stroke-linecap="square" stroke-linejoin="round" stroke-width="24">
+    <path d="M110 146h107l53 55h132"/>
+    <path d="M110 256h292"/>
+    <path d="M110 366h107l53-55h132"/>
+    <path d="M356 180v152M396 180v152"/>
+  </g>
+  <g fill="#C8FF45">
+    <circle cx="95" cy="146" r="17"/>
+    <circle cx="95" cy="256" r="17"/>
+    <circle cx="95" cy="366" r="17"/>
+  </g>
+</svg>

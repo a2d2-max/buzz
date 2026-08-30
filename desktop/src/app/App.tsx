@@ -45,7 +45,10 @@ import {
   enableLocalOpsGuestMode,
   useLocalOpsGuestMode,
 } from "@/features/onboarding/localOpsGuestMode";
-import { LocalOpsGuestApp } from "@/features/ops-room/ui/LocalOpsGuestApp";
+import {
+  LocalOpsGuestApp,
+  RaouWorkspaceApp,
+} from "@/features/ops-room/ui/LocalOpsGuestApp";
 import { PendingInviteGate } from "@/features/onboarding/ui/PendingInviteGate";
 import { KeyringLockedScreen } from "@/features/onboarding/ui/KeyringLockedScreen";
 import { RelaunchRequiredScreen } from "@/features/onboarding/ui/RelaunchRequiredScreen";
@@ -818,7 +821,7 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   );
 }
 
-export function App() {
+export function LegacyCommunityApp() {
   useReloadShortcut();
   useCloseWindowShortcut();
   useInitialRenderReady();
@@ -840,5 +843,33 @@ export function App() {
     <QueryClientProvider client={queryClient}>
       <MachineBootstrap sharedIdentity={sharedIdentity} />
     </QueryClientProvider>
+  );
+}
+
+export function isLegacyCompatibilityAdapterActive(): boolean {
+  if (huddleWindowChannelId() !== null) return true;
+  return (
+    import.meta.env.MODE === "e2e" &&
+    new URL(window.location.href).searchParams.get("raouPrimary") !== "1"
+  );
+}
+
+function RaouPrimaryApp() {
+  useReloadShortcut();
+  useCloseWindowShortcut();
+  useInitialRenderReady();
+  const [queryClient] = useState(createBuzzQueryClient);
+  return (
+    <QueryClientProvider client={queryClient}>
+      <RaouWorkspaceApp />
+    </QueryClientProvider>
+  );
+}
+
+export function App() {
+  return isLegacyCompatibilityAdapterActive() ? (
+    <LegacyCommunityApp />
+  ) : (
+    <RaouPrimaryApp />
   );
 }

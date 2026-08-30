@@ -14946,6 +14946,8 @@ export function maybeInstallE2eTauriMocks() {
         return null;
       case "plugin:window|is_fullscreen":
         return false;
+      case "plugin:window|start_dragging":
+        return null;
       // Settings reads the app version through the app plugin. Without this the
       // bridge throws an unhandled page error on every Settings render, which
       // shows up as noise in unrelated specs.
