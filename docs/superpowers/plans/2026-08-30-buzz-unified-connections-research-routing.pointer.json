@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "workspace_registry_id": "buzz-workspace",
+  "canonical_registry_id": "hub-unified-ops",
+  "canonical_plan_relative_path": "docs/superpowers/plans/2026-08-30-buzz-unified-connections-research-routing.md",
+  "canonical_plan_commit_sha": "032f6ff3e33ed1018a38dce27e79569ab4d3f994",
+  "canonical_plan_sha256": "ab98f32221e4beb4fa42b67c75cd831016dd425ca8e44c0fb907f2bef5235bb6",
+  "review_receipt_sha256": "3be860c514a308c7a210a5c10a82b5eaadd6718f7cffc97f0aa2a85f0f42aa55"
+}
