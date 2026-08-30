@@ -275,14 +275,20 @@ fn task5_rust_boundary_matrix_matches_frozen_limits_and_patterns() {
         assert!(!validate_research_detail(&research_max));
     }
     for invalid_comparison in [
+        "c".repeat(39),
         format!("x{}", "c".repeat(40)),
         format!("{}x", "c".repeat(40)),
+        "c".repeat(63),
+        "c".repeat(65),
         "C".repeat(40),
     ] {
         let mut value = repository_max.clone();
         value["comparison_sha"] = json!(invalid_comparison);
         assert!(!validate_repository_detail(&value));
     }
+    let mut repository_sha64 = repository_max.clone();
+    repository_sha64["comparison_sha"] = json!("c".repeat(64));
+    assert!(validate_repository_detail(&repository_sha64));
     let mut unsafe_version = research_max;
     unsafe_version["markdown"]["sha256"] = json!(SHA);
     unsafe_version["release_version"] = json!(9_007_199_254_740_992_u64);

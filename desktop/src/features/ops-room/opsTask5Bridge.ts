@@ -185,19 +185,33 @@ export async function loadOpsTeamsActivityState(
   }
   const key = capabilityKey(capability);
   prepareDormantState("teams_activity", key);
-  if (getDormantOpsPageStates().teams_activity?.status === "contract_invalid")
-    return { status: "contract_invalid" };
+  const fencedState = () => {
+    const state = getDormantOpsPageStates().teams_activity;
+    if (state?.status === "contract_invalid")
+      return { status: "contract_invalid" } as const;
+    if (!isOpsPagedModuleGenerationCurrent("teams_activity", key))
+      return { status: "unavailable" } as const;
+    return null;
+  };
+  const beforeRequest = fencedState();
+  if (beforeRequest) return beforeRequest;
   try {
+    const data = (await getOpsPage(
+      request,
+      capability.collection_revision,
+    )) as OpsPageV1<OpsTeamsActivityV1>;
+    const afterRequest = fencedState();
+    if (afterRequest) return afterRequest;
     const state = {
       status: "ready",
-      data: (await getOpsPage(
-        request,
-        capability.collection_revision,
-      )) as OpsPageV1<OpsTeamsActivityV1>,
+      data,
     } as const;
-    setDormantState("teams_activity", key, state);
+    if (!setDormantState("teams_activity", key, state))
+      return fencedState() ?? { status: "unavailable" };
     return state;
   } catch (error) {
+    const afterFailure = fencedState();
+    if (afterFailure) return afterFailure;
     if (
       error instanceof OpsBridgeContractError ||
       (error instanceof OpsPageError && error.code === "unavailable") ||

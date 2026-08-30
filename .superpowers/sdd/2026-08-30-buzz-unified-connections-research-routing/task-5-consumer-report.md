@@ -65,6 +65,19 @@ The page-state implementation was split into `opsPagedModuleState.ts` to keep th
 - `git diff --check`: passed.
 - Playwright was not run because no rendered UI behavior or E2E mock boundary was changed.
 
+### Teams generation follow-up
+
+A final scoped review found that the Teams loader did not apply the shared generation fence around its deferred native request. RED tests demonstrated both failure modes: a deferred old-revision success returned stale ready data after the newer revision won, and a deferred old-revision failure returned `contract_invalid` and poisoned the newer ready state. The Teams loader now checks the shared authoritative generation before the request, after either completion path, and after the guarded state commit, matching the research loaders.
+
+The Rust/Zod repository-detail parity matrix was also completed with a valid lowercase 64-hex `comparison_sha` and exact invalid 39-, 63-, and 65-character cases, alongside the existing valid 40-character and prefix/suffix/uppercase coverage.
+
+- Focused Task 5 bridge/contracts: 16 passed, 0 failed.
+- Full Ops-room TypeScript: 175 passed, 0 failed.
+- Full desktop TypeScript after the follow-up: 6,006 passed, 0 failed.
+- Focused Rust Task 5 boundary matrix: passed.
+- TypeScript typecheck, touched Biome, Rust formatting, differential file-size gate, and `git diff --check`: passed.
+- Rust production code was unchanged in this follow-up; the preceding full Rust gate remains applicable.
+
 ## Self-review
 
 - Confirmed all changed production paths are Buzz consumers under `desktop/`; there are no Hub changes.

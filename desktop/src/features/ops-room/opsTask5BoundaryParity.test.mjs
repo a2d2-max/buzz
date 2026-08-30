@@ -335,8 +335,11 @@ test("Task 5 Zod boundary matrix enforces frozen sizes, cardinalities, and full-
       invalidHash,
     );
   for (const invalidComparison of [
+    "c".repeat(39),
     `x${"c".repeat(40)}`,
     `${"c".repeat(40)}x`,
+    "c".repeat(63),
+    "c".repeat(65),
     "C".repeat(40),
   ])
     assert.equal(
@@ -347,4 +350,12 @@ test("Task 5 Zod boundary matrix enforces frozen sizes, cardinalities, and full-
       false,
       invalidComparison,
     );
+  assert.equal(
+    task5.opsRepositoryDetailSchema.safeParse({
+      ...repositoryMax,
+      comparison_sha: "c".repeat(64),
+    }).success,
+    true,
+    "64-character lowercase comparison SHA",
+  );
 });

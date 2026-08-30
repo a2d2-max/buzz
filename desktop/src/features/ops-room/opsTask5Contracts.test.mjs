@@ -111,6 +111,26 @@ function researchDetail(id = "research:one") {
   };
 }
 
+function teamsPage(revision, id = "activity:one") {
+  return {
+    contract_version: 1,
+    revision,
+    generated_at: NOW,
+    items: [
+      {
+        id,
+        connection_id: "connection:one",
+        activity_kind: "mention",
+        summary: "Observed activity",
+        observed_at: NOW,
+        source_alias: SOURCE,
+        locator_label: "Channel",
+      },
+    ],
+    next_cursor: null,
+  };
+}
+
 function workflow(overrides = {}) {
   return {
     status: "ready",
@@ -836,6 +856,96 @@ test("advertised Teams unavailable and native contract markers become sticky con
   assert.deepEqual(
     await task5Bridge.loadOpsTeamsActivityState(request, advertised),
     { status: "contract_invalid" },
+  );
+});
+
+test("Teams activity fences a deferred old-revision success after the new revision wins", async () => {
+  bridge.resetDormantOpsPageStates();
+  let resolveOld;
+  const oldResponse = new Promise((resolve) => {
+    resolveOld = resolve;
+  });
+  responses.push(oldResponse, teamsPage(6, "activity:new"));
+  const request = {
+    module: "teams_activity",
+    scope: { connection: "connection:one", sort: "observed_at_desc" },
+    page_size: 100,
+    cursor: null,
+  };
+  const oldCapabilities = capabilities([
+    {
+      name: "teams_activity",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 5,
+    },
+  ]);
+  const newCapabilities = capabilities([
+    {
+      name: "teams_activity",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 6,
+    },
+  ]);
+  const oldResult = task5Bridge.loadOpsTeamsActivityState(
+    request,
+    oldCapabilities,
+  );
+  const newResult = await task5Bridge.loadOpsTeamsActivityState(
+    request,
+    newCapabilities,
+  );
+  resolveOld(teamsPage(5, "activity:old"));
+
+  assert.equal(newResult.status, "ready");
+  assert.deepEqual(await oldResult, { status: "unavailable" });
+});
+
+test("Teams activity ignores a deferred old-revision failure after the new revision wins", async () => {
+  bridge.resetDormantOpsPageStates();
+  let rejectOld;
+  const oldResponse = new Promise((_resolve, reject) => {
+    rejectOld = reject;
+  });
+  responses.push(oldResponse, teamsPage(8, "activity:new"));
+  const request = {
+    module: "teams_activity",
+    scope: { connection: "connection:one", sort: "observed_at_desc" },
+    page_size: 100,
+    cursor: null,
+  };
+  const oldCapabilities = capabilities([
+    {
+      name: "teams_activity",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 7,
+    },
+  ]);
+  const newCapabilities = capabilities([
+    {
+      name: "teams_activity",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 8,
+    },
+  ]);
+  const oldResult = task5Bridge.loadOpsTeamsActivityState(
+    request,
+    oldCapabilities,
+  );
+  const newResult = await task5Bridge.loadOpsTeamsActivityState(
+    request,
+    newCapabilities,
+  );
+  rejectOld({ error: "contract_invalid" });
+
+  assert.equal(newResult.status, "ready");
+  assert.deepEqual(await oldResult, { status: "unavailable" });
+  assert.equal(
+    bridge.getDormantOpsPageStates().teams_activity?.status,
+    "ready",
   );
 });
 
