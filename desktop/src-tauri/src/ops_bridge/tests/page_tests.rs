@@ -85,6 +85,24 @@ async fn ops_bridge_capabilities_require_collection_revision_for_paged_modules()
 fn ops_bridge_page_request_is_a_closed_exact_contract() {
     let valid = [
         json!({
+            "module": "work_items",
+            "scope": {"sort": "last_activity_at_desc"},
+            "page_size": 100,
+            "cursor": null
+        }),
+        json!({
+            "module": "checklist_items",
+            "scope": {"work_item": "work:one", "sort": "order_asc_then_id"},
+            "page_size": 100,
+            "cursor": null
+        }),
+        json!({
+            "module": "search",
+            "scope": {"q": "Café", "kind": "audit", "work": "work:one", "sort": "rank_desc_then_observed_at_desc"},
+            "page_size": 100,
+            "cursor": null
+        }),
+        json!({
             "module": "timeline",
             "scope": {"channel": null, "thread": null, "sort": "occurred_at_desc"},
             "page_size": 100,

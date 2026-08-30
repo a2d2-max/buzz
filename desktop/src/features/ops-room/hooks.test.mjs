@@ -60,6 +60,7 @@ function nextResponse(command) {
     throw new Error(`unexpected invoke: ${command}`);
   }
   const value = values.shift();
+  if (value?.reject !== undefined) throw value.reject;
   if (value instanceof Error || typeof value === "string") throw value;
   return value;
 }
@@ -122,6 +123,7 @@ afterEach(async () => {
   const { cleanup } = await import("@testing-library/react");
   cleanup();
   await resetOpsWatchManager();
+  resetDormantOpsPageStates();
   mock.timers.reset();
 });
 
@@ -129,6 +131,11 @@ after(() => dom.window.close());
 
 const { opsMutationsDisabled, resetOpsWatchManager, useOpsSnapshot } =
   await import("./hooks.ts");
+const {
+  getOpsCapabilities,
+  loadDormantOpsModuleState,
+  resetDormantOpsPageStates,
+} = await import("./opsBridge.ts");
 
 test("mutations stay disabled for every non-ready lifecycle and any invalid optional module", () => {
   const valid = {
@@ -163,6 +170,174 @@ test("mutations stay disabled for every non-ready lifecycle and any invalid opti
     }),
     true,
   );
+  const pagedStates = {
+    work_items: { status: "ready", data: { items: [] } },
+    search: { status: "contract_invalid" },
+  };
+  assert.equal(opsMutationsDisabled("ready", valid, pagedStates), true);
+  assert.equal(
+    opsMutationsDisabled("ready", valid, {
+      work_items: { status: "ready", data: { items: [] } },
+    }),
+    false,
+  );
+});
+
+test("a malformed paged module disables the real hook while retaining unrelated reads", async () => {
+  const pagedCapabilities = {
+    ...capabilities,
+    modules: [
+      {
+        name: "work_items",
+        schema_version: 1,
+        paged: true,
+        collection_revision: 3,
+      },
+    ],
+  };
+  queue("ops_bridge_capabilities", pagedCapabilities, pagedCapabilities);
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
+  queue("ops_bridge_start_watch", { started: true });
+  queue(
+    "ops_bridge_page",
+    {
+      contract_version: 1,
+      revision: 3,
+      generated_at: "2026-08-30T00:00:00Z",
+      items: [{ extra: true }],
+      next_cursor: null,
+    },
+    {
+      contract_version: 1,
+      revision: 3,
+      generated_at: "2026-08-30T00:00:00Z",
+      items: [],
+      next_cursor: null,
+    },
+    { reject: { error: "unavailable" } },
+  );
+
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForRevision(view, 2);
+  assert.equal(view.result.current.mutationsDisabled, false);
+  await act(async () => {
+    const state = await loadDormantOpsModuleState(
+      {
+        module: "work_items",
+        scope: { sort: "last_activity_at_desc" },
+        page_size: 100,
+        cursor: null,
+      },
+      pagedCapabilities,
+    );
+    assert.deepEqual(state, { status: "contract_invalid" });
+  });
+  assert.equal(view.result.current.mutationsDisabled, true);
+  assert.equal(view.result.current.snapshot.revision, 2);
+  assert.equal(view.result.current.state, "ready");
+  await act(async () => {
+    assert.equal(
+      (
+        await loadDormantOpsModuleState(
+          {
+            module: "work_items",
+            scope: { sort: "last_activity_at_desc" },
+            page_size: 100,
+            cursor: null,
+          },
+          pagedCapabilities,
+        )
+      ).status,
+      "ready",
+    );
+  });
+  assert.equal(view.result.current.mutationsDisabled, true);
+  await act(async () => {
+    assert.equal(
+      (
+        await loadDormantOpsModuleState(
+          {
+            module: "work_items",
+            scope: { sort: "last_activity_at_desc" },
+            page_size: 100,
+            cursor: null,
+          },
+          pagedCapabilities,
+        )
+      ).status,
+      "unavailable",
+    );
+  });
+  assert.equal(view.result.current.mutationsDisabled, true);
+  view.unmount();
+  client.clear();
+});
+
+test("an older capability probe cannot re-enable real hook mutations", async () => {
+  const pagedCapabilities = {
+    ...capabilities,
+    modules: [
+      {
+        name: "work_items",
+        schema_version: 1,
+        paged: true,
+        collection_revision: 3,
+      },
+    ],
+  };
+  queue("ops_bridge_capabilities", pagedCapabilities, pagedCapabilities);
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
+  queue("ops_bridge_start_watch", { started: true });
+  queue("ops_bridge_page", {
+    contract_version: 1,
+    revision: 3,
+    generated_at: "2026-08-30T00:00:00Z",
+    items: [{ extra: true }],
+    next_cursor: null,
+  });
+
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForRevision(view, 2);
+  await act(async () => {
+    assert.equal(
+      (
+        await loadDormantOpsModuleState(
+          {
+            module: "work_items",
+            scope: { sort: "last_activity_at_desc" },
+            page_size: 100,
+            cursor: null,
+          },
+          pagedCapabilities,
+        )
+      ).status,
+      "contract_invalid",
+    );
+  });
+  assert.equal(view.result.current.mutationsDisabled, true);
+
+  let resolveOlder;
+  const olderAbsent = new Promise((resolve) => {
+    resolveOlder = resolve;
+  });
+  queue("ops_bridge_capabilities", olderAbsent, {
+    ...capabilities,
+    modules: [{ name: "work_items", schema_version: 1, paged: false }],
+  });
+  await act(async () => {
+    const pendingOlder = getOpsCapabilities();
+    await getOpsCapabilities();
+    resolveOlder({ ...capabilities, modules: [] });
+    await pendingOlder;
+  });
+
+  assert.equal(view.result.current.mutationsDisabled, true);
+  assert.equal(view.result.current.snapshot.revision, 2);
+  assert.equal(view.result.current.state, "ready");
+  view.unmount();
+  client.clear();
 });
 
 function wrapper(client) {

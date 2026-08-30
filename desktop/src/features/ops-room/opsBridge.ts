@@ -6,6 +6,7 @@ import {
   type OpsBridgeSnapshotV1,
   type OpsConnectionState,
   type OpsSelection,
+  OPS_MODULE_NAMES,
   containsAbsolutePath,
   opsArtifactSchema,
   opsCapabilitiesSchema,
@@ -17,6 +18,14 @@ import {
   parseOpsModuleStates,
   parseOpsRoom,
 } from "./types";
+import {
+  dormantPageItemSchemas,
+  dormantPageRequestSchema,
+  parseDormantPage,
+  type DormantOpsItemByModule,
+  type DormantOpsModuleName,
+  type DormantOpsPageRequest,
+} from "./opsDormantContracts";
 
 const selectionSchema = z
   .object({
@@ -46,8 +55,16 @@ const opsPageModuleSchema = z.enum([
   "artifacts",
   "research",
   "repositories",
+  "work_items",
+  "sessions",
+  "checklist_items",
+  "decisions",
+  "approval_index",
+  "evidence",
+  "audit",
+  "search",
 ]);
-const opsPageRequestSchema = z.discriminatedUnion("module", [
+const existingOpsPageRequestSchema = z.discriminatedUnion("module", [
   z
     .object({
       module: z.literal("timeline"),
@@ -103,6 +120,10 @@ const opsPageRequestSchema = z.discriminatedUnion("module", [
     })
     .strict(),
 ]);
+const opsPageRequestSchema = z.union([
+  existingOpsPageRequestSchema,
+  dormantPageRequestSchema,
+]);
 
 const opsPageItemSchemas = {
   timeline: opsTimelineItemSchema.strict(),
@@ -112,7 +133,7 @@ const opsPageItemSchemas = {
 } as const;
 
 const opsPageErrorSchema = z
-  .object({ error: z.enum(["invalid_cursor", "stale_cursor"]) })
+  .object({ error: z.enum(["invalid_cursor", "stale_cursor", "unavailable"]) })
   .strict();
 
 const artifactIdSchema = z.string().regex(/^artifact:[0-9a-f]{32}$/u);
@@ -234,7 +255,8 @@ export type OpsPageRequest =
   | (OpsPageRequestBase & {
       module: "repositories";
       scope: { project: string | null; sort: "display_name_asc" };
-    });
+    })
+  | DormantOpsPageRequest;
 
 export interface OpsPageV1<T = unknown> {
   contract_version: 1;
@@ -244,10 +266,133 @@ export interface OpsPageV1<T = unknown> {
   next_cursor: string | null;
 }
 
-export class OpsPageError extends Error {
-  readonly code: "invalid_cursor" | "stale_cursor";
+export type DormantOpsPageState<Module extends DormantOpsModuleName> =
+  | { status: "unavailable" }
+  | { status: "contract_invalid" }
+  | {
+      status: "ready";
+      data: OpsPageV1<DormantOpsItemByModule[Module]>;
+    };
 
-  constructor(code: "invalid_cursor" | "stale_cursor") {
+export type DormantOpsPageStates = Partial<{
+  [Module in DormantOpsModuleName]: DormantOpsPageState<Module>;
+}>;
+
+type DormantStateRecord = {
+  capabilityKey: string;
+  state: DormantOpsPageState<DormantOpsModuleName>;
+};
+
+const dormantStateRecords = new Map<DormantOpsModuleName, DormantStateRecord>();
+const authoritativeDormantCapabilityKeys = new Map<
+  DormantOpsModuleName,
+  string
+>();
+const dormantStateListeners = new Set<() => void>();
+let dormantStateSnapshot: DormantOpsPageStates = {};
+let capabilityProbeGeneration = 0;
+
+function publishDormantStateSnapshot(): void {
+  dormantStateSnapshot = Object.fromEntries(
+    [...dormantStateRecords].map(([module, record]) => [module, record.state]),
+  ) as DormantOpsPageStates;
+  for (const listener of dormantStateListeners) listener();
+}
+
+function capabilityKey(
+  capability:
+    | NonNullable<OpsBridgeCapabilitiesV1["modules"]>[number]
+    | undefined,
+): string {
+  if (!capability) return "absent";
+  if (!capability.paged || capability.collection_revision === undefined)
+    return "invalid";
+  return `revision:${capability.collection_revision}`;
+}
+
+function reconcileAuthoritativeDormantStates(
+  capabilities: OpsBridgeCapabilitiesV1,
+): void {
+  let changed = false;
+  for (const module of Object.keys(
+    dormantPageItemSchemas,
+  ) as DormantOpsModuleName[]) {
+    const capability = capabilities.modules?.find(
+      (candidate) => candidate.name === module,
+    );
+    const key = capabilityKey(capability);
+    authoritativeDormantCapabilityKeys.set(module, key);
+    const current = dormantStateRecords.get(module);
+    if (current?.capabilityKey === key) continue;
+    if (key === "invalid") {
+      dormantStateRecords.set(module, {
+        capabilityKey: key,
+        state: { status: "contract_invalid" },
+      });
+      changed = true;
+    } else if (current) {
+      dormantStateRecords.delete(module);
+      changed = true;
+    }
+  }
+  if (changed) publishDormantStateSnapshot();
+}
+
+function prepareDormantState(module: DormantOpsModuleName, key: string): void {
+  const current = dormantStateRecords.get(module);
+  if (current?.capabilityKey === key) return;
+  const authoritativeKey = authoritativeDormantCapabilityKeys.get(module);
+  if (
+    (authoritativeKey !== undefined && authoritativeKey !== key) ||
+    current?.state.status === "contract_invalid"
+  )
+    return;
+  dormantStateRecords.set(module, {
+    capabilityKey: key,
+    state: { status: "unavailable" },
+  });
+  publishDormantStateSnapshot();
+}
+
+function setDormantState(
+  module: DormantOpsModuleName,
+  key: string,
+  state: DormantOpsPageState<DormantOpsModuleName>,
+): void {
+  const current = dormantStateRecords.get(module);
+  if (current?.capabilityKey !== key) return;
+  if (
+    current.state.status === "contract_invalid" &&
+    state.status !== "contract_invalid"
+  )
+    return;
+  dormantStateRecords.set(module, { capabilityKey: key, state });
+  publishDormantStateSnapshot();
+}
+
+export function getDormantOpsPageStates(): DormantOpsPageStates {
+  return dormantStateSnapshot;
+}
+
+export function subscribeDormantOpsPageStates(
+  listener: () => void,
+): () => void {
+  dormantStateListeners.add(listener);
+  return () => dormantStateListeners.delete(listener);
+}
+
+export function resetDormantOpsPageStates(): void {
+  capabilityProbeGeneration += 1;
+  authoritativeDormantCapabilityKeys.clear();
+  if (dormantStateRecords.size === 0) return;
+  dormantStateRecords.clear();
+  publishDormantStateSnapshot();
+}
+
+export class OpsPageError extends Error {
+  readonly code: "invalid_cursor" | "stale_cursor" | "unavailable";
+
+  constructor(code: "invalid_cursor" | "stale_cursor" | "unavailable") {
     super(code);
     this.name = "OpsPageError";
     this.code = code;
@@ -338,7 +483,18 @@ function parseCapabilities(value: unknown): OpsBridgeCapabilitiesV1 {
   if (new Set(moduleNames).size !== moduleNames.length) {
     throw new OpsBridgeContractError();
   }
-  return parsed.data;
+  return {
+    ...parsed.data,
+    ...(parsed.data.modules === undefined
+      ? {}
+      : {
+          modules: parsed.data.modules.filter((module) =>
+            OPS_MODULE_NAMES.includes(
+              module.name as (typeof OPS_MODULE_NAMES)[number],
+            ),
+          ),
+        }),
+  };
 }
 
 function parseSnapshot(
@@ -398,6 +554,7 @@ function parsePage(
   value: unknown,
   module: OpsPageModule,
   expectedCollectionRevision: number,
+  scope: unknown,
 ): OpsPageV1 {
   requireVersionOne(value);
   if (
@@ -407,12 +564,24 @@ function parsePage(
   ) {
     throw new OpsBridgeContractError();
   }
+  if (module in dormantPageItemSchemas) {
+    const parsedDormant = parseDormantPage(
+      value,
+      module as DormantOpsModuleName,
+      expectedCollectionRevision,
+      scope,
+    );
+    if (!parsedDormant) throw new OpsBridgeContractError();
+    return parsedDormant;
+  }
   const schema = z
     .object({
       contract_version: z.literal(1),
       revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
       generated_at: z.string().min(1),
-      items: z.array(opsPageItemSchemas[module]),
+      items: z.array(
+        opsPageItemSchemas[module as keyof typeof opsPageItemSchemas],
+      ),
       next_cursor: z.string().min(1).max(4096).nullable(),
     })
     .strict();
@@ -456,8 +625,13 @@ export function opsSnapshotQueryKey(selection: OpsSelection) {
 }
 
 export async function getOpsCapabilities(): Promise<OpsBridgeCapabilitiesV1> {
+  const probeGeneration = ++capabilityProbeGeneration;
   const value = await invoke<unknown>("ops_bridge_capabilities", null as never);
-  return parseCapabilities(value);
+  const capabilities = parseCapabilities(value);
+  if (probeGeneration === capabilityProbeGeneration) {
+    reconcileAuthoritativeDormantStates(capabilities);
+  }
+  return capabilities;
 }
 
 export async function getOpsSnapshot(
@@ -482,6 +656,14 @@ export async function loadOpsSnapshot(
   return getOpsSnapshot(selection, capabilities);
 }
 
+export async function getOpsPage<Module extends DormantOpsModuleName>(
+  request: Extract<DormantOpsPageRequest, { module: Module }>,
+  expectedCollectionRevision: number,
+): Promise<OpsPageV1<DormantOpsItemByModule[Module]>>;
+export async function getOpsPage(
+  request: OpsPageRequest,
+  expectedCollectionRevision: number,
+): Promise<OpsPageV1>;
 export async function getOpsPage(
   request: OpsPageRequest,
   expectedCollectionRevision: number,
@@ -491,10 +673,56 @@ export async function getOpsPage(
     const value = await invoke<unknown>("ops_bridge_page", {
       request: normalized,
     });
-    return parsePage(value, normalized.module, expectedCollectionRevision);
+    return parsePage(
+      value,
+      normalized.module,
+      expectedCollectionRevision,
+      normalized.scope,
+    );
   } catch (error) {
     const parsed = opsPageErrorSchema.safeParse(error);
     if (parsed.success) throw new OpsPageError(parsed.data.error);
+    throw error;
+  }
+}
+
+/** Resolves a paged Task 3 module without turning an absent capability into an empty successful page. */
+export async function loadDormantOpsModuleState<
+  Module extends DormantOpsModuleName,
+>(
+  request: Extract<DormantOpsPageRequest, { module: Module }>,
+  capabilities: OpsBridgeCapabilitiesV1,
+): Promise<DormantOpsPageState<Module>> {
+  const capability = capabilities.modules?.find(
+    (candidate) => candidate.name === request.module,
+  );
+  if (!capability) return { status: "unavailable" };
+  if (!capability.paged || capability.collection_revision === undefined) {
+    const key = capabilityKey(capability);
+    prepareDormantState(request.module, key);
+    setDormantState(request.module, key, { status: "contract_invalid" });
+    return { status: "contract_invalid" };
+  }
+  const key = capabilityKey(capability);
+  prepareDormantState(request.module, key);
+  try {
+    const state = {
+      status: "ready",
+      data: await getOpsPage(request, capability.collection_revision),
+    } as const;
+    setDormantState(request.module, key, state);
+    return state;
+  } catch (error) {
+    if (error instanceof OpsPageError && error.code === "unavailable") {
+      const state = { status: "unavailable" } as const;
+      setDormantState(request.module, key, state);
+      return state;
+    }
+    if (error instanceof OpsBridgeContractError) {
+      const state = { status: "contract_invalid" } as const;
+      setDormantState(request.module, key, state);
+      return state;
+    }
     throw error;
   }
 }
@@ -675,8 +903,10 @@ export async function acknowledgeOpsSync(
 
 export function hasInvalidOpsModule(
   snapshot: Pick<OpsBridgeSnapshotV1, "module_states">,
+  pagedModuleStates: DormantOpsPageStates = {},
 ): boolean {
-  return Object.values(snapshot.module_states).some(
-    (module) => module.status === "contract_invalid",
-  );
+  return [
+    ...Object.values(snapshot.module_states),
+    ...Object.values(pagedModuleStates),
+  ].some((module) => module?.status === "contract_invalid");
 }

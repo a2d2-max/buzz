@@ -4,10 +4,13 @@ import * as React from "react";
 import {
   classifyOpsBridgeError,
   acknowledgeOpsSync,
+  type DormantOpsPageStates,
   getOpsCapabilities,
+  getDormantOpsPageStates,
   hasInvalidOpsModule,
   loadOpsSnapshot,
   opsSnapshotQueryKey,
+  subscribeDormantOpsPageStates,
 } from "./opsBridge";
 import {
   ensureOpsWatchManager,
@@ -82,13 +85,22 @@ function lifecycleState(
 export function opsMutationsDisabled(
   state: OpsConnectionState,
   snapshot: Pick<OpsBridgeSnapshotV1, "module_states"> | null,
+  pagedModuleStates: DormantOpsPageStates = {},
 ): boolean {
-  return state !== "ready" || (snapshot ? hasInvalidOpsModule(snapshot) : true);
+  return (
+    state !== "ready" ||
+    (snapshot ? hasInvalidOpsModule(snapshot, pagedModuleStates) : true)
+  );
 }
 
 export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
   const queryClient = useQueryClient();
   const focused = useOpsWindowFocused();
+  const pagedModuleStates = React.useSyncExternalStore(
+    subscribeDormantOpsPageStates,
+    getDormantOpsPageStates,
+    getDormantOpsPageStates,
+  );
   const normalizedSelection = React.useMemo(
     () => ({
       channel: selection.channel ?? null,
@@ -382,7 +394,7 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     state,
     snapshot,
     error: query.error,
-    mutationsDisabled: opsMutationsDisabled(state, snapshot),
+    mutationsDisabled: opsMutationsDisabled(state, snapshot, pagedModuleStates),
     refetch,
     watchState,
   };

@@ -228,7 +228,7 @@ async fn ops_bridge_client_accepts_a_bounded_version_one_json_response() {
         "transitions": [],
         "modules": [
             {"name": "timeline", "schema_version": 1, "paged": false},
-            {"name": "future_module", "schema_version": 2, "paged": true, "collection_revision": 8}
+            {"name": "future_module", "schema_version": 1, "paged": true, "collection_revision": 8}
         ],
         "private_extension": {"must_not_cross": true}
     }))
@@ -252,7 +252,7 @@ async fn ops_bridge_client_accepts_a_bounded_version_one_json_response() {
     assert!(capabilities.transitions.is_empty());
     let renderer_value = serde_json::to_value(&capabilities).expect("serialize capabilities");
     assert_eq!(renderer_value["modules"][0]["name"], "timeline");
-    assert_eq!(renderer_value["modules"][1]["name"], "future_module");
+    assert_eq!(renderer_value["modules"].as_array().map(Vec::len), Some(1));
     assert!(renderer_value.get("private_extension").is_none());
     server.await.expect("fake server exits");
 

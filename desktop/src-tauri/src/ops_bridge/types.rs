@@ -1,6 +1,13 @@
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
-use super::client::OpsBridgeError;
+use super::{
+    client::OpsBridgeError,
+    page::{
+        deserialize_optional_non_null, deserialize_required_option, OpsChecklistScope,
+        OpsLastActivitySort, OpsNoScope, OpsObservedAtSort, OpsPageModule, OpsSearchScope,
+        OpsUpdatedAtSort,
+    },
+};
 
 /// Version implemented by the native Ops bridge and its loopback hub contract.
 pub const OPS_CONTRACT_VERSION: u8 = 1;
@@ -55,11 +62,16 @@ pub enum OpsTransitionAction {
 /// advertise a future optional module without making the native bridge reject
 /// the entire response. The renderer validates modules it understands.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpsModuleCapability {
     pub name: String,
     pub schema_version: u64,
     pub paged: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub collection_revision: Option<u64>,
 }
 
@@ -70,7 +82,11 @@ pub struct OpsBridgeCapabilities {
     pub reads: Vec<OpsReadCapability>,
     pub drafts: Vec<OpsDraftCapability>,
     pub transitions: Vec<OpsTransitionAction>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub modules: Option<Vec<OpsModuleCapability>>,
 }
 
@@ -85,9 +101,9 @@ impl OpsBridgeCapabilities {
         if let Some(modules) = &self.modules {
             let mut names = std::collections::HashSet::with_capacity(modules.len());
             for module in modules {
-                valid_value(&module.name, MAX_ID_BYTES)
-                    .map_err(|_| OpsBridgeError::ContractMismatch)?;
-                if (module.paged && module.collection_revision.is_none())
+                if !super::dormant::module_name(&module.name)
+                    || module.schema_version != 1
+                    || (module.paged && module.collection_revision.is_none())
                     || module
                         .collection_revision
                         .is_some_and(|revision| revision > MAX_SAFE_INTEGER_U64)
@@ -99,6 +115,31 @@ impl OpsBridgeCapabilities {
         }
         Ok(())
     }
+
+    pub(crate) fn retain_known_modules(&mut self) {
+        if let Some(modules) = &mut self.modules {
+            modules.retain(|module| {
+                matches!(
+                    module.name.as_str(),
+                    "timeline"
+                        | "approvals"
+                        | "artifacts"
+                        | "connections"
+                        | "workflow_routing"
+                        | "research"
+                        | "repositories"
+                        | "work_items"
+                        | "sessions"
+                        | "checklist_items"
+                        | "decisions"
+                        | "approval_index"
+                        | "evidence"
+                        | "audit"
+                        | "search"
+                )
+            });
+        }
+    }
 }
 
 /// Optional snapshot selection. Only these three query fields can reach the hub.
@@ -108,15 +149,6 @@ pub struct OpsSelection {
     pub channel: Option<String>,
     pub thread: Option<String>,
     pub limit: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpsPageModule {
-    Timeline,
-    Artifacts,
-    Research,
-    Repositories,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -373,7 +405,7 @@ pub struct OpsRepositoryScope {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "module", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OpsPageRequest {
+pub(crate) enum OpsPageRequest {
     Timeline {
         scope: OpsTimelineScope,
         page_size: u16,
@@ -398,6 +430,54 @@ pub enum OpsPageRequest {
         #[serde(deserialize_with = "deserialize_required_option")]
         cursor: Option<String>,
     },
+    WorkItems {
+        scope: OpsNoScope<OpsLastActivitySort>,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    Sessions {
+        scope: OpsNoScope<OpsLastActivitySort>,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    ChecklistItems {
+        scope: OpsChecklistScope,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    Decisions {
+        scope: OpsNoScope<OpsUpdatedAtSort>,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    ApprovalIndex {
+        scope: OpsNoScope<OpsUpdatedAtSort>,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    Evidence {
+        scope: OpsNoScope<OpsObservedAtSort>,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    Audit {
+        scope: OpsNoScope<OpsObservedAtSort>,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    Search {
+        scope: OpsSearchScope,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
 }
 
 impl OpsPageRequest {
@@ -407,6 +487,14 @@ impl OpsPageRequest {
             Self::Artifacts { .. } => OpsPageModule::Artifacts,
             Self::Research { .. } => OpsPageModule::Research,
             Self::Repositories { .. } => OpsPageModule::Repositories,
+            Self::WorkItems { .. } => OpsPageModule::WorkItems,
+            Self::Sessions { .. } => OpsPageModule::Sessions,
+            Self::ChecklistItems { .. } => OpsPageModule::ChecklistItems,
+            Self::Decisions { .. } => OpsPageModule::Decisions,
+            Self::ApprovalIndex { .. } => OpsPageModule::ApprovalIndex,
+            Self::Evidence { .. } => OpsPageModule::Evidence,
+            Self::Audit { .. } => OpsPageModule::Audit,
+            Self::Search { .. } => OpsPageModule::Search,
         }
     }
 
@@ -415,7 +503,15 @@ impl OpsPageRequest {
             Self::Timeline { page_size, .. }
             | Self::Artifacts { page_size, .. }
             | Self::Research { page_size, .. }
-            | Self::Repositories { page_size, .. } => *page_size,
+            | Self::Repositories { page_size, .. }
+            | Self::WorkItems { page_size, .. }
+            | Self::Sessions { page_size, .. }
+            | Self::ChecklistItems { page_size, .. }
+            | Self::Decisions { page_size, .. }
+            | Self::ApprovalIndex { page_size, .. }
+            | Self::Evidence { page_size, .. }
+            | Self::Audit { page_size, .. }
+            | Self::Search { page_size, .. } => *page_size,
         }
     }
 
@@ -424,7 +520,15 @@ impl OpsPageRequest {
             Self::Timeline { cursor, .. }
             | Self::Artifacts { cursor, .. }
             | Self::Research { cursor, .. }
-            | Self::Repositories { cursor, .. } => cursor.as_deref(),
+            | Self::Repositories { cursor, .. }
+            | Self::WorkItems { cursor, .. }
+            | Self::Sessions { cursor, .. }
+            | Self::ChecklistItems { cursor, .. }
+            | Self::Decisions { cursor, .. }
+            | Self::ApprovalIndex { cursor, .. }
+            | Self::Evidence { cursor, .. }
+            | Self::Audit { cursor, .. }
+            | Self::Search { cursor, .. } => cursor.as_deref(),
         }
     }
 
@@ -446,6 +550,28 @@ impl OpsPageRequest {
             }
             Self::Repositories { scope, .. } => {
                 valid_optional_value(scope.project.as_deref(), MAX_ID_BYTES)
+            }
+            Self::WorkItems { .. }
+            | Self::Sessions { .. }
+            | Self::Decisions { .. }
+            | Self::ApprovalIndex { .. }
+            | Self::Evidence { .. }
+            | Self::Audit { .. } => Ok(()),
+            Self::ChecklistItems { scope, .. } => {
+                if super::dormant::public_id(&scope.work_item) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            Self::Search { scope, .. } => {
+                if super::dormant::search_query(&scope.q)
+                    && scope.work.as_deref().is_none_or(super::dormant::public_id)
+                {
+                    Ok(())
+                } else {
+                    Err(())
+                }
             }
         }
         .map_err(|_| OpsBridgeError::InvalidRequest)
@@ -521,15 +647,6 @@ pub struct OpsRepositoryStatusV1 {
     pub ahead: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behind: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum OpsPageResult {
-    Timeline(OpsPageV1<OpsTimelineItemV1>),
-    Artifacts(OpsPageV1<OpsArtifactV1>),
-    Research(OpsPageV1<OpsResearchCardV1>),
-    Repositories(OpsPageV1<OpsRepositoryStatusV1>),
 }
 
 /// Hub health in the public snapshot contract.
@@ -841,14 +958,6 @@ where
     D: Deserializer<'de>,
 {
     deserialize_event_sequence(deserializer).map(Some)
-}
-
-fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
 }
 
 fn valid_value(value: &str, max_bytes: usize) -> Result<(), ()> {

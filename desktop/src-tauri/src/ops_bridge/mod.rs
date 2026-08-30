@@ -1,5 +1,7 @@
 mod artifacts;
 mod client;
+mod dormant;
+mod page;
 mod types;
 mod watch;
 
@@ -9,12 +11,13 @@ use tauri::Emitter;
 use crate::app_state::AppState;
 pub(crate) use artifacts::OpsArtifactState;
 use client::{OpsBridgeClient, OpsBridgeConfig, OpsBridgeError};
+use page::OpsPageResult;
 use types::{
     OpsArtifactHandleChunk, OpsArtifactHandleReadRequest, OpsArtifactHandleReleaseRequest,
     OpsArtifactHandleReleaseResult, OpsArtifactReadRequest, OpsArtifactReadResult,
     OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsPageRequest,
-    OpsPageResult, OpsSelection, OpsSyncAckRequest, OpsSyncAckResult, OpsTransitionReceipt,
-    OpsTransitionRequest, OpsWatchStartResult, DEFAULT_HUB_PORT, MAX_RESPONSE_BYTES,
+    OpsSelection, OpsSyncAckRequest, OpsSyncAckResult, OpsTransitionReceipt, OpsTransitionRequest,
+    OpsWatchStartResult, DEFAULT_HUB_PORT, MAX_RESPONSE_BYTES,
 };
 use watch::OpsBridgeWatcher;
 
@@ -77,6 +80,7 @@ pub(crate) async fn ops_bridge_snapshot(
 pub(crate) enum OpsPageErrorCode {
     InvalidCursor,
     StaleCursor,
+    Unavailable,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -277,6 +281,9 @@ fn page_error(error: OpsBridgeError) -> OpsPageCommandError {
         OpsBridgeError::StaleCursor => OpsPageCommandError::Cursor {
             error: OpsPageErrorCode::StaleCursor,
         },
+        OpsBridgeError::Unavailable => OpsPageCommandError::Cursor {
+            error: OpsPageErrorCode::Unavailable,
+        },
         _ => OpsPageCommandError::Bridge(public_error(error)),
     }
 }
@@ -309,6 +316,9 @@ fn artifact_error(error: OpsBridgeError) -> OpsArtifactCommandError {
 #[cfg(test)]
 #[path = "tests/artifact_tests.rs"]
 mod artifact_tests;
+#[cfg(test)]
+#[path = "tests/dormant_page_tests.rs"]
+mod dormant_page_tests;
 #[cfg(test)]
 #[path = "tests/page_tests.rs"]
 mod page_tests;

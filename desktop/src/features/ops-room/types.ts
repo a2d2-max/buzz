@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dormantModuleCapabilitySchema } from "./opsDormantContracts";
 
 export const OPS_MODULE_NAMES = [
   "timeline",
@@ -8,6 +9,14 @@ export const OPS_MODULE_NAMES = [
   "workflow_routing",
   "research",
   "repositories",
+  "work_items",
+  "sessions",
+  "checklist_items",
+  "decisions",
+  "approval_index",
+  "evidence",
+  "audit",
+  "search",
 ] as const;
 
 export type OpsModuleName = (typeof OPS_MODULE_NAMES)[number];
@@ -54,19 +63,18 @@ const transitionCapabilitySchema = z.enum([
 
 export const opsModuleCapabilitySchema = z
   .object({
-    name: requiredPublicString,
-    schema_version: nonNegativeInteger,
+    name: dormantModuleCapabilitySchema.shape.name,
+    schema_version: z.literal(1),
     paged: z.boolean(),
     collection_revision: safeNonNegativeInteger.optional(),
   })
-  .strip()
+  .strict()
   .superRefine((module, context) => {
-    if (module.paged && module.collection_revision === undefined) {
+    if (module.paged && module.collection_revision === undefined)
       context.addIssue({
         code: "custom",
-        message: "paged modules require exactly one collection revision",
+        message: "paged modules require collection revision",
       });
-    }
   });
 
 export const opsCapabilitiesSchema = z
@@ -420,7 +428,9 @@ const optionalModuleSchemas = {
 } as const;
 
 export type OpsModuleData = {
-  [Name in OpsModuleName]: z.infer<(typeof optionalModuleSchemas)[Name]>;
+  [Name in OpsModuleName]: Name extends keyof typeof optionalModuleSchemas
+    ? z.infer<(typeof optionalModuleSchemas)[Name]>
+    : never;
 };
 
 export type OpsModuleState<T> =
@@ -468,9 +478,11 @@ export function parseOpsModuleStates(
       const capability = capabilities.modules?.find(
         (module) => module.name === name && module.schema_version === 1,
       );
-      if (!capability || capability.paged)
+      if (!capability || capability.paged || !(name in optionalModuleSchemas))
         return [name, { status: "unavailable" }];
-      const parsed = optionalModuleSchemas[name].safeParse(snapshot[name]);
+      const parsed = optionalModuleSchemas[
+        name as keyof typeof optionalModuleSchemas
+      ].safeParse(snapshot[name]);
       return parsed.success
         ? [name, { status: "ready", data: parsed.data }]
         : [name, { status: "contract_invalid" }];

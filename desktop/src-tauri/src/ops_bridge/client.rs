@@ -13,13 +13,17 @@ use reqwest::{
 use serde::{de::DeserializeOwned, Deserialize};
 use zeroize::Zeroizing;
 
+use super::dormant::{
+    self, OpsApprovalIndexV1, OpsAuditPageV1, OpsChecklistItemPageV1, OpsDecisionPageV1,
+    OpsEvidencePageV1, OpsGlobalSessionV1, OpsSearchResultV1, OpsWorkItemV1,
+};
+use super::page::{OpsPageModule, OpsPageResult, OpsSearchKind};
 use super::types::{
     OpsArtifactChunkV1, OpsArtifactManifestV1, OpsArtifactReadRequest, OpsArtifactV1,
-    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsPageModule,
-    OpsPageRequest, OpsPageResult, OpsPageV1, OpsRepositoryStatusV1, OpsResearchCardV1,
-    OpsSelection, OpsTimelineItemV1, OpsTransitionReceipt, OpsTransitionRequest,
-    OpsTransitionWireRequest, VersionedResponse, MAX_RESPONSE_BYTES, MAX_SAFE_INTEGER_U64,
-    OPS_CONTRACT_VERSION,
+    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsPageRequest,
+    OpsPageV1, OpsRepositoryStatusV1, OpsResearchCardV1, OpsSelection, OpsTimelineItemV1,
+    OpsTransitionReceipt, OpsTransitionRequest, OpsTransitionWireRequest, VersionedResponse,
+    MAX_RESPONSE_BYTES, MAX_SAFE_INTEGER_U64, OPS_CONTRACT_VERSION,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -38,6 +42,7 @@ struct CursorError {
 enum CursorErrorCode {
     InvalidCursor,
     StaleCursor,
+    Unavailable,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +104,7 @@ pub(crate) enum OpsBridgeError {
     InvalidRequest,
     InvalidCursor,
     StaleCursor,
+    Unavailable,
     WatchState,
     InvalidArtifactRequest,
     ArtifactNotFound,
@@ -129,6 +135,7 @@ impl std::fmt::Display for OpsBridgeError {
             Self::InvalidRequest => "ops_bridge_invalid_request",
             Self::InvalidCursor => "invalid_cursor",
             Self::StaleCursor => "stale_cursor",
+            Self::Unavailable => "unavailable",
             Self::WatchState => "ops_bridge_watch_state",
             Self::InvalidArtifactRequest => "invalid_artifact_request",
             Self::ArtifactNotFound => "artifact_not_found",
@@ -188,8 +195,9 @@ impl OpsBridgeClient {
     pub(crate) async fn capabilities(&self) -> Result<OpsBridgeCapabilities, OpsBridgeError> {
         let request =
             self.authenticated(&self.request_client, Method::GET, self.capabilities_url()?)?;
-        let capabilities: OpsBridgeCapabilities = self.execute_json(request).await?;
+        let mut capabilities: OpsBridgeCapabilities = self.execute_json(request).await?;
         capabilities.validate()?;
+        capabilities.retain_known_modules();
         Ok(capabilities)
     }
 
@@ -261,6 +269,46 @@ impl OpsBridgeClient {
                     }
                     query.append_pair("sort", "display_name_asc");
                 }
+                OpsPageRequest::WorkItems { .. } => {
+                    query.append_pair("sort", "last_activity_at_desc");
+                }
+                OpsPageRequest::Sessions { .. } => {
+                    query.append_pair("sort", "last_activity_at_desc");
+                }
+                OpsPageRequest::ChecklistItems { scope, .. } => {
+                    query.append_pair("work_item", &scope.work_item);
+                    query.append_pair("sort", "order_asc_then_id");
+                }
+                OpsPageRequest::Decisions { .. } | OpsPageRequest::ApprovalIndex { .. } => {
+                    query.append_pair("sort", "updated_at_desc");
+                }
+                OpsPageRequest::Evidence { .. } | OpsPageRequest::Audit { .. } => {
+                    query.append_pair("sort", "observed_at_desc");
+                }
+                OpsPageRequest::Search { scope, .. } => {
+                    query.append_pair("q", &scope.q);
+                    if let Some(kind) = &scope.kind {
+                        query.append_pair(
+                            "kind",
+                            match kind {
+                                OpsSearchKind::WorkItem => "work_item",
+                                OpsSearchKind::Session => "session",
+                                OpsSearchKind::ChecklistItem => "checklist_item",
+                                OpsSearchKind::Decision => "decision",
+                                OpsSearchKind::Approval => "approval",
+                                OpsSearchKind::Evidence => "evidence",
+                                OpsSearchKind::Audit => "audit",
+                                OpsSearchKind::Artifact => "artifact",
+                                OpsSearchKind::Repository => "repository",
+                                OpsSearchKind::Research => "research",
+                            },
+                        );
+                    }
+                    if let Some(work) = &scope.work {
+                        query.append_pair("work", work);
+                    }
+                    query.append_pair("sort", "rank_desc_then_observed_at_desc");
+                }
             }
             query.append_pair("page_size", &request.page_size().to_string());
             if let Some(cursor) = request.cursor() {
@@ -268,7 +316,7 @@ impl OpsBridgeClient {
             }
         }
         let builder = self.authenticated(&self.request_client, Method::GET, url)?;
-        self.execute_page_json(builder, request.module()).await
+        self.execute_page_json(builder, request).await
     }
 
     pub(crate) async fn artifact_manifest(
@@ -392,16 +440,20 @@ impl OpsBridgeClient {
 
     async fn execute_page_json(
         &self,
-        request: reqwest::RequestBuilder,
-        module: OpsPageModule,
+        builder: reqwest::RequestBuilder,
+        request: &OpsPageRequest,
     ) -> Result<OpsPageResult, OpsBridgeError> {
-        let response = request
+        let module = request.module();
+        let response = builder
             .send()
             .await
             .map_err(|_| OpsBridgeError::Transport)?;
         let status = response.status();
         if !status.is_success() {
-            if !matches!(status, StatusCode::BAD_REQUEST | StatusCode::CONFLICT) {
+            if !matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
+            ) {
                 return Err(OpsBridgeError::HttpStatus);
             }
             let body = self
@@ -416,6 +468,9 @@ impl OpsBridgeClient {
                 }
                 (StatusCode::CONFLICT, CursorErrorCode::StaleCursor) => {
                     Err(OpsBridgeError::StaleCursor)
+                }
+                (StatusCode::SERVICE_UNAVAILABLE, CursorErrorCode::Unavailable) => {
+                    Err(OpsBridgeError::Unavailable)
                 }
                 _ => Err(OpsBridgeError::HttpStatus),
             };
@@ -433,6 +488,49 @@ impl OpsBridgeClient {
             }
             OpsPageModule::Repositories => {
                 OpsPageResult::Repositories(parse_page::<OpsRepositoryStatusV1>(&body)?)
+            }
+            OpsPageModule::WorkItems => {
+                let page = parse_page::<OpsWorkItemV1>(&body)?;
+                dormant::validate_page(&page)?;
+                OpsPageResult::WorkItems(page)
+            }
+            OpsPageModule::Sessions => {
+                let page = parse_page::<OpsGlobalSessionV1>(&body)?;
+                dormant::validate_page(&page)?;
+                OpsPageResult::Sessions(page)
+            }
+            OpsPageModule::ChecklistItems => {
+                let page = parse_page::<OpsChecklistItemPageV1>(&body)?;
+                dormant::validate_page(&page)?;
+                if let OpsPageRequest::ChecklistItems { scope, .. } = request {
+                    dormant::validate_checklist_scope(&page, &scope.work_item)?;
+                }
+                OpsPageResult::ChecklistItems(page)
+            }
+            OpsPageModule::Decisions => {
+                let page = parse_page::<OpsDecisionPageV1>(&body)?;
+                dormant::validate_page(&page)?;
+                OpsPageResult::Decisions(page)
+            }
+            OpsPageModule::ApprovalIndex => {
+                let page = parse_page::<OpsApprovalIndexV1>(&body)?;
+                dormant::validate_page(&page)?;
+                OpsPageResult::ApprovalIndex(page)
+            }
+            OpsPageModule::Evidence => {
+                let page = parse_page::<OpsEvidencePageV1>(&body)?;
+                dormant::validate_page(&page)?;
+                OpsPageResult::Evidence(page)
+            }
+            OpsPageModule::Audit => {
+                let page = parse_page::<OpsAuditPageV1>(&body)?;
+                dormant::validate_page(&page)?;
+                OpsPageResult::Audit(page)
+            }
+            OpsPageModule::Search => {
+                let page = parse_page::<OpsSearchResultV1>(&body)?;
+                dormant::validate_page(&page)?;
+                OpsPageResult::Search(page)
             }
         };
         Ok(result)
@@ -528,6 +626,14 @@ impl OpsBridgeClient {
             OpsPageModule::Artifacts => "artifacts",
             OpsPageModule::Research => "research",
             OpsPageModule::Repositories => "repositories",
+            OpsPageModule::WorkItems => "work-items",
+            OpsPageModule::Sessions => "sessions",
+            OpsPageModule::ChecklistItems => "checklist-items",
+            OpsPageModule::Decisions => "decisions",
+            OpsPageModule::ApprovalIndex => "approvals",
+            OpsPageModule::Evidence => "evidence",
+            OpsPageModule::Audit => "audit",
+            OpsPageModule::Search => "search",
         };
         self.fixed_url(&["ops-bridge", "v1", segment])
     }
