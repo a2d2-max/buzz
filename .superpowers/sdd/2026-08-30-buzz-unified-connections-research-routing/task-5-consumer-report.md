@@ -40,11 +40,24 @@ GREEN coverage includes:
 
 ## Verification
 
-- Focused TypeScript Task 5/overview: 17 passed, 0 failed.
-- Focused Rust Ops bridge: 57 passed, 0 failed.
+### Reviewer fix loop
+
+An independent committed-HEAD review found six important boundary gaps. Each was reproduced before its fix:
+
+- Recognized page-error statuses with malformed JSON/content type/envelopes or the wrong status/error pairing returned generic `HttpStatus`. They now become native `ContractMismatch`, which Tauri exposes only as bounded `{error:"contract_invalid"}`.
+- An advertised repository overview `503 unavailable` was incorrectly treated as unavailable. Both advertised overview routes now latch module-local `contract_invalid`; only repository detail retains its explicit local-unavailable exception.
+- Research overview/detail invalid state was write-only. The shared page-state authority now checks the sticky same-revision latch before a request and generation-fences both successful and failed deferred completions.
+- Native snapshot revision did not enforce the JavaScript-safe maximum. Rust now rejects it before Tauri, and Zod carries the explicit same maximum.
+- Research/repository detail response IDs were not bound to the requested ID. Both Rust and TypeScript now reject mismatches.
+- Rust/Zod parity coverage now exercises the exact/over 2 MiB boundary; 64-row plan, route, and evidence limits; 16-entry routing/policy arrays; active-session, count, and version bounds; and full-match hash/comparison-SHA prefix, suffix, and uppercase negatives. The dormant compatibility fixture also executes through a frozen pre-Task-5 parser instead of only the new parser.
+
+The page-state implementation was split into `opsPagedModuleState.ts` to keep the file-size ratchet while centralizing sticky and generation-fenced state.
+
+- Focused TypeScript Task 5/overview/parity: 26 passed, 0 failed.
+- Focused Rust Ops bridge: 60 passed, 0 failed.
 - TypeScript typecheck: passed.
-- Full desktop TypeScript: 5,995 passed, 0 failed.
-- Full desktop Rust: 3,065 passed, 0 failed, 18 ignored; integration groups 7/7 and 3/3 passed.
+- Full desktop TypeScript: 6,004 passed, 0 failed.
+- Full desktop Rust: 3,068 passed, 0 failed, 18 ignored; integration groups 7/7 and 3/3 passed.
 - Touched Biome check: passed.
 - `cargo fmt --check`: passed.
 - Differential file-size gate against the required base: passed after splitting Task 5 Rust/page-detail/capability modules and the Task 5 TypeScript bridge/contracts.

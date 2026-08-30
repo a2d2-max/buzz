@@ -32,6 +32,30 @@ import {
   parseOpsResearchPage,
   parseOpsTeamsActivityPage,
 } from "./opsTask5Contracts";
+import {
+  capabilityKey,
+  getDormantOpsPageStates,
+  isOpsPagedModuleGenerationCurrent,
+  markOpsPagedModuleContractInvalid,
+  prepareDormantState,
+  reconcileAuthoritativeDormantStates,
+  resetPagedModuleState,
+  setDormantState,
+  subscribeDormantOpsPageStates,
+  type DormantOpsPageStates,
+  type OpsPagedSafetyModule,
+} from "./opsPagedModuleState";
+
+export {
+  capabilityKey,
+  getDormantOpsPageStates,
+  isOpsPagedModuleGenerationCurrent,
+  markOpsPagedModuleContractInvalid,
+  prepareDormantState,
+  setDormantState,
+  subscribeDormantOpsPageStates,
+};
+export type { DormantOpsPageStates, OpsPagedSafetyModule };
 
 const selectionSchema = z
   .object({
@@ -300,135 +324,11 @@ export type DormantOpsPageState<Module extends DormantOpsModuleName> =
       data: OpsPageV1<DormantOpsItemByModule[Module]>;
     };
 
-export type OpsPagedSafetyModule =
-  | DormantOpsModuleName
-  | "repositories"
-  | "research"
-  | "teams_activity";
-type OpsPagedSafetyState =
-  | { status: "unavailable" }
-  | { status: "contract_invalid" }
-  | { status: "ready"; data?: OpsPageV1 };
-export type DormantOpsPageStates = Partial<
-  Record<OpsPagedSafetyModule, OpsPagedSafetyState>
->;
-
-type DormantStateRecord = {
-  capabilityKey: string;
-  state: OpsPagedSafetyState;
-};
-
-const PAGED_SAFETY_MODULES: OpsPagedSafetyModule[] = [
-  ...(Object.keys(dormantPageItemSchemas) as DormantOpsModuleName[]),
-  "research",
-  "repositories",
-  "teams_activity",
-];
-const dormantStateRecords = new Map<OpsPagedSafetyModule, DormantStateRecord>();
-const authoritativeDormantCapabilityKeys = new Map<
-  OpsPagedSafetyModule,
-  string
->();
-const dormantStateListeners = new Set<() => void>();
-let dormantStateSnapshot: DormantOpsPageStates = {};
 let capabilityProbeGeneration = 0;
-
-function publishDormantStateSnapshot(): void {
-  dormantStateSnapshot = Object.fromEntries(
-    [...dormantStateRecords].map(([module, record]) => [module, record.state]),
-  ) as DormantOpsPageStates;
-  for (const listener of dormantStateListeners) listener();
-}
-
-export function capabilityKey(
-  capability:
-    | NonNullable<OpsBridgeCapabilitiesV1["modules"]>[number]
-    | undefined,
-): string {
-  if (!capability) return "absent";
-  if (!capability.paged || capability.collection_revision === undefined)
-    return "invalid";
-  return `revision:${capability.collection_revision}`;
-}
-
-function reconcileAuthoritativeDormantStates(
-  capabilities: OpsBridgeCapabilitiesV1,
-): void {
-  let changed = false;
-  for (const module of PAGED_SAFETY_MODULES) {
-    const capability = capabilities.modules?.find(
-      (candidate) => candidate.name === module,
-    );
-    const key = capabilityKey(capability);
-    authoritativeDormantCapabilityKeys.set(module, key);
-    const current = dormantStateRecords.get(module);
-    if (current?.capabilityKey === key) continue;
-    if (key === "invalid") {
-      dormantStateRecords.set(module, {
-        capabilityKey: key,
-        state: { status: "contract_invalid" },
-      });
-      changed = true;
-    } else if (current) {
-      dormantStateRecords.delete(module);
-      changed = true;
-    }
-  }
-  if (changed) publishDormantStateSnapshot();
-}
-
-export function prepareDormantState(
-  module: OpsPagedSafetyModule,
-  key: string,
-): void {
-  const current = dormantStateRecords.get(module);
-  if (current?.capabilityKey === key) return;
-  const authoritativeKey = authoritativeDormantCapabilityKeys.get(module);
-  if (
-    (authoritativeKey !== undefined && authoritativeKey !== key) ||
-    current?.state.status === "contract_invalid"
-  )
-    return;
-  dormantStateRecords.set(module, {
-    capabilityKey: key,
-    state: { status: "unavailable" },
-  });
-  publishDormantStateSnapshot();
-}
-
-export function setDormantState(
-  module: OpsPagedSafetyModule,
-  key: string,
-  state: OpsPagedSafetyState,
-): void {
-  const current = dormantStateRecords.get(module);
-  if (current?.capabilityKey !== key) return;
-  if (
-    current.state.status === "contract_invalid" &&
-    state.status !== "contract_invalid"
-  )
-    return;
-  dormantStateRecords.set(module, { capabilityKey: key, state });
-  publishDormantStateSnapshot();
-}
-
-export function getDormantOpsPageStates(): DormantOpsPageStates {
-  return dormantStateSnapshot;
-}
-
-export function subscribeDormantOpsPageStates(
-  listener: () => void,
-): () => void {
-  dormantStateListeners.add(listener);
-  return () => dormantStateListeners.delete(listener);
-}
 
 export function resetDormantOpsPageStates(): void {
   capabilityProbeGeneration += 1;
-  authoritativeDormantCapabilityKeys.clear();
-  if (dormantStateRecords.size === 0) return;
-  dormantStateRecords.clear();
-  publishDormantStateSnapshot();
+  resetPagedModuleState();
 }
 
 export function markDormantOpsModuleContractInvalid(
@@ -436,21 +336,6 @@ export function markDormantOpsModuleContractInvalid(
   capabilities: OpsBridgeCapabilitiesV1,
 ): void {
   markOpsPagedModuleContractInvalid(module, capabilities);
-}
-
-export function markOpsPagedModuleContractInvalid(
-  module: OpsPagedSafetyModule,
-  capabilities: OpsBridgeCapabilitiesV1,
-): void {
-  const capability = capabilities.modules?.find(
-    (candidate) => candidate.name === module,
-  );
-  const key = capabilityKey(capability);
-  const authoritativeKey = authoritativeDormantCapabilityKeys.get(module);
-  if (authoritativeKey !== undefined && authoritativeKey !== key) return;
-  authoritativeDormantCapabilityKeys.set(module, key);
-  prepareDormantState(module, key);
-  setDormantState(module, key, { status: "contract_invalid" });
 }
 
 export class OpsPageError extends Error {

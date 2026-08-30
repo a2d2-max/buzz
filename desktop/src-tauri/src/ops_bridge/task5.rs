@@ -11,7 +11,7 @@ use super::{
     types::MAX_RESPONSE_BYTES,
 };
 
-fn bounded(value: &Value) -> bool {
+pub(crate) fn task5_response_within_limit(value: &Value) -> bool {
     serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= MAX_RESPONSE_BYTES)
 }
 
@@ -112,7 +112,7 @@ impl OpsConnectionV1 {
 }
 
 pub(crate) fn validate_connections(value: &Value) -> bool {
-    bounded(value)
+    task5_response_within_limit(value)
         && serde_json::from_value::<Vec<OpsConnectionV1>>(value.clone())
             .ok()
             .is_some_and(|rows| {
@@ -349,7 +349,7 @@ fn aggregate(superpowers: &SourceStatus, routing: &SourceStatus) -> WorkflowStat
 }
 
 pub(crate) fn validate_workflow_routing(value: &Value) -> bool {
-    bounded(value)
+    task5_response_within_limit(value)
         && serde_json::from_value::<WorkflowRouting>(value.clone())
             .ok()
             .is_some_and(|item| {
@@ -432,7 +432,7 @@ struct SafetyPolicy {
 }
 
 pub(crate) fn validate_safety_policy(value: &Value) -> bool {
-    bounded(value)
+    task5_response_within_limit(value)
         && serde_json::from_value::<SafetyPolicy>(value.clone())
             .ok()
             .is_some_and(|policy| {

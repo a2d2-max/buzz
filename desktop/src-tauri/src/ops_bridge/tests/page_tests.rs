@@ -457,7 +457,7 @@ async fn ops_bridge_page_maps_only_exact_cursor_errors_and_rejects_contract_drif
     );
     assert_eq!(
         client.page(&request).await.unwrap_err(),
-        OpsBridgeError::HttpStatus
+        OpsBridgeError::ContractMismatch
     );
     assert_eq!(
         client.page(&request).await.unwrap_err(),

@@ -7,7 +7,7 @@ use super::super::{
     dormant::{positive, public_id, public_text, safe, utc, DormantPageItem},
     types::{OpsPageV1, OpsRepositoryStatusV1, OpsResearchCardV1},
 };
-use super::{bounded, sha256, source_alias, token};
+use super::{sha256, source_alias, task5_response_within_limit, token};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,11 +131,15 @@ impl OpsResearchDetailV1 {
             && self.markdown.validate(Representation::Markdown)
             && self.json.validate(Representation::Json)
     }
+
+    pub(crate) fn matches_id(&self, id: &str) -> bool {
+        self.id == id
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_research_detail(value: &Value) -> bool {
-    bounded(value)
+    task5_response_within_limit(value)
         && serde_json::from_value::<OpsResearchDetailV1>(value.clone())
             .ok()
             .is_some_and(|detail| detail.validate())
@@ -199,11 +203,15 @@ impl OpsRepositoryDetailV1 {
                 .len()
                 == self.evidence.len()
     }
+
+    pub(crate) fn matches_id(&self, id: &str) -> bool {
+        self.id == id
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_repository_detail(value: &Value) -> bool {
-    bounded(value)
+    task5_response_within_limit(value)
         && serde_json::from_value::<OpsRepositoryDetailV1>(value.clone())
             .ok()
             .is_some_and(|detail| detail.validate())
@@ -229,7 +237,7 @@ fn validate_repository_status(status: &OpsRepositoryStatusV1) -> bool {
 }
 
 pub(crate) fn validate_research_snapshot(value: &Value) -> bool {
-    bounded(value)
+    task5_response_within_limit(value)
         && serde_json::from_value::<Vec<OpsResearchCardV1>>(value.clone())
             .ok()
             .is_some_and(|items| {
@@ -245,7 +253,7 @@ pub(crate) fn validate_research_snapshot(value: &Value) -> bool {
 }
 
 pub(crate) fn validate_repository_snapshot(value: &Value) -> bool {
-    bounded(value)
+    task5_response_within_limit(value)
         && serde_json::from_value::<Vec<OpsRepositoryStatusV1>>(value.clone())
             .ok()
             .is_some_and(|items| {

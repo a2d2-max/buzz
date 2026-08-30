@@ -223,6 +223,9 @@ impl OpsBridgeClient {
         }
         let request = self.authenticated(&self.request_client, Method::GET, url)?;
         let mut snapshot: OpsBridgeSnapshot = self.execute_json(request).await?;
+        if snapshot.revision > MAX_SAFE_INTEGER_U64 {
+            return Err(OpsBridgeError::ContractMismatch);
+        }
         snapshot.sanitize_task5_modules();
         Ok(snapshot)
     }
@@ -330,8 +333,13 @@ impl OpsBridgeClient {
         request.validate()?;
         let url = self.detail_url("research", &request.id)?;
         let builder = self.authenticated(&self.request_client, Method::GET, url)?;
-        self.execute_detail_json(builder, OpsResearchDetailV1::validate)
-            .await
+        let detail = self
+            .execute_detail_json(builder, OpsResearchDetailV1::validate)
+            .await?;
+        if !detail.matches_id(&request.id) {
+            return Err(OpsBridgeError::ContractMismatch);
+        }
+        Ok(detail)
     }
 
     pub(crate) async fn repository_detail(
@@ -341,8 +349,13 @@ impl OpsBridgeClient {
         request.validate()?;
         let url = self.detail_url("repositories", &request.id)?;
         let builder = self.authenticated(&self.request_client, Method::GET, url)?;
-        self.execute_detail_json(builder, OpsRepositoryDetailV1::validate)
-            .await
+        let detail = self
+            .execute_detail_json(builder, OpsRepositoryDetailV1::validate)
+            .await?;
+        if !detail.matches_id(&request.id) {
+            return Err(OpsBridgeError::ContractMismatch);
+        }
+        Ok(detail)
     }
 
     pub(crate) async fn artifact_manifest(
@@ -485,9 +498,14 @@ impl OpsBridgeClient {
             let body = self
                 .read_json_body(response)
                 .await
-                .map_err(|_| OpsBridgeError::HttpStatus)?;
+                .map_err(|error| match error {
+                    OpsBridgeError::ResponseContentType | OpsBridgeError::ResponseTooLarge => {
+                        OpsBridgeError::ContractMismatch
+                    }
+                    other => other,
+                })?;
             let error: CursorError =
-                serde_json::from_slice(&body).map_err(|_| OpsBridgeError::HttpStatus)?;
+                serde_json::from_slice(&body).map_err(|_| OpsBridgeError::ContractMismatch)?;
             return match (status, error.error) {
                 (StatusCode::BAD_REQUEST, CursorErrorCode::InvalidCursor) => {
                     Err(OpsBridgeError::InvalidCursor)
@@ -498,7 +516,7 @@ impl OpsBridgeClient {
                 (StatusCode::SERVICE_UNAVAILABLE, CursorErrorCode::Unavailable) => {
                     Err(OpsBridgeError::Unavailable)
                 }
-                _ => Err(OpsBridgeError::HttpStatus),
+                _ => Err(OpsBridgeError::ContractMismatch),
             };
         }
         let body = self.read_json_body(response).await?;

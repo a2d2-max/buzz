@@ -490,7 +490,7 @@ async fn dormant_native_rejects_non_exact_unavailable_error_bodies() {
             .page(&request)
             .await
             .expect_err("extra error field rejected"),
-        OpsBridgeError::HttpStatus
+        OpsBridgeError::ContractMismatch
     );
     server.await.expect("fake server exits");
 }

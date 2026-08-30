@@ -87,6 +87,30 @@ function connection(overrides = {}) {
   };
 }
 
+function researchDetail(id = "research:one") {
+  return {
+    id,
+    title: "Release",
+    status: "ready",
+    release_version: 1,
+    updated_at: NOW,
+    review_receipt_id: "receipt:one",
+    reviewed_at: NOW,
+    markdown: {
+      artifact_id: "artifact:markdown",
+      version: 1,
+      representation: "markdown",
+      sha256: SHA,
+    },
+    json: {
+      artifact_id: "artifact:json",
+      version: 1,
+      representation: "json",
+      sha256: SHA,
+    },
+  };
+}
+
 function workflow(overrides = {}) {
   return {
     status: "ready",
@@ -579,11 +603,28 @@ test("Task 5 typed native requests use fixed Teams and detail commands and prese
     evidence: [],
   });
   await task5Bridge.getOpsRepositoryDetail({ id: "repository:one" });
+  responses.push(researchDetail("research:other"));
+  await assert.rejects(
+    task5Bridge.getOpsResearchDetail({ id: "research:requested" }),
+    (error) => error instanceof bridge.OpsBridgeContractError,
+  );
+  responses.push({
+    id: "repository:other",
+    comparison_sha: "c".repeat(40),
+    tracking_ref_observed_at: NOW,
+    evidence: [],
+  });
+  await assert.rejects(
+    task5Bridge.getOpsRepositoryDetail({ id: "repository:requested" }),
+    (error) => error instanceof bridge.OpsBridgeContractError,
+  );
   assert.deepEqual(
     calls.map(({ command }) => command),
     [
       "ops_bridge_page",
       "ops_bridge_research_detail",
+      "ops_bridge_research_detail",
+      "ops_bridge_repository_detail",
       "ops_bridge_research_detail",
       "ops_bridge_repository_detail",
     ],
@@ -614,6 +655,13 @@ test("research detail failure is sticky module-invalid while repository detail f
   assert.deepEqual(bridge.getDormantOpsPageStates().research, {
     status: "contract_invalid",
   });
+  const researchCalls = calls.length;
+  responses.push(researchDetail());
+  assert.deepEqual(
+    await task5Bridge.loadOpsResearchDetailState("research:one", advertised),
+    { status: "contract_invalid" },
+  );
+  assert.equal(calls.length, researchCalls);
 
   responses.push({ id: "repository:one", root: "/private/repo" });
   assert.deepEqual(
@@ -624,6 +672,92 @@ test("research detail failure is sticky module-invalid while repository detail f
     { status: "contract_invalid" },
   );
   assert.equal(bridge.getDormantOpsPageStates().repositories, undefined);
+});
+
+test("research detail fences a deferred old revision after the new revision wins", async () => {
+  bridge.resetDormantOpsPageStates();
+  let resolveOld;
+  const oldResponse = new Promise((resolve) => {
+    resolveOld = resolve;
+  });
+  responses.push(oldResponse, researchDetail("research:new"));
+  const oldCapabilities = capabilities([
+    {
+      name: "research",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 8,
+    },
+  ]);
+  const newCapabilities = capabilities([
+    {
+      name: "research",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 9,
+    },
+  ]);
+  const oldResult = task5Bridge.loadOpsResearchDetailState(
+    "research:old",
+    oldCapabilities,
+  );
+  const newResult = await task5Bridge.loadOpsResearchDetailState(
+    "research:new",
+    newCapabilities,
+  );
+  resolveOld(researchDetail("research:old"));
+
+  assert.equal(newResult.status, "ready");
+  assert.deepEqual(await oldResult, { status: "unavailable" });
+});
+
+test("research detail ignores a deferred old-revision failure after new data wins", async () => {
+  bridge.resetDormantOpsPageStates();
+  let rejectOld;
+  const oldResponse = new Promise((_resolve, reject) => {
+    rejectOld = reject;
+  });
+  responses.push(oldResponse, researchDetail("research:new"));
+  const oldCapabilities = capabilities([
+    {
+      name: "research",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 8,
+    },
+  ]);
+  const newCapabilities = capabilities([
+    {
+      name: "research",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 9,
+    },
+  ]);
+  const oldResult = task5Bridge.loadOpsResearchDetailState(
+    "research:old",
+    oldCapabilities,
+  );
+  const newResult = await task5Bridge.loadOpsResearchDetailState(
+    "research:new",
+    newCapabilities,
+  );
+  rejectOld({ error: "contract_invalid" });
+
+  assert.equal(newResult.status, "ready");
+  assert.deepEqual(await oldResult, { status: "unavailable" });
+  assert.notEqual(
+    bridge.getDormantOpsPageStates().research?.status,
+    "contract_invalid",
+  );
+});
+
+test("snapshot envelope rejects revisions above the JavaScript-safe boundary", async () => {
+  responses.push(snapshot({ revision: Number.MAX_SAFE_INTEGER + 1 }));
+  await assert.rejects(
+    bridge.getOpsSnapshot({}),
+    (error) => error instanceof bridge.OpsBridgeContractError,
+  );
 });
 
 test("Teams page contract failure is revision-keyed and sticky until capability reset", async () => {

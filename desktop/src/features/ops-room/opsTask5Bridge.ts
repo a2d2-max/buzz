@@ -5,6 +5,7 @@ import { publicId } from "./opsDormantContracts";
 import {
   getDormantOpsPageStates,
   getOpsPage,
+  isOpsPagedModuleGenerationCurrent,
   markOpsPagedModuleContractInvalid,
   OpsBridgeContractError,
   OpsPageError,
@@ -38,7 +39,7 @@ const detailErrorSchema = z
   .object({ error: z.enum(["unavailable", "contract_invalid"]) })
   .strict();
 
-async function getOpsDetail<T>(
+async function getOpsDetail<T extends { id: string }>(
   command: "ops_bridge_research_detail" | "ops_bridge_repository_detail",
   request: unknown,
   schema: z.ZodType<T>,
@@ -48,7 +49,11 @@ async function getOpsDetail<T>(
   try {
     const value = await invoke<unknown>(command, { request: normalized.data });
     const parsed = schema.safeParse(value);
-    if (!parsed.success || containsAbsolutePath(value))
+    if (
+      !parsed.success ||
+      parsed.data.id !== normalized.data.id ||
+      containsAbsolutePath(value)
+    )
       throw new OpsBridgeContractError();
     return parsed.data;
   } catch (error) {
@@ -111,9 +116,24 @@ export async function loadOpsResearchDetailState(
     markOpsPagedModuleContractInvalid("research", capabilities);
     return { status: "contract_invalid" };
   }
+  const key = capabilityKey(capability);
+  prepareDormantState("research", key);
+  const fencedState = () => {
+    const state = getDormantOpsPageStates().research;
+    if (state?.status === "contract_invalid")
+      return { status: "contract_invalid" } as const;
+    if (!isOpsPagedModuleGenerationCurrent("research", key))
+      return { status: "unavailable" } as const;
+    return null;
+  };
+  const beforeRequest = fencedState();
+  if (beforeRequest) return beforeRequest;
   try {
-    return { status: "ready", data: await getOpsResearchDetail({ id }) };
+    const data = await getOpsResearchDetail({ id });
+    return fencedState() ?? { status: "ready", data };
   } catch (error) {
+    const afterFailure = fencedState();
+    if (afterFailure) return afterFailure;
     if (
       error instanceof OpsBridgeContractError ||
       (error instanceof OpsDetailError && error.code === "unavailable")

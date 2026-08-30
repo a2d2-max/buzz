@@ -1,10 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
 import {
+  capabilityKey,
+  getDormantOpsPageStates,
   getOpsCapabilities,
   getOpsPage,
+  isOpsPagedModuleGenerationCurrent,
   markOpsPagedModuleContractInvalid,
   OpsBridgeContractError,
   OpsPageError,
+  prepareDormantState,
+  setDormantState,
   type OpsPageRequest,
   type OpsPageV1,
 } from "./opsBridge";
@@ -87,6 +92,22 @@ export async function loadCompleteOpsOverviewCollection<
       dependencies.markContractInvalid(request.module, capabilities);
       return { status: "contract_invalid" };
     }
+    const key = capabilityKey(
+      capabilities.modules?.find(
+        (candidate) => candidate.name === request.module,
+      ),
+    );
+    prepareDormantState(request.module, key);
+    const fencedState = () => {
+      const state = getDormantOpsPageStates()[request.module];
+      if (state?.status === "contract_invalid")
+        return { status: "contract_invalid" } as const;
+      if (!isOpsPagedModuleGenerationCurrent(request.module, key))
+        return { status: "unavailable" } as const;
+      return null;
+    };
+    const beforeRequest = fencedState();
+    if (beforeRequest) return beforeRequest;
 
     const items: OpsOverviewItem<Module>[] = [];
     const ids = new Set<string>();
@@ -103,6 +124,8 @@ export async function loadCompleteOpsOverviewCollection<
           { ...request, cursor, page_size: PAGE_SIZE } as OpsPageRequest,
           revision,
         );
+        const afterPage = fencedState();
+        if (afterPage) return afterPage;
         pageCount += 1;
         if (page.items.length > PAGE_SIZE) {
           dependencies.markContractInvalid(request.module, capabilities);
@@ -125,8 +148,12 @@ export async function loadCompleteOpsOverviewCollection<
         }
         cursor = page.next_cursor;
       } while (cursor !== null);
+      if (!setDormantState(request.module, key, { status: "ready" }))
+        return fencedState() ?? { status: "unavailable" };
       return { status: "ready", items, revision, refreshed };
     } catch (error) {
+      const afterFailure = fencedState();
+      if (afterFailure) return afterFailure;
       if (error instanceof OpsPageError && error.code === "stale_cursor") {
         if (attempt === 1) return { status: "retry_required", refreshed: true };
         capabilities = await dependencies.getCapabilities();
@@ -134,11 +161,8 @@ export async function loadCompleteOpsOverviewCollection<
         continue;
       }
       if (error instanceof OpsPageError && error.code === "unavailable") {
-        if (request.module === "research") {
-          dependencies.markContractInvalid(request.module, capabilities);
-          return { status: "contract_invalid" };
-        }
-        return { status: "unavailable" };
+        dependencies.markContractInvalid(request.module, capabilities);
+        return { status: "contract_invalid" };
       }
       if (
         error instanceof OpsBridgeContractError ||

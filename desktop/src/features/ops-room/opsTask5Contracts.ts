@@ -39,10 +39,14 @@ function responseBytes(value: unknown): number | null {
   }
 }
 
+export function task5ResponseWithinLimit(value: unknown): boolean {
+  const bytes = responseBytes(value);
+  return bytes !== null && bytes <= MAX_RESPONSE_BYTES;
+}
+
 function boundedResponse<T extends z.ZodType>(schema: T) {
   return schema.superRefine((value, context) => {
-    const bytes = responseBytes(value);
-    if (bytes === null || bytes > MAX_RESPONSE_BYTES)
+    if (!task5ResponseWithinLimit(value))
       context.addIssue({ code: "custom", message: "response exceeds 2 MiB" });
   });
 }

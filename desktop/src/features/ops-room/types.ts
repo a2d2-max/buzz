@@ -48,7 +48,11 @@ const publicString = z
   .refine((value) => !looksLikeAbsolutePath(value), "absolute path is private");
 const requiredPublicString = publicString.min(1);
 const nullablePublicString = publicString.nullable();
-const nonNegativeInteger = z.number().int().nonnegative();
+const nonNegativeInteger = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(Number.MAX_SAFE_INTEGER);
 export const opsEventSequenceSchema = z.string().regex(/^(?:0|[1-9][0-9]*)$/u);
 const publicDetails = z.record(z.string(), z.unknown()).default({});
 

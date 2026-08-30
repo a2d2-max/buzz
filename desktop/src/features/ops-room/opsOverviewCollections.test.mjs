@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 
 import {
   loadCompleteOpsOverviewCollection,
   opsOverviewCollectionQueryKey,
 } from "./opsOverviewCollections.ts";
-import { OpsBridgeContractError, OpsPageError } from "./opsBridge.ts";
+import {
+  markOpsPagedModuleContractInvalid,
+  OpsBridgeContractError,
+  OpsPageError,
+  resetDormantOpsPageStates,
+} from "./opsBridge.ts";
+
+beforeEach(() => resetDormantOpsPageStates());
 
 const generated_at = "2026-08-30T10:00:00Z";
 
@@ -112,6 +119,126 @@ test("advertised research unavailable and malformed overviews fail closed", asyn
   });
   assert.deepEqual(invalid, { status: "contract_invalid" });
   assert.deepEqual(marked, ["research", "research"]);
+});
+
+test("advertised repository overview unavailable is sticky contract-invalid", async () => {
+  const advertised = capabilities("repositories", 11);
+  let pageCalls = 0;
+  const dependencies = {
+    getCapabilities: async () => advertised,
+    getPage: async () => {
+      pageCalls += 1;
+      if (pageCalls === 1) throw new OpsPageError("unavailable");
+      return page(11, []);
+    },
+    markContractInvalid(module, nextCapabilities) {
+      markOpsPagedModuleContractInvalid(module, nextCapabilities);
+    },
+  };
+  const request = {
+    module: "repositories",
+    scope: { project: null, sort: "display_name_asc" },
+  };
+
+  assert.deepEqual(
+    await loadCompleteOpsOverviewCollection(request, dependencies, advertised),
+    { status: "contract_invalid" },
+  );
+  assert.deepEqual(
+    await loadCompleteOpsOverviewCollection(request, dependencies, advertised),
+    { status: "contract_invalid" },
+  );
+  assert.equal(pageCalls, 1);
+});
+
+test("advertised research overview failure cannot be replaced by later valid same-revision data", async () => {
+  const advertised = capabilities("research", 12);
+  let pageCalls = 0;
+  const dependencies = {
+    getCapabilities: async () => advertised,
+    getPage: async () => {
+      pageCalls += 1;
+      if (pageCalls === 1) throw new OpsBridgeContractError();
+      return page(12, [research]);
+    },
+    markContractInvalid(module, nextCapabilities) {
+      markOpsPagedModuleContractInvalid(module, nextCapabilities);
+    },
+  };
+  const request = { module: "research", scope: { sort: "created_at_desc" } };
+
+  assert.deepEqual(
+    await loadCompleteOpsOverviewCollection(request, dependencies, advertised),
+    { status: "contract_invalid" },
+  );
+  assert.deepEqual(
+    await loadCompleteOpsOverviewCollection(request, dependencies, advertised),
+    { status: "contract_invalid" },
+  );
+  assert.equal(pageCalls, 1);
+});
+
+test("research overview ignores a deferred old-revision failure after new data wins", async () => {
+  let rejectOld;
+  const oldPage = new Promise((_resolve, reject) => {
+    rejectOld = reject;
+  });
+  const dependencies = {
+    getCapabilities: async () => capabilities("research", 8),
+    getPage: async (_request, revision) =>
+      revision === 7 ? oldPage : page(8, [research]),
+    markContractInvalid(module, nextCapabilities) {
+      markOpsPagedModuleContractInvalid(module, nextCapabilities);
+    },
+  };
+  const request = { module: "research", scope: { sort: "created_at_desc" } };
+  const oldResult = loadCompleteOpsOverviewCollection(
+    request,
+    dependencies,
+    capabilities("research", 7),
+  );
+  const newResult = await loadCompleteOpsOverviewCollection(
+    request,
+    dependencies,
+    capabilities("research", 8),
+  );
+  rejectOld(new OpsBridgeContractError());
+
+  assert.equal(newResult.status, "ready");
+  assert.deepEqual(await oldResult, { status: "unavailable" });
+});
+
+test("research overview fences a deferred old revision after the new revision wins", async () => {
+  let resolveOld;
+  const oldPage = new Promise((resolve) => {
+    resolveOld = resolve;
+  });
+  const dependencies = {
+    getCapabilities: async () => capabilities("research", 8),
+    getPage: async (_request, revision) =>
+      revision === 7 ? oldPage : page(8, [research]),
+    markContractInvalid(module, nextCapabilities) {
+      markOpsPagedModuleContractInvalid(module, nextCapabilities);
+    },
+  };
+  const request = {
+    module: "research",
+    scope: { sort: "created_at_desc" },
+  };
+  const oldResult = loadCompleteOpsOverviewCollection(
+    request,
+    dependencies,
+    capabilities("research", 7),
+  );
+  const newResult = await loadCompleteOpsOverviewCollection(
+    request,
+    dependencies,
+    capabilities("research", 8),
+  );
+  resolveOld(page(7, [research]));
+
+  assert.equal(newResult.status, "ready");
+  assert.deepEqual(await oldResult, { status: "unavailable" });
 });
 
 test("overview traversal restarts once from the new revision and exposes a second stale", async () => {
