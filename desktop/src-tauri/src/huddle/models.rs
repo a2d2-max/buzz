@@ -667,6 +667,14 @@ impl ModelManager {
     /// ~100 MB download fails. The post-install path inside
     /// `download_stt_model` handles cleanup once the new install reaches Ready.
     pub fn start_stt_download(&self, http_client: reqwest::Client) {
+        self.start_stt_download_with_policy(http_client, crate::evidence_offline::enabled());
+    }
+
+    fn start_stt_download_with_policy(&self, http_client: reqwest::Client, offline: bool) {
+        if offline {
+            eprintln!("buzz-desktop: evidence offline mode: STT model fetch disabled");
+            return;
+        }
         let manager = self.clone();
         self.stt.start_download(
             &self.models_dir,
@@ -687,6 +695,14 @@ impl ModelManager {
 
     /// Start a background Pocket TTS download. No-op if already ready or downloading.
     pub fn start_tts_download(&self, http_client: reqwest::Client) {
+        self.start_tts_download_with_policy(http_client, crate::evidence_offline::enabled());
+    }
+
+    fn start_tts_download_with_policy(&self, http_client: reqwest::Client, offline: bool) {
+        if offline {
+            eprintln!("buzz-desktop: evidence offline mode: TTS model fetch disabled");
+            return;
+        }
         if let Err(error) = voice_upgrade::install_vctk_presets_into_v4_model(&self.models_dir) {
             eprintln!("buzz-desktop: could not upgrade existing Pocket voices in place: {error}");
         }

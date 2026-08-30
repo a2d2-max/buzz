@@ -9,6 +9,7 @@ mod deep_link;
 mod egress_guard;
 mod event_sync;
 mod events;
+mod evidence_offline;
 mod huddle;
 mod identity_storage;
 mod initial_window;
@@ -237,6 +238,10 @@ pub fn run() {
         .manage(ops_bridge::OpsArtifactState::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            let evidence_offline = crate::evidence_offline::enabled();
+            if evidence_offline {
+                eprintln!("buzz-desktop: evidence offline mode enabled");
+            }
             match app_handle.path().app_cache_dir() {
                 Ok(artifact_cache) => {
                     if let Err(error) = app_handle
@@ -364,10 +369,16 @@ pub fn run() {
             // MeshLLM's native admission and transport.
             #[cfg(feature = "mesh-llm")]
             {
-                // Route mesh-llm's download progress (model weights, runtime)
-                // onto Tauri events so the UI can render real progress.
-                crate::mesh_llm::install_progress_sink(&app_handle);
-                tauri::async_runtime::spawn(crate::mesh_llm::start_coordinator(app_handle.clone()));
+                if evidence_offline {
+                    eprintln!("buzz-desktop: evidence offline mode: mesh coordinator disabled");
+                } else {
+                    // Route mesh-llm's download progress (model weights, runtime)
+                    // onto Tauri events so the UI can render real progress.
+                    crate::mesh_llm::install_progress_sink(&app_handle);
+                    tauri::async_runtime::spawn(crate::mesh_llm::start_coordinator(
+                        app_handle.clone(),
+                    ));
+                }
             }
 
             // Start the localhost media streaming proxy. Uses the shared HTTP
@@ -460,7 +471,16 @@ pub fn run() {
             // has no relay override to the localhost fallback. Preserve the
             // boot-time repos and identity recovery safety gates by only marking
             // restoration pending when both allow it.
-            if restore_agents && !recovery_mode {
+            // Evidence runs must never mutate user/system processes or publish
+            // pending events. Local work under their isolated HOME is allowed,
+            // but managed-agent restore can spawn a child, the system sweep can
+            // kill foreign process groups, and the event loop can publish.
+            let startup_side_effect_policy = crate::evidence_offline::startup_side_effect_policy(
+                evidence_offline,
+                restore_agents,
+                recovery_mode,
+            );
+            if startup_side_effect_policy.allow_managed_agent_restore {
                 state
                     .managed_agent_restore_pending
                     .store(true, Ordering::Release);
@@ -470,40 +490,46 @@ pub fn run() {
             // Catches agents that escaped both the Justfile trap and boot-time
             // reaping (e.g. a `just staging` Ctrl+C leak that only gets collected
             // by a different instance's periodic sweep).
-            let sweep_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use std::collections::HashSet;
-                use std::time::Duration;
-                use tauri::Manager;
-                let instance_id = managed_agents::current_instance_id(&sweep_handle);
-                let state = sweep_handle.state::<AppState>();
-                // Two-tick grace: only reap same-instance orphans seen on two
-                // consecutive sweeps. Prevents killing a legitimately-starting
-                // agent that spawned between the skip-list snapshot and the scan.
-                let mut prev_orphans: HashSet<u32> = HashSet::new();
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    // Collect PIDs of our own live agents to avoid killing them.
-                    let skip_pids: Vec<u32> = state
-                        .managed_agent_processes
-                        .lock()
-                        .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
+            if startup_side_effect_policy.start_periodic_agent_sweep {
+                let sweep_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use std::collections::HashSet;
+                    use std::time::Duration;
+                    use tauri::Manager;
+                    let instance_id = managed_agents::current_instance_id(&sweep_handle);
+                    let state = sweep_handle.state::<AppState>();
+                    // Two-tick grace: only reap same-instance orphans seen on two
+                    // consecutive sweeps. Prevents killing a legitimately-starting
+                    // agent that spawned between the skip-list snapshot and the scan.
+                    let mut prev_orphans: HashSet<u32> = HashSet::new();
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        // Collect PIDs of our own live agents to avoid killing them.
+                        let skip_pids: Vec<u32> = state
+                            .managed_agent_processes
+                            .lock()
+                            .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
+                            .unwrap_or_default();
+                        let prev = prev_orphans.clone();
+                        let inst = instance_id.clone();
+                        // Run the blocking syscall work off the async executor.
+                        let new_orphans = tauri::async_runtime::spawn_blocking(move || {
+                            let orphans = managed_agents::sweep_system_agent_processes_with_grace(
+                                &inst, &skip_pids, &prev,
+                            );
+                            managed_agents::reap_dead_instance_agents(&inst, &skip_pids);
+                            orphans
+                        })
+                        .await
                         .unwrap_or_default();
-                    let prev = prev_orphans.clone();
-                    let inst = instance_id.clone();
-                    // Run the blocking syscall work off the async executor.
-                    let new_orphans = tauri::async_runtime::spawn_blocking(move || {
-                        let orphans = managed_agents::sweep_system_agent_processes_with_grace(
-                            &inst, &skip_pids, &prev,
-                        );
-                        managed_agents::reap_dead_instance_agents(&inst, &skip_pids);
-                        orphans
-                    })
-                    .await
-                    .unwrap_or_default();
-                    prev_orphans = new_orphans;
-                }
-            });
+                        prev_orphans = new_orphans;
+                    }
+                });
+            } else {
+                eprintln!(
+                    "buzz-desktop: evidence offline mode: managed-agent system sweep disabled"
+                );
+            }
 
             // Drain events the retention store flagged `pending_sync` (UI
             // create/edit, delete tombstones, launch reconcile) to the relay.
@@ -512,7 +538,7 @@ pub fn run() {
             // the next sweep.
             // Skipped in recovery mode — flushing under an ephemeral key would
             // publish events attributed to an identity the user doesn't own.
-            if !recovery_mode {
+            if startup_side_effect_policy.start_periodic_event_publish {
                 let flush_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use std::time::Duration;
@@ -530,6 +556,8 @@ pub fn run() {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
                 });
+            } else if evidence_offline {
+                eprintln!("buzz-desktop: evidence offline mode: periodic event publish disabled");
             }
             Ok(())
         })

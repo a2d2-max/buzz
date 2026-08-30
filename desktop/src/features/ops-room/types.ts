@@ -465,10 +465,11 @@ export function parseOpsModuleStates(
 ): OpsModuleStates {
   return Object.fromEntries(
     OPS_MODULE_NAMES.map((name) => {
-      const advertised = capabilities.modules?.some(
+      const capability = capabilities.modules?.find(
         (module) => module.name === name && module.schema_version === 1,
       );
-      if (!advertised) return [name, { status: "unavailable" }];
+      if (!capability || capability.paged)
+        return [name, { status: "unavailable" }];
       const parsed = optionalModuleSchemas[name].safeParse(snapshot[name]);
       return parsed.success
         ? [name, { status: "ready", data: parsed.data }]

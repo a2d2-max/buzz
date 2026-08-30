@@ -391,6 +391,37 @@ describe("native Ops bridge contract", () => {
     assert.equal(invalid.module_states.timeline.status, "contract_invalid");
   });
 
+  test("treats paged modules as page-endpoint-only even when the snapshot omits or shadows their payload", async () => {
+    const pagedCapabilities = {
+      ...capabilities,
+      modules: [
+        {
+          name: "timeline",
+          schema_version: 1,
+          paged: true,
+          collection_revision: 6,
+        },
+      ],
+    };
+    responses.push(pagedCapabilities, validSnapshot());
+    const absent = await bridge.loadOpsSnapshot({});
+    assert.equal(absent.module_states.timeline.status, "unavailable");
+
+    responses.push(
+      pagedCapabilities,
+      validSnapshot({
+        timeline: [
+          {
+            id: 1,
+            author: "must-not-be-treated-as-inline-snapshot-data",
+          },
+        ],
+      }),
+    );
+    const shadowed = await bridge.loadOpsSnapshot({});
+    assert.equal(shadowed.module_states.timeline.status, "unavailable");
+  });
+
   test("accepts a valid advertised module and ignores unknown future modules", async () => {
     responses.push(
       {

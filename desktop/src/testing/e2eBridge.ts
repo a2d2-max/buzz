@@ -602,6 +602,8 @@ type E2eConfig = {
     >;
     /** Strict native artifact read fixtures keyed by public artifact identity. */
     opsArtifactReads?: Record<string, Record<string, unknown>>;
+    /** Delay native artifact reads so loading UI is observable. */
+    opsArtifactReadDelayMs?: number;
     opsArtifactReadErrors?: Record<
       string,
       | "invalid_artifact_request"
@@ -11835,6 +11837,10 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "ops_bridge_read_artifact": {
         const request = parseMockArtifactReadRequest(payload);
+        const artifactDelay = activeConfig?.mock?.opsArtifactReadDelayMs ?? 0;
+        if (artifactDelay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, artifactDelay));
+        }
         const key = artifactFixtureKey(request);
         const configuredError =
           activeConfig?.mock?.opsArtifactReadErrors?.[key];
@@ -11864,8 +11870,10 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "ops_bridge_read_artifact_handle": {
         const request = parseMockArtifactHandleRequest(payload);
+        const chunks = activeConfig?.mock?.opsArtifactHandleChunks;
         const configured =
-          activeConfig?.mock?.opsArtifactHandleChunks?.[request.handle];
+          chunks?.[`${request.handle}|${request.offset}`] ??
+          chunks?.[request.handle];
         if (configured) return structuredClone(configured);
         if (request.handle !== MOCK_ARTIFACT_HANDLE) {
           return Promise.reject({ error: "invalid_artifact_request" });

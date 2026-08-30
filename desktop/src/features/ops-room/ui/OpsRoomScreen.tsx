@@ -1,6 +1,10 @@
 import { PanelRightOpen, X } from "lucide-react";
 import * as React from "react";
 
+import {
+  artifactRepresentationForKind,
+  type OpsArtifactSelection,
+} from "../artifactReader";
 import { useOpsSnapshot } from "../hooks";
 import {
   opsRoomHash,
@@ -17,6 +21,7 @@ import type {
   OpsConnectionState as ConnectionState,
   OpsSelection,
 } from "../types";
+import { OpsArtifactReader } from "./OpsArtifactReader";
 import { OpsConnectionState } from "./OpsConnectionState";
 import { OpsContextPanel } from "./OpsContextPanel";
 import { OpsSessionTree } from "./OpsSessionTree";
@@ -97,6 +102,8 @@ export function OpsRoomView({
   const reducedMotion = useReducedMotionPreference();
   const [mobileTab, setMobileTab] = React.useState<MobileTab>("timeline");
   const [contextOpen, setContextOpen] = React.useState(false);
+  const [selectedArtifact, setSelectedArtifact] =
+    React.useState<OpsArtifactSelection | null>(null);
   const [selectedSessionId, setSelectedSessionId] = React.useState<
     string | null
   >(() => {
@@ -113,6 +120,7 @@ export function OpsRoomView({
   );
   const contextTriggerRef = React.useRef<HTMLButtonElement>(null);
   const contextDrawerRef = React.useRef<HTMLDivElement>(null);
+  const artifactTriggerRef = React.useRef<HTMLButtonElement>(null);
 
   const closeContext = React.useCallback(() => {
     setContextOpen(false);
@@ -123,6 +131,9 @@ export function OpsRoomView({
     if (!contextOpen) return;
     contextDrawerRef.current?.focus({ preventScroll: true });
     const onKeyDown = (event: KeyboardEvent) => {
+      if (document.querySelector('[data-testid="ops-artifact-reader"]')) {
+        return;
+      }
       if (event.key === "Escape") {
         event.preventDefault();
         closeContext();
@@ -156,6 +167,19 @@ export function OpsRoomView({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [closeContext, contextOpen]);
+
+  const openArtifact = React.useCallback(
+    (
+      artifact: OpsRoomProjection["context"]["artifacts"][number],
+      trigger: HTMLButtonElement,
+    ) => {
+      const representation = artifactRepresentationForKind(artifact.kind);
+      if (!representation) return;
+      artifactTriggerRef.current = trigger;
+      setSelectedArtifact({ ...artifact, representation });
+    },
+    [],
+  );
 
   React.useEffect(() => {
     const canonicalThread = projection?.workspace.selectedThreadId ?? null;
@@ -227,7 +251,10 @@ export function OpsRoomView({
                 <OpsTimeline items={projection.timeline} />
               </MainPane>
               <MainPane>
-                <OpsContextPanel context={projection.context} />
+                <OpsContextPanel
+                  context={projection.context}
+                  onOpenArtifact={openArtifact}
+                />
               </MainPane>
             </div>
           ) : layout === "compact" ? (
@@ -299,7 +326,10 @@ export function OpsRoomView({
                     sessions={projection.sessions}
                   />
                 ) : mobileTab === "context" ? (
-                  <OpsContextPanel context={projection.context} />
+                  <OpsContextPanel
+                    context={projection.context}
+                    onOpenArtifact={openArtifact}
+                  />
                 ) : (
                   <OpsTimeline items={projection.timeline} />
                 )}
@@ -338,9 +368,20 @@ export function OpsRoomView({
             >
               <X className="h-4 w-4" />
             </button>
-            <OpsContextPanel context={projection.context} />
+            <OpsContextPanel
+              context={projection.context}
+              onOpenArtifact={openArtifact}
+            />
           </div>
         </div>
+      ) : null}
+
+      {selectedArtifact ? (
+        <OpsArtifactReader
+          artifact={selectedArtifact}
+          onClose={() => setSelectedArtifact(null)}
+          returnFocus={artifactTriggerRef.current}
+        />
       ) : null}
     </div>
   );

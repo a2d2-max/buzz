@@ -9,11 +9,18 @@ import {
 } from "lucide-react";
 import type * as React from "react";
 
+import { artifactRepresentationForKind } from "../artifactReader";
 import type { OpsProjectedContext } from "../opsProjection";
 
 type OpsContextPanelProps = {
   context: OpsProjectedContext;
+  onOpenArtifact: (
+    artifact: OpsProjectedContext["artifacts"][number],
+    trigger: HTMLButtonElement,
+  ) => void;
 };
+
+const INTERACTIVE_SIZE = { minHeight: 44, minWidth: 44 } as const;
 
 function EmptyRecords() {
   return <p className="py-2 text-xs text-muted-foreground">기록 없음</p>;
@@ -52,7 +59,10 @@ function ContextSection({
   );
 }
 
-export function OpsContextPanel({ context }: OpsContextPanelProps) {
+export function OpsContextPanel({
+  context,
+  onOpenArtifact,
+}: OpsContextPanelProps) {
   return (
     <section
       aria-labelledby="ops-context-heading"
@@ -237,20 +247,43 @@ export function OpsContextPanel({ context }: OpsContextPanelProps) {
             <EmptyRecords />
           ) : (
             <ul className="space-y-2">
-              {context.artifacts.map((artifact) => (
-                <li
-                  className="rounded-lg bg-muted/40 px-2.5 py-2"
-                  key={artifact.id}
-                >
-                  <p className="break-words text-xs font-medium [overflow-wrap:anywhere]">
-                    {artifact.title}
-                  </p>
-                  <p className="mt-1 text-2xs text-muted-foreground">
-                    {artifact.kind} · v{artifact.version} ·{" "}
-                    {statusLabel(artifact.status)}
-                  </p>
-                </li>
-              ))}
+              {context.artifacts.map((artifact) => {
+                const readable =
+                  artifactRepresentationForKind(artifact.kind) !== null;
+                return (
+                  <li className="rounded-lg bg-muted/40" key={artifact.id}>
+                    {readable ? (
+                      <button
+                        aria-label={`${artifact.title} 아티팩트 열기`}
+                        className="flex w-full min-w-0 flex-col items-start justify-center rounded-lg px-2.5 py-2 text-left hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                        data-ops-interactive
+                        onClick={(event) =>
+                          onOpenArtifact(artifact, event.currentTarget)
+                        }
+                        style={INTERACTIVE_SIZE}
+                        type="button"
+                      >
+                        <span className="break-words text-xs font-medium [overflow-wrap:anywhere]">
+                          {artifact.title}
+                        </span>
+                        <span className="mt-1 text-2xs text-muted-foreground">
+                          {artifact.kind} · v{artifact.version} ·{" "}
+                          {statusLabel(artifact.status)}
+                        </span>
+                      </button>
+                    ) : (
+                      <div className="px-2.5 py-2">
+                        <p className="break-words text-xs font-medium [overflow-wrap:anywhere]">
+                          {artifact.title}
+                        </p>
+                        <p className="mt-1 text-2xs text-muted-foreground">
+                          {artifact.kind} · 네이티브 텍스트 읽기 미지원
+                        </p>
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           )}
         </ContextSection>

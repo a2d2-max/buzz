@@ -3,6 +3,10 @@ import { expect, test, type Page } from "@playwright/test";
 import { installMockBridge } from "../helpers/bridge";
 
 const LOCAL_OPS_STORAGE_KEY = "buzz-local-ops-guest.v1";
+const OPS_ARTIFACT_ID = "artifact:0123456789abcdef0123456789abcdef";
+const OPS_ARTIFACT_KEY = `${OPS_ARTIFACT_ID}|1|preview`;
+const OPS_ARTIFACT_HANDLE =
+  "artifact-handle:01234567-89ab-4def-8123-456789abcdef";
 const FORBIDDEN_ACTION_NAME =
   /deliver|send|execute|push|merge|deploy|전달|보내기|실행|푸시|병합|배포/i;
 
@@ -48,7 +52,7 @@ const OPS_SNAPSHOT_FIXTURE = {
         updated_at: "2026-08-30T00:00:00.000Z",
         session_count: 2,
         approval_count: 1,
-        artifact_count: 0,
+        artifact_count: 2,
       },
     ],
     selected_thread_id: "work:configured-redacted",
@@ -95,7 +99,30 @@ const OPS_SNAPSHOT_FIXTURE = {
           updated_at: "2026-08-30T00:01:00.000Z",
         },
       ],
-      artifacts: [],
+      artifacts: [
+        {
+          id: OPS_ARTIFACT_ID,
+          work_item_id: "work:configured-redacted",
+          title: "Parity report",
+          kind: "markdown",
+          status: "ready",
+          version: 1,
+          source_event_id: "event:configured-completion-redacted",
+          created_at: "2026-08-30T00:01:00.000Z",
+          updated_at: "2026-08-30T00:01:00.000Z",
+        },
+        {
+          id: "artifact:fedcba9876543210fedcba9876543210",
+          work_item_id: "work:configured-redacted",
+          title: "Screenshot evidence",
+          kind: "screenshot",
+          status: "ready",
+          version: 1,
+          source_event_id: "event:configured-completion-redacted",
+          created_at: "2026-08-30T00:01:00.000Z",
+          updated_at: "2026-08-30T00:01:00.000Z",
+        },
+      ],
     },
     diagnostics: { fixture: "configured-deterministic-redacted" },
   },
@@ -127,7 +154,11 @@ const OPS_SNAPSHOT_FIXTURE = {
   decisions: [],
 };
 
-async function openLocalOpsRoom(page: Page, probeWatchStart: boolean) {
+async function openLocalOpsRoom(
+  page: Page,
+  probeWatchStart: boolean,
+  mockOverrides: Record<string, unknown> = {},
+) {
   if (!probeWatchStart) {
     await page.addInitScript((storageKey) => {
       window.localStorage.setItem(storageKey, "true");
@@ -137,6 +168,7 @@ async function openLocalOpsRoom(page: Page, probeWatchStart: boolean) {
     identityLost: true,
     opsCapabilities: OPS_CAPABILITIES_FIXTURE,
     opsSnapshot: OPS_SNAPSHOT_FIXTURE,
+    ...mockOverrides,
   };
   await installMockBridge(page, mockConfig, {
     seedPreviewFeatures: false,
@@ -209,6 +241,32 @@ async function expectContextContent(page: Page) {
   const context = page.getByTestId("ops-context");
   await expect(context).toBeVisible();
   await expect(context.getByText("승인 필요", { exact: true })).toBeVisible();
+  await expect(
+    context.getByText("Screenshot evidence", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    context.getByRole("button", { name: "Screenshot evidence 아티팩트 열기" }),
+  ).toHaveCount(0);
+}
+
+async function expectInlineArtifactReader(page: Page) {
+  const trigger = page.getByRole("button", {
+    name: "Parity report 아티팩트 열기",
+  });
+  await trigger.scrollIntoViewIfNeeded();
+  await trigger.click();
+  const reader = page.getByRole("dialog", { name: "Parity report" });
+  await expect(reader).toBeFocused();
+  await expect(
+    reader.getByText("# Fixture artifact", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    reader.getByText(/인라인 검증됨 · v1 · text\/markdown · 18 B/u),
+  ).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+  await reader.getByRole("button", { name: "아티팩트 닫기" }).click();
+  await expect(reader).toHaveCount(0);
+  await expect(trigger).toBeFocused();
 }
 
 async function expectWorkspaceFixture(page: Page) {
@@ -539,6 +597,150 @@ test("an older snapshot remains visible with live watch compatibility disabled",
   ).toEqual([]);
 });
 
+test("the native artifact reader exposes loading before verified inline content", async ({
+  page,
+}) => {
+  await page.setViewportSize(VIEWPORTS[0]);
+  await openLocalOpsRoom(page, false, { opsArtifactReadDelayMs: 250 });
+  await page
+    .getByRole("button", { name: "Parity report 아티팩트 열기" })
+    .click();
+  const reader = page.getByRole("dialog", { name: "Parity report" });
+  await expect(reader.getByRole("status")).toContainText("불러오는 중");
+  await expect(
+    reader.getByText("# Fixture artifact", { exact: true }),
+  ).toBeVisible();
+});
+
+for (const [code, copy] of [
+  ["artifact_read_denied", "읽기 권한이 없습니다"],
+  ["artifact_integrity_mismatch", "무결성 검증에 실패했습니다"],
+  ["artifact_version_not_found", "요청한 버전을 찾을 수 없습니다"],
+  ["artifact_too_large", "아티팩트가 너무 큽니다"],
+  ["artifact_media_unsupported", "지원하지 않는 형식입니다"],
+] as const) {
+  test(`the native artifact reader renders ${code} without leaking bridge details`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(VIEWPORTS[0]);
+    await openLocalOpsRoom(page, false, {
+      opsArtifactReadErrors: { [OPS_ARTIFACT_KEY]: code },
+    });
+    await page
+      .getByRole("button", { name: "Parity report 아티팩트 열기" })
+      .click();
+    const reader = page.getByRole("dialog", { name: "Parity report" });
+    await expect(reader.getByRole("alert")).toContainText(copy);
+    await expect(reader).not.toContainText(code);
+  });
+}
+
+test("opaque artifact content streams in exact chunks and releases without mutations", async ({
+  page,
+}) => {
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  await page.setViewportSize(VIEWPORTS[0]);
+  await openLocalOpsRoom(page, false, {
+    opsArtifactReads: {
+      [OPS_ARTIFACT_KEY]: {
+        contract_version: 1,
+        artifact_id: OPS_ARTIFACT_ID,
+        version: 1,
+        representation: "preview",
+        mime: "text/plain",
+        total_size: 12,
+        sha256: "d".repeat(64),
+        kind: "opaque_handle",
+        handle: OPS_ARTIFACT_HANDLE,
+        expires_at: expiresAt,
+      },
+    },
+    opsArtifactHandleChunks: {
+      [`${OPS_ARTIFACT_HANDLE}|0`]: {
+        contract_version: 1,
+        handle: OPS_ARTIFACT_HANDLE,
+        mime: "text/plain",
+        offset: 0,
+        next_offset: 6,
+        total_size: 12,
+        data_base64: "Zmlyc3Qg",
+        eof: false,
+      },
+      [`${OPS_ARTIFACT_HANDLE}|6`]: {
+        contract_version: 1,
+        handle: OPS_ARTIFACT_HANDLE,
+        mime: "text/plain",
+        offset: 6,
+        next_offset: 12,
+        total_size: 12,
+        data_base64: "c2Vjb25k",
+        eof: true,
+      },
+    },
+  });
+
+  await page
+    .getByRole("button", { name: "Parity report 아티팩트 열기" })
+    .click();
+  const reader = page.getByRole("dialog", { name: "Parity report" });
+  await expect(reader.getByText("first second", { exact: true })).toBeVisible();
+  await expect(
+    reader.getByText(/보안 스트림 검증됨 · v1 · text\/plain · 12 B/u),
+  ).toBeVisible();
+  await expect(reader).not.toContainText("artifact-handle:");
+
+  const calls = await page.evaluate(
+    () => window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [],
+  );
+  expect(
+    calls.filter(({ command }) => command === "ops_bridge_read_artifact"),
+  ).toEqual([
+    {
+      command: "ops_bridge_read_artifact",
+      payload: {
+        request: {
+          artifact_id: OPS_ARTIFACT_ID,
+          version: 1,
+          representation: "preview",
+        },
+      },
+    },
+  ]);
+  expect(
+    calls.filter(
+      ({ command }) => command === "ops_bridge_read_artifact_handle",
+    ),
+  ).toEqual([
+    {
+      command: "ops_bridge_read_artifact_handle",
+      payload: {
+        request: { handle: OPS_ARTIFACT_HANDLE, offset: 0, length: 12 },
+      },
+    },
+    {
+      command: "ops_bridge_read_artifact_handle",
+      payload: {
+        request: { handle: OPS_ARTIFACT_HANDLE, offset: 6, length: 6 },
+      },
+    },
+  ]);
+  expect(
+    calls.filter(
+      ({ command }) => command === "ops_bridge_release_artifact_handle",
+    ),
+  ).toEqual([
+    {
+      command: "ops_bridge_release_artifact_handle",
+      payload: { request: { handle: OPS_ARTIFACT_HANDLE } },
+    },
+  ]);
+  expect(
+    calls.filter(({ command }) =>
+      ["ops_bridge_create_draft", "ops_bridge_transition"].includes(command),
+    ),
+  ).toEqual([]);
+});
+
 for (const viewport of VIEWPORTS) {
   test(`Local Ops Room matches native safety and responsive parity at ${viewport.width}x${viewport.height}`, async ({
     page,
@@ -561,6 +763,7 @@ for (const viewport of VIEWPORTS) {
       await expectSessionContent(page);
       await expectTimelineContent(page);
       await expectContextContent(page);
+      await expectInlineArtifactReader(page);
     } else if (viewport.name === "compact") {
       await expect(panes).toHaveCount(2);
       await expect(
@@ -589,6 +792,7 @@ for (const viewport of VIEWPORTS) {
       const drawer = page.getByRole("dialog", { name: "작업 컨텍스트" });
       await expect(drawer).toBeFocused();
       await expectContextContent(page);
+      await expectInlineArtifactReader(page);
       await expectAccessibleTargets(page);
       await expectReducedMotionComputed(page);
       await drawer.press("Escape");
@@ -607,6 +811,7 @@ for (const viewport of VIEWPORTS) {
 
       await page.getByRole("tab", { name: "컨텍스트" }).click();
       await expectContextContent(page);
+      await expectInlineArtifactReader(page);
       await expectAccessibleTargets(page);
 
       await page.getByRole("tab", { name: "작업" }).click();
