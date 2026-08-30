@@ -566,11 +566,14 @@ async fn dormant_rust_capabilities_are_exact_additive_duplicate_safe_and_future_
         .expect("future module is valid")
         .modules
         .is_some_and(|modules| modules.is_empty()));
-    assert_eq!(
-        client.capabilities().await.expect_err("record is closed"),
-        OpsBridgeError::ResponseInvalidJson
-    );
-    for reason in ["schema", "name", "duplicate"] {
+    for reason in ["record is closed", "schema"] {
+        let isolated = client.capabilities().await.expect(reason);
+        assert_eq!(
+            serde_json::to_value(isolated).expect("serialize isolated capability")["modules"][0],
+            json!({"name":"work_items"})
+        );
+    }
+    for reason in ["name", "duplicate"] {
         assert_eq!(
             client.capabilities().await.expect_err(reason),
             OpsBridgeError::ContractMismatch
@@ -634,11 +637,14 @@ async fn dormant_rust_capabilities_distinguish_optional_omission_from_explicit_n
         .modules
         .is_some());
     assert_eq!(
-        client
-            .capabilities()
-            .await
-            .expect_err("revision null rejected"),
-        OpsBridgeError::ResponseInvalidJson
+        serde_json::to_value(
+            client
+                .capabilities()
+                .await
+                .expect("known null revision reaches Zod")
+        )
+        .expect("serialize isolated null revision")["modules"][0],
+        json!({"name":"timeline"})
     );
     server.await.expect("fake server exits");
 }

@@ -98,7 +98,7 @@ static SENSITIVE_PATTERNS: LazyLock<Result<SensitivePatterns, regex::Error>> = L
     },
 );
 
-fn safe_public(value: &str) -> bool {
+pub(crate) fn safe_public(value: &str) -> bool {
     if value.chars().any(|ch| {
         ch.is_control()
             || matches!(ch, '\u{200b}'..='\u{200d}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
@@ -137,14 +137,14 @@ fn safe_public(value: &str) -> bool {
     true
 }
 
-fn public_text(value: &str, maximum: usize, required: bool) -> bool {
+pub(crate) fn public_text(value: &str, maximum: usize, required: bool) -> bool {
     (!required || !value.is_empty())
         && value.chars().count() <= maximum
         && value == value.nfc().collect::<String>()
         && safe_public(value)
 }
 
-fn utc(value: &str) -> bool {
+pub(crate) fn utc(value: &str) -> bool {
     if !value.is_ascii() {
         return false;
     }
@@ -200,10 +200,10 @@ pub(crate) fn search_query(value: &str) -> bool {
         && safe_public(value)
 }
 
-fn positive(value: u64) -> bool {
+pub(crate) fn positive(value: u64) -> bool {
     (1..=MAX_SAFE_INTEGER_U64).contains(&value)
 }
-fn safe(value: u64) -> bool {
+pub(crate) fn safe(value: u64) -> bool {
     value <= MAX_SAFE_INTEGER_U64
 }
 fn unique_ids(values: &[String], maximum: usize) -> bool {

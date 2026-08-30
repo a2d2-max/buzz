@@ -26,6 +26,12 @@ import {
   type DormantOpsModuleName,
   type DormantOpsPageRequest,
 } from "./opsDormantContracts";
+import {
+  opsTeamsActivityScopeSchema,
+  parseOpsRepositoryPage,
+  parseOpsResearchPage,
+  parseOpsTeamsActivityPage,
+} from "./opsTask5Contracts";
 
 const selectionSchema = z
   .object({
@@ -55,6 +61,7 @@ const opsPageModuleSchema = z.enum([
   "artifacts",
   "research",
   "repositories",
+  "teams_activity",
   "work_items",
   "sessions",
   "checklist_items",
@@ -98,7 +105,6 @@ const existingOpsPageRequestSchema = z.discriminatedUnion("module", [
       module: z.literal("research"),
       scope: z
         .object({
-          work_item: z.string().min(1).nullable(),
           sort: z.literal("created_at_desc"),
         })
         .strict(),
@@ -119,6 +125,14 @@ const existingOpsPageRequestSchema = z.discriminatedUnion("module", [
       cursor: z.string().min(1).max(4096).nullable(),
     })
     .strict(),
+  z
+    .object({
+      module: z.literal("teams_activity"),
+      scope: opsTeamsActivityScopeSchema,
+      page_size: z.number().int().min(1).max(100),
+      cursor: z.string().min(1).max(4096).nullable(),
+    })
+    .strict(),
 ]);
 const opsPageRequestSchema = z.union([
   existingOpsPageRequestSchema,
@@ -130,10 +144,18 @@ const opsPageItemSchemas = {
   artifacts: opsArtifactSchema.strict(),
   research: opsResearchCardSchema.strict(),
   repositories: opsRepositoryStatusSchema.strict(),
+  teams_activity: z.unknown(),
 } as const;
 
 const opsPageErrorSchema = z
-  .object({ error: z.enum(["invalid_cursor", "stale_cursor", "unavailable"]) })
+  .object({
+    error: z.enum([
+      "invalid_cursor",
+      "stale_cursor",
+      "unavailable",
+      "contract_invalid",
+    ]),
+  })
   .strict();
 
 const artifactIdSchema = z.string().regex(/^artifact:[0-9a-f]{32}$/u);
@@ -250,11 +272,15 @@ export type OpsPageRequest =
     })
   | (OpsPageRequestBase & {
       module: "research";
-      scope: { work_item: string | null; sort: "created_at_desc" };
+      scope: { sort: "created_at_desc" };
     })
   | (OpsPageRequestBase & {
       module: "repositories";
       scope: { project: string | null; sort: "display_name_asc" };
+    })
+  | (OpsPageRequestBase & {
+      module: "teams_activity";
+      scope: { connection: string; sort: "observed_at_desc" };
     })
   | DormantOpsPageRequest;
 
@@ -277,7 +303,8 @@ export type DormantOpsPageState<Module extends DormantOpsModuleName> =
 export type OpsPagedSafetyModule =
   | DormantOpsModuleName
   | "repositories"
-  | "research";
+  | "research"
+  | "teams_activity";
 type OpsPagedSafetyState =
   | { status: "unavailable" }
   | { status: "contract_invalid" }
@@ -295,6 +322,7 @@ const PAGED_SAFETY_MODULES: OpsPagedSafetyModule[] = [
   ...(Object.keys(dormantPageItemSchemas) as DormantOpsModuleName[]),
   "research",
   "repositories",
+  "teams_activity",
 ];
 const dormantStateRecords = new Map<OpsPagedSafetyModule, DormantStateRecord>();
 const authoritativeDormantCapabilityKeys = new Map<
@@ -312,7 +340,7 @@ function publishDormantStateSnapshot(): void {
   for (const listener of dormantStateListeners) listener();
 }
 
-function capabilityKey(
+export function capabilityKey(
   capability:
     | NonNullable<OpsBridgeCapabilitiesV1["modules"]>[number]
     | undefined,
@@ -349,7 +377,10 @@ function reconcileAuthoritativeDormantStates(
   if (changed) publishDormantStateSnapshot();
 }
 
-function prepareDormantState(module: OpsPagedSafetyModule, key: string): void {
+export function prepareDormantState(
+  module: OpsPagedSafetyModule,
+  key: string,
+): void {
   const current = dormantStateRecords.get(module);
   if (current?.capabilityKey === key) return;
   const authoritativeKey = authoritativeDormantCapabilityKeys.get(module);
@@ -365,7 +396,7 @@ function prepareDormantState(module: OpsPagedSafetyModule, key: string): void {
   publishDormantStateSnapshot();
 }
 
-function setDormantState(
+export function setDormantState(
   module: OpsPagedSafetyModule,
   key: string,
   state: OpsPagedSafetyState,
@@ -400,7 +431,6 @@ export function resetDormantOpsPageStates(): void {
   publishDormantStateSnapshot();
 }
 
-/** Publishes complete-collection validation failures into the existing mutation-disable authority. */
 export function markDormantOpsModuleContractInvalid(
   module: DormantOpsModuleName,
   capabilities: OpsBridgeCapabilitiesV1,
@@ -408,7 +438,6 @@ export function markDormantOpsModuleContractInvalid(
   markOpsPagedModuleContractInvalid(module, capabilities);
 }
 
-/** Publishes every paged Ops validation failure into the shared mutation-disable authority. */
 export function markOpsPagedModuleContractInvalid(
   module: OpsPagedSafetyModule,
   capabilities: OpsBridgeCapabilitiesV1,
@@ -609,6 +638,25 @@ function parsePage(
     if (!parsedDormant) throw new OpsBridgeContractError();
     return parsedDormant;
   }
+  if (module === "teams_activity") {
+    const parsed = parseOpsTeamsActivityPage(
+      value,
+      expectedCollectionRevision,
+      scope,
+    );
+    if (!parsed) throw new OpsBridgeContractError();
+    return parsed;
+  }
+  if (module === "research") {
+    const parsed = parseOpsResearchPage(value, expectedCollectionRevision);
+    if (!parsed) throw new OpsBridgeContractError();
+    return parsed;
+  }
+  if (module === "repositories") {
+    const parsed = parseOpsRepositoryPage(value, expectedCollectionRevision);
+    if (!parsed) throw new OpsBridgeContractError();
+    return parsed;
+  }
   const schema = z
     .object({
       contract_version: z.literal(1),
@@ -716,7 +764,11 @@ export async function getOpsPage(
     );
   } catch (error) {
     const parsed = opsPageErrorSchema.safeParse(error);
-    if (parsed.success) throw new OpsPageError(parsed.data.error);
+    if (parsed.success) {
+      if (parsed.data.error === "contract_invalid")
+        throw new OpsBridgeContractError();
+      throw new OpsPageError(parsed.data.error);
+    }
     throw error;
   }
 }

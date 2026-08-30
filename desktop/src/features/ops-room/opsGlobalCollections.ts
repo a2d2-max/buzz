@@ -237,7 +237,7 @@ export function useOpsGlobalCollections({
     const revisions = new Map(
       nextCapabilities.modules?.map((module) => [
         module.name,
-        module.collection_revision,
+        module.paged ? module.collection_revision : undefined,
       ]) ?? [],
     );
     await queryClient.invalidateQueries({

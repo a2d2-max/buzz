@@ -427,7 +427,7 @@ describe("native Ops bridge contract", () => {
       {
         ...capabilities,
         modules: [
-          { name: "timeline", schema_version: 1, paged: false },
+          { name: "connections", schema_version: 1, paged: false },
           {
             name: "future_module",
             schema_version: 1,
@@ -437,13 +437,16 @@ describe("native Ops bridge contract", () => {
         ],
       },
       validSnapshot({
-        timeline: [
+        connections: [
           {
-            id: "event:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            timestamp: "2026-08-29T00:00:01.000Z",
-            kind: "status",
-            author: "Orca",
-            body: "Observed",
+            id: "connection:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            name: "Hub",
+            kind: "hub",
+            status: "ready",
+            updated_at: "2026-08-29T00:00:01.000Z",
+            observed_at: "2026-08-29T00:00:01.000Z",
+            source_alias: "source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            locator_label: "Local Hub",
           },
         ],
       }),
@@ -451,8 +454,8 @@ describe("native Ops bridge contract", () => {
 
     const result = await bridge.loadOpsSnapshot({});
 
-    assert.equal(result.module_states.timeline.status, "ready");
-    assert.equal(result.module_states.timeline.data[0].author, "Orca");
+    assert.equal(result.module_states.connections.status, "ready");
+    assert.equal(result.module_states.connections.data[0].name, "Hub");
   });
 
   test("rejects an invalid required session tree", async () => {
@@ -583,14 +586,15 @@ describe("native Ops bridge contract", () => {
     );
   });
 
-  test("requires a safe collection revision when a module is paged", async () => {
+  test("isolates malformed known collection revisions for module-local classification", async () => {
     responses.push({
       ...capabilities,
       modules: [{ name: "timeline", schema_version: 1, paged: true }],
     });
-    await assert.rejects(bridge.getOpsCapabilities(), {
-      name: "OpsBridgeContractError",
-    });
+    assert.equal(
+      (await bridge.getOpsCapabilities()).modules[0].contract_invalid,
+      true,
+    );
 
     responses.push({
       ...capabilities,
@@ -604,8 +608,8 @@ describe("native Ops bridge contract", () => {
       ],
     });
     assert.equal(
-      (await bridge.getOpsCapabilities()).modules[0].collection_revision,
-      8,
+      (await bridge.getOpsCapabilities()).modules[0].contract_invalid,
+      true,
     );
 
     responses.push({
@@ -619,9 +623,10 @@ describe("native Ops bridge contract", () => {
         },
       ],
     });
-    await assert.rejects(bridge.getOpsCapabilities(), {
-      name: "OpsBridgeContractError",
-    });
+    assert.equal(
+      (await bridge.getOpsCapabilities()).modules[0].contract_invalid,
+      true,
+    );
   });
 
   test("loads an exact timeline page with normalized native arguments", async () => {
@@ -699,7 +704,7 @@ describe("native Ops bridge contract", () => {
       },
       {
         module: "research",
-        scope: { work_item: null, sort: "created_at_desc" },
+        scope: { sort: "created_at_desc" },
         item: {
           id: "research:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           title: "Source review",
@@ -833,7 +838,7 @@ describe("native Ops bridge contract", () => {
       bridge.loadOpsPageWithStaleRestart(
         {
           module: "research",
-          scope: { work_item: null, sort: "created_at_desc" },
+          scope: { sort: "created_at_desc" },
           cursor: "invalid",
         },
         4,
@@ -1025,7 +1030,7 @@ describe("native Ops bridge contract", () => {
     const result = await bridge.loadOpsPageWithStaleRestartResult(
       {
         module: "research",
-        scope: { work_item: null, sort: "created_at_desc" },
+        scope: { sort: "created_at_desc" },
       },
       11,
     );

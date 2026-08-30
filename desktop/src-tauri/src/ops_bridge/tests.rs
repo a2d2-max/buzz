@@ -323,11 +323,11 @@ async fn ops_bridge_snapshot_constructs_only_the_typed_query_fields() {
     ));
     let renderer_value = serde_json::to_value(&snapshot).expect("serialize snapshot");
     assert_eq!(renderer_value["timeline"][0]["id"], "event:one");
+    assert!(renderer_value["workflow_routing"].is_null());
     assert_eq!(
-        renderer_value["workflow_routing"]["default_provider"],
-        "codex"
+        renderer_value["repositories"],
+        serde_json::json!([{"contract_invalid":true}])
     );
-    assert_eq!(renderer_value["repositories"][0]["id"], "repo:one");
     assert!(renderer_value.get("private_extension").is_none());
     server.await.expect("snapshot fake server exits");
 

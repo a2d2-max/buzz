@@ -1,5 +1,6 @@
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
+pub use super::capabilities::{OpsBridgeCapabilities, OpsTransitionAction};
 use super::{
     client::OpsBridgeError,
     page::{
@@ -25,121 +26,6 @@ pub(crate) const MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
 pub(crate) trait VersionedResponse {
     fn contract_version(&self) -> u8;
-}
-
-/// Read capability advertised by the version 1 Ops hub.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpsReadCapability {
-    Snapshot,
-    Events,
-    Artifact,
-}
-
-/// Draft capability advertised by the version 1 Ops hub.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpsDraftCapability {
-    Message,
-    InternalTask,
-    ProviderAction,
-}
-
-/// Approval transition advertised and accepted by the version 1 Ops hub.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpsTransitionAction {
-    Submit,
-    Approve,
-    RiskConfirm,
-    Deliver,
-    Reject,
-}
-
-/// Versioned optional module advertised by the Ops hub.
-///
-/// The module name remains a public contract string so a version-one hub can
-/// advertise a future optional module without making the native bridge reject
-/// the entire response. The renderer validates modules it understands.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct OpsModuleCapability {
-    pub name: String,
-    pub schema_version: u64,
-    pub paged: bool,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub collection_revision: Option<u64>,
-}
-
-/// Strict version 1 capability response returned to the webview.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OpsBridgeCapabilities {
-    pub contract_version: u8,
-    pub reads: Vec<OpsReadCapability>,
-    pub drafts: Vec<OpsDraftCapability>,
-    pub transitions: Vec<OpsTransitionAction>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub modules: Option<Vec<OpsModuleCapability>>,
-}
-
-impl VersionedResponse for OpsBridgeCapabilities {
-    fn contract_version(&self) -> u8 {
-        self.contract_version
-    }
-}
-
-impl OpsBridgeCapabilities {
-    pub(crate) fn validate(&self) -> Result<(), OpsBridgeError> {
-        if let Some(modules) = &self.modules {
-            let mut names = std::collections::HashSet::with_capacity(modules.len());
-            for module in modules {
-                if !super::dormant::module_name(&module.name)
-                    || module.schema_version != 1
-                    || (module.paged && module.collection_revision.is_none())
-                    || module
-                        .collection_revision
-                        .is_some_and(|revision| revision > MAX_SAFE_INTEGER_U64)
-                    || !names.insert(module.name.as_str())
-                {
-                    return Err(OpsBridgeError::ContractMismatch);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn retain_known_modules(&mut self) {
-        if let Some(modules) = &mut self.modules {
-            modules.retain(|module| {
-                matches!(
-                    module.name.as_str(),
-                    "timeline"
-                        | "approvals"
-                        | "artifacts"
-                        | "connections"
-                        | "workflow_routing"
-                        | "research"
-                        | "repositories"
-                        | "work_items"
-                        | "sessions"
-                        | "checklist_items"
-                        | "decisions"
-                        | "approval_index"
-                        | "evidence"
-                        | "audit"
-                        | "search"
-                )
-            });
-        }
-    }
 }
 
 /// Optional snapshot selection. Only these three query fields can reach the hub.
@@ -390,8 +276,6 @@ pub struct OpsArtifactScope {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpsResearchScope {
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub work_item: Option<String>,
     pub sort: OpsCreatedAtSort,
 }
 
@@ -401,6 +285,13 @@ pub struct OpsRepositoryScope {
     #[serde(deserialize_with = "deserialize_required_option")]
     pub project: Option<String>,
     pub sort: OpsRepositorySort,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsTeamsActivityScope {
+    pub connection: String,
+    pub sort: OpsObservedAtSort,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -426,6 +317,12 @@ pub(crate) enum OpsPageRequest {
     },
     Repositories {
         scope: OpsRepositoryScope,
+        page_size: u16,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        cursor: Option<String>,
+    },
+    TeamsActivity {
+        scope: OpsTeamsActivityScope,
         page_size: u16,
         #[serde(deserialize_with = "deserialize_required_option")]
         cursor: Option<String>,
@@ -487,6 +384,7 @@ impl OpsPageRequest {
             Self::Artifacts { .. } => OpsPageModule::Artifacts,
             Self::Research { .. } => OpsPageModule::Research,
             Self::Repositories { .. } => OpsPageModule::Repositories,
+            Self::TeamsActivity { .. } => OpsPageModule::TeamsActivity,
             Self::WorkItems { .. } => OpsPageModule::WorkItems,
             Self::Sessions { .. } => OpsPageModule::Sessions,
             Self::ChecklistItems { .. } => OpsPageModule::ChecklistItems,
@@ -504,6 +402,7 @@ impl OpsPageRequest {
             | Self::Artifacts { page_size, .. }
             | Self::Research { page_size, .. }
             | Self::Repositories { page_size, .. }
+            | Self::TeamsActivity { page_size, .. }
             | Self::WorkItems { page_size, .. }
             | Self::Sessions { page_size, .. }
             | Self::ChecklistItems { page_size, .. }
@@ -521,6 +420,7 @@ impl OpsPageRequest {
             | Self::Artifacts { cursor, .. }
             | Self::Research { cursor, .. }
             | Self::Repositories { cursor, .. }
+            | Self::TeamsActivity { cursor, .. }
             | Self::WorkItems { cursor, .. }
             | Self::Sessions { cursor, .. }
             | Self::ChecklistItems { cursor, .. }
@@ -533,7 +433,12 @@ impl OpsPageRequest {
     }
 
     pub(crate) fn validate(&self) -> Result<(), OpsBridgeError> {
-        if !(1..=200).contains(&self.page_size()) {
+        let maximum = if matches!(self, Self::TeamsActivity { .. }) {
+            100
+        } else {
+            200
+        };
+        if !(1..=maximum).contains(&self.page_size()) {
             return Err(OpsBridgeError::InvalidRequest);
         }
         valid_optional_value(self.cursor(), 4096).map_err(|_| OpsBridgeError::InvalidRequest)?;
@@ -545,11 +450,16 @@ impl OpsPageRequest {
             Self::Artifacts { scope, .. } => {
                 valid_optional_value(scope.work_item.as_deref(), MAX_ID_BYTES)
             }
-            Self::Research { scope, .. } => {
-                valid_optional_value(scope.work_item.as_deref(), MAX_ID_BYTES)
-            }
+            Self::Research { .. } => Ok(()),
             Self::Repositories { scope, .. } => {
                 valid_optional_value(scope.project.as_deref(), MAX_ID_BYTES)
+            }
+            Self::TeamsActivity { scope, .. } => {
+                if super::dormant::public_id(&scope.connection) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
             }
             Self::WorkItems { .. }
             | Self::Sessions { .. }
@@ -575,6 +485,22 @@ impl OpsPageRequest {
             }
         }
         .map_err(|_| OpsBridgeError::InvalidRequest)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsDetailRequest {
+    pub id: String,
+}
+
+impl OpsDetailRequest {
+    pub(crate) fn validate(&self) -> Result<(), OpsBridgeError> {
+        if super::dormant::public_id(&self.id) {
+            Ok(())
+        } else {
+            Err(OpsBridgeError::InvalidRequest)
+        }
     }
 }
 
@@ -632,7 +558,11 @@ pub struct OpsResearchCardV1 {
     pub id: String,
     pub title: String,
     pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub updated_at: Option<String>,
 }
 
@@ -643,9 +573,17 @@ pub struct OpsRepositoryStatusV1 {
     pub name: String,
     pub branch: String,
     pub clean: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ahead: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub behind: Option<u64>,
 }
 
@@ -717,6 +655,8 @@ pub struct OpsBridgeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_routing: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_policy: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub research: Option<Vec<serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repositories: Option<Vec<serde_json::Value>>,
@@ -725,6 +665,43 @@ pub struct OpsBridgeSnapshot {
 impl VersionedResponse for OpsBridgeSnapshot {
     fn contract_version(&self) -> u8 {
         self.contract_version
+    }
+}
+
+impl OpsBridgeSnapshot {
+    pub(crate) fn sanitize_task5_modules(&mut self) {
+        if let Some(connections) = &mut self.connections {
+            let value = serde_json::Value::Array(connections.clone());
+            if !super::task5::validate_connections(&value) {
+                *connections = vec![serde_json::json!({"contract_invalid": true})];
+            }
+        }
+        if self
+            .workflow_routing
+            .as_ref()
+            .is_some_and(|value| !super::task5::validate_workflow_routing(value))
+        {
+            self.workflow_routing = Some(serde_json::Value::Null);
+        }
+        if self
+            .safety_policy
+            .as_ref()
+            .is_some_and(|value| !super::task5::validate_safety_policy(value))
+        {
+            self.safety_policy = Some(serde_json::Value::Null);
+        }
+        if let Some(research) = &mut self.research {
+            let value = serde_json::Value::Array(research.clone());
+            if !super::task5::validate_research_snapshot(&value) {
+                *research = vec![serde_json::json!({"contract_invalid": true})];
+            }
+        }
+        if let Some(repositories) = &mut self.repositories {
+            let value = serde_json::Value::Array(repositories.clone());
+            if !super::task5::validate_repository_snapshot(&value) {
+                *repositories = vec![serde_json::json!({"contract_invalid": true})];
+            }
+        }
     }
 }
 

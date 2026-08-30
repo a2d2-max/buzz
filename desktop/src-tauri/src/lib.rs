@@ -565,6 +565,8 @@ pub fn run() {
             ops_bridge::ops_bridge_capabilities,
             ops_bridge::ops_bridge_snapshot,
             ops_bridge::ops_bridge_page,
+            ops_bridge::ops_bridge_research_detail,
+            ops_bridge::ops_bridge_repository_detail,
             ops_bridge::ops_bridge_read_artifact,
             ops_bridge::ops_bridge_read_artifact_handle,
             ops_bridge::ops_bridge_release_artifact_handle,
@@ -997,11 +999,8 @@ pub fn run() {
                 relaunch_after_mesh_shutdown(app_handle);
             }
 
-            // AppKit terminates through libc exit(), which runs C++ static
-            // destructors. The embedded ggml/Metal runtime currently aborts in
-            // that destructor phase even after its node has stopped cleanly.
-            // End the process only after Buzz and Mesh shutdown above, while
-            // deliberately skipping those native global destructors.
+            // AppKit's libc exit() runs C++ static destructors; embedded ggml/Metal
+            // aborts there, so skip them only after Buzz and Mesh shut down above.
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
             hard_exit_after_mesh_shutdown();
         }

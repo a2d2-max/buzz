@@ -1,0 +1,8 @@
+{
+  "capabilities": {
+    "contract_version": 1,
+    "reads": ["snapshot", "events", "artifact"],
+    "drafts": [],
+    "transitions": []
+  }
+}

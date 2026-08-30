@@ -18,12 +18,13 @@ use super::dormant::{
     OpsEvidencePageV1, OpsGlobalSessionV1, OpsSearchResultV1, OpsWorkItemV1,
 };
 use super::page::{OpsPageModule, OpsPageResult, OpsSearchKind};
+use super::task5::{self, OpsRepositoryDetailV1, OpsResearchDetailV1, OpsTeamsActivityV1};
 use super::types::{
     OpsArtifactChunkV1, OpsArtifactManifestV1, OpsArtifactReadRequest, OpsArtifactV1,
-    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsPageRequest,
-    OpsPageV1, OpsRepositoryStatusV1, OpsResearchCardV1, OpsSelection, OpsTimelineItemV1,
-    OpsTransitionReceipt, OpsTransitionRequest, OpsTransitionWireRequest, VersionedResponse,
-    MAX_RESPONSE_BYTES, MAX_SAFE_INTEGER_U64, OPS_CONTRACT_VERSION,
+    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDetailRequest, OpsDraftReceipt, OpsDraftRequest,
+    OpsPageRequest, OpsPageV1, OpsRepositoryStatusV1, OpsResearchCardV1, OpsSelection,
+    OpsTimelineItemV1, OpsTransitionReceipt, OpsTransitionRequest, OpsTransitionWireRequest,
+    VersionedResponse, MAX_RESPONSE_BYTES, MAX_SAFE_INTEGER_U64, OPS_CONTRACT_VERSION,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -221,7 +222,9 @@ impl OpsBridgeClient {
             }
         }
         let request = self.authenticated(&self.request_client, Method::GET, url)?;
-        self.execute_json(request).await
+        let mut snapshot: OpsBridgeSnapshot = self.execute_json(request).await?;
+        snapshot.sanitize_task5_modules();
+        Ok(snapshot)
     }
 
     pub(crate) async fn page(
@@ -257,10 +260,7 @@ impl OpsBridgeClient {
                     }
                     query.append_pair("sort", "created_at_desc");
                 }
-                OpsPageRequest::Research { scope, .. } => {
-                    if let Some(work_item) = &scope.work_item {
-                        query.append_pair("work_item", work_item);
-                    }
+                OpsPageRequest::Research { .. } => {
                     query.append_pair("sort", "created_at_desc");
                 }
                 OpsPageRequest::Repositories { scope, .. } => {
@@ -268,6 +268,10 @@ impl OpsBridgeClient {
                         query.append_pair("project", project);
                     }
                     query.append_pair("sort", "display_name_asc");
+                }
+                OpsPageRequest::TeamsActivity { scope, .. } => {
+                    query.append_pair("connection", &scope.connection);
+                    query.append_pair("sort", "observed_at_desc");
                 }
                 OpsPageRequest::WorkItems { .. } => {
                     query.append_pair("sort", "last_activity_at_desc");
@@ -317,6 +321,28 @@ impl OpsBridgeClient {
         }
         let builder = self.authenticated(&self.request_client, Method::GET, url)?;
         self.execute_page_json(builder, request).await
+    }
+
+    pub(crate) async fn research_detail(
+        &self,
+        request: &OpsDetailRequest,
+    ) -> Result<OpsResearchDetailV1, OpsBridgeError> {
+        request.validate()?;
+        let url = self.detail_url("research", &request.id)?;
+        let builder = self.authenticated(&self.request_client, Method::GET, url)?;
+        self.execute_detail_json(builder, OpsResearchDetailV1::validate)
+            .await
+    }
+
+    pub(crate) async fn repository_detail(
+        &self,
+        request: &OpsDetailRequest,
+    ) -> Result<OpsRepositoryDetailV1, OpsBridgeError> {
+        request.validate()?;
+        let url = self.detail_url("repositories", &request.id)?;
+        let builder = self.authenticated(&self.request_client, Method::GET, url)?;
+        self.execute_detail_json(builder, OpsRepositoryDetailV1::validate)
+            .await
     }
 
     pub(crate) async fn artifact_manifest(
@@ -484,10 +510,28 @@ impl OpsBridgeClient {
                 OpsPageResult::Artifacts(parse_page::<OpsArtifactV1>(&body)?)
             }
             OpsPageModule::Research => {
-                OpsPageResult::Research(parse_page::<OpsResearchCardV1>(&body)?)
+                let page = parse_page::<OpsResearchCardV1>(&body)?;
+                if !task5::validate_research_page(&page) {
+                    return Err(OpsBridgeError::ContractMismatch);
+                }
+                OpsPageResult::Research(page)
             }
             OpsPageModule::Repositories => {
-                OpsPageResult::Repositories(parse_page::<OpsRepositoryStatusV1>(&body)?)
+                let page = parse_page::<OpsRepositoryStatusV1>(&body)?;
+                if !task5::validate_repository_page(&page) {
+                    return Err(OpsBridgeError::ContractMismatch);
+                }
+                OpsPageResult::Repositories(page)
+            }
+            OpsPageModule::TeamsActivity => {
+                let page = parse_page::<OpsTeamsActivityV1>(&body)?;
+                let OpsPageRequest::TeamsActivity { scope, .. } = request else {
+                    return Err(OpsBridgeError::InvalidRequest);
+                };
+                if !task5::validate_teams_page(&page, &scope.connection) {
+                    return Err(OpsBridgeError::ContractMismatch);
+                }
+                OpsPageResult::TeamsActivity(page)
             }
             OpsPageModule::WorkItems => {
                 let page = parse_page::<OpsWorkItemV1>(&body)?;
@@ -534,6 +578,38 @@ impl OpsBridgeClient {
             }
         };
         Ok(result)
+    }
+
+    async fn execute_detail_json<T>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        validate: fn(&T) -> bool,
+    ) -> Result<T, OpsBridgeError>
+    where
+        T: DeserializeOwned,
+    {
+        let response = builder
+            .send()
+            .await
+            .map_err(|_| OpsBridgeError::Transport)?;
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            let body = self.read_json_body(response).await?;
+            let error: CursorError =
+                serde_json::from_slice(&body).map_err(|_| OpsBridgeError::ContractMismatch)?;
+            return if matches!(error.error, CursorErrorCode::Unavailable) {
+                Err(OpsBridgeError::Unavailable)
+            } else {
+                Err(OpsBridgeError::ContractMismatch)
+            };
+        }
+        ensure_success(&response)?;
+        let body = self.read_json_body(response).await?;
+        let value: T =
+            serde_json::from_slice(&body).map_err(|_| OpsBridgeError::ResponseInvalidJson)?;
+        if !validate(&value) {
+            return Err(OpsBridgeError::ContractMismatch);
+        }
+        Ok(value)
     }
 
     async fn execute_artifact_json<T>(
@@ -626,6 +702,7 @@ impl OpsBridgeClient {
             OpsPageModule::Artifacts => "artifacts",
             OpsPageModule::Research => "research",
             OpsPageModule::Repositories => "repositories",
+            OpsPageModule::TeamsActivity => "teams-activity",
             OpsPageModule::WorkItems => "work-items",
             OpsPageModule::Sessions => "sessions",
             OpsPageModule::ChecklistItems => "checklist-items",
@@ -636,6 +713,13 @@ impl OpsBridgeClient {
             OpsPageModule::Search => "search",
         };
         self.fixed_url(&["ops-bridge", "v1", segment])
+    }
+
+    fn detail_url(&self, resource: &'static str, id: &str) -> Result<Url, OpsBridgeError> {
+        if !matches!(resource, "research" | "repositories") {
+            return Err(OpsBridgeError::InvalidEndpoint);
+        }
+        self.fixed_url(&["ops-bridge", "v1", resource, id])
     }
 
     fn artifact_url(

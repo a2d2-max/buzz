@@ -1,7 +1,9 @@
 mod artifacts;
+mod capabilities;
 mod client;
 mod dormant;
 mod page;
+mod task5;
 mod types;
 mod watch;
 
@@ -12,12 +14,13 @@ use crate::app_state::AppState;
 pub(crate) use artifacts::OpsArtifactState;
 use client::{OpsBridgeClient, OpsBridgeConfig, OpsBridgeError};
 use page::OpsPageResult;
+use task5::{OpsRepositoryDetailV1, OpsResearchDetailV1};
 use types::{
     OpsArtifactHandleChunk, OpsArtifactHandleReadRequest, OpsArtifactHandleReleaseRequest,
     OpsArtifactHandleReleaseResult, OpsArtifactReadRequest, OpsArtifactReadResult,
-    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDraftReceipt, OpsDraftRequest, OpsPageRequest,
-    OpsSelection, OpsSyncAckRequest, OpsSyncAckResult, OpsTransitionReceipt, OpsTransitionRequest,
-    OpsWatchStartResult, DEFAULT_HUB_PORT, MAX_RESPONSE_BYTES,
+    OpsBridgeCapabilities, OpsBridgeSnapshot, OpsDetailRequest, OpsDraftReceipt, OpsDraftRequest,
+    OpsPageRequest, OpsSelection, OpsSyncAckRequest, OpsSyncAckResult, OpsTransitionReceipt,
+    OpsTransitionRequest, OpsWatchStartResult, DEFAULT_HUB_PORT, MAX_RESPONSE_BYTES,
 };
 use watch::OpsBridgeWatcher;
 
@@ -81,6 +84,7 @@ pub(crate) enum OpsPageErrorCode {
     InvalidCursor,
     StaleCursor,
     Unavailable,
+    ContractInvalid,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -99,6 +103,32 @@ pub(crate) async fn ops_bridge_page(
         .client()
         .map_err(page_error)?
         .page(&request)
+        .await
+        .map_err(page_error)
+}
+
+#[tauri::command]
+pub(crate) async fn ops_bridge_research_detail(
+    request: OpsDetailRequest,
+    state: tauri::State<'_, OpsBridgeState>,
+) -> Result<OpsResearchDetailV1, OpsPageCommandError> {
+    state
+        .client()
+        .map_err(page_error)?
+        .research_detail(&request)
+        .await
+        .map_err(page_error)
+}
+
+#[tauri::command]
+pub(crate) async fn ops_bridge_repository_detail(
+    request: OpsDetailRequest,
+    state: tauri::State<'_, OpsBridgeState>,
+) -> Result<OpsRepositoryDetailV1, OpsPageCommandError> {
+    state
+        .client()
+        .map_err(page_error)?
+        .repository_detail(&request)
         .await
         .map_err(page_error)
 }
@@ -284,6 +314,12 @@ fn page_error(error: OpsBridgeError) -> OpsPageCommandError {
         OpsBridgeError::Unavailable => OpsPageCommandError::Cursor {
             error: OpsPageErrorCode::Unavailable,
         },
+        OpsBridgeError::ResponseContentType
+        | OpsBridgeError::ResponseTooLarge
+        | OpsBridgeError::ResponseInvalidJson
+        | OpsBridgeError::ContractMismatch => OpsPageCommandError::Cursor {
+            error: OpsPageErrorCode::ContractInvalid,
+        },
         _ => OpsPageCommandError::Bridge(public_error(error)),
     }
 }
@@ -322,5 +358,8 @@ mod dormant_page_tests;
 #[cfg(test)]
 #[path = "tests/page_tests.rs"]
 mod page_tests;
+#[cfg(test)]
+#[path = "tests/task5_tests.rs"]
+mod task5_tests;
 #[cfg(test)]
 mod tests;

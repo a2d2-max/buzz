@@ -44,7 +44,7 @@ test("absent overview capability is unavailable without invoking the page route"
   const result = await loadCompleteOpsOverviewCollection(
     {
       module: "research",
-      scope: { work_item: null, sort: "created_at_desc" },
+      scope: { sort: "created_at_desc" },
     },
     {
       getCapabilities: async () => capabilities(null),
@@ -66,7 +66,7 @@ test("captured overview capabilities avoid a second initial capability probe", a
   const result = await loadCompleteOpsOverviewCollection(
     {
       module: "research",
-      scope: { work_item: null, sort: "created_at_desc" },
+      scope: { sort: "created_at_desc" },
     },
     {
       getCapabilities: async () => {
@@ -83,11 +83,11 @@ test("captured overview capabilities avoid a second initial capability probe", a
   assert.equal(probes, 0);
 });
 
-test("exact unavailable route stays unavailable while malformed overview fails closed", async () => {
+test("advertised research unavailable and malformed overviews fail closed", async () => {
   const marked = [];
   const request = {
     module: "research",
-    scope: { work_item: null, sort: "created_at_desc" },
+    scope: { sort: "created_at_desc" },
   };
   const unavailable = await loadCompleteOpsOverviewCollection(request, {
     getCapabilities: async () => capabilities("research"),
@@ -98,8 +98,8 @@ test("exact unavailable route stays unavailable while malformed overview fails c
       marked.push(module);
     },
   });
-  assert.deepEqual(unavailable, { status: "unavailable" });
-  assert.deepEqual(marked, []);
+  assert.deepEqual(unavailable, { status: "contract_invalid" });
+  assert.deepEqual(marked, ["research"]);
 
   const invalid = await loadCompleteOpsOverviewCollection(request, {
     getCapabilities: async () => capabilities("research"),
@@ -111,7 +111,7 @@ test("exact unavailable route stays unavailable while malformed overview fails c
     },
   });
   assert.deepEqual(invalid, { status: "contract_invalid" });
-  assert.deepEqual(marked, ["research"]);
+  assert.deepEqual(marked, ["research", "research"]);
 });
 
 test("overview traversal restarts once from the new revision and exposes a second stale", async () => {
@@ -123,7 +123,7 @@ test("overview traversal restarts once from the new revision and exposes a secon
   const result = await loadCompleteOpsOverviewCollection(
     {
       module: "research",
-      scope: { work_item: null, sort: "created_at_desc" },
+      scope: { sort: "created_at_desc" },
     },
     {
       getCapabilities: async () => capabilityResults.shift(),
@@ -147,7 +147,7 @@ test("overview traversal restarts once from the new revision and exposes a secon
   const raced = await loadCompleteOpsOverviewCollection(
     {
       module: "research",
-      scope: { work_item: null, sort: "created_at_desc" },
+      scope: { sort: "created_at_desc" },
     },
     {
       getCapabilities: async () => capabilities("research", 7 + calls),

@@ -134,6 +134,10 @@ export async function loadCompleteOpsOverviewCollection<
         continue;
       }
       if (error instanceof OpsPageError && error.code === "unavailable") {
+        if (request.module === "research") {
+          dependencies.markContractInvalid(request.module, capabilities);
+          return { status: "contract_invalid" };
+        }
         return { status: "unavailable" };
       }
       if (
@@ -167,7 +171,7 @@ type UseOpsOverviewCollectionsOptions = {
 
 const RESEARCH_REQUEST = {
   module: "research",
-  scope: { work_item: null, sort: "created_at_desc" },
+  scope: { sort: "created_at_desc" },
 } as const satisfies OpsOverviewRequest<"research">;
 const REPOSITORIES_REQUEST = {
   module: "repositories",

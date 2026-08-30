@@ -7,6 +7,7 @@ use super::{
         OpsApprovalIndexV1, OpsAuditPageV1, OpsChecklistItemPageV1, OpsDecisionPageV1,
         OpsEvidencePageV1, OpsGlobalSessionV1, OpsSearchResultV1, OpsWorkItemV1,
     },
+    task5::OpsTeamsActivityV1,
     types::{
         OpsArtifactV1, OpsPageV1, OpsRepositoryStatusV1, OpsResearchCardV1, OpsTimelineItemV1,
     },
@@ -37,6 +38,7 @@ pub(crate) enum OpsPageModule {
     Artifacts,
     Research,
     Repositories,
+    TeamsActivity,
     WorkItems,
     Sessions,
     ChecklistItems,
@@ -131,6 +133,7 @@ pub(crate) enum OpsPageResult {
     Artifacts(OpsPageV1<OpsArtifactV1>),
     Research(OpsPageV1<OpsResearchCardV1>),
     Repositories(OpsPageV1<OpsRepositoryStatusV1>),
+    TeamsActivity(OpsPageV1<OpsTeamsActivityV1>),
     WorkItems(OpsPageV1<OpsWorkItemV1>),
     Sessions(OpsPageV1<OpsGlobalSessionV1>),
     ChecklistItems(OpsPageV1<OpsChecklistItemPageV1>),

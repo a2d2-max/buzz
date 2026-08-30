@@ -1,25 +1,30 @@
 import { z } from "zod";
-import { dormantModuleCapabilitySchema } from "./opsDormantContracts";
-
-export const OPS_MODULE_NAMES = [
-  "timeline",
-  "approvals",
-  "artifacts",
-  "connections",
-  "workflow_routing",
-  "research",
-  "repositories",
-  "work_items",
-  "sessions",
-  "checklist_items",
-  "decisions",
-  "approval_index",
-  "evidence",
-  "audit",
-  "search",
-] as const;
-
-export type OpsModuleName = (typeof OPS_MODULE_NAMES)[number];
+import {
+  OPS_MODULE_NAMES,
+  OPS_MODULE_PAGED_TOPOLOGY,
+  type OpsBridgeCapabilitiesV1,
+  type OpsModuleName,
+} from "./opsCapabilities";
+export {
+  OPS_MODULE_NAMES,
+  OPS_MODULE_PAGED_TOPOLOGY,
+  opsCapabilitiesSchema,
+  opsModuleCapabilitySchema,
+  type OpsBridgeCapabilitiesV1,
+  type OpsInvalidKnownModuleCapabilityV1,
+  type OpsModuleCapabilityV1,
+  type OpsModuleName,
+  type OpsValidModuleCapabilityV1,
+} from "./opsCapabilities";
+import {
+  opsConnectionSchema as strictOpsConnectionSchema,
+  opsConnectionsSchema,
+  opsRepositoryStatusSchema as strictOpsRepositoryStatusSchema,
+  opsResearchCardSchema as strictOpsResearchCardSchema,
+  opsSafetyPolicySchema,
+  opsTeamsActivitySchema,
+  opsWorkflowRoutingSchema as strictOpsWorkflowRoutingSchema,
+} from "./opsTask5Contracts";
 
 const ABSOLUTE_PATH =
   /^(?:file:\/\/|[A-Za-z]:[\\/]|\\\\|\/(?:Users|Volumes|Library|Applications|System|home|root|private|tmp|var|etc|opt|workspace|mnt|srv|usr|bin|sbin|lib|lib64|proc|run|dev|sys|boot|media|nix|snap)(?:\/|$))/i;
@@ -44,55 +49,8 @@ const publicString = z
 const requiredPublicString = publicString.min(1);
 const nullablePublicString = publicString.nullable();
 const nonNegativeInteger = z.number().int().nonnegative();
-const safeNonNegativeInteger = nonNegativeInteger.max(Number.MAX_SAFE_INTEGER);
 export const opsEventSequenceSchema = z.string().regex(/^(?:0|[1-9][0-9]*)$/u);
 const publicDetails = z.record(z.string(), z.unknown()).default({});
-
-const draftCapabilitySchema = z.enum([
-  "message",
-  "internal_task",
-  "provider_action",
-]);
-const transitionCapabilitySchema = z.enum([
-  "submit",
-  "approve",
-  "risk_confirm",
-  "deliver",
-  "reject",
-]);
-
-export const opsModuleCapabilitySchema = z
-  .object({
-    name: dormantModuleCapabilitySchema.shape.name,
-    schema_version: z.literal(1),
-    paged: z.boolean(),
-    collection_revision: safeNonNegativeInteger.optional(),
-  })
-  .strict()
-  .superRefine((module, context) => {
-    if (module.paged && module.collection_revision === undefined)
-      context.addIssue({
-        code: "custom",
-        message: "paged modules require collection revision",
-      });
-  });
-
-export const opsCapabilitiesSchema = z
-  .object({
-    contract_version: z.literal(1),
-    reads: z.tuple([
-      z.literal("snapshot"),
-      z.literal("events"),
-      z.literal("artifact"),
-    ]),
-    drafts: z.array(draftCapabilitySchema),
-    transitions: z.array(transitionCapabilitySchema),
-    modules: z.array(opsModuleCapabilitySchema).optional(),
-  })
-  .strip();
-
-export type OpsModuleCapabilityV1 = z.infer<typeof opsModuleCapabilitySchema>;
-export type OpsBridgeCapabilitiesV1 = z.infer<typeof opsCapabilitiesSchema>;
 
 export const opsHealthSchema = z
   .object({
@@ -381,50 +339,21 @@ export const opsTimelineItemSchema = z
   })
   .strip();
 
-export const opsConnectionSchema = z
-  .object({
-    id: requiredPublicString,
-    name: requiredPublicString,
-    status: requiredPublicString,
-    updated_at: requiredPublicString.optional(),
-  })
-  .strip();
-
-export const opsWorkflowRoutingSchema = z
-  .object({
-    status: requiredPublicString,
-    routes: z.array(publicDetails),
-  })
-  .strip();
-
-export const opsResearchCardSchema = z
-  .object({
-    id: requiredPublicString,
-    title: requiredPublicString,
-    status: requiredPublicString,
-    updated_at: requiredPublicString.optional(),
-  })
-  .strip();
-
-export const opsRepositoryStatusSchema = z
-  .object({
-    id: requiredPublicString,
-    name: requiredPublicString,
-    branch: requiredPublicString,
-    clean: z.boolean(),
-    ahead: nonNegativeInteger.optional(),
-    behind: nonNegativeInteger.optional(),
-  })
-  .strip();
+export const opsConnectionSchema = strictOpsConnectionSchema;
+export const opsWorkflowRoutingSchema = strictOpsWorkflowRoutingSchema;
+export const opsResearchCardSchema = strictOpsResearchCardSchema;
+export const opsRepositoryStatusSchema = strictOpsRepositoryStatusSchema;
 
 const optionalModuleSchemas = {
   timeline: z.array(opsTimelineItemSchema),
   approvals: z.array(opsApprovalSchema),
   artifacts: z.array(opsArtifactSchema),
-  connections: z.array(opsConnectionSchema),
+  connections: opsConnectionsSchema,
   workflow_routing: opsWorkflowRoutingSchema,
+  safety_policy: opsSafetyPolicySchema,
   research: z.array(opsResearchCardSchema),
   repositories: z.array(opsRepositoryStatusSchema),
+  teams_activity: z.array(opsTeamsActivitySchema),
 } as const;
 
 export type OpsModuleData = {
@@ -476,9 +405,15 @@ export function parseOpsModuleStates(
   return Object.fromEntries(
     OPS_MODULE_NAMES.map((name) => {
       const capability = capabilities.modules?.find(
-        (module) => module.name === name && module.schema_version === 1,
+        (module) => module.name === name,
       );
-      if (!capability || capability.paged || !(name in optionalModuleSchemas))
+      if (!capability) return [name, { status: "unavailable" }];
+      if (
+        "contract_invalid" in capability ||
+        capability.paged !== OPS_MODULE_PAGED_TOPOLOGY[name]
+      )
+        return [name, { status: "contract_invalid" }];
+      if (capability.paged || !(name in optionalModuleSchemas))
         return [name, { status: "unavailable" }];
       const parsed = optionalModuleSchemas[
         name as keyof typeof optionalModuleSchemas

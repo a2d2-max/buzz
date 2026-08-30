@@ -54,29 +54,104 @@ async fn ops_bridge_capabilities_require_collection_revision_for_paged_modules()
     write_token(&token, &[b't'; 32], 0o600);
     let client = OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client");
 
+    for reason in ["paged revision required", "JS-safe revision required"] {
+        let isolated = client.capabilities().await.expect(reason);
+        assert_eq!(
+            serde_json::to_value(isolated).expect("serialize isolated capability")["modules"][0],
+            json!({"name":"timeline"})
+        );
+    }
     assert_eq!(
-        client
-            .capabilities()
-            .await
-            .expect_err("paged revision required"),
-        OpsBridgeError::ContractMismatch
+        serde_json::to_value(
+            client
+                .capabilities()
+                .await
+                .expect("known malformed record reaches Zod")
+        )
+        .expect("serialize capabilities")["modules"][0]
+            .clone(),
+        json!({"name":"timeline"})
+    );
+    server.await.expect("fake server exits");
+}
+
+#[tokio::test]
+async fn ops_bridge_capabilities_preserve_malformed_known_records_for_zod_isolation() {
+    let malformed_known = serde_json::to_vec(&json!({
+        "contract_version": 1,
+        "reads": ["snapshot", "events", "artifact"],
+        "drafts": [],
+        "transitions": [],
+        "modules": [{
+            "name": "connections",
+            "schema_version": 1,
+            "paged": false,
+            "collection_revision": 8,
+            "private_path": "/Users/private/repo",
+            "access_token": "ghp_abcdefghijk"
+        }]
+    }))
+    .expect("serialize malformed known capability");
+    let malformed_unknown = serde_json::to_vec(&json!({
+        "contract_version": 1,
+        "reads": ["snapshot", "events", "artifact"],
+        "drafts": [],
+        "transitions": [],
+        "modules": [{
+            "name": "future_unknown_module",
+            "schema_version": 1,
+            "paged": false,
+            "collection_revision": 8
+        }]
+    }))
+    .expect("serialize malformed unknown capability");
+    let task5_known = serde_json::to_vec(&json!({
+        "contract_version": 1,
+        "reads": ["snapshot", "events", "artifact"],
+        "drafts": [],
+        "transitions": [],
+        "modules": [
+            {"name": "safety_policy", "schema_version": 1, "paged": false},
+            {"name": "teams_activity", "schema_version": 1, "paged": true, "collection_revision": 9}
+        ]
+    }))
+    .expect("serialize Task 5 known capabilities");
+    let (port, _, server) = spawn_fake_server(vec![
+        http_response("200 OK", "application/json", &malformed_known, &[]),
+        http_response("200 OK", "application/json", &malformed_unknown, &[]),
+        http_response("200 OK", "application/json", &task5_known, &[]),
+    ])
+    .await;
+    let temp = tempfile::tempdir().expect("temp token directory");
+    let token = temp.path().join("hub.token");
+    write_token(&token, &[b't'; 32], 0o600);
+    let client = OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client");
+
+    let isolated = client
+        .capabilities()
+        .await
+        .expect("known malformed record reaches Zod");
+    assert_eq!(
+        serde_json::to_value(isolated).expect("serialize isolated capabilities")["modules"][0],
+        json!({"name": "connections"})
     );
     assert_eq!(
         client
             .capabilities()
             .await
-            .expect_err("JS-safe revision required"),
+            .expect_err("unknown malformed record is globally invalid"),
         OpsBridgeError::ContractMismatch
     );
+    let known = client
+        .capabilities()
+        .await
+        .expect("Task 5 known records survive native filtering");
     assert_eq!(
-        client
-            .capabilities()
-            .await
-            .expect("unpaged revision is additive")
-            .modules
-            .unwrap()[0]
-            .collection_revision,
-        Some(8)
+        serde_json::to_value(known).expect("serialize known capabilities")["modules"],
+        json!([
+            {"name": "safety_policy", "schema_version": 1, "paged": false},
+            {"name": "teams_activity", "schema_version": 1, "paged": true, "collection_revision": 9}
+        ])
     );
     server.await.expect("fake server exits");
 }
@@ -116,7 +191,7 @@ fn ops_bridge_page_request_is_a_closed_exact_contract() {
         }),
         json!({
             "module": "research",
-            "scope": {"work_item": null, "sort": "created_at_desc"},
+            "scope": {"sort": "created_at_desc"},
             "page_size": 1,
             "cursor": null
         }),
@@ -153,7 +228,7 @@ fn ops_bridge_page_request_is_a_closed_exact_contract() {
         }),
         json!({
             "module": "research",
-            "scope": {"work_item": null, "sort": "created_at_desc"},
+            "scope": {"sort": "created_at_desc"},
             "page_size": 100,
             "cursor": null,
             "path": "/private"
@@ -176,7 +251,7 @@ fn ops_bridge_page_request_is_a_closed_exact_contract() {
     for value in [
         json!({
             "module": "research",
-            "scope": {"work_item": null, "sort": "created_at_desc"},
+            "scope": {"sort": "created_at_desc"},
             "page_size": 0,
             "cursor": null
         }),
@@ -199,7 +274,7 @@ fn ops_bridge_page_request_is_a_closed_exact_contract() {
 }
 
 #[test]
-fn ops_bridge_page_command_allowlists_only_typed_cursor_errors() {
+fn ops_bridge_page_command_emits_only_bounded_typed_errors() {
     assert_eq!(
         serde_json::to_value(page_error(OpsBridgeError::InvalidCursor)).unwrap(),
         json!({"error": "invalid_cursor"})
@@ -212,6 +287,17 @@ fn ops_bridge_page_command_allowlists_only_typed_cursor_errors() {
         serde_json::to_value(page_error(OpsBridgeError::Transport)).unwrap(),
         json!("ops_bridge_disconnected")
     );
+    for error in [
+        OpsBridgeError::ResponseContentType,
+        OpsBridgeError::ResponseTooLarge,
+        OpsBridgeError::ResponseInvalidJson,
+        OpsBridgeError::ContractMismatch,
+    ] {
+        assert_eq!(
+            serde_json::to_value(page_error(error)).unwrap(),
+            json!({"error": "contract_invalid"})
+        );
+    }
 }
 
 #[tokio::test]
@@ -248,7 +334,7 @@ async fn ops_bridge_pages_use_only_fixed_module_routes_and_exact_queries() {
         }),
         json!({
             "module": "research",
-            "scope": {"work_item": null, "sort": "created_at_desc"},
+            "scope": {"sort": "created_at_desc"},
             "page_size": 50,
             "cursor": null
         }),

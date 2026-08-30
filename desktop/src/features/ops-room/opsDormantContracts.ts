@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
-const publicId = z
+export const publicId = z
   .string()
   .min(1)
   .max(128)
@@ -13,7 +13,7 @@ const publicId = z
 const sessionId = publicId.regex(
   /^(?:orca|codex_direct|codex_sub|claude_code):[A-Za-z0-9][A-Za-z0-9._-]*$/u,
 );
-const publicToken = z.string().regex(/^[a-z][a-z0-9_.-]{0,63}$/u);
+export const publicToken = z.string().regex(/^[a-z][a-z0-9_.-]{0,63}$/u);
 const moduleToken = z
   .string()
   .min(1)
@@ -23,9 +23,9 @@ const moduleToken = z
     if (!safePublic(value))
       ctx.addIssue({ code: "custom", message: "unsafe module name" });
   });
-const safeInteger = z.number().int().min(0).max(MAX_SAFE);
-const positiveInteger = safeInteger.min(1);
-const count = safeInteger.max(10_000);
+export const safeInteger = z.number().int().min(0).max(MAX_SAFE);
+export const positiveInteger = safeInteger.min(1);
+export const count = safeInteger.max(10_000);
 const nullableId = publicId.nullable();
 
 function unsafeUnicode(value: string): boolean {
@@ -123,7 +123,7 @@ function safePublic(value: string): boolean {
   );
 }
 
-function publicText(maximum: number, required = true) {
+export function publicText(maximum: number, required = true) {
   return z.string().superRefine((value, ctx) => {
     if (
       (required && [...value].length === 0) ||
@@ -162,7 +162,7 @@ export const utcTimestamp = z.string().superRefine((value, ctx) => {
 });
 const nullableTimestamp = z.union([z.null(), utcTimestamp]);
 
-const unique = <T extends z.ZodType>(schema: T, maximum: number) =>
+export const unique = <T extends z.ZodType>(schema: T, maximum: number) =>
   z
     .array(schema)
     .max(maximum)
@@ -172,21 +172,23 @@ const unique = <T extends z.ZodType>(schema: T, maximum: number) =>
     });
 
 /** Exact wire-open capability record. Unknown valid module names are intentionally retained for filtering by callers. */
-export const dormantModuleCapabilitySchema = z
-  .object({
-    name: moduleToken,
-    schema_version: z.literal(1),
-    paged: z.boolean(),
-    collection_revision: safeInteger.optional(),
-  })
-  .strict()
-  .superRefine((value, ctx) => {
-    if (value.paged && value.collection_revision === undefined)
-      ctx.addIssue({
-        code: "custom",
-        message: "paged module requires collection revision",
-      });
-  });
+export const dormantModuleCapabilitySchema = z.discriminatedUnion("paged", [
+  z
+    .object({
+      name: moduleToken,
+      schema_version: z.literal(1),
+      paged: z.literal(false),
+    })
+    .strict(),
+  z
+    .object({
+      name: moduleToken,
+      schema_version: z.literal(1),
+      paged: z.literal(true),
+      collection_revision: safeInteger,
+    })
+    .strict(),
+]);
 
 export const dormantPageItemSchemas = {
   work_items: z
