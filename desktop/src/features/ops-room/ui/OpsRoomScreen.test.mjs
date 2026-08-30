@@ -44,8 +44,13 @@ const { cleanup, fireEvent, render, screen } = await import(
 );
 const { projectOpsRoom } = await import("../opsProjection.ts");
 const { OpsSessionTree } = await import("./OpsSessionTree.tsx");
-const { OpsRoomView, opsGlobalStateNoticeMessages, opsWorkRouteMode } =
-  await import("./OpsRoomScreen.tsx");
+const {
+  OpsRoomView,
+  opsGlobalStateNoticeMessages,
+  opsSourceConnectionState,
+  opsSourceRoutePending,
+  opsWorkRouteMode,
+} = await import("./OpsRoomScreen.tsx");
 
 afterEach(() => {
   cleanup();
@@ -85,6 +90,37 @@ describe("native Ops Room components", () => {
         search: { status: "not_requested" },
       }),
       ["Evidence is loading.", "Audit changed again. Retry required."],
+    );
+  });
+
+  test("source routes relax snapshot transport only after capabilities are ready", () => {
+    assert.equal(opsSourceRoutePending(undefined, null), true);
+    assert.equal(opsSourceRoutePending({ contract_version: 1 }, null), false);
+    assert.equal(
+      opsSourceConnectionState(false, null, "disconnected"),
+      "disconnected",
+    );
+    assert.equal(opsSourceConnectionState(true, null, "disconnected"), "ready");
+    assert.equal(opsSourceConnectionState(true, null, "loading"), "ready");
+    assert.equal(
+      opsSourceConnectionState(true, null, "version_mismatch"),
+      "version_mismatch",
+    );
+    assert.equal(
+      opsSourceConnectionState(true, null, "contract_invalid"),
+      "contract_invalid",
+    );
+    assert.equal(
+      opsSourceConnectionState(
+        true,
+        new Error("capability failed"),
+        "version_mismatch",
+      ),
+      "version_mismatch",
+    );
+    assert.equal(
+      opsSourceConnectionState(true, new Error("capability failed"), "ready"),
+      "disconnected",
     );
   });
 
@@ -276,7 +312,7 @@ describe("native Ops Room components", () => {
     const close = screen.getByRole("button", { name: "컨텍스트 닫기" });
     assert.equal(document.activeElement, close);
     fireEvent.click(close);
-    assert.equal(document.activeElement, trigger);
+    assert.ok(document.activeElement === trigger);
   });
 
   test("renders one mobile pane behind four 44px tabs", () => {
@@ -364,6 +400,10 @@ describe("native Ops Room components", () => {
       new URL("./OpsRoomScreen.tsx", import.meta.url),
       "utf8",
     );
+    const roomViewSource = await readFile(
+      new URL("./OpsRoomView.tsx", import.meta.url),
+      "utf8",
+    );
     const leafNames = [
       "OpsWorkspaceNav",
       "OpsSessionTree",
@@ -373,13 +413,15 @@ describe("native Ops Room components", () => {
     ];
 
     for (const name of leafNames) {
-      assert.match(rootSource, new RegExp(`import.*${name}`));
       const source = await readFile(
         new URL(`./${name}.tsx`, import.meta.url),
         "utf8",
       );
       assert.doesNotMatch(source, /@tauri-apps|\binvoke\s*\(/);
     }
-    assert.doesNotMatch(rootSource, /snapshot\.room\.[\s\S]*?\.map\s*\(/);
+    assert.doesNotMatch(
+      `${rootSource}\n${roomViewSource}`,
+      /snapshot\.room\.[\s\S]*?\.map\s*\(/,
+    );
   });
 });

@@ -134,6 +134,7 @@ const { opsMutationsDisabled, resetOpsWatchManager, useOpsSnapshot } =
 const {
   getOpsCapabilities,
   loadDormantOpsModuleState,
+  markOpsPagedModuleContractInvalid,
   resetDormantOpsPageStates,
 } = await import("./opsBridge.ts");
 
@@ -270,6 +271,52 @@ test("a malformed paged module disables the real hook while retaining unrelated 
     );
   });
   assert.equal(view.result.current.mutationsDisabled, true);
+  view.unmount();
+  client.clear();
+});
+
+test("a malformed research overview stays in the real mutation-disable authority until a newer capability revision", async () => {
+  const revision3 = {
+    ...capabilities,
+    modules: [
+      {
+        name: "research",
+        schema_version: 1,
+        paged: true,
+        collection_revision: 3,
+      },
+    ],
+  };
+  const revision4 = {
+    ...capabilities,
+    modules: [
+      {
+        name: "research",
+        schema_version: 1,
+        paged: true,
+        collection_revision: 4,
+      },
+    ],
+  };
+  queue("ops_bridge_capabilities", revision3, revision3);
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
+  queue("ops_bridge_start_watch", { started: true });
+
+  const { act } = await import("@testing-library/react");
+  const { client, view } = await mount({});
+  await waitForRevision(view, 2);
+  assert.equal(view.result.current.mutationsDisabled, false);
+
+  await act(async () => {
+    markOpsPagedModuleContractInvalid("research", revision3);
+  });
+  assert.equal(view.result.current.mutationsDisabled, true);
+
+  queue("ops_bridge_capabilities", revision4);
+  await act(async () => {
+    await getOpsCapabilities();
+  });
+  assert.equal(view.result.current.mutationsDisabled, false);
   view.unmount();
   client.clear();
 });

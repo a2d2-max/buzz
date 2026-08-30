@@ -81,3 +81,30 @@ test("first global load never mounts fabricated empty collections", () => {
     "content",
   );
 });
+
+test("unrequested modules stay omitted even when capability revision is absent", () => {
+  assert.equal(
+    typeof globalCollections.opsCollectionLifecycleState,
+    "function",
+  );
+  assert.deepEqual(
+    globalCollections.opsCollectionLifecycleState(null, false, undefined),
+    { status: "not_requested" },
+  );
+  assert.deepEqual(
+    globalCollections.opsCollectionLifecycleState(null, true, undefined),
+    { status: "unavailable" },
+  );
+});
+
+test("a requested page transport failure stays module-local", () => {
+  assert.deepEqual(
+    globalCollections.opsCollectionLifecycleState(
+      4,
+      true,
+      undefined,
+      new Error("transport disconnected"),
+    ),
+    { status: "disconnected" },
+  );
+});

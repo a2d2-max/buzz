@@ -604,6 +604,8 @@ type E2eConfig = {
     opsCapabilities?: Record<string, unknown>;
     /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
     opsSnapshot?: Record<string, unknown>;
+    /** Force a snapshot transport rejection while leaving capabilities/pages healthy. */
+    opsSnapshotError?: "disconnected";
     /** Strict deterministic page fixtures keyed by the fixed Ops module enum. */
     opsPages?: MockOpsPages;
     /** Cursor-indexed strict fixtures; use `first` for the null cursor. */
@@ -619,7 +621,11 @@ type E2eConfig = {
     opsPageErrors?: Partial<
       Record<
         MockOpsPageModule,
-        "invalid_cursor" | "stale_cursor" | "unavailable"
+        | "invalid_cursor"
+        | "stale_cursor"
+        | "unavailable"
+        | "disconnected"
+        | "disconnected_once"
       >
     >;
     /** Strict native artifact read fixtures keyed by public artifact identity. */
@@ -11813,6 +11819,7 @@ export function maybeInstallE2eTauriMocks() {
     };
   }> = [];
   let mockOpsWatchStarted = false;
+  const mockOpsConsumedPageErrors = new Set<string>();
   let mockOpsConnectionGeneration = 1;
   let mockOpsSyncRequired = false;
   let mockOpsAppliedSequence: string | null = null;
@@ -11878,6 +11885,9 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig?.mock?.opsCapabilities ?? MOCK_OPS_CAPABILITIES,
         );
       case "ops_bridge_snapshot":
+        if (activeConfig?.mock?.opsSnapshotError) {
+          return Promise.reject({ error: activeConfig.mock.opsSnapshotError });
+        }
         return structuredClone(
           activeConfig?.mock?.opsSnapshot ?? MOCK_OPS_SNAPSHOT,
         );
@@ -11885,7 +11895,14 @@ export function maybeInstallE2eTauriMocks() {
         const { cursor, module } = parseMockOpsPageRequest(payload);
         const configuredError = activeConfig?.mock?.opsPageErrors?.[module];
         if (configuredError) {
-          return Promise.reject({ error: configuredError });
+          if (configuredError === "disconnected_once") {
+            if (!mockOpsConsumedPageErrors.has(module)) {
+              mockOpsConsumedPageErrors.add(module);
+              return Promise.reject({ error: "disconnected" });
+            }
+          } else {
+            return Promise.reject({ error: configuredError });
+          }
         }
         if (
           activeConfig?.mock?.opsRawPages &&

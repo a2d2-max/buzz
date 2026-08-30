@@ -1,6 +1,7 @@
 import type { Page } from "@playwright/test";
 import type { ChannelTemplate, RelayEvent } from "../../src/shared/api/types";
 import type { MockManagedAgentSeed } from "../../src/testing/e2eBridge";
+import type { DormantOpsModuleName } from "../../src/features/ops-room/opsDormantContracts";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
 export const TEST_IDENTITIES = {
@@ -151,6 +152,12 @@ type MockOpsPage<T extends Record<string, unknown>> = {
   items: T[];
   next_cursor: string | null;
 };
+type MockOpsPageModule =
+  | "timeline"
+  | "artifacts"
+  | "research"
+  | "repositories"
+  | DormantOpsModuleName;
 
 type MockBridgeOptions = {
   /** Tauri window label exposed to the app. Defaults to the main window. */
@@ -480,49 +487,21 @@ type MockBridgeOptions = {
   opsCapabilities?: Record<string, unknown>;
   /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
   opsSnapshot?: Record<string, unknown>;
+  opsSnapshotError?: "disconnected";
   /** Strict deterministic page fixtures keyed by the fixed Ops module enum. */
-  opsPages?: Partial<{
-    timeline: MockOpsPage<{
-      id: string;
-      timestamp: string;
-      kind: string;
-      author: string;
-      body: string;
-      source?: string;
-      outcome?: string | null;
-      details?: Record<string, unknown>;
-    }>;
-    artifacts: MockOpsPage<{
-      id: string;
-      work_item_id: string;
-      title: string;
-      kind: string;
-      status: string;
-      version: number;
-      source_event_id: string | null;
-      created_at: string;
-      updated_at: string;
-    }>;
-    research: MockOpsPage<{
-      id: string;
-      title: string;
-      status: string;
-      updated_at?: string;
-    }>;
-    repositories: MockOpsPage<{
-      id: string;
-      name: string;
-      branch: string;
-      clean: boolean;
-      ahead?: number;
-      behind?: number;
-    }>;
-  }>;
+  opsPages?: Partial<
+    Record<MockOpsPageModule, MockOpsPage<Record<string, unknown>>>
+  >;
+  opsRawPages?: Partial<Record<MockOpsPageModule, unknown>>;
   /** Typed cursor errors returned by the fixed page command. */
   opsPageErrors?: Partial<
     Record<
-      "timeline" | "artifacts" | "research" | "repositories",
-      "invalid_cursor" | "stale_cursor"
+      MockOpsPageModule,
+      | "invalid_cursor"
+      | "stale_cursor"
+      | "unavailable"
+      | "disconnected"
+      | "disconnected_once"
     >
   >;
   /**

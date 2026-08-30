@@ -274,18 +274,31 @@ export type DormantOpsPageState<Module extends DormantOpsModuleName> =
       data: OpsPageV1<DormantOpsItemByModule[Module]>;
     };
 
-export type DormantOpsPageStates = Partial<{
-  [Module in DormantOpsModuleName]: DormantOpsPageState<Module>;
-}>;
+export type OpsPagedSafetyModule =
+  | DormantOpsModuleName
+  | "repositories"
+  | "research";
+type OpsPagedSafetyState =
+  | { status: "unavailable" }
+  | { status: "contract_invalid" }
+  | { status: "ready"; data?: OpsPageV1 };
+export type DormantOpsPageStates = Partial<
+  Record<OpsPagedSafetyModule, OpsPagedSafetyState>
+>;
 
 type DormantStateRecord = {
   capabilityKey: string;
-  state: DormantOpsPageState<DormantOpsModuleName>;
+  state: OpsPagedSafetyState;
 };
 
-const dormantStateRecords = new Map<DormantOpsModuleName, DormantStateRecord>();
+const PAGED_SAFETY_MODULES: OpsPagedSafetyModule[] = [
+  ...(Object.keys(dormantPageItemSchemas) as DormantOpsModuleName[]),
+  "research",
+  "repositories",
+];
+const dormantStateRecords = new Map<OpsPagedSafetyModule, DormantStateRecord>();
 const authoritativeDormantCapabilityKeys = new Map<
-  DormantOpsModuleName,
+  OpsPagedSafetyModule,
   string
 >();
 const dormantStateListeners = new Set<() => void>();
@@ -314,9 +327,7 @@ function reconcileAuthoritativeDormantStates(
   capabilities: OpsBridgeCapabilitiesV1,
 ): void {
   let changed = false;
-  for (const module of Object.keys(
-    dormantPageItemSchemas,
-  ) as DormantOpsModuleName[]) {
+  for (const module of PAGED_SAFETY_MODULES) {
     const capability = capabilities.modules?.find(
       (candidate) => candidate.name === module,
     );
@@ -338,7 +349,7 @@ function reconcileAuthoritativeDormantStates(
   if (changed) publishDormantStateSnapshot();
 }
 
-function prepareDormantState(module: DormantOpsModuleName, key: string): void {
+function prepareDormantState(module: OpsPagedSafetyModule, key: string): void {
   const current = dormantStateRecords.get(module);
   if (current?.capabilityKey === key) return;
   const authoritativeKey = authoritativeDormantCapabilityKeys.get(module);
@@ -355,9 +366,9 @@ function prepareDormantState(module: DormantOpsModuleName, key: string): void {
 }
 
 function setDormantState(
-  module: DormantOpsModuleName,
+  module: OpsPagedSafetyModule,
   key: string,
-  state: DormantOpsPageState<DormantOpsModuleName>,
+  state: OpsPagedSafetyState,
 ): void {
   const current = dormantStateRecords.get(module);
   if (current?.capabilityKey !== key) return;
@@ -392,6 +403,14 @@ export function resetDormantOpsPageStates(): void {
 /** Publishes complete-collection validation failures into the existing mutation-disable authority. */
 export function markDormantOpsModuleContractInvalid(
   module: DormantOpsModuleName,
+  capabilities: OpsBridgeCapabilitiesV1,
+): void {
+  markOpsPagedModuleContractInvalid(module, capabilities);
+}
+
+/** Publishes every paged Ops validation failure into the shared mutation-disable authority. */
+export function markOpsPagedModuleContractInvalid(
+  module: OpsPagedSafetyModule,
   capabilities: OpsBridgeCapabilitiesV1,
 ): void {
   const capability = capabilities.modules?.find(

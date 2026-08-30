@@ -24,6 +24,10 @@ const opsScreenSource = await readFile(
   new URL("./ui/OpsRoomScreen.tsx", import.meta.url),
   "utf8",
 );
+const opsRoomViewSource = await readFile(
+  new URL("./ui/OpsRoomView.tsx", import.meta.url),
+  "utf8",
+);
 const opsProjectionSource = await readFile(
   new URL("./opsProjection.ts", import.meta.url),
   "utf8",
@@ -87,6 +91,7 @@ describe("native Ops Room route", () => {
   });
 
   test("composes the typed room leaves and keeps selection in the URL", () => {
+    const composedRoomSource = `${opsScreenSource}\n${opsRoomViewSource}`;
     for (const component of [
       "OpsWorkspaceNav",
       "OpsSessionTree",
@@ -94,10 +99,10 @@ describe("native Ops Room route", () => {
       "OpsContextPanel",
       "OpsConnectionState",
     ]) {
-      assert.match(opsScreenSource, new RegExp(`import.*${component}`));
+      assert.match(composedRoomSource, new RegExp(`import.*${component}`));
     }
-    assert.match(opsScreenSource, /min-h-0 min-w-0 flex-1/);
-    assert.match(opsScreenSource, /\[overflow-wrap:anywhere\]/);
+    assert.match(composedRoomSource, /min-h-0 min-w-0 flex-1/);
+    assert.match(composedRoomSource, /\[overflow-wrap:anywhere\]/);
     assert.match(opsScreenSource, /OpsWorkspaceScreen/);
     assert.match(opsScreenSource, /OpsNavigationPort/);
     assert.match(

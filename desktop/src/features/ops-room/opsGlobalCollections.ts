@@ -150,6 +150,7 @@ function readyItems<Module extends DormantOpsModuleName>(
 
 export type OpsGlobalCollectionState<Module extends DormantOpsModuleName> =
   | CompleteOpsCollectionState<DormantOpsItemByModule[Module]>
+  | { status: "disconnected" }
   | { status: "not_requested" }
   | { status: "pending" };
 
@@ -157,13 +158,17 @@ export type OpsGlobalCollectionStates = {
   [Module in DormantOpsModuleName]?: OpsGlobalCollectionState<Module>;
 };
 
-function collectionLifecycleState<Module extends DormantOpsModuleName>(
+export function opsCollectionLifecycleState<
+  Module extends DormantOpsModuleName,
+>(
   revision: number | null,
   requested: boolean,
   state: CompleteOpsCollectionState<DormantOpsItemByModule[Module]> | undefined,
+  error?: unknown,
 ): OpsGlobalCollectionState<Module> {
-  if (revision === null) return { status: "unavailable" };
   if (!requested) return { status: "not_requested" };
+  if (revision === null) return { status: "unavailable" };
+  if (error) return { status: "disconnected" };
   return state ?? { status: "pending" };
 }
 
@@ -189,6 +194,7 @@ export type UseOpsGlobalCollectionsOptions = {
     request: CompleteOpsCollectionRequest<Module>,
     refreshCapabilities?: () => Promise<OpsBridgeCapabilitiesV1>,
   ) => Promise<CompleteOpsCollectionState<DormantOpsItemByModule[Module]>>;
+  requestedModules?: DormantOpsModuleName[];
   searchRequest: CompleteOpsCollectionRequest<"search"> | null;
   selectedWorkId: string | null;
   subscribeInvalidations?: (
@@ -202,6 +208,7 @@ export function useOpsGlobalCollections({
   getCapabilities: getCapabilitiesDependency = getOpsCapabilities,
   invalidationRevision = 0,
   loadCollection,
+  requestedModules,
   searchRequest,
   selectedWorkId,
   subscribeInvalidations:
@@ -273,11 +280,14 @@ export function useOpsGlobalCollections({
   }, [active, refetchGlobal, subscribeInvalidationsDependency]);
   const revision = (module: DormantOpsModuleName) =>
     moduleRevision(capabilities.data, module);
+  const requested = (module: DormantOpsModuleName) =>
+    active &&
+    (requestedModules === undefined || requestedModules.includes(module));
   const requests = opsHomeCollectionRequests();
   const workItems = useOpsCompleteCollectionQuery<"work_items">({
     capabilities: capabilities.data,
     capabilityRevision: revision("work_items") ?? -1,
-    enabled: active && revision("work_items") !== null,
+    enabled: requested("work_items") && revision("work_items") !== null,
     invalidationRevision,
     load: loadCollection,
     refreshCapabilities,
@@ -286,7 +296,7 @@ export function useOpsGlobalCollections({
   const sessions = useOpsCompleteCollectionQuery<"sessions">({
     capabilities: capabilities.data,
     capabilityRevision: revision("sessions") ?? -1,
-    enabled: active && revision("sessions") !== null,
+    enabled: requested("sessions") && revision("sessions") !== null,
     invalidationRevision,
     load: loadCollection,
     refreshCapabilities,
@@ -295,7 +305,7 @@ export function useOpsGlobalCollections({
   const decisions = useOpsCompleteCollectionQuery<"decisions">({
     capabilities: capabilities.data,
     capabilityRevision: revision("decisions") ?? -1,
-    enabled: active && revision("decisions") !== null,
+    enabled: requested("decisions") && revision("decisions") !== null,
     invalidationRevision,
     load: loadCollection,
     refreshCapabilities,
@@ -304,7 +314,7 @@ export function useOpsGlobalCollections({
   const approvals = useOpsCompleteCollectionQuery<"approval_index">({
     capabilities: capabilities.data,
     capabilityRevision: revision("approval_index") ?? -1,
-    enabled: active && revision("approval_index") !== null,
+    enabled: requested("approval_index") && revision("approval_index") !== null,
     invalidationRevision,
     load: loadCollection,
     refreshCapabilities,
@@ -313,7 +323,7 @@ export function useOpsGlobalCollections({
   const evidence = useOpsCompleteCollectionQuery<"evidence">({
     capabilities: capabilities.data,
     capabilityRevision: revision("evidence") ?? -1,
-    enabled: active && revision("evidence") !== null,
+    enabled: requested("evidence") && revision("evidence") !== null,
     invalidationRevision,
     load: loadCollection,
     refreshCapabilities,
@@ -322,7 +332,7 @@ export function useOpsGlobalCollections({
   const audit = useOpsCompleteCollectionQuery<"audit">({
     capabilities: capabilities.data,
     capabilityRevision: revision("audit") ?? -1,
-    enabled: active && revision("audit") !== null,
+    enabled: requested("audit") && revision("audit") !== null,
     invalidationRevision,
     load: loadCollection,
     refreshCapabilities,
@@ -335,7 +345,9 @@ export function useOpsGlobalCollections({
     capabilities: capabilities.data,
     capabilityRevision: revision("checklist_items") ?? -1,
     enabled:
-      active && selectedWorkId !== null && revision("checklist_items") !== null,
+      requested("checklist_items") &&
+      selectedWorkId !== null &&
+      revision("checklist_items") !== null,
     invalidationRevision,
     load: loadCollection,
     refreshCapabilities,
@@ -344,52 +356,63 @@ export function useOpsGlobalCollections({
   const search = useOpsCompleteCollectionQuery<"search">({
     capabilities: capabilities.data,
     capabilityRevision: revision("search") ?? -1,
-    enabled: active && searchRequest !== null && revision("search") !== null,
+    enabled:
+      requested("search") &&
+      searchRequest !== null &&
+      revision("search") !== null,
     invalidationRevision,
     load: loadCollection,
     refreshCapabilities,
     request: searchRequest ?? DISABLED_SEARCH_REQUEST,
   });
   const states: OpsGlobalCollectionStates = {
-    work_items: collectionLifecycleState<"work_items">(
+    work_items: opsCollectionLifecycleState<"work_items">(
       revision("work_items"),
-      active,
+      requested("work_items"),
       workItems.data,
+      workItems.error,
     ),
-    sessions: collectionLifecycleState<"sessions">(
+    sessions: opsCollectionLifecycleState<"sessions">(
       revision("sessions"),
-      active,
+      requested("sessions"),
       sessions.data,
+      sessions.error,
     ),
-    decisions: collectionLifecycleState<"decisions">(
+    decisions: opsCollectionLifecycleState<"decisions">(
       revision("decisions"),
-      active,
+      requested("decisions"),
       decisions.data,
+      decisions.error,
     ),
-    approval_index: collectionLifecycleState<"approval_index">(
+    approval_index: opsCollectionLifecycleState<"approval_index">(
       revision("approval_index"),
-      active,
+      requested("approval_index"),
       approvals.data,
+      approvals.error,
     ),
-    evidence: collectionLifecycleState<"evidence">(
+    evidence: opsCollectionLifecycleState<"evidence">(
       revision("evidence"),
-      active,
+      requested("evidence"),
       evidence.data,
+      evidence.error,
     ),
-    audit: collectionLifecycleState<"audit">(
+    audit: opsCollectionLifecycleState<"audit">(
       revision("audit"),
-      active,
+      requested("audit"),
       audit.data,
+      audit.error,
     ),
-    checklist_items: collectionLifecycleState<"checklist_items">(
+    checklist_items: opsCollectionLifecycleState<"checklist_items">(
       revision("checklist_items"),
-      active && selectedWorkId !== null,
+      requested("checklist_items") && selectedWorkId !== null,
       checklist.data,
+      checklist.error,
     ),
-    search: collectionLifecycleState<"search">(
+    search: opsCollectionLifecycleState<"search">(
       revision("search"),
-      active && searchRequest !== null,
+      requested("search") && searchRequest !== null,
       search.data,
+      search.error,
     ),
   };
   const collectionQueries = [
@@ -402,7 +425,22 @@ export function useOpsGlobalCollections({
     checklist,
     search,
   ];
+  const queryByModule: Record<
+    DormantOpsModuleName,
+    { refetch: () => Promise<unknown> }
+  > = {
+    work_items: workItems,
+    sessions,
+    checklist_items: checklist,
+    decisions,
+    approval_index: approvals,
+    evidence,
+    audit,
+    search,
+  };
   return {
+    capabilities: capabilities.data,
+    capabilityError: capabilities.error,
     collections: {
       workItems: readyItems<"work_items">(workItems.data),
       sessions: readyItems<"sessions">(sessions.data),
@@ -425,6 +463,9 @@ export function useOpsGlobalCollections({
       ({ data }) => data && "refreshed" in data && data.refreshed,
     ),
     refetch: refetchGlobal,
+    refetchModule: (module: DormantOpsModuleName) =>
+      queryByModule[module].refetch(),
+    refreshCapabilities,
     states,
   };
 }

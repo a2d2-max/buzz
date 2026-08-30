@@ -48,11 +48,14 @@ function EmptyRow({ children }: { children: React.ReactNode }) {
 
 export function OpsCollectionState<T>({
   label,
+  onRetry,
   state,
 }: {
   label: string;
+  onRetry?: () => void;
   state:
     | CompleteOpsCollectionState<T>
+    | { status: "disconnected" }
     | { status: "not_requested" }
     | { status: "pending" };
 }) {
@@ -69,6 +72,22 @@ export function OpsCollectionState<T>({
       </p>
     );
   }
+  if (state.status === "disconnected") {
+    return (
+      <div className="p-4 text-sm text-muted-foreground">
+        <p>{label} is disconnected.</p>
+        {onRetry ? (
+          <button
+            className="mt-2 min-h-11 rounded-lg border border-border px-3 text-foreground"
+            onClick={onRetry}
+            type="button"
+          >
+            Retry {label}
+          </button>
+        ) : null}
+      </div>
+    );
+  }
   if (state.status === "contract_invalid") {
     return (
       <p className="p-4 text-sm text-destructive">
@@ -78,9 +97,18 @@ export function OpsCollectionState<T>({
   }
   if (state.status === "retry_required") {
     return (
-      <p className="p-4 text-sm text-amber-300">
-        {label} changed again. Retry required.
-      </p>
+      <div className="p-4 text-sm text-amber-300">
+        <p>{label} changed again. Retry required.</p>
+        {onRetry ? (
+          <button
+            className="mt-2 min-h-11 rounded-lg border border-border px-3 text-foreground"
+            onClick={onRetry}
+            type="button"
+          >
+            Retry {label}
+          </button>
+        ) : null}
+      </div>
     );
   }
   if (state.items.length === 0) {

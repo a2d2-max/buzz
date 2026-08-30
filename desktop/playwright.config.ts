@@ -187,6 +187,7 @@ export default defineConfig({
         "**/ops-room.spec.ts",
         "**/raou-primary.spec.ts",
         "**/raou-home-work.spec.ts",
+        "**/raou-source-views.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],
