@@ -159,7 +159,14 @@ async function openPrimary(page: Page, viewport: (typeof VIEWPORTS)[number]) {
   );
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/?raouPrimary=1");
-  await expect(page.getByRole("banner")).toBeVisible();
+  await expect(page.getByTestId("app-top-chrome")).toBeVisible();
+  if (viewport.width < 768) {
+    await page.getByRole("button", { name: "Toggle Sidebar" }).click();
+  }
+  await expect(page.getByTestId("raou-workspace-sidebar")).toBeVisible();
+  await expect(
+    page.getByRole("navigation", { name: "RAOU workspace" }),
+  ).toBeVisible();
   await expect(page.getByText("RAOU", { exact: true })).toBeVisible();
   await expect(
     page.getByText("Local workspace", { exact: true }),
@@ -174,6 +181,7 @@ async function openPrimary(page: Page, viewport: (typeof VIEWPORTS)[number]) {
   await expect(page.getByText(FORBIDDEN_KEY_COPY)).toHaveCount(0);
   await expect(page).toHaveURL(/raouPrimary=1#\/ops\?view=room$/);
   await expect(page.getByTestId("ops-room-view")).toBeVisible();
+  await expect(page.getByText("Sections", { exact: true })).toHaveCount(0);
 }
 
 for (const viewport of VIEWPORTS) {
@@ -182,12 +190,12 @@ for (const viewport of VIEWPORTS) {
   }, testInfo) => {
     await openPrimary(page, viewport);
 
-    const header = page.getByRole("banner");
-    const box = await header.boundingBox();
+    const topChrome = page.getByTestId("app-top-chrome");
+    const box = await topChrome.boundingBox();
     expect(box).not.toBeNull();
-    expect(box?.height).toBeLessThanOrEqual(52);
+    expect(box?.height).toBeLessThanOrEqual(40);
 
-    await header.dispatchEvent("pointerdown", {
+    await topChrome.dispatchEvent("pointerdown", {
       bubbles: true,
       button: 0,
       clientY: 20,
@@ -220,17 +228,7 @@ for (const viewport of VIEWPORTS) {
       "true",
     );
 
-    const sectionTrigger = page.getByRole("button", { name: "Sections" });
-    if (viewport.name === "mobile") {
-      await sectionTrigger.focus();
-      await sectionTrigger.click();
-      const dialog = page.getByRole("dialog", { name: "Sections" });
-      await expect(dialog).toBeFocused();
-      await dialog.getByRole("button", { name: "Artifacts" }).click();
-      await expect(sectionTrigger).toBeFocused();
-    } else {
-      await page.getByRole("button", { name: "Artifacts" }).click();
-    }
+    await page.getByRole("button", { name: "Artifacts" }).click();
     await expect(page).toHaveURL(/view=artifacts/);
     await expect(page.getByTestId("ops-artifacts-view")).toBeVisible();
 
@@ -241,6 +239,42 @@ for (const viewport of VIEWPORTS) {
     });
   });
 }
+
+test("Hub absence keeps the Buzz workspace shell and a useful room surface", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize(VIEWPORTS[0]);
+  await installMockBridge(
+    page,
+    { identityLost: true, opsCapabilitiesError: "not_configured" },
+    {
+      seedPreviewFeatures: false,
+      skipCommunitySeed: true,
+      skipOnboardingSeed: true,
+    },
+  );
+  await page.goto("/?raouPrimary=1");
+
+  await expect(page.getByTestId("app-top-chrome")).toBeVisible();
+  await expect(page.getByTestId("raou-workspace-sidebar")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Agent room" })).toBeVisible();
+  await expect(
+    page.getByTestId("app-top-chrome").getByText("Agent room", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByTestId("ops-connection-card")).toBeVisible();
+  await expect(
+    page.getByText("Local Ops Hub가 설정되지 않았습니다"),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "연결 다시 확인" }),
+  ).toBeVisible();
+  await expect(page.getByText("Sections", { exact: true })).toHaveCount(0);
+  await page.screenshot({
+    animations: "disabled",
+    fullPage: true,
+    path: testInfo.outputPath("raou-hub-waiting.png"),
+  });
+});
 
 test("the local workspace UUID is stable across reloads", async ({ page }) => {
   await openPrimary(page, VIEWPORTS[0]);
@@ -330,7 +364,9 @@ test("light OS keeps RAOU status, artifact, error, and document surfaces dark an
   await expect(
     errorPage.getByText("Ops 계약 버전이 맞지 않습니다"),
   ).toBeVisible();
-  const errorDescription = errorPage.getByText(/RAOU.*Hub/);
+  const errorDescription = errorPage.getByText(
+    "RAOU와 Local Ops Hub의 계약 버전을 맞춘 뒤 다시 여세요.",
+  );
   await expect(errorDescription).toBeVisible();
   await expect(errorPage.getByText(/Buzz/)).toHaveCount(0);
   expect(await contrastRatio(errorDescription)).toBeGreaterThanOrEqual(4.5);

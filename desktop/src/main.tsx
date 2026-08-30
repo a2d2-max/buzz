@@ -16,6 +16,7 @@ import { CommunitiesProvider } from "@/features/communities/useCommunities";
 import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnboarding";
 import { ThemeProvider } from "@/shared/theme/ThemeProvider";
+import { FixedDarkThemeProvider } from "@/shared/theme/FixedDarkThemeProvider";
 import { EmojiBurstProvider } from "@/shared/ui/EmojiBurstProvider";
 import { PoofBurstProvider } from "@/shared/ui/PoofBurstProvider";
 import { Toaster } from "@/shared/ui/sonner";
@@ -104,11 +105,13 @@ function renderApp() {
       </CommunitiesProvider>
     </RootErrorBoundary>
   ) : (
-    <RootErrorBoundary>
-      <TooltipProvider>
-        <App />
-      </TooltipProvider>
-    </RootErrorBoundary>
+    <FixedDarkThemeProvider>
+      <RootErrorBoundary>
+        <TooltipProvider>
+          <App />
+        </TooltipProvider>
+      </RootErrorBoundary>
+    </FixedDarkThemeProvider>
   );
 
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

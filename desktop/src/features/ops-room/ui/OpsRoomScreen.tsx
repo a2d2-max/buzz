@@ -50,8 +50,10 @@ export {
 
 export function OpsRoomScreen({
   navigation: providedNavigation,
+  showSectionNavigation = true,
 }: {
   navigation?: OpsNavigationPort;
+  showSectionNavigation?: boolean;
 }) {
   const defaultNavigation = React.useRef<OpsNavigationPort | null>(null);
   defaultNavigation.current ??= createHashOpsNavigationPort();
@@ -374,6 +376,7 @@ export function OpsRoomScreen({
     <OpsWorkspaceScreen
       layout={layout}
       navigation={navigation}
+      showSectionNavigation={showSectionNavigation}
       state={routeState}
     >
       {content}

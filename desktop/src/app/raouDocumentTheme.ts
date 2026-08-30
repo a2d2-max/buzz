@@ -16,6 +16,17 @@ export const RAOU_THEME = {
   "--ring": "78 100% 64%",
   "--secondary": "204 12% 17%",
   "--secondary-foreground": "102 14% 86%",
+  "--sidebar": "205 16% 9%",
+  "--sidebar-background": "205 16% 9%",
+  "--sidebar-foreground": "102 14% 86%",
+  "--sidebar-primary": "78 100% 64%",
+  "--sidebar-primary-foreground": "204 13% 7%",
+  "--sidebar-active": "78 100% 64%",
+  "--sidebar-active-foreground": "204 13% 7%",
+  "--sidebar-accent": "78 28% 16%",
+  "--sidebar-accent-foreground": "78 100% 76%",
+  "--sidebar-border": "204 12% 18%",
+  "--sidebar-ring": "78 100% 64%",
 } as const;
 
 /**

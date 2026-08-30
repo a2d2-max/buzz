@@ -1,4 +1,11 @@
-import { AlertTriangle, LoaderCircle, RefreshCw, Unplug } from "lucide-react";
+import {
+  AlertTriangle,
+  CircleCheck,
+  Clock3,
+  LoaderCircle,
+  RefreshCw,
+  Unplug,
+} from "lucide-react";
 
 import type { OpsConnectionState as ConnectionState } from "../types";
 
@@ -58,24 +65,58 @@ export function OpsConnectionState({
 
   const copy = STATE_COPY[state];
   return (
-    <div className="flex min-h-56 flex-1 flex-col items-center justify-center px-6 text-center">
-      <Unplug className="mb-4 h-7 w-7 text-muted-foreground" />
-      <h2 className="text-base font-semibold">{copy.title}</h2>
-      <p className="mt-2 max-w-md text-sm text-muted-foreground">
-        {copy.description}
-      </p>
-      {state === "disconnected" ? (
-        <button
-          className="mt-5 inline-flex items-center justify-center gap-2 rounded-lg border border-border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"
-          data-ops-interactive
-          onClick={onRetry}
-          style={INTERACTIVE_SIZE}
-          type="button"
-        >
-          <RefreshCw className="h-4 w-4" />
-          다시 연결
-        </button>
-      ) : null}
+    <div className="flex min-h-56 flex-1 items-center justify-center overflow-y-auto px-5 py-8 sm:px-8">
+      <section
+        className="w-full max-w-xl overflow-hidden rounded-xl border border-border/80 bg-card text-left shadow-sm"
+        data-testid="ops-connection-card"
+      >
+        <header className="flex items-center justify-between gap-4 border-border/70 border-b px-5 py-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border bg-muted/60 text-muted-foreground">
+              <Unplug className="h-4 w-4" />
+            </span>
+            <div className="min-w-0">
+              <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                Local workspace
+              </p>
+              <p className="mt-0.5 truncate text-sm font-medium">Agent room</p>
+            </div>
+          </div>
+          <span className="shrink-0 rounded-full border border-primary/25 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary">
+            연결 대기
+          </span>
+        </header>
+        <div className="px-5 py-5 sm:px-6 sm:py-6">
+          <h2 className="text-lg font-semibold tracking-tight">{copy.title}</h2>
+          <p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">
+            {copy.description}
+          </p>
+          <div className="mt-5 divide-y divide-border/60 rounded-lg border border-border/70 bg-background/40 px-4">
+            <div className="flex items-center gap-3 py-3 text-sm">
+              <CircleCheck className="h-4 w-4 shrink-0 text-primary" />
+              <span className="flex-1">RAOU 작업공간과 에이전트 룸</span>
+              <span className="text-xs text-muted-foreground">준비됨</span>
+            </div>
+            <div className="flex items-center gap-3 py-3 text-sm">
+              <Clock3 className="h-4 w-4 shrink-0 text-muted-foreground" />
+              <span className="flex-1">Hub 작업·세션·아티팩트 피드</span>
+              <span className="text-xs text-muted-foreground">대기 중</span>
+            </div>
+          </div>
+          {state === "disconnected" || state === "not_configured" ? (
+            <button
+              className="mt-5 inline-flex items-center justify-center gap-2 rounded-lg border border-border bg-background/60 px-4 py-2 text-sm font-medium transition-colors hover:border-primary/40 hover:bg-primary/10 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"
+              data-ops-interactive
+              onClick={onRetry}
+              style={INTERACTIVE_SIZE}
+              type="button"
+            >
+              <RefreshCw className="h-4 w-4" />
+              연결 다시 확인
+            </button>
+          ) : null}
+        </div>
+      </section>
     </div>
   );
 }

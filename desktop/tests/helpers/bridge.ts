@@ -160,6 +160,8 @@ type MockOpsPageModule =
   | DormantOpsModuleName;
 
 type MockBridgeOptions = {
+  /** Force local Ops capabilities discovery to fail before data loading. */
+  opsCapabilitiesError?: "disconnected" | "not_configured";
   /** Tauri window label exposed to the app. Defaults to the main window. */
   windowLabel?: string;
   ttsSettings?: {

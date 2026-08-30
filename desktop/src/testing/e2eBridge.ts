@@ -81,6 +81,7 @@ import {
   dormantPageRequestSchema,
   type DormantOpsModuleName,
 } from "@/features/ops-room/opsDormantContracts";
+import { opsTeamsActivityScopeSchema } from "@/features/ops-room/opsTask5Contracts";
 import {
   isValidLinkPreviewSnapshotCanonicalUrl,
   parseLinkPreviewSnapshots,
@@ -602,6 +603,8 @@ type E2eConfig = {
     identityImportDelayMs?: number;
     /** Deterministic capabilities returned by the local Ops E2E bridge. */
     opsCapabilities?: Record<string, unknown>;
+    /** Force capabilities discovery to fail before any Ops data is read. */
+    opsCapabilitiesError?: "disconnected" | "not_configured";
     /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
     opsSnapshot?: Record<string, unknown>;
     /** Force a snapshot transport rejection while leaving capabilities/pages healthy. */
@@ -1924,9 +1927,7 @@ function parseMockOpsPageRequest(payload: unknown): {
         );
       case "research":
         return (
-          hasMockOpsKeys(scope, ["work_item", "sort"]) &&
-          nullableText(scope.work_item) &&
-          scope.sort === "created_at_desc"
+          hasMockOpsKeys(scope, ["sort"]) && scope.sort === "created_at_desc"
         );
       case "repositories":
         return (
@@ -1934,6 +1935,8 @@ function parseMockOpsPageRequest(payload: unknown): {
           nullableText(scope.project) &&
           scope.sort === "display_name_asc"
         );
+      case "teams_activity":
+        return opsTeamsActivityScopeSchema.safeParse(scope).success;
       default:
         return false;
     }
@@ -11881,6 +11884,13 @@ export function maybeInstallE2eTauriMocks() {
 
     switch (command) {
       case "ops_bridge_capabilities":
+        if (activeConfig?.mock?.opsCapabilitiesError) {
+          const code =
+            activeConfig.mock.opsCapabilitiesError === "not_configured"
+              ? "ops_bridge_invalid_config"
+              : "disconnected";
+          return Promise.reject(code);
+        }
         return structuredClone(
           activeConfig?.mock?.opsCapabilities ?? MOCK_OPS_CAPABILITIES,
         );

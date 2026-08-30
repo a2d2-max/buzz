@@ -1,68 +1,84 @@
 import * as React from "react";
 
-import { RAOU_PRODUCT } from "@/app/productBrand";
+import { AppTopChrome } from "@/app/AppTopChrome";
+import { AppTopChromePortal } from "@/app/AppTopChromePortal";
 import { RAOU_THEME } from "@/app/raouDocumentTheme";
 import { macTrafficLightClearance } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
 import { getLocalWorkspaceId } from "@/shared/lib/localWorkspaceIdentity";
 import { isMacPlatform } from "@/shared/lib/platform";
 import { useIsFullscreen } from "@/shared/lib/useIsFullscreen";
+import { useTauriWindowDrag } from "@/app/useTauriWindowDrag";
 import { Button } from "@/shared/ui/button";
 import { RaouMark } from "@/shared/ui/RaouMark";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
+import { SidebarInset, SidebarProvider } from "@/shared/ui/sidebar";
 import {
   createHashOpsNavigationPort,
   normalizeHashOpsNavigation,
+  type OpsRouteState,
 } from "../opsRouteState";
 import { OpsRoomScreen } from "./OpsRoomScreen";
+import {
+  RAOU_WORKSPACE_VIEW_LABELS,
+  RaouWorkspaceSidebar,
+} from "./RaouWorkspaceSidebar";
 
 type LocalOpsGuestAppProps = { onRestoreIdentity?: () => void };
 
 export function RaouWorkspaceApp() {
-  const isFullscreen = useIsFullscreen();
-  const clearsMacTrafficLights = isMacPlatform() && !isFullscreen;
+  useTauriWindowDrag();
   const navigation = React.useMemo(() => createHashOpsNavigationPort(), []);
   const workspaceId = React.useMemo(() => getLocalWorkspaceId(), []);
+  const [routeState, setRouteState] = React.useState<OpsRouteState>(() =>
+    navigation.readOpsState(),
+  );
 
   React.useLayoutEffect(() => {
     normalizeHashOpsNavigation(navigation, window.location.hash);
   }, [navigation]);
+  React.useEffect(() => {
+    const sync = () => setRouteState(navigation.readOpsState());
+    sync();
+    return navigation.subscribe(sync);
+  }, [navigation]);
 
   return (
-    <div
+    <SidebarProvider
       className="flex min-h-dvh min-w-0 flex-col overflow-hidden bg-background text-foreground"
       style={RAOU_THEME as React.CSSProperties}
     >
-      <StartupWindowDragRegion />
-      <header
-        className={cn(
-          "relative flex h-12 min-w-0 shrink-0 items-center gap-2 overflow-hidden border-border border-b bg-[#161A1D] pr-4",
-          clearsMacTrafficLights
-            ? macTrafficLightClearance.withoutLeadingRail
-            : "pl-4",
-        )}
-      >
-        <RaouMark className="h-6 w-8 shrink-0 text-[#C8FF45]" />
-        <span className="shrink-0 text-sm font-semibold tracking-[0.18em] text-[#D9E0D6]">
-          {RAOU_PRODUCT.name}
-        </span>
-        <span className="h-4 w-px shrink-0 bg-[#262C30]" aria-hidden="true" />
-        <span className="min-w-0 truncate text-xs text-[#D9E0D6]/70">
-          {RAOU_PRODUCT.localWorkspaceLabel}
-        </span>
-        <span
-          className="shrink-0 font-mono text-2xs tracking-[0.08em] text-[#F2C45C]"
-          data-testid="raou-workspace-id"
-        >
-          {workspaceId.slice(0, 8)}
-        </span>
-        <span
-          aria-hidden="true"
-          className="absolute bottom-0 left-[80px] right-[22%] h-px bg-[#C8FF45]"
+      <AppTopChrome
+        canGoBack={window.history.length > 1}
+        canGoForward={false}
+        onGoBack={() => window.history.back()}
+        onGoForward={() => window.history.forward()}
+      />
+      <AppTopChromePortal>
+        <div className="flex min-w-0 flex-1 items-center justify-center px-3 text-xs font-medium text-sidebar-foreground/70">
+          <RaouMark className="mr-2 h-4 w-5 shrink-0 text-primary md:hidden" />
+          <span className="truncate">
+            {RAOU_WORKSPACE_VIEW_LABELS[routeState.view]}
+          </span>
+        </div>
+      </AppTopChromePortal>
+      <div className="relative flex min-h-0 flex-1 overflow-hidden">
+        <RaouWorkspaceSidebar
+          onSelect={(view) => navigation.pushOpsState({ ...routeState, view })}
+          state={routeState}
+          workspaceId={workspaceId}
         />
-      </header>
-      <OpsRoomScreen navigation={navigation} />
-    </div>
+        <SidebarInset className="min-h-0 min-w-0 overflow-hidden border-sidebar-border/40 border-l">
+          <span className="sr-only" data-testid="raou-workspace-id">
+            {workspaceId.slice(0, 8)}
+          </span>
+          <OpsRoomScreen
+            navigation={navigation}
+            showSectionNavigation={false}
+          />
+        </SidebarInset>
+      </div>
+    </SidebarProvider>
   );
 }
 

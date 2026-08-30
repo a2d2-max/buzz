@@ -108,14 +108,47 @@ function snapshot() {
     connections: [
       {
         id: "connection:hub",
+        kind: "hub",
+        locator_label: "Local Hub",
         name: "Local Hub",
+        observed_at: generated_at,
+        source_alias: `source:${"a".repeat(32)}`,
         status: "ready",
         updated_at: generated_at,
       },
     ],
     workflow_routing: {
+      plans: [],
+      routes: [
+        {
+          approval_boundary: "local_internal",
+          effort: "high",
+          enabled: true,
+          from: "controller",
+          id: "route:controller-codex",
+          model: "codex",
+          to: "codex",
+        },
+      ],
+      routing: {
+        allowed_efforts: ["high"],
+        allowed_models: ["codex"],
+        approval_boundaries: ["external_delivery"],
+        controller: "controller",
+        fallback: "forbidden",
+        max_active_sessions: 4,
+        observed_at: generated_at,
+        schema_version: 1,
+        source_sha256: "b".repeat(64),
+        status: "ready",
+      },
       status: "ready",
-      routes: [{ from: "controller", to: "codex", effort: "high" }],
+      superpowers: {
+        manifest_sha256: "c".repeat(64),
+        observed_at: generated_at,
+        status: "ready",
+        version: "6.3.0",
+      },
     },
   });
 }
@@ -125,15 +158,23 @@ async function selectSection(
   label: string,
   mobile: boolean,
 ) {
+  const navigationLabel = label === "Room" ? "Agent room" : label;
   if (!mobile) {
-    await browser.getByRole("button", { name: label, exact: true }).click();
+    await browser
+      .getByRole("button", { name: navigationLabel, exact: true })
+      .click();
     return;
   }
-  const trigger = browser.getByRole("button", { name: "Sections" });
+  const trigger = browser.getByRole("button", { name: "Toggle Sidebar" });
   await trigger.click();
-  const dialog = browser.getByRole("dialog", { name: "Sections" });
-  await expect(dialog).toBeFocused();
-  const target = dialog.getByRole("button", { name: label, exact: true });
+  const navigation = browser.getByRole("navigation", {
+    name: "RAOU workspace",
+  });
+  await expect(navigation).toBeVisible();
+  const target = navigation.getByRole("button", {
+    name: navigationLabel,
+    exact: true,
+  });
   expect(
     await target.evaluate((element) => {
       const style = getComputedStyle(element);
@@ -179,7 +220,7 @@ for (const viewport of [
     ).toBeVisible();
     await expect(browser.getByText("Reader, Come Home")).toBeVisible();
 
-    await selectSection(browser, "Connections", viewport.name === "mobile");
+    await selectSection(browser, "Connections", viewport.width < 768);
     await expect(
       browser.getByRole("heading", { name: "Connections", exact: true }),
     ).toBeVisible();
@@ -188,13 +229,13 @@ for (const viewport of [
       browser.getByText(/read-only inbound activity only/i),
     ).toBeVisible();
 
-    await selectSection(browser, "Routing", viewport.name === "mobile");
+    await selectSection(browser, "Routing", viewport.width < 768);
     await expect(
       browser.getByRole("heading", { name: "Routing", exact: true }),
     ).toBeVisible();
     await expect(browser.getByText("controller → codex")).toBeVisible();
 
-    await selectSection(browser, "Safety", viewport.name === "mobile");
+    await selectSection(browser, "Safety", viewport.width < 768);
     await expect(
       browser.getByRole("heading", { name: "Safety", exact: true }),
     ).toBeVisible();
@@ -205,7 +246,7 @@ for (const viewport of [
       path: testInfo.outputPath(`raou-source-${viewport.name}.png`),
     });
 
-    await selectSection(browser, "Room", viewport.name === "mobile");
+    await selectSection(browser, "Room", viewport.width < 768);
     await expect(
       browser.getByRole("heading", { name: "Agent Room", exact: true }),
     ).toBeVisible();
@@ -317,7 +358,9 @@ test("absent, unavailable, and malformed source modules stay isolated and fail c
   ).toBeVisible();
 
   await selectSection(browser, "Connections", false);
-  await expect(browser.getByText("Repositories is unavailable.")).toBeVisible();
+  await expect(
+    browser.getByText("Repositories contract is invalid."),
+  ).toBeVisible();
   await expect(browser.getByText("Local Hub")).toBeVisible();
 
   await selectSection(browser, "Routing", false);
