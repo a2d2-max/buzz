@@ -503,8 +503,20 @@ export async function loadOpsPageWithStaleRestart(
   request: OpsPageRequest,
   expectedCollectionRevision: number,
 ): Promise<OpsPageV1> {
+  return (
+    await loadOpsPageWithStaleRestartResult(request, expectedCollectionRevision)
+  ).page;
+}
+
+export async function loadOpsPageWithStaleRestartResult(
+  request: OpsPageRequest,
+  expectedCollectionRevision: number,
+): Promise<{ page: OpsPageV1; restarted: boolean }> {
   try {
-    return await getOpsPage(request, expectedCollectionRevision);
+    return {
+      page: await getOpsPage(request, expectedCollectionRevision),
+      restarted: false,
+    };
   } catch (error) {
     const staleCursor =
       error instanceof OpsPageError &&
@@ -528,10 +540,20 @@ export async function loadOpsPageWithStaleRestart(
   ) {
     throw new OpsBridgeContractError();
   }
-  return getOpsPage(
-    { ...request, cursor: null } as OpsPageRequest,
-    module.collection_revision,
-  );
+  try {
+    return {
+      page: await getOpsPage(
+        { ...request, cursor: null } as OpsPageRequest,
+        module.collection_revision,
+      ),
+      restarted: true,
+    };
+  } catch (error) {
+    if (error instanceof OpsPageRevisionMismatchError) {
+      throw new OpsPageError("stale_cursor");
+    }
+    throw error;
+  }
 }
 
 export async function readOpsArtifact(
@@ -651,7 +673,9 @@ export async function acknowledgeOpsSync(
   return parsed.data;
 }
 
-export function hasInvalidOpsModule(snapshot: OpsBridgeSnapshotV1): boolean {
+export function hasInvalidOpsModule(
+  snapshot: Pick<OpsBridgeSnapshotV1, "module_states">,
+): boolean {
   return Object.values(snapshot.module_states).some(
     (module) => module.status === "contract_invalid",
   );

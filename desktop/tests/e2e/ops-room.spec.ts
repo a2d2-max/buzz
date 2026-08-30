@@ -21,7 +21,112 @@ const OPS_CAPABILITIES_FIXTURE = {
   reads: ["snapshot", "events", "artifact"],
   drafts: ["message", "internal_task", "provider_action"],
   transitions: ["submit", "approve", "risk_confirm", "deliver", "reject"],
+  modules: [
+    {
+      name: "artifacts",
+      schema_version: 1,
+      paged: true,
+      collection_revision: 19,
+    },
+  ],
 };
+
+for (const viewport of [
+  { height: 800, name: "desktop", width: 1280 },
+  { height: 800, name: "compact", width: 736 },
+  { height: 844, name: "mobile", width: 390 },
+])
+  test(`no-key guest opens signed global Artifacts at ${viewport.width}`, async ({
+    page,
+  }) => {
+    const artifactPage = {
+      contract_version: 1 as const,
+      revision: 19,
+      generated_at: "2026-08-30T00:00:00.000Z",
+      next_cursor: null,
+      items: [
+        {
+          id: OPS_ARTIFACT_ID,
+          work_item_id: "work:configured-redacted",
+          title: "Parity report",
+          kind: "markdown",
+          status: "ready",
+          version: 1,
+          source_event_id: null,
+          created_at: "2026-08-30T00:00:00.000Z",
+          updated_at: "2026-08-30T00:00:00.000Z",
+        },
+      ],
+    };
+    await page.setViewportSize(viewport);
+    await openLocalOpsRoom(page, false, {
+      opsPages: { artifacts: artifactPage },
+    });
+    if (viewport.name === "mobile") {
+      const sections = page.getByRole("button", { name: "Sections" });
+      await sections.focus();
+      await sections.click();
+      await page
+        .getByRole("dialog", { name: "Sections" })
+        .getByRole("button", { name: "Artifacts" })
+        .click();
+      await expect(sections).toBeFocused();
+    } else await page.getByRole("button", { name: "Artifacts" }).click();
+    await expect(page).toHaveURL(/view=artifacts/);
+    await expect(page.getByTestId("ops-artifacts-view")).toBeVisible();
+    await expect(
+      page.getByText("Parity report", { exact: true }),
+    ).toBeVisible();
+    if (viewport.name === "desktop") {
+      const rail = await page
+        .getByRole("navigation", { name: "Ops sections" })
+        .boundingBox();
+      const artifacts = await page
+        .getByTestId("ops-artifacts-view")
+        .boundingBox();
+      expect(rail).not.toBeNull();
+      expect(artifacts).not.toBeNull();
+      expect(rail.x + rail.width).toBeLessThanOrEqual(artifacts.x);
+      expect(Math.abs(rail.y - artifacts.y)).toBeLessThan(4);
+    }
+    await expectNoHorizontalOverflow(page, "ops-artifacts-view");
+    const row = page.getByRole("button", { name: /Parity report/ });
+    await row.click();
+    const reader = page.getByRole("dialog", { name: "Parity report" });
+    await expect(reader).toBeVisible();
+    await reader.getByRole("button", { name: "아티팩트 닫기" }).click();
+    await expect(row).toBeFocused();
+    await expect(
+      page.getByRole("button", { name: FORBIDDEN_ACTION_NAME }),
+    ).toHaveCount(0);
+    const calls = await page.evaluate(
+      () => window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [],
+    );
+    expect(
+      calls.filter(({ command }) => command === "ops_bridge_page")[0]?.payload,
+    ).toEqual({
+      request: {
+        module: "artifacts",
+        scope: {
+          work_item: null,
+          representation: null,
+          sort: "created_at_desc",
+        },
+        page_size: 100,
+        cursor: null,
+      },
+    });
+    expect(
+      calls.filter(({ command }) =>
+        [
+          "ops_bridge_create_draft",
+          "ops_bridge_transition",
+          "ops_bridge_deliver",
+          "ops_bridge_delivery",
+        ].includes(command),
+      ),
+    ).toEqual([]);
+  });
 
 const OPS_SNAPSHOT_FIXTURE = {
   contract_version: 1,
@@ -277,21 +382,24 @@ async function expectWorkspaceFixture(page: Page) {
   ).toBeVisible();
 }
 
-async function expectNoHorizontalOverflow(page: Page) {
+async function expectNoHorizontalOverflow(
+  page: Page,
+  testId = "ops-room-view",
+) {
   await expect
     .poll(() =>
-      page.evaluate(() => {
+      page.evaluate((targetTestId) => {
         const root = document.documentElement;
-        const room = document.querySelector<HTMLElement>(
-          '[data-testid="ops-room-view"]',
+        const target = document.querySelector<HTMLElement>(
+          `[data-testid="${targetTestId}"]`,
         );
         return {
           document: root.scrollWidth - root.clientWidth,
-          room: room ? room.scrollWidth - room.clientWidth : 1,
+          target: target ? target.scrollWidth - target.clientWidth : 1,
         };
-      }),
+      }, testId),
     )
-    .toEqual({ document: 0, room: 0 });
+    .toEqual({ document: 0, target: 0 });
 }
 
 async function expectAccessibleTargets(page: Page) {

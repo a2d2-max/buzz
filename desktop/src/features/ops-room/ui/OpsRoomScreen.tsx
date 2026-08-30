@@ -6,12 +6,7 @@ import {
   type OpsArtifactSelection,
 } from "../artifactReader";
 import { useOpsSnapshot } from "../hooks";
-import {
-  opsRoomHash,
-  parseOpsRoomHash,
-  projectOpsRoom,
-  type OpsRoomProjection,
-} from "../opsProjection";
+import { projectOpsRoom, type OpsRoomProjection } from "../opsProjection";
 import {
   opsLayoutForWidth,
   type OpsResponsiveLayout,
@@ -27,6 +22,14 @@ import { OpsContextPanel } from "./OpsContextPanel";
 import { OpsSessionTree } from "./OpsSessionTree";
 import { OpsTimeline } from "./OpsTimeline";
 import { OpsWorkspaceNav } from "./OpsWorkspaceNav";
+import {
+  createHashOpsNavigationPort,
+  opsRouteNeedsNormalization,
+  type OpsNavigationPort,
+  type OpsRouteState,
+} from "../opsRouteState";
+import { OpsArtifactsView } from "./OpsArtifactsView";
+import { OpsWorkspaceScreen } from "./OpsWorkspaceScreen";
 
 const INTERACTIVE_SIZE = { minHeight: 44, minWidth: 44 } as const;
 const MOBILE_TABS = ["workspace", "sessions", "timeline", "context"] as const;
@@ -387,29 +390,65 @@ export function OpsRoomView({
   );
 }
 
-function currentOpsSelection(): Required<OpsSelection> {
-  return parseOpsRoomHash(window.location.hash);
-}
-
-export function OpsRoomScreen() {
+export function OpsRoomScreen({
+  navigation: providedNavigation,
+}: {
+  navigation?: OpsNavigationPort;
+}) {
+  const defaultNavigation = React.useRef<OpsNavigationPort | null>(null);
+  defaultNavigation.current ??= createHashOpsNavigationPort();
+  const navigation = providedNavigation ?? defaultNavigation.current;
   useOpsWindowSize();
-  const [selection, setSelection] = React.useState(currentOpsSelection);
-  const { refetch, snapshot, state, watchState } = useOpsSnapshot(selection);
+  const [routeState, setRouteState] = React.useState<OpsRouteState>(() =>
+    navigation.readOpsState(),
+  );
+  React.useEffect(() => {
+    if (
+      !providedNavigation &&
+      opsRouteNeedsNormalization(window.location.hash)
+    ) {
+      navigation.replaceOpsState(routeState);
+    }
+  }, [navigation, providedNavigation, routeState]);
+  const selection = React.useMemo(
+    () => ({
+      channel: routeState.channel,
+      thread: routeState.thread,
+      limit: 100,
+    }),
+    [routeState],
+  );
+  const { mutationsDisabled, refetch, snapshot, state, watchState } =
+    useOpsSnapshot(selection);
   const projection = React.useMemo(
     () => (snapshot ? projectOpsRoom(snapshot) : null),
     [snapshot],
   );
 
   React.useEffect(() => {
-    const syncFromHash = () => setSelection(currentOpsSelection());
-    window.addEventListener("hashchange", syncFromHash);
-    return () => window.removeEventListener("hashchange", syncFromHash);
-  }, []);
+    const sync = () => setRouteState(navigation.readOpsState());
+    return navigation.subscribe(sync);
+  }, [navigation]);
 
-  const select = React.useCallback((next: Required<OpsSelection>) => {
-    setSelection(next);
-    window.history.replaceState(null, "", opsRoomHash(next));
-  }, []);
+  React.useEffect(() => {
+    const canonical = navigation.readOpsState();
+    if (
+      canonical.view !== routeState.view ||
+      canonical.channel !== routeState.channel ||
+      canonical.thread !== routeState.thread
+    )
+      setRouteState(canonical);
+  }, [navigation, routeState]);
+
+  const select = React.useCallback(
+    (next: Required<OpsSelection>) =>
+      navigation.pushOpsState({
+        channel: next.channel,
+        thread: next.thread,
+        view: routeState.view,
+      }),
+    [navigation, routeState.view],
+  );
 
   const selectChannel = React.useCallback(
     (channel: string) =>
@@ -422,14 +461,38 @@ export function OpsRoomScreen() {
     [select, selection.channel, selection.limit],
   );
 
+  const [layout, setLayout] = React.useState(() =>
+    opsLayoutForWidth(window.innerWidth),
+  );
+  React.useEffect(() => {
+    const update = () => setLayout(opsLayoutForWidth(window.innerWidth));
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  const content =
+    routeState.view === "artifacts" ? (
+      <OpsArtifactsView connectionState={state} disabled={mutationsDisabled} />
+    ) : routeState.view === "room" ? (
+      <OpsRoomView
+        connectionState={state}
+        onRetry={() => void refetch()}
+        onSelectChannel={selectChannel}
+        onSelectThread={selectThread}
+        projection={projection}
+        watchState={watchState}
+      />
+    ) : (
+      <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
+        {routeState.view} is available as a read-only Ops section.
+      </div>
+    );
   return (
-    <OpsRoomView
-      connectionState={state}
-      onRetry={() => void refetch()}
-      onSelectChannel={selectChannel}
-      onSelectThread={selectThread}
-      projection={projection}
-      watchState={watchState}
-    />
+    <OpsWorkspaceScreen
+      layout={layout}
+      navigation={navigation}
+      state={routeState}
+    >
+      {content}
+    </OpsWorkspaceScreen>
   );
 }

@@ -127,7 +127,43 @@ afterEach(async () => {
 
 after(() => dom.window.close());
 
-const { resetOpsWatchManager, useOpsSnapshot } = await import("./hooks.ts");
+const { opsMutationsDisabled, resetOpsWatchManager, useOpsSnapshot } =
+  await import("./hooks.ts");
+
+test("mutations stay disabled for every non-ready lifecycle and any invalid optional module", () => {
+  const valid = {
+    module_states: {
+      timeline: { status: "ready", data: [] },
+      approvals: { status: "unavailable" },
+      artifacts: { status: "unavailable" },
+      connections: { status: "unavailable" },
+      workflow_routing: { status: "unavailable" },
+      research: { status: "unavailable" },
+      repositories: { status: "unavailable" },
+    },
+  };
+  for (const state of [
+    "loading",
+    "stale",
+    "disconnected",
+    "not_configured",
+    "version_mismatch",
+    "contract_invalid",
+  ]) {
+    assert.equal(opsMutationsDisabled(state, valid), true, state);
+  }
+  assert.equal(opsMutationsDisabled("ready", valid), false);
+  assert.equal(
+    opsMutationsDisabled("ready", {
+      ...valid,
+      module_states: {
+        ...valid.module_states,
+        research: { status: "contract_invalid" },
+      },
+    }),
+    true,
+  );
+});
 
 function wrapper(client) {
   return ({ children }) =>

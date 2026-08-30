@@ -867,7 +867,7 @@ describe("native Ops bridge contract", () => {
       },
     );
 
-    await bridge.loadOpsPageWithStaleRestart(
+    const restarted = await bridge.loadOpsPageWithStaleRestartResult(
       {
         module: "repositories",
         scope: { project: null, sort: "display_name_asc" },
@@ -876,6 +876,7 @@ describe("native Ops bridge contract", () => {
       },
       11,
     );
+    assert.equal(restarted.restarted, true);
 
     assert.deepEqual(
       calls.map(({ command }) => command),
@@ -910,6 +911,48 @@ describe("native Ops bridge contract", () => {
         12,
       ),
       (error) => error?.code === "stale_cursor",
+    );
+    assert.equal(calls.length, 3);
+  });
+
+  test("classifies a second revision race after stale restart as retryable stale", async () => {
+    responses.push(
+      { reject: { error: "stale_cursor" } },
+      {
+        ...capabilities,
+        modules: [
+          {
+            name: "artifacts",
+            schema_version: 1,
+            paged: true,
+            collection_revision: 13,
+          },
+        ],
+      },
+      {
+        contract_version: 1,
+        revision: 14,
+        generated_at: "2026-08-30T00:00:00.000Z",
+        items: [],
+        next_cursor: null,
+      },
+    );
+
+    await assert.rejects(
+      bridge.loadOpsPageWithStaleRestart(
+        {
+          module: "artifacts",
+          scope: {
+            work_item: null,
+            representation: null,
+            sort: "created_at_desc",
+          },
+          cursor: "stale",
+        },
+        12,
+      ),
+      (error) =>
+        error?.name === "OpsPageError" && error?.code === "stale_cursor",
     );
     assert.equal(calls.length, 3);
   });
@@ -968,6 +1011,28 @@ describe("native Ops bridge contract", () => {
         Number.MAX_SAFE_INTEGER,
       ),
       { name: "OpsBridgeContractError" },
+    );
+  });
+
+  test("marks a non-stale page result without refreshing capabilities", async () => {
+    responses.push({
+      contract_version: 1,
+      revision: 11,
+      generated_at: "2026-08-30T00:00:00.000Z",
+      items: [],
+      next_cursor: null,
+    });
+    const result = await bridge.loadOpsPageWithStaleRestartResult(
+      {
+        module: "research",
+        scope: { work_item: null, sort: "created_at_desc" },
+      },
+      11,
+    );
+    assert.equal(result.restarted, false);
+    assert.deepEqual(
+      calls.map(({ command }) => command),
+      ["ops_bridge_page"],
     );
   });
 

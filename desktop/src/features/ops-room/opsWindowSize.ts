@@ -37,7 +37,7 @@ let currentOpsWindowHandle: OpsWindowHandle | null = null;
 
 export function opsLayoutForWidth(width: number): OpsResponsiveLayout {
   if (width >= 1024) return "desktop";
-  if (width >= 640) return "compact";
+  if (width >= 600) return "compact";
   return "mobile";
 }
 

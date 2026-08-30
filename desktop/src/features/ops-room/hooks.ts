@@ -30,6 +30,7 @@ export interface UseOpsSnapshotResult {
   state: OpsConnectionState;
   snapshot: OpsBridgeSnapshotV1 | null;
   error: unknown;
+  mutationsDisabled: boolean;
   refetch: () => Promise<void>;
   watchState: "enabled" | "disabled_compatibility";
 }
@@ -74,9 +75,15 @@ function lifecycleState(
     if (classified === "disconnected" && snapshot) return "stale";
     return classified;
   }
-  if (snapshot && hasInvalidOpsModule(snapshot)) return "contract_invalid";
   if (snapshot) return "ready";
   return pending ? "loading" : "disconnected";
+}
+
+export function opsMutationsDisabled(
+  state: OpsConnectionState,
+  snapshot: Pick<OpsBridgeSnapshotV1, "module_states"> | null,
+): boolean {
+  return state !== "ready" || (snapshot ? hasInvalidOpsModule(snapshot) : true);
 }
 
 export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
@@ -371,5 +378,12 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     await query.refetch({ cancelRefetch: false });
   }, [query.refetch]);
 
-  return { state, snapshot, error: query.error, refetch, watchState };
+  return {
+    state,
+    snapshot,
+    error: query.error,
+    mutationsDisabled: opsMutationsDisabled(state, snapshot),
+    refetch,
+    watchState,
+  };
 }

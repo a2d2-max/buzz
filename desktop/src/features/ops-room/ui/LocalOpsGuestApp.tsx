@@ -6,7 +6,10 @@ import { isMacPlatform } from "@/shared/lib/platform";
 import { useIsFullscreen } from "@/shared/lib/useIsFullscreen";
 import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
-import { ensureOpsRoomHash } from "../opsProjection";
+import {
+  createHashOpsNavigationPort,
+  normalizeHashOpsNavigation,
+} from "../opsRouteState";
 import { OpsRoomScreen } from "./OpsRoomScreen";
 
 type LocalOpsGuestAppProps = {
@@ -16,11 +19,11 @@ type LocalOpsGuestAppProps = {
 export function LocalOpsGuestApp({ onRestoreIdentity }: LocalOpsGuestAppProps) {
   const isFullscreen = useIsFullscreen();
   const clearsMacTrafficLights = isMacPlatform() && !isFullscreen;
+  const navigation = React.useMemo(() => createHashOpsNavigationPort(), []);
 
   React.useLayoutEffect(() => {
-    const nextHash = ensureOpsRoomHash(window.location.hash);
-    if (window.location.hash !== nextHash) window.location.hash = nextHash;
-  }, []);
+    normalizeHashOpsNavigation(navigation, window.location.hash);
+  }, [navigation]);
 
   return (
     <div className="flex min-h-dvh min-w-0 flex-col overflow-hidden bg-background text-foreground">
@@ -50,7 +53,7 @@ export function LocalOpsGuestApp({ onRestoreIdentity }: LocalOpsGuestAppProps) {
           Restore identity
         </Button>
       </aside>
-      <OpsRoomScreen />
+      <OpsRoomScreen navigation={navigation} />
     </div>
   );
 }

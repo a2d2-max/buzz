@@ -19,8 +19,8 @@ describe("native Ops window sizing", () => {
   test("uses four-column, two-pane, and one-pane boundaries", () => {
     assert.equal(opsLayoutForWidth(1024), "desktop");
     assert.equal(opsLayoutForWidth(736), "compact");
-    assert.equal(opsLayoutForWidth(640), "compact");
-    assert.equal(opsLayoutForWidth(639), "mobile");
+    assert.equal(opsLayoutForWidth(600), "compact");
+    assert.equal(opsLayoutForWidth(599), "mobile");
     assert.equal(opsLayoutForWidth(390), "mobile");
   });
 

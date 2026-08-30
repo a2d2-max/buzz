@@ -98,8 +98,8 @@ describe("native Ops Room route", () => {
     }
     assert.match(opsScreenSource, /min-h-0 min-w-0 flex-1/);
     assert.match(opsScreenSource, /\[overflow-wrap:anywhere\]/);
-    assert.match(opsScreenSource, /opsRoomHash/);
-    assert.match(opsScreenSource, /parseOpsRoomHash/);
+    assert.match(opsScreenSource, /OpsWorkspaceScreen/);
+    assert.match(opsScreenSource, /OpsNavigationPort/);
     assert.match(
       opsProjectionSource,
       /new URLSearchParams\(\{ view: "room" \}\)/,
