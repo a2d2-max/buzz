@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-30T01:27:01.563Z",
+  "fixture_hash": "f1eb9aaaa6948bc8ffd8aef067b9de401f79941e6aee44458bd14f6f4174a499",
+  "hub_sha": "dfdd6a36d2ac3ff0ae9de53330e5fb8319e4e741",
+  "buzz_sha": "7fa62841f3be0fa7a419c0d6b5d6fce70c9d1757",
+  "hub_worktree_dirty": false,
+  "buzz_worktree_dirty": false,
+  "artifacts": {
+    "inline": {
+      "artifact_id": "artifact:d1a1a4cda48064cabd7fc370ef402773",
+      "title": "evidence-summary.md",
+      "mime": "text/markdown",
+      "sha256": "f8eb6d8c6a3e213ba332648c4f5af64599924b9684c9c12246b3b62c6b522a6a",
+      "total_size": 63,
+      "source": "inline"
+    },
+    "opaque": {
+      "artifact_id": "artifact:210aa30e94a4ff6ed4eb2a407f971dd9",
+      "title": "evidence-large.txt",
+      "mime": "text/plain",
+      "sha256": "b105bfde1f5f8aca1238b50b167d2a4acd5d17b9f591d640cc014bed25706650",
+      "total_size": 1052672,
+      "source": "opaque"
+    }
+  },
+  "viewports": [
+    {
+      "name": "desktop",
+      "width": 1280,
+      "height": 900,
+      "inline": {
+        "screenshot": "artifact-inline-1280.png",
+        "screenshot_sha256": "4446f3f1bdbb727b866b0a42dc2cdfa40b0089ac0856337350b915bf80242719",
+        "accessibility": "artifact-inline-1280.accessibility.json",
+        "accessibility_sha256": "61b0c443f08b55ee0b075c57b072c3cda6e6e2961de1b486a4e6ab0d0f54536b",
+        "verified": true,
+        "focused_return": true
+      },
+      "opaque": {
+        "screenshot": "artifact-opaque-1280.png",
+        "screenshot_sha256": "80c521a131e8177cd511a2489911bf1649441b6a16df28c8713446c308826041",
+        "accessibility": "artifact-opaque-1280.accessibility.json",
+        "accessibility_sha256": "3fd7817bc4758e9330206d24c9fb1157ae871eff356e73b0dffc0a722decc445",
+        "verified": true,
+        "focused_return": true
+      },
+      "log": "artifact-1280.log",
+      "log_sha256": "983d2bbb51499f54d18cb64b024db2df30c081f620d213e0c4a3a7c5b6e5acb4",
+      "process_cleanup": true,
+      "artifact_handle_remnants": 0,
+      "non_loopback_sockets": 0,
+      "network_observations": 801
+    },
+    {
+      "name": "compact",
+      "width": 736,
+      "height": 900,
+      "inline": {
+        "screenshot": "artifact-inline-736.png",
+        "screenshot_sha256": "19ac017647259056b3dc8e023993075d27ba800a339648408b44568a9f649b5e",
+        "accessibility": "artifact-inline-736.accessibility.json",
+        "accessibility_sha256": "159fd836025d0448109d42e53ccd58e5b50c4d43c736f609e1a403d468e22d31",
+        "verified": true,
+        "focused_return": true
+      },
+      "opaque": {
+        "screenshot": "artifact-opaque-736.png",
+        "screenshot_sha256": "1e341f245f5ae512b9a6be2ba4c536b2da00c837f10b4eb4d479843afb7f6948",
+        "accessibility": "artifact-opaque-736.accessibility.json",
+        "accessibility_sha256": "e836235faf1361e3c77fd78070eae43bd170029d43c084f7588f34edf7cc29c3",
+        "verified": true,
+        "focused_return": true
+      },
+      "log": "artifact-736.log",
+      "log_sha256": "0a506aef878d0368cd12d357626ded633cb71727116b4ead484e8f0500daaffb",
+      "process_cleanup": true,
+      "artifact_handle_remnants": 0,
+      "non_loopback_sockets": 0,
+      "network_observations": 207
+    },
+    {
+      "name": "mobile",
+      "width": 390,
+      "height": 844,
+      "inline": {
+        "screenshot": "artifact-inline-390.png",
+        "screenshot_sha256": "dc15a4720e2fcb75e1ea0aac2f363d1978fbbf9e77d23d266cf74a66d47b0d3a",
+        "accessibility": "artifact-inline-390.accessibility.json",
+        "accessibility_sha256": "04cbda31742a82b5ed1c24335aaad99bcc3add33b33ff9abff97187f36753015",
+        "verified": true,
+        "focused_return": true
+      },
+      "opaque": {
+        "screenshot": "artifact-opaque-390.png",
+        "screenshot_sha256": "8bb2b19df8bcc9512739c708f21a230cc3bc0b834dec70de42dd68f89cc2ab12",
+        "accessibility": "artifact-opaque-390.accessibility.json",
+        "accessibility_sha256": "d17366078ff820e8f8ac5a0df8fa788661540b20b7e53a8b69cd66cd6cb59fac",
+        "verified": true,
+        "focused_return": true
+      },
+      "log": "artifact-390.log",
+      "log_sha256": "1c5bc66a794a602c23b1d3b127c1e78f9fe112603e3818536fc1975b09034468",
+      "process_cleanup": true,
+      "artifact_handle_remnants": 0,
+      "non_loopback_sockets": 0,
+      "network_observations": 207
+    }
+  ],
+  "zero_side_effect_counters": {
+    "delivery_callback_count": 0,
+    "provider_execution_count": 0,
+    "external_network_client_count": 0,
+    "mutation_request_count": 0
+  },
+  "assertions": {
+    "offline_mode": true,
+    "startup_effects_disabled": true,
+    "non_loopback_sockets": 0,
+    "logs_redacted": true,
+    "exact_process_cleanup": true,
+    "temporary_root_removed_after_process_exit": true
+  }
+}

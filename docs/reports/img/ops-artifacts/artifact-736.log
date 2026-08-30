@@ -1,0 +1,18 @@
+[stderr]      Running BeforeDevCommand (`exec ./node_modules/.bin/vite --host 127.0.0.1 --port 55023 --strictPort`)
+
+  VITE v8.0.16  ready in 394 ms
+
+  ➜  Local:   http://127.0.0.1:55023/
+[stderr]      Running DevCommand (`cargo  run --no-default-features --features system-keyring --color always --`)
+[stderr] [1m[92m   Compiling[0m buzz-desktop v0.5.20 (<evidence-root>/desktop/src-tauri)
+[1m[96m    Building[0m [=======================> ] 850/853: buzz-desktop(build)         [stderr] [1m[96m    Building[0m [=======================> ] 851/853: buzz-desktop                [stderr] [1m[96m    Building[0m [=======================> ] 852/853: buzz-desktop(bin)           [stderr] [K[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 7.68s
+[1m[92m     Running[0m `target/debug/buzz-desktop`
+[stderr] buzz-desktop: evidence offline mode enabled
+[stderr] buzz-desktop: macOS notifications disabled because the process is not running from an app bundle
+buzz-desktop: identity lost — keyring was empty despite migration marker; using ephemeral key 61a1d091af2069fe8f37d15704c935381733c7e729708dc936be0567d3bfce88, awaiting user re-import
+buzz-desktop: media proxy listening on 127.0.0.1:55045
+buzz-desktop: repos dir resolved at boot — no configured override, REPOS is the default real dir
+buzz-desktop: evidence offline mode: STT model fetch disabled
+buzz-desktop: evidence offline mode: TTS model fetch disabled
+buzz-desktop: evidence offline mode: managed-agent system sweep disabled
+buzz-desktop: evidence offline mode: periodic event publish disabled

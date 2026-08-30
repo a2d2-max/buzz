@@ -1,0 +1,24 @@
+{
+  "artifact_kind": "inline",
+  "viewport": {
+    "name": "mobile",
+    "width": 390,
+    "height": 844
+  },
+  "window": {
+    "isMinimized": false,
+    "height": 844,
+    "x": 765,
+    "isOffscreen": false,
+    "id": 120198,
+    "width": 390,
+    "title": "",
+    "platform": {
+      "layer": 0
+    },
+    "y": 68,
+    "screenIndex": 0
+  },
+  "focused_element_id": 3,
+  "tree_text": "App=buzz-desktop (pid 92799)\nWindow: \"\", App: buzz-desktop.\n\n0 standard window\n\t1 scroll area\n\t\t2 HTML content\n\t\t\t3 container evidence-summary.md\n\t\t\t\t4 container\n\t\t\t\t\t5 heading evidence-summary.md\n\t\t\t\t\t6 text 읽기 전용 네이티브 아티팩트\n\t\t\t\t\t7 button 아티팩트 닫기\n\t\t\t\t8 container, Text: 인라인 검증됨 · v 1 · text/markdown 63 B\n\t\t\t\t9 text # Evidence summary  Fixture-only evidence is ready for review.\n\t10 close button\n\t11 full screen button, Secondary Actions: zoom the window\n\t12 minimize button\n\nThe focused UI element is 3 container evidence-summary.md."
+}
