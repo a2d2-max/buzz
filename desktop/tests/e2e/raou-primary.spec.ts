@@ -184,6 +184,23 @@ async function openPrimary(page: Page, viewport: (typeof VIEWPORTS)[number]) {
   await expect(page.getByText("Sections", { exact: true })).toHaveCount(0);
 }
 
+test("default launch keeps the complete Buzz shell and opens RAOU Ops inside it", async ({
+  page,
+}) => {
+  await installMockBridge(page, undefined, { seedPreviewFeatures: true });
+  await page.goto("/");
+
+  await expect(page.getByTestId("app-sidebar-layer")).toBeVisible();
+  await expect(page.getByTestId("app-sidebar")).toBeVisible();
+  await expect(page.getByTestId("open-ops-view")).toBeVisible();
+  await expect(page.getByTestId("raou-workspace-sidebar")).toHaveCount(0);
+
+  await page.getByTestId("open-ops-view").click();
+  await expect(page).toHaveURL(/#\/ops/);
+  await expect(page.getByTestId("ops-room-view")).toBeVisible();
+  await expect(page.getByTestId("app-sidebar")).toBeVisible();
+});
+
 for (const viewport of VIEWPORTS) {
   test(`RAOU boots directly into the local workspace at ${viewport.width}`, async ({
     page,

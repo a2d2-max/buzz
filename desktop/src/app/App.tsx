@@ -13,6 +13,7 @@ import {
 } from "react";
 
 import { router } from "@/app/router";
+import { shouldUseLegacyCommunityApp } from "@/app/appEntryMode";
 import {
   completeCommunityViewTransition,
   replaceCommunityDestinationRoute,
@@ -847,11 +848,10 @@ export function LegacyCommunityApp() {
 }
 
 export function isLegacyCompatibilityAdapterActive(): boolean {
-  if (huddleWindowChannelId() !== null) return true;
-  return (
-    import.meta.env.MODE === "e2e" &&
-    new URL(window.location.href).searchParams.get("raouPrimary") !== "1"
-  );
+  return shouldUseLegacyCommunityApp({
+    href: window.location.href,
+    huddleChannelId: huddleWindowChannelId(),
+  });
 }
 
 function RaouPrimaryApp() {

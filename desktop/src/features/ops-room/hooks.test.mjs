@@ -1077,17 +1077,28 @@ test("a terminal probe failure from selection A does not classify deferred selec
   client.clear();
 });
 
-test("native setup errors become not_configured without starting polling or watch", async () => {
+test("a missing installed Hub token automatically reconnects when the local Hub becomes ready", async () => {
   enableFakeTimeouts();
-  queue("ops_bridge_capabilities", "ops_bridge_token_unavailable");
+  queue(
+    "ops_bridge_capabilities",
+    "ops_bridge_token_unavailable",
+    capabilities,
+    capabilities,
+  );
+  queue("ops_bridge_snapshot", snapshot(1), snapshot(2));
+  queue("ops_bridge_start_watch", { started: true });
 
   const { client, view } = await mount({});
   await waitForState(view, "not_configured");
-  await tick(30_000);
-
+  await tick(1_999);
   assert.equal(opsCalls("ops_bridge_capabilities").length, 1);
-  assert.equal(opsCalls("ops_bridge_start_watch").length, 0);
-  assert.equal(opsCalls("plugin:event|listen").length, 0);
+  await tick(1);
+  await waitForRevision(view, 2);
+
+  assert.equal(view.result.current.state, "ready");
+  assert.equal(opsCalls("ops_bridge_capabilities").length, 3);
+  assert.equal(opsCalls("ops_bridge_start_watch").length, 1);
+  assert.equal(opsCalls("plugin:event|listen").length, 1);
   view.unmount();
   client.clear();
 });

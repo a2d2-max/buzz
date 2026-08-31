@@ -275,21 +275,29 @@ pub(crate) async fn ops_bridge_ack_sync(
 }
 
 fn native_config() -> Result<OpsBridgeConfig, OpsBridgeError> {
+    let installed = installed_hub_config();
     let port = match std::env::var("BUZZ_OPS_HUB_PORT") {
         Ok(value) => value
             .parse::<u16>()
             .ok()
             .filter(|port| *port != 0)
             .ok_or(OpsBridgeError::InvalidConfig)?,
-        Err(_) => DEFAULT_HUB_PORT,
+        Err(_) => installed
+            .as_ref()
+            .map(|config| config.port)
+            .unwrap_or(DEFAULT_HUB_PORT),
     };
     let token_file = match std::env::var_os("BUZZ_OPS_HUB_TOKEN_FILE") {
         Some(path) => PathBuf::from(path),
         None => match std::env::var_os("HUB_STATE_DIR") {
             Some(directory) => PathBuf::from(directory).join("hub.token"),
-            None => std::env::current_dir()
-                .map(|directory| directory.join("state").join("hub.token"))
-                .unwrap_or_default(),
+            None => installed
+                .map(|config| config.state_dir.join("hub.token"))
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|directory| directory.join("state").join("hub.token"))
+                        .unwrap_or_default()
+                }),
         },
     };
     Ok(OpsBridgeConfig {
@@ -297,6 +305,53 @@ fn native_config() -> Result<OpsBridgeConfig, OpsBridgeError> {
         token_file,
         max_response_bytes: MAX_RESPONSE_BYTES,
     })
+}
+
+#[derive(Debug)]
+struct InstalledHubConfig {
+    port: u16,
+    state_dir: PathBuf,
+}
+
+fn installed_hub_config() -> Option<InstalledHubConfig> {
+    let launch_agent = installed_hub_launch_agent_path()?;
+    let value = plist::Value::from_file(launch_agent).ok()?;
+    let variables = value
+        .as_dictionary()?
+        .get("EnvironmentVariables")?
+        .as_dictionary()?;
+    let port = variables
+        .get("HUB_PORT")?
+        .as_string()?
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)?;
+    let state_dir = PathBuf::from(variables.get("HUB_STATE_DIR")?.as_string()?);
+    state_dir
+        .is_absolute()
+        .then_some(InstalledHubConfig { port, state_dir })
+}
+
+fn installed_hub_launch_agent_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("BUZZ_OPS_HUB_LAUNCH_AGENT_FILE") {
+        return Some(PathBuf::from(path));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let directory = PathBuf::from(std::env::var_os("HOME")?).join("Library/LaunchAgents");
+        for label in [
+            "com.raou.ops-hub.plist",
+            "kr.dlmarketing.unified-ops-hub.plist",
+        ] {
+            let candidate = directory.join(label);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 fn public_error(error: OpsBridgeError) -> String {

@@ -29,6 +29,11 @@ const READY_PROBE_MS = 10_000;
 const RECOVERY_POLL_MS = 2_000;
 export { resetOpsWatchManager } from "./opsWatchManager";
 
+function isMissingHubToken(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.includes("ops_bridge_token_unavailable");
+}
+
 export interface UseOpsSnapshotResult {
   state: OpsConnectionState;
   snapshot: OpsBridgeSnapshotV1 | null;
@@ -202,13 +207,20 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
         }
       };
       timer = setTimeout(probe, READY_PROBE_MS);
-    } else if (state === "stale" || state === "disconnected") {
+    } else if (
+      state === "stale" ||
+      state === "disconnected" ||
+      (state === "not_configured" && isMissingHubToken(query.error))
+    ) {
       const recover = async () => {
         const result = await query.refetch({ cancelRefetch: false });
         if (!cancelled && result.error) {
           const failure = classifyOpsBridgeError(result.error);
           setProbeFailureRecord({ queryKeyIdentity, state: failure });
-          if (failure === "disconnected") {
+          if (
+            failure === "disconnected" ||
+            (failure === "not_configured" && isMissingHubToken(result.error))
+          ) {
             timer = setTimeout(recover, RECOVERY_POLL_MS);
           }
         } else if (!cancelled) {
@@ -224,7 +236,7 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
       cancelled = true;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [focused, query.refetch, queryKeyIdentity, state]);
+  }, [focused, query.error, query.refetch, queryKeyIdentity, state]);
 
   const wasFocused = React.useRef(focused);
   React.useEffect(() => {
@@ -232,14 +244,14 @@ export function useOpsSnapshot(selection: OpsSelection): UseOpsSnapshotResult {
     wasFocused.current = focused;
     if (!returnedToFocus) return;
     if (
-      state === "not_configured" ||
+      (state === "not_configured" && !isMissingHubToken(query.error)) ||
       state === "version_mismatch" ||
       state === "contract_invalid"
     ) {
       return;
     }
     void query.refetch({ cancelRefetch: false });
-  }, [focused, query.refetch, state]);
+  }, [focused, query.error, query.refetch, state]);
 
   const handleInvalidation = React.useCallback(
     (payload: OpsInvalidationPayload) => {

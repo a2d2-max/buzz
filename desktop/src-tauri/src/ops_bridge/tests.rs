@@ -15,7 +15,7 @@ use tokio::{
 
 use super::{
     client::{read_hub_token, validate_hub_endpoint, OpsBridgeClient, OpsBridgeConfig},
-    ops_bridge_create_draft, ops_bridge_stop_watch, ops_bridge_transition,
+    native_config, ops_bridge_create_draft, ops_bridge_stop_watch, ops_bridge_transition,
     types::{
         OpsBridgeSnapshot, OpsDraftRequest, OpsSelection, OpsSessionSource, OpsSyncAckRequest,
         OpsTransitionAction, OpsTransitionOrigin, OpsTransitionRequest, OPS_CONTRACT_VERSION,
@@ -25,6 +25,52 @@ use super::{
 };
 use crate::app_state::{build_app_state, AppState};
 use tauri::Manager;
+
+static OPS_CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn ops_bridge_discovers_the_installed_local_hub_without_manual_token_input() {
+    let _guard = OPS_CONFIG_ENV_LOCK.lock().expect("lock ops config env");
+    let temp = tempfile::tempdir().expect("temp launch agent root");
+    let state_dir = temp.path().join("RAOU Ops Hub");
+    std::fs::create_dir_all(&state_dir).expect("create fake hub state");
+    let launch_agent = temp.path().join("kr.dlmarketing.unified-ops-hub.plist");
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>EnvironmentVariables</key><dict>
+    <key>HUB_PORT</key><string>17331</string>
+    <key>HUB_STATE_DIR</key><string>{}</string>
+  </dict>
+</dict></plist>"#,
+        state_dir.display()
+    );
+    std::fs::write(&launch_agent, plist).expect("write fake launch agent");
+
+    let variable_names = [
+        "BUZZ_OPS_HUB_PORT",
+        "BUZZ_OPS_HUB_TOKEN_FILE",
+        "HUB_STATE_DIR",
+        "BUZZ_OPS_HUB_LAUNCH_AGENT_FILE",
+    ];
+    let previous = variable_names.map(|name| (name, std::env::var_os(name)));
+    for name in variable_names {
+        std::env::remove_var(name);
+    }
+    std::env::set_var("BUZZ_OPS_HUB_LAUNCH_AGENT_FILE", &launch_agent);
+
+    let config = native_config().expect("discover installed local hub");
+
+    for (name, value) in previous {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    assert_eq!(config.port, 17_331);
+    assert_eq!(config.token_file, state_dir.join("hub.token"));
+}
 
 pub(super) fn write_token(path: &Path, contents: &[u8], mode: u32) {
     std::fs::write(path, contents).expect("write fake token");
