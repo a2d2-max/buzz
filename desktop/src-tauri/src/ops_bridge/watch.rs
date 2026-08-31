@@ -78,6 +78,7 @@ struct SanitizedRecord {
 
 /// Explicit canonical-refetch barrier shared by the watcher task and the ACK
 /// command. It retains only decimal sequence numbers and sanitized event types.
+#[derive(Default)]
 pub(crate) struct WatchSyncState {
     connection_generation: u64,
     connected_once: bool,
@@ -85,19 +86,6 @@ pub(crate) struct WatchSyncState {
     required_anchor: Option<u64>,
     last_applied_sequence: Option<u64>,
     queued: VecDeque<SanitizedRecord>,
-}
-
-impl Default for WatchSyncState {
-    fn default() -> Self {
-        Self {
-            connection_generation: 0,
-            connected_once: false,
-            sync_required: false,
-            required_anchor: None,
-            last_applied_sequence: None,
-            queued: VecDeque::new(),
-        }
-    }
 }
 
 impl WatchSyncState {
@@ -559,6 +547,18 @@ impl SseDecoder {
     }
 }
 
+fn valid_event_id(value: &str) -> bool {
+    value.len() <= 20 && parse_event_sequence(value).is_ok()
+}
+
+fn valid_event_type(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use std::sync::{atomic::AtomicUsize, Barrier};
@@ -628,16 +628,4 @@ mod lifecycle_tests {
         assert_eq!(stopped_emissions, 1);
         assert_eq!(emissions.load(Ordering::SeqCst), stopped_emissions);
     }
-}
-
-fn valid_event_id(value: &str) -> bool {
-    value.len() <= 20 && parse_event_sequence(value).is_ok()
-}
-
-fn valid_event_type(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }

@@ -87,9 +87,8 @@ fn artifact_requests_are_exact_and_bounded() {
         json!({"artifact_id": ARTIFACT_ID, "version": 1, "representation": "raw"}),
         json!({"artifact_id": ARTIFACT_ID, "version": 1, "representation": "preview", "path": "/tmp/report"}),
     ] {
-        match serde_json::from_value::<OpsArtifactReadRequest>(value) {
-            Ok(request) => assert_eq!(request.validate(), Err(OpsBridgeError::InvalidRequest)),
-            Err(_) => {}
+        if let Ok(request) = serde_json::from_value::<OpsArtifactReadRequest>(value) {
+            assert_eq!(request.validate(), Err(OpsBridgeError::InvalidRequest));
         }
     }
 
@@ -98,9 +97,8 @@ fn artifact_requests_are_exact_and_bounded() {
         json!({"handle": "artifact-handle:01234567-89ab-4def-8123-456789abcdef", "offset": 0, "length": 0}),
         json!({"handle": "artifact-handle:01234567-89ab-4def-8123-456789abcdef", "offset": 0, "length": 262145}),
     ] {
-        match serde_json::from_value::<OpsArtifactHandleReadRequest>(value) {
-            Ok(request) => assert_eq!(request.validate(), Err(OpsBridgeError::InvalidRequest)),
-            Err(_) => {}
+        if let Ok(request) = serde_json::from_value::<OpsArtifactHandleReadRequest>(value) {
+            assert_eq!(request.validate(), Err(OpsBridgeError::InvalidRequest));
         }
     }
 }

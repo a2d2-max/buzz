@@ -244,11 +244,11 @@ fn ops_bridge_endpoint_accepts_only_fixed_http_loopback_with_nonzero_port() {
 fn ops_bridge_token_file_fails_closed_on_permissions_symlink_and_empty_content() {
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
     assert!(read_hub_token(&token).is_ok());
 
     let world_readable = temp.path().join("world-readable.token");
-    write_token(&world_readable, &vec![b't'; 32], 0o644);
+    write_token(&world_readable, &[b't'; 32], 0o644);
     assert!(read_hub_token(&world_readable).is_err());
 
     let empty = temp.path().join("empty.token");
@@ -288,7 +288,7 @@ async fn ops_bridge_client_accepts_a_bounded_version_one_json_response() {
     .await;
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
 
     let client = OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client");
     let capabilities = client.capabilities().await.expect("version one response");
@@ -350,7 +350,7 @@ async fn ops_bridge_snapshot_constructs_only_the_typed_query_fields() {
     .await;
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
     let client = OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client");
 
     let snapshot = client
@@ -415,7 +415,7 @@ async fn ops_bridge_client_rejects_redirect_without_following_it() {
     .await;
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
     let client = OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client");
 
     assert!(client.capabilities().await.is_err());
@@ -431,7 +431,7 @@ async fn ops_bridge_client_rejects_redirect_without_following_it() {
 async fn ops_bridge_client_rejects_contract_drift_oversize_and_non_json() {
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
 
     let version_two = serde_json::to_vec(&json!({
         "contract_version": 2,
@@ -477,7 +477,7 @@ async fn ops_bridge_mutations_use_only_fixed_draft_and_transition_routes() {
     let (port, requests, server) = spawn_fake_server(responses).await;
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
     let client = OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client");
 
     let draft = OpsDraftRequest::Message {
@@ -868,7 +868,7 @@ async fn ops_bridge_stop_waits_for_active_task_quiescence_before_reset() {
     let (port, _requests, server) = spawn_fake_server(vec![response]).await;
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
     let client = Arc::new(OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client"));
     let watcher = Arc::new(OpsBridgeWatcher::default());
     let entered = Arc::new(Barrier::new(2));
@@ -963,7 +963,7 @@ async fn ops_bridge_watcher_reconnects_after_post_header_sse_stall() {
     let (port, requests, server) = spawn_stalled_sse_then_recovery_server(recovery_response).await;
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
     let client = Arc::new(OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client"));
     let watcher = OpsBridgeWatcher::default();
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -1055,7 +1055,7 @@ async fn ops_bridge_watcher_reconnect_before_ack_forces_sync_and_emits_no_sse_da
     let (port, requests, server) = spawn_fake_server(responses).await;
     let temp = tempfile::tempdir().expect("temp token directory");
     let token = temp.path().join("hub.token");
-    write_token(&token, &vec![b't'; 32], 0o600);
+    write_token(&token, &[b't'; 32], 0o600);
     let client = Arc::new(OpsBridgeClient::new(config(port, &token, 4096)).expect("strict client"));
     let watcher = OpsBridgeWatcher::default();
     let events = Arc::new(Mutex::new(Vec::new()));
