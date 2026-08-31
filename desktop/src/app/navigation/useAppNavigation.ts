@@ -93,6 +93,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goOps = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/ops",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goPulse = React.useCallback(
     (behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -467,6 +478,7 @@ export function useAppNavigation() {
     goNewMessage,
     goNewWorkflow,
     goNewWorkflowForChannel,
+    goOps,
     goProject,
     goProjects,
     goPulse,

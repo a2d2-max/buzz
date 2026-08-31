@@ -6,7 +6,10 @@ import { useIsFullscreen } from "@/shared/lib/useIsFullscreen";
 import { Button } from "@/shared/ui/button";
 import { DrawerPanelIcon } from "@/shared/ui/DrawerPanelIcon";
 import { cn } from "@/shared/lib/cn";
-import { topChromeBackdrop } from "@/shared/layout/chromeLayout";
+import {
+  macTrafficLightClearance,
+  topChromeBackdrop,
+} from "@/shared/layout/chromeLayout";
 import { useOptionalSidebar } from "@/shared/ui/sidebar";
 
 type AppTopChromeProps = {
@@ -73,8 +76,8 @@ export function AppTopChrome({
   const macChrome = isMacPlatform() && !isFullscreen;
   const navRowPaddingClass = macChrome
     ? hasCommunityRail
-      ? "pl-[32px]"
-      : "pl-[80px]"
+      ? macTrafficLightClearance.afterLeadingRail
+      : macTrafficLightClearance.withoutLeadingRail
     : "pl-3";
   const navRowAlignmentClass = macChrome ? "translate-y-[3px]" : null;
 

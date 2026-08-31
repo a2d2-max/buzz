@@ -1,18 +1,33 @@
-//! OS keyring access for desktop nsec private keys.
+//! Secret storage for desktop nsec private keys.
 //!
-//! All secrets are stored as a single JSON blob under one keychain entry
-//! (service = the store's service name, username = `"secrets"`). This means
-//! exactly one OS prompt per process lifetime regardless of how many keys are
-//! stored — the same pattern used by Goose.
+//! All secrets are stored as a single JSON blob under one entry
+//! (service = the store's service name, username = `"secrets"`). Two
+//! backends share that blob format:
 //!
-//! The chosen backend is selected at compile time by the per-target feature in
-//! `Cargo.toml`. On macOS the legacy `keyring` crate (SecKeychain API) is used
-//! for the blob entry so that signed release builds and unsigned dev builds
-//! share the same store. DPK (Data Protection Keychain) is used only by the
-//! one-time migration path that reads old per-key entries written by #1264.
-//! Windows and Linux use the `keyring` crate directly. The `system-keyring`
-//! feature gates the whole store; when it is off, [`SecretStore`] is unusable
-//! and callers fall back to their own `0o600` file storage.
+//! - **OS keyring** — release builds, and debug builds with
+//!   `BUZZ_DEV_USE_KEYCHAIN=1`. One keychain entry means exactly one OS
+//!   prompt per process lifetime regardless of how many keys are stored —
+//!   the same pattern used by Goose. On macOS the legacy `keyring` crate
+//!   (SecKeychain API) is used for the blob entry so that signed release
+//!   builds and keychain-opted dev builds share the same store. DPK (Data
+//!   Protection Keychain) is used only by the one-time migration path that
+//!   reads old per-key entries written by #1264. Windows and Linux use the
+//!   `keyring` crate directly.
+//! - **Plain file** — debug builds by default: `secrets.<service>.json`
+//!   (0o600) in the app-data dir. Unsigned dev binaries get a fresh code
+//!   identity on every rebuild, which invalidates the keychain item's
+//!   "Always Allow" ACL and made macOS demand the login password on every
+//!   `tauri dev` relaunch; a file sidesteps the keychain entirely. The file
+//!   store deliberately starts empty — there is NO migration from the old
+//!   `buzz-desktop-dev` keychain item. Dev keys are cheap to re-import, and
+//!   a one-shot migration would live on as dead code. Old dev keychain
+//!   items are simply never read again (every legacy-keychain path
+//!   short-circuits in file mode); clean them up manually with
+//!   `security delete-generic-password -s buzz-desktop-dev -a secrets`.
+//!
+//! The `system-keyring` feature gates the whole store; when it is off,
+//! [`SecretStore`] is unusable and callers fall back to their own `0o600`
+//! file storage.
 //!
 //! The store is deliberately NOT on any env-read path. `BUZZ_PRIVATE_KEY`
 //! resolution for harnessed agents and CI is handled upstream (an env
@@ -74,8 +89,7 @@ fn blob_lockfile_path(service: &str) -> PathBuf {
     #[cfg(unix)]
     {
         // Use the real UID so distinct users get distinct lockfiles.
-        // SAFETY: getuid() is always safe on Unix — it never fails.
-        let uid = unsafe { libc::getuid() };
+        let uid = current_user_id();
         PathBuf::from(format!("/tmp/buzz-keychain-{uid}-{service}.lock"))
     }
     #[cfg(not(unix))]
@@ -84,6 +98,12 @@ fn blob_lockfile_path(service: &str) -> PathBuf {
         // used to derive the mutex name and for test assertions.
         std::env::temp_dir().join(format!("buzz-keychain-{service}.lock"))
     }
+}
+
+#[cfg(unix)]
+fn current_user_id() -> libc::uid_t {
+    // SAFETY: getuid() is always safe on Unix — it never fails.
+    unsafe { libc::getuid() }
 }
 
 /// Acquire an exclusive advisory file lock for the blob identified by `service`.
@@ -213,22 +233,240 @@ impl Drop for BlobLockGuard {
 
 // ── End interprocess advisory lock ────────────────────────────────────────
 
-/// An OS keyring, addressed by service name. All secrets are stored in a
-/// single JSON blob entry (one OS prompt per process lifetime).
+/// Read the file backend's blob. `Ok(None)` = no file yet (fresh store —
+/// deliberately no fallback to the old dev keychain item).
+#[cfg(all(debug_assertions, feature = "system-keyring"))]
+fn read_blob_raw_file(path: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("secrets file open {}: {e}", path.display())),
+    };
+    secure_secret_file_permissions(&file, path)?;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("secrets file read {}: {e}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+#[cfg(all(debug_assertions, feature = "system-keyring", unix))]
+fn secure_secret_file_permissions(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("secrets file metadata {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "secrets path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let expected_uid = current_user_id();
+    if metadata.uid() != expected_uid {
+        return Err(format!(
+            "secrets file owner mismatch {}: expected uid {expected_uid}, got {}",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("secrets file chmod {}: {e}", path.display()))?;
+
+    let verified = file
+        .metadata()
+        .map_err(|e| format!("secrets file metadata verify {}: {e}", path.display()))?;
+    if verified.uid() != expected_uid || verified.mode() & 0o7777 != 0o600 {
+        return Err(format!(
+            "secrets file permissions verify failed {}: uid {}, mode {:o}",
+            path.display(),
+            verified.uid(),
+            verified.mode() & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(debug_assertions, feature = "system-keyring", not(unix)))]
+fn secure_secret_file_permissions(
+    _file: &std::fs::File,
+    _path: &std::path::Path,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// Atomically replace the file backend's blob: write a `0o600` sibling tmp
+/// file, fsync, rename over the final path. A crash mid-write can never leave
+/// a truncated secrets file.
+#[cfg(all(debug_assertions, feature = "system-keyring"))]
+fn write_blob_raw_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("secrets dir create {}: {e}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("secrets.json");
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts
+        .open(&tmp)
+        .map_err(|e| format!("secrets tmp open {}: {e}", tmp.display()))?;
+    secure_secret_file_permissions(&file, &tmp)?;
+    file.set_len(0)
+        .map_err(|e| format!("secrets tmp truncate {}: {e}", tmp.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("secrets tmp write: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("secrets tmp fsync: {e}"))?;
+    #[cfg(unix)]
+    {
+        std::fs::rename(&tmp, path).map_err(|e| format!("secrets file rename: {e}"))?;
+        secure_secret_file_permissions(&file, path)?;
+        file.sync_all()
+            .map_err(|e| format!("secrets file fsync {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows does not permit renaming this file while the handle is open.
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| format!("secrets file rename: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Where a [`SecretStore`]'s blob physically lives. The `File` variant is
+/// debug-only so release binaries are keyring-only by construction.
+enum SecretBackend {
+    Keyring,
+    /// Blob at this exact path (`secrets.<service>.json` in the app-data dir).
+    #[cfg(debug_assertions)]
+    File(PathBuf),
+}
+
+/// App-data dir for the debug file backend, recorded once at boot.
+#[cfg(debug_assertions)]
+static FILE_BACKEND_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the app-data dir the debug file backend stores secrets under.
+/// Must run before the first [`SecretStore::shared`] call — `lib.rs` setup
+/// does, ahead of `run_boot_reset`. Later calls are no-ops.
+#[cfg(debug_assertions)]
+pub fn init_file_backend_dir(dir: &std::path::Path) {
+    let _ = FILE_BACKEND_DIR.set(dir.to_path_buf());
+}
+
+/// Pure backend decision for debug builds: keyring when the user opted back
+/// in via `BUZZ_DEV_USE_KEYCHAIN=1` or the file dir was never initialized,
+/// otherwise the per-service secrets file (namespaced because `just dev` and
+/// a main-checkout standalone share one app-data dir with different services).
+#[cfg(debug_assertions)]
+fn select_backend(
+    use_keychain_env: Option<&str>,
+    file_dir: Option<&std::path::Path>,
+    service: &str,
+) -> SecretBackend {
+    if use_keychain_env == Some("1") {
+        return SecretBackend::Keyring;
+    }
+    match file_dir {
+        Some(dir) => SecretBackend::File(dir.join(format!("secrets.{service}.json"))),
+        None => SecretBackend::Keyring,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn backend_for(service: &str) -> SecretBackend {
+    let env = std::env::var("BUZZ_DEV_USE_KEYCHAIN").ok();
+    let backend = select_backend(
+        env.as_deref(),
+        FILE_BACKEND_DIR.get().map(|p| p.as_path()),
+        service,
+    );
+    if matches!(backend, SecretBackend::Keyring) && env.as_deref() != Some("1") {
+        eprintln!(
+            "buzz-desktop: file backend dir not initialized; \
+             using OS keychain for service {service}"
+        );
+    }
+    backend
+}
+
+#[cfg(not(debug_assertions))]
+fn backend_for(_service: &str) -> SecretBackend {
+    SecretBackend::Keyring
+}
+
+/// Secret storage addressed by service name. All secrets are stored in a
+/// single JSON blob (one OS prompt per process lifetime on the keyring
+/// backend; a `0o600` file on the debug file backend).
 pub struct SecretStore {
     service: String,
+    backend: SecretBackend,
     /// In-memory cache of the deserialized blob. `None` means "not yet loaded".
     cache: Mutex<Option<HashMap<String, String>>>,
 }
 
 impl SecretStore {
-    /// Keyring-backed store under `service`. The active platform backend
-    /// (apple-native / windows-native / sync-secret-service) is chosen at
-    /// compile time.
+    /// Keyring-backed store under `service`, unconditionally — never the
+    /// debug file backend. For the build's default backend use
+    /// [`SecretStore::shared`]. The active platform keyring (apple-native /
+    /// windows-native / sync-secret-service) is chosen at compile time.
     pub fn keyring(service: impl Into<String>) -> Self {
         SecretStore {
             service: service.into(),
+            backend: SecretBackend::Keyring,
             cache: Mutex::new(None),
+        }
+    }
+
+    /// Store for `service` on the build's default backend: the debug file
+    /// backend when active, the OS keyring otherwise.
+    pub fn for_service(service: impl Into<String>) -> Self {
+        let service = service.into();
+        let backend = backend_for(&service);
+        SecretStore {
+            service,
+            backend,
+            cache: Mutex::new(None),
+        }
+    }
+
+    /// Whether this store is on the debug file backend. Callers use this to
+    /// report `local-file` storage to the UI and to skip keychain-only work.
+    pub(crate) fn is_file_backed(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            matches!(self.backend, SecretBackend::File(_))
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
         }
     }
 
@@ -242,7 +480,7 @@ impl SecretStore {
     pub fn shared(service: &'static str) -> &'static SecretStore {
         use std::sync::OnceLock;
         static INSTANCE: OnceLock<SecretStore> = OnceLock::new();
-        INSTANCE.get_or_init(|| SecretStore::keyring(service))
+        INSTANCE.get_or_init(|| SecretStore::for_service(service))
     }
 }
 
@@ -334,19 +572,18 @@ impl SecretStore {
         Ok(Some(map))
     }
 
-    /// Read the raw blob bytes from the keychain. `Ok(None)` = not found.
+    /// Read the raw blob bytes from the active backend. `Ok(None)` = not found.
     ///
-    /// Always uses the legacy keyring crate on macOS so that signed and
-    /// unsigned (dev) builds share the same store. DPK is only used by
-    /// `migrate_legacy_key` to read old per-key entries written by #1264.
-    #[cfg(all(feature = "system-keyring", target_os = "macos"))]
+    /// The keyring path always uses the legacy keyring crate on macOS so that
+    /// signed and keychain-opted dev builds share the same store. DPK is only
+    /// used by `migrate_legacy_key` to read old per-key entries from #1264.
+    #[cfg(feature = "system-keyring")]
     fn read_blob_raw(&self) -> Result<Option<Vec<u8>>, String> {
-        self.read_blob_raw_keyring()
-    }
-
-    #[cfg(all(feature = "system-keyring", not(target_os = "macos")))]
-    fn read_blob_raw(&self) -> Result<Option<Vec<u8>>, String> {
-        self.read_blob_raw_keyring()
+        match &self.backend {
+            SecretBackend::Keyring => self.read_blob_raw_keyring(),
+            #[cfg(debug_assertions)]
+            SecretBackend::File(path) => read_blob_raw_file(path),
+        }
     }
 
     /// Read blob via the legacy `keyring` crate (Windows, Linux, or macOS dev
@@ -451,15 +688,14 @@ impl SecretStore {
         }
     }
 
-    /// Always uses the legacy keyring crate on macOS — see `read_blob_raw`.
-    #[cfg(all(feature = "system-keyring", target_os = "macos"))]
+    /// Write the raw blob bytes to the active backend — see `read_blob_raw`.
+    #[cfg(feature = "system-keyring")]
     fn write_blob_raw(&self, bytes: &[u8]) -> Result<(), String> {
-        self.write_blob_raw_keyring(bytes)
-    }
-
-    #[cfg(all(feature = "system-keyring", not(target_os = "macos")))]
-    fn write_blob_raw(&self, bytes: &[u8]) -> Result<(), String> {
-        self.write_blob_raw_keyring(bytes)
+        match &self.backend {
+            SecretBackend::Keyring => self.write_blob_raw_keyring(bytes),
+            #[cfg(debug_assertions)]
+            SecretBackend::File(path) => write_blob_raw_file(path, bytes),
+        }
     }
 
     #[cfg(feature = "system-keyring")]
@@ -480,6 +716,9 @@ impl SecretStore {
                 Ok(Some(map)) => {
                     if map.contains_key(key) {
                         KeyringProbe::Present
+                    } else if self.is_file_backed() {
+                        // File mode never consults the legacy keychain.
+                        KeyringProbe::ReachableButEmpty
                     } else {
                         // Blob exists but key absent — still check old per-key
                         // entries so a partial migration (e.g. identity migrated
@@ -487,6 +726,7 @@ impl SecretStore {
                         self.probe_legacy_key(key)
                     }
                 }
+                Ok(None) if self.is_file_backed() => KeyringProbe::ReachableButEmpty,
                 // No blob yet — check old per-key entries so callers that
                 // gate `load()` on `Present` still trigger migration.
                 Ok(None) => self.probe_legacy_key(key),
@@ -553,6 +793,9 @@ impl SecretStore {
                 Ok(Some(map)) => {
                     if let Some(value) = map.get(key) {
                         Ok(Some(value.clone()))
+                    } else if self.is_file_backed() {
+                        // File mode never consults the legacy keychain.
+                        Ok(None)
                     } else {
                         // Blob exists but key absent — attempt migration from old
                         // per-key entry. migrate_legacy_key writes the result into
@@ -560,6 +803,7 @@ impl SecretStore {
                         self.migrate_legacy_key(key)
                     }
                 }
+                Ok(None) if self.is_file_backed() => Ok(None),
                 Ok(None) => {
                     // No blob yet — attempt one-time migration from old per-key
                     // DPK entry (macOS) or return Ok(None) (other platforms).
@@ -758,6 +1002,20 @@ impl SecretStore {
         {
             let _lock = acquire_blob_lock(&self.service)?;
 
+            // File mode: deleting the file IS the complete wipe — nothing
+            // reads the keychain in this mode, so legacy entries are inert.
+            #[cfg(debug_assertions)]
+            if let SecretBackend::File(path) = &self.backend {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("secrets file delete {}: {e}", path.display())),
+                }
+                let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = None;
+                return Ok(());
+            }
+
             // Step 1: read current blob keys (best-effort; no entry = empty set).
             let blob_keys: Vec<String> = match self.read_blob_raw() {
                 Ok(Some(bytes)) => {
@@ -848,6 +1106,13 @@ impl SecretStore {
     pub fn verify_fully_wiped(&self) -> bool {
         #[cfg(feature = "system-keyring")]
         {
+            // File mode: the secrets file is the only shape `load()` can
+            // consume — its absence is the whole proof.
+            #[cfg(debug_assertions)]
+            if let SecretBackend::File(path) = &self.backend {
+                return !path.exists();
+            }
+
             // 1. Main blob must be absent.
             match self.read_blob_raw() {
                 Ok(None) => {}
@@ -904,6 +1169,11 @@ impl SecretStore {
             self.mutate_blob(|map| {
                 map.remove(key);
             })?;
+            // File mode never reads the keychain, so there is nothing a
+            // leftover legacy entry could resurrect — skip the cleanup.
+            if self.is_file_backed() {
+                return Ok(());
+            }
             // Best-effort: also delete any old per-key entry for this key to
             // prevent resurrection on the next probe/load (migration path).
             #[cfg(target_os = "macos")]
@@ -922,385 +1192,5 @@ impl SecretStore {
 }
 
 #[cfg(all(test, feature = "system-keyring"))]
-mod tests {
-    use super::*;
-
-    // Test-only constructor: pre-seed the cache without touching the OS keychain.
-    impl SecretStore {
-        fn with_cache(service: &str, cache: Option<HashMap<String, String>>) -> Self {
-            SecretStore {
-                service: service.to_string(),
-                cache: Mutex::new(cache),
-            }
-        }
-    }
-
-    #[test]
-    fn probe_returns_present_when_key_in_cache() {
-        let mut map = HashMap::new();
-        map.insert("identity".to_string(), "nsec1test".to_string());
-        let store = SecretStore::with_cache("buzz-test-cache-hit", Some(map));
-        // Cache is warm and contains "identity" — probe must return Present
-        // without touching the keychain.
-        assert_eq!(store.probe("identity"), KeyringProbe::Present);
-    }
-
-    #[test]
-    fn load_returns_value_when_key_in_cache() {
-        let mut map = HashMap::new();
-        map.insert("identity".to_string(), "nsec1test".to_string());
-        let store = SecretStore::with_cache("buzz-test-load-cache-hit", Some(map));
-        // Cache is warm and contains "identity" — load must return the value
-        // without touching the keychain.
-        assert_eq!(
-            store.load("identity").unwrap(),
-            Some("nsec1test".to_string())
-        );
-    }
-
-    // ── Cross-process race tests (require real OS keychain) ────────────────
-
-    #[ignore = "requires real OS keychain (run locally)"]
-    #[test]
-    fn test_stale_warm_cache_add_observes_prior_write() {
-        // Simulates the cross-process race that stranded Will's agent keys.
-        //
-        // Setup: two SecretStore instances for the same service (= two
-        // "processes" with separate caches). Process A warms its cache to
-        // {k1}. Process B then writes {k1, k2}. Without the fix, A's next
-        // mutate_blob would build from its stale {k1} cache and write
-        // {k1, k3}, silently dropping k2. With the fix, A always re-reads
-        // from the keychain inside the lock, so the result is {k1, k2, k3}.
-        let svc = "buzz-test-race-stale-cache";
-
-        // Clean state.
-        let setup = SecretStore::keyring(svc);
-        let _ = setup.delete("k1");
-        let _ = setup.delete("k2");
-        let _ = setup.delete("k3");
-
-        // Process A: write k1, warming its cache.
-        let store_a = SecretStore::keyring(svc);
-        store_a.store("k1", "v1").unwrap();
-
-        // Process B: write k2 (separate instance = separate cache).
-        let store_b = SecretStore::keyring(svc);
-        store_b.store("k2", "v2").unwrap();
-
-        // Process A: write k3. With the fix, A re-reads inside the lock and
-        // sees {k1, k2} before appending k3 — result must be {k1, k2, k3}.
-        store_a.store("k3", "v3").unwrap();
-
-        // Verify via a third reader (clean cache).
-        let reader = SecretStore::keyring(svc);
-        assert_eq!(
-            reader.load("k1").unwrap(),
-            Some("v1".to_string()),
-            "k1 must survive"
-        );
-        assert_eq!(
-            reader.load("k2").unwrap(),
-            Some("v2".to_string()),
-            "k2 must not be dropped"
-        );
-        assert_eq!(
-            reader.load("k3").unwrap(),
-            Some("v3".to_string()),
-            "k3 must be written"
-        );
-
-        // Cleanup.
-        let _ = reader.delete("k1");
-        let _ = reader.delete("k2");
-        let _ = reader.delete("k3");
-    }
-
-    #[ignore = "requires real OS keychain (run locally)"]
-    #[test]
-    fn test_concurrent_adds_neither_key_dropped() {
-        // Two sequential stores from distinct instances (simulating two
-        // processes each adding one key) must both be durably visible.
-        let svc = "buzz-test-race-concurrent-add";
-
-        let setup = SecretStore::keyring(svc);
-        let _ = setup.delete("agent_a");
-        let _ = setup.delete("agent_b");
-
-        let store1 = SecretStore::keyring(svc);
-        store1.store("agent_a", "nsec1aaa").unwrap();
-
-        let store2 = SecretStore::keyring(svc);
-        store2.store("agent_b", "nsec1bbb").unwrap();
-
-        let reader = SecretStore::keyring(svc);
-        assert_eq!(
-            reader.load("agent_a").unwrap(),
-            Some("nsec1aaa".to_string()),
-            "agent_a must not be dropped"
-        );
-        assert_eq!(
-            reader.load("agent_b").unwrap(),
-            Some("nsec1bbb".to_string()),
-            "agent_b must not be dropped"
-        );
-
-        // Cleanup.
-        let _ = reader.delete("agent_a");
-        let _ = reader.delete("agent_b");
-    }
-
-    #[test]
-    fn test_blob_lockfile_path_is_in_tmp_with_uid() {
-        // The lockfile must be at a deterministic per-user path under /tmp —
-        // invariant to $TMPDIR — so both a GUI-launched DMG (env-stripped by
-        // launchd) and a terminal-launched dev build resolve the same inode and
-        // achieve mutual exclusion.
-        let path = blob_lockfile_path("buzz-desktop");
-        #[cfg(unix)]
-        {
-            let uid = unsafe { libc::getuid() };
-            assert!(
-                path.starts_with("/tmp"),
-                "lockfile {path:?} must start with /tmp (not $TMPDIR)"
-            );
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            assert!(
-                name.contains(&uid.to_string()),
-                "lockfile {path:?} must contain uid {uid}"
-            );
-            assert!(
-                name.contains("buzz-keychain"),
-                "lockfile name must contain 'buzz-keychain'"
-            );
-        }
-        #[cfg(not(unix))]
-        {
-            assert!(
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains("buzz-keychain")),
-                "lockfile name must contain 'buzz-keychain'"
-            );
-        }
-    }
-
-    #[test]
-    fn test_blob_lock_acquire_and_release() {
-        // Verify the advisory lock can be acquired and released without errors.
-        // This exercises the real flock/mutex path on the current platform.
-        let guard = acquire_blob_lock("buzz-test-lock-smoke");
-        assert!(
-            guard.is_ok(),
-            "advisory lock acquire must succeed: {:?}",
-            guard.err()
-        );
-        // Drop the guard — lock is released. A second acquire must succeed.
-        drop(guard);
-        let guard2 = acquire_blob_lock("buzz-test-lock-smoke");
-        assert!(
-            guard2.is_ok(),
-            "advisory lock re-acquire after release must succeed: {:?}",
-            guard2.err()
-        );
-    }
-
-    #[ignore = "requires real OS keychain (run locally)"]
-    #[test]
-    fn mutate_blob_does_not_advance_cache_on_write_failure() {
-        // Copy-on-write safety: if `write_blob_raw` fails (denied prompt,
-        // transient outage, ACL rejection), the cache must stay at the last
-        // known durable state. A subsequent `store()` for the same key/value
-        // must NOT be skipped as a no-op — the equality check must compare
-        // against the durable cache, not an unpersisted candidate.
-        //
-        // This is a real-keychain integration test. Run locally with:
-        //   cargo test -p buzz-desktop -- --ignored mutate_blob_does_not_advance
-        //
-        // On a machine with a reachable keychain the `store()` call succeeds
-        // (result.is_ok()) and the write-failure branch is skipped — the test
-        // still passes. On a machine where the write is denied (e.g., user
-        // clicks Deny in the macOS prompt) result.is_err() and the assertions
-        // below verify the cache invariant. We verify that after an error:
-        //   1. The cache is not advanced (the previously cached key is intact).
-        //   2. The failed key is not present (the dirty candidate was discarded).
-        let mut map = HashMap::new();
-        map.insert("existing".to_string(), "durable_val".to_string());
-        let store = SecretStore::with_cache("buzz-test-cow-write-fail", Some(map));
-
-        // Attempt to add a new key — this calls write_blob_raw against the
-        // real keychain; with copy-on-write the cache must remain at {existing}
-        // if the write fails.
-        let result = store.store("new_key", "new_val");
-
-        if result.is_err() {
-            // Write failed (e.g., user denied the keychain prompt): confirm
-            // cache was not advanced — the existing key is still intact and
-            // the new key was never committed to the in-memory state.
-            assert_eq!(
-                store.load("existing").unwrap(),
-                Some("durable_val".to_string()),
-                "cache must remain at last durable state after write failure"
-            );
-            // load("new_key") goes through the unchanged cache (no entry),
-            // then attempts migrate_legacy_key which also fails on a denied
-            // keychain, returning either Ok(None) or Err — either is correct
-            // since the key was never durably stored.
-            let after = store.load("new_key");
-            assert!(
-                matches!(after, Ok(None) | Err(_)),
-                "a key whose write failed must not be visible via load: {after:?}"
-            );
-        }
-        // If result.is_ok() the write succeeded — the cache-integrity invariant
-        // does not apply to the success path; no assertion needed here.
-    }
-
-    #[test]
-    fn availability_error_discriminator() {
-        assert!(is_keyring_availability_error("dbus connection failed"));
-        assert!(is_keyring_availability_error(
-            "org.freedesktop.secrets not provided"
-        ));
-        assert!(is_keyring_availability_error("No Secret Service"));
-        assert!(is_keyring_availability_error(
-            "Platform secure storage failure"
-        ));
-        // A plain "not found" is per-entry, not an availability failure.
-        assert!(!is_keyring_availability_error("entry not found"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn dpk_error_discriminators() {
-        // errSecMissingEntitlement = -34018 signals unsigned dev build.
-        let e = SFError::from_code(-34018);
-        assert!(is_dpk_unavailable(&e));
-        assert!(!is_not_found(&e));
-        // errSecItemNotFound = -25300 is not a DPK-unavailable error.
-        let e = SFError::from_code(-25300);
-        assert!(is_not_found(&e));
-        assert!(!is_dpk_unavailable(&e));
-    }
-
-    // Integration tests that exercise the real OS keychain. Skipped in CI
-    // (unsigned builds lack keychain entitlements); run locally with:
-    //   cargo test -p buzz-desktop -- --ignored blob_
-    //
-    // Each test uses a unique service name to avoid cross-test pollution.
-
-    #[ignore = "requires real OS keychain (run locally)"]
-    #[test]
-    fn blob_stores_and_retrieves_multiple_keys() {
-        let store = SecretStore::keyring("buzz-test-blob-multi");
-        store.store("key_a", "val_a").unwrap();
-        store.store("key_b", "val_b").unwrap();
-        assert_eq!(store.load("key_a").unwrap(), Some("val_a".to_string()));
-        assert_eq!(store.load("key_b").unwrap(), Some("val_b".to_string()));
-        assert_eq!(store.load("key_c").unwrap(), None);
-        // Cleanup.
-        let _ = store.delete("key_a");
-        let _ = store.delete("key_b");
-    }
-
-    #[ignore = "requires real OS keychain (run locally)"]
-    #[test]
-    fn blob_probe_present_absent_unreachable() {
-        let store = SecretStore::keyring("buzz-test-blob-probe");
-        // No blob yet — key absent, backend reachable.
-        assert_eq!(store.probe("identity"), KeyringProbe::ReachableButEmpty);
-        store.store("identity", "nsec1test").unwrap();
-        // Key now present.
-        assert_eq!(store.probe("identity"), KeyringProbe::Present);
-        // Different key — blob exists but key absent.
-        assert_eq!(store.probe("other"), KeyringProbe::ReachableButEmpty);
-        // Cleanup.
-        let _ = store.delete("identity");
-    }
-
-    #[ignore = "requires real OS keychain (run locally)"]
-    #[test]
-    fn blob_delete_removes_key_not_others() {
-        let store = SecretStore::keyring("buzz-test-blob-delete");
-        store.store("keep", "keep_val").unwrap();
-        store.store("remove", "remove_val").unwrap();
-        store.delete("remove").unwrap();
-        assert_eq!(store.load("keep").unwrap(), Some("keep_val".to_string()));
-        assert_eq!(store.load("remove").unwrap(), None);
-        // Cleanup.
-        let _ = store.delete("keep");
-    }
-
-    #[ignore = "requires real OS keychain (run locally)"]
-    #[test]
-    fn blob_migration_from_per_key_entry() {
-        let svc = "buzz-test-blob-migration";
-        let key = "identity";
-        let value = "nsec1migrationtest";
-
-        // Seed a per-key entry (old format) — no blob exists.
-        let entry = keyring_entry(svc, key).unwrap();
-        entry.set_password(value).unwrap();
-
-        // Fresh store — no blob in the keychain yet.
-        let store = SecretStore::keyring(svc);
-
-        // probe should find the legacy key.
-        assert_eq!(store.probe(key), KeyringProbe::Present);
-
-        // load should migrate it into the blob and return the value.
-        assert_eq!(store.load(key).unwrap(), Some(value.to_string()));
-
-        // Old per-key entry should be cleaned up.
-        let entry = keyring_entry(svc, key).unwrap();
-        assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
-
-        // Key is now in the blob — probe confirms.
-        let store2 = SecretStore::keyring(svc);
-        assert_eq!(store2.probe(key), KeyringProbe::Present);
-        assert_eq!(store2.load(key).unwrap(), Some(value.to_string()));
-
-        // Cleanup.
-        let _ = store2.delete(key);
-    }
-
-    #[ignore = "requires real OS keychain (run locally)"]
-    #[test]
-    fn delete_all_with_legacy_cleanup_removes_per_key_identity() {
-        let svc = "buzz-test-delete-all-legacy";
-        let key = "identity";
-        let value = "nsec1legacytest";
-
-        // Seed a legacy per-key entry (old format, pre-blob migration).
-        let entry = keyring_entry(svc, key).unwrap();
-        entry.set_password(value).unwrap();
-
-        // Also seed a blob with a different key to exercise the full path.
-        let store = SecretStore::keyring(svc);
-        store.store("agent:abc123", "nsec1agent").unwrap();
-
-        // Legacy per-key identity should be discoverable via probe.
-        let store2 = SecretStore::keyring(svc);
-        assert_eq!(store2.probe(key), KeyringProbe::Present);
-
-        // Wipe everything via the sign-out path.
-        store2.delete_all_with_legacy_cleanup().unwrap();
-
-        // Fresh store — neither the blob nor the per-key entry should remain.
-        let store3 = SecretStore::keyring(svc);
-        assert_eq!(
-            store3.probe(key),
-            KeyringProbe::ReachableButEmpty,
-            "per-key identity must not survive delete_all_with_legacy_cleanup"
-        );
-        assert_eq!(
-            store3.load(key).unwrap(),
-            None,
-            "load must not resurrect the legacy per-key identity"
-        );
-        // Agent key should also be gone.
-        assert_eq!(store3.load("agent:abc123").unwrap(), None);
-    }
-}
+#[path = "secret_store_tests.rs"]
+mod tests;

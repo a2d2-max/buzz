@@ -472,6 +472,12 @@ pub fn migrate_agent_keys_to_dev_service(app: &tauri::AppHandle) {
     if !cfg!(feature = "system-keyring") || keyring_service() != "buzz-desktop-dev" {
         return;
     }
+    // The dev file backend deliberately starts empty (no keychain
+    // migration); reading the prod keychain here would reintroduce the
+    // password prompt that backend exists to avoid.
+    if crate::secret_store::SecretStore::shared(keyring_service()).is_file_backed() {
+        return;
+    }
 
     // Read the JSON store for pubkeys only — we want every instance
     // record without running hydrate_keys (which would try the dev
@@ -970,8 +976,7 @@ pub fn meaningful_agent_error_from_log(path: &Path) -> Option<AgentLogError> {
                 code: None,
             });
         }
-        // Bare prefixes emitted by older agent binaries whose Display still leaks
-        // unwrapped errors. Promote these so they surface instead of the generic
+        // Promote bare errors from older binaries instead of using the generic
         // "harness exited with status N" fallback.
         if line.starts_with("llm auth:") {
             return Some(AgentLogError {

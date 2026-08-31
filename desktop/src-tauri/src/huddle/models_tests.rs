@@ -17,6 +17,25 @@ fn create_ready_model_dir(root: &Path) -> PathBuf {
 }
 
 #[test]
+fn evidence_offline_policy_does_not_start_or_materialize_voice_model_downloads() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let models_dir = temp.path().join("models");
+    let manager = ModelManager {
+        models_dir: models_dir.clone(),
+        stt: ModelSlot::new(STT_MODEL_DIR_NAME, STT_EXPECTED_FILES, STT_MODEL_VERSION),
+        tts: tts_model_slot(),
+    };
+    let client = reqwest::Client::new();
+
+    manager.start_stt_download_with_policy(client.clone(), true);
+    manager.start_tts_download_with_policy(client, true);
+
+    assert!(matches!(manager.stt_status(), ModelStatus::NotDownloaded));
+    assert!(matches!(manager.tts_status(), ModelStatus::NotDownloaded));
+    assert!(!models_dir.exists());
+}
+
+#[test]
 fn expected_files_match_april_int8_metadata() {
     let mut expected = april_model_info()
         .artifacts

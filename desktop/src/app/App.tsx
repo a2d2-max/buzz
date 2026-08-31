@@ -13,6 +13,7 @@ import {
 } from "react";
 
 import { router } from "@/app/router";
+import { shouldUseLegacyCommunityApp } from "@/app/appEntryMode";
 import {
   completeCommunityViewTransition,
   replaceCommunityDestinationRoute,
@@ -40,6 +41,15 @@ import {
   type PostOnboardingNavigation,
 } from "@/features/onboarding/ui/MachineOnboardingFlow";
 import { OnboardingFlow } from "@/features/onboarding/ui/OnboardingFlow";
+import {
+  clearLocalOpsGuestMode,
+  enableLocalOpsGuestMode,
+  useLocalOpsGuestMode,
+} from "@/features/onboarding/localOpsGuestMode";
+import {
+  LocalOpsGuestApp,
+  RaouWorkspaceApp,
+} from "@/features/ops-room/ui/LocalOpsGuestApp";
 import { PendingInviteGate } from "@/features/onboarding/ui/PendingInviteGate";
 import { KeyringLockedScreen } from "@/features/onboarding/ui/KeyringLockedScreen";
 import { RelaunchRequiredScreen } from "@/features/onboarding/ui/RelaunchRequiredScreen";
@@ -690,6 +700,7 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
       : undefined,
     isSharedIdentity: sharedIdentity,
   });
+  const localOpsGuestMode = useLocalOpsGuestMode();
   const [machineInitialPage, setMachineInitialPage] =
     useState<MachineOnboardingPage>();
   const [postOnboardingNav, setPostOnboardingNav] =
@@ -729,6 +740,16 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
     }
   }, [machine.stage, postOnboardingNav]);
 
+  useEffect(() => {
+    if (
+      localOpsGuestMode &&
+      !machine.identityLost &&
+      machine.stage !== "blocking"
+    ) {
+      clearLocalOpsGuestMode();
+    }
+  }, [localOpsGuestMode, machine.identityLost, machine.stage]);
+
   const openAddCommunity = useCallback(
     (payload: AddCommunityDeepLinkPayload & { requestId: string }) =>
       activeCommunity
@@ -762,6 +783,9 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   if (machine.stage === "keyring-locked") return <KeyringLockedScreen />;
   if (machine.stage === "relaunch-required") return <RelaunchRequiredScreen />;
   if (machine.stage === "blocking") return <AppLoadingGate />;
+  if (machine.identityLost && localOpsGuestMode) {
+    return <LocalOpsGuestApp onRestoreIdentity={clearLocalOpsGuestMode} />;
+  }
   if (machine.stage === "ready") {
     return (
       <CommunityApp
@@ -785,6 +809,7 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
     <>
       <MachineOnboardingFlow
         complete={completeMachineOnboarding}
+        continueInLocalOpsMode={enableLocalOpsGuestMode}
         continueWithIdentity={machine.continueWithIdentity}
         continueWithRecoveredIdentity={machine.continueWithRecoveredIdentity}
         identityLost={machine.identityLost}
@@ -797,7 +822,7 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   );
 }
 
-export function App() {
+export function LegacyCommunityApp() {
   useReloadShortcut();
   useCloseWindowShortcut();
   useInitialRenderReady();
@@ -819,5 +844,32 @@ export function App() {
     <QueryClientProvider client={queryClient}>
       <MachineBootstrap sharedIdentity={sharedIdentity} />
     </QueryClientProvider>
+  );
+}
+
+export function isLegacyCompatibilityAdapterActive(): boolean {
+  return shouldUseLegacyCommunityApp({
+    href: window.location.href,
+    huddleChannelId: huddleWindowChannelId(),
+  });
+}
+
+function RaouPrimaryApp() {
+  useReloadShortcut();
+  useCloseWindowShortcut();
+  useInitialRenderReady();
+  const [queryClient] = useState(createBuzzQueryClient);
+  return (
+    <QueryClientProvider client={queryClient}>
+      <RaouWorkspaceApp />
+    </QueryClientProvider>
+  );
+}
+
+export function App() {
+  return isLegacyCompatibilityAdapterActive() ? (
+    <LegacyCommunityApp />
+  ) : (
+    <RaouPrimaryApp />
   );
 }

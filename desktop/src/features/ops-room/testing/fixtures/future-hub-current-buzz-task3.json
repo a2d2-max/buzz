@@ -1,0 +1,14 @@
+{
+  "contract_version": 1,
+  "reads": ["snapshot", "events", "artifact"],
+  "drafts": [],
+  "transitions": [],
+  "modules": [
+    {
+      "name": "future_unknown_module",
+      "schema_version": 1,
+      "paged": true,
+      "collection_revision": 0
+    }
+  ]
+}

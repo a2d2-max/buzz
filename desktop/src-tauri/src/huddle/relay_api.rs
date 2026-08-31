@@ -184,7 +184,7 @@ pub(crate) async fn connect_audio_relay(
     state: &AppState,
 ) -> Result<(CancellationToken, tokio::sync::mpsc::Sender<Vec<u8>>), String> {
     let relay_url = crate::relay::relay_ws_url_with_override(state);
-    let keys = state.keys.lock().map_err(|e| e.to_string())?.clone();
+    let keys = state.signing_keys()?;
 
     // TTS interrupt flags — recv task cancels TTS when remote humans speak.
     let (

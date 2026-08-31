@@ -238,6 +238,7 @@ pub fn start_managed_agent_runtime(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
+    app.state::<AppState>().require_active_identity()?;
     start_managed_agent_runtime_pair_lazy(pubkey, relay_url, app)
 }
 
@@ -387,6 +388,7 @@ pub fn restart_managed_agent_runtime(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
+    app.state::<AppState>().require_active_identity()?;
     stop_managed_agent_runtime(pubkey.clone(), relay_url.clone(), app.clone())?;
     start_pair(pubkey, relay_url, true, None, app)
 }

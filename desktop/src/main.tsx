@@ -1,8 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { App } from "@/app/App";
+import { App, isLegacyCompatibilityAdapterActive } from "@/app/App";
 import { RootErrorBoundary } from "@/app/RootErrorBoundary";
+import { applyRaouDocumentTheme } from "@/app/raouDocumentTheme";
 import { NostrBindConsentDialog } from "@/features/profile/ui/NostrBindConsentDialog";
+import { useLocalOpsGuestMode } from "@/features/onboarding/localOpsGuestMode";
 import "@fontsource-variable/inter/opsz.css";
 import "@fontsource-variable/inter/opsz-italic.css";
 import "@fontsource/jetbrains-mono/400.css";
@@ -14,6 +16,7 @@ import { CommunitiesProvider } from "@/features/communities/useCommunities";
 import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnboarding";
 import { ThemeProvider } from "@/shared/theme/ThemeProvider";
+import { FixedDarkThemeProvider } from "@/shared/theme/FixedDarkThemeProvider";
 import { EmojiBurstProvider } from "@/shared/ui/EmojiBurstProvider";
 import { PoofBurstProvider } from "@/shared/ui/PoofBurstProvider";
 import { Toaster } from "@/shared/ui/sonner";
@@ -79,33 +82,47 @@ function configureDevE2eBridgeFromUrl() {
 }
 
 function renderApp() {
-  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-    <React.StrictMode>
-      {/* block/buzz#5078 — catch any uncaught render error so a WebKit
-          SecurityError from localStorage can't blank the whole window. */}
+  const legacyCompatibility = isLegacyCompatibilityAdapterActive();
+  if (!legacyCompatibility) applyRaouDocumentTheme();
+  const app = legacyCompatibility ? (
+    <RootErrorBoundary>
+      <CommunitiesProvider>
+        <CommunityOnboardingProvider enabled={huddleWindowChannelId() === null}>
+          <ThemeProvider defaultTheme="buzz">
+            <TooltipProvider>
+              <EmojiBurstProvider>
+                <PoofBurstProvider>
+                  <UpdaterProvider>
+                    <App />
+                    <LegacyIdentityBoundGlobalSurfaces />
+                  </UpdaterProvider>
+                  <Toaster />
+                </PoofBurstProvider>
+              </EmojiBurstProvider>
+            </TooltipProvider>
+          </ThemeProvider>
+        </CommunityOnboardingProvider>
+      </CommunitiesProvider>
+    </RootErrorBoundary>
+  ) : (
+    <FixedDarkThemeProvider>
       <RootErrorBoundary>
-        <CommunitiesProvider>
-          <CommunityOnboardingProvider
-            enabled={huddleWindowChannelId() === null}
-          >
-            <ThemeProvider defaultTheme="buzz">
-              <TooltipProvider>
-                <EmojiBurstProvider>
-                  <PoofBurstProvider>
-                    <UpdaterProvider>
-                      <App />
-                      <NostrBindConsentDialog />
-                    </UpdaterProvider>
-                    <Toaster />
-                  </PoofBurstProvider>
-                </EmojiBurstProvider>
-              </TooltipProvider>
-            </ThemeProvider>
-          </CommunityOnboardingProvider>
-        </CommunitiesProvider>
+        <TooltipProvider>
+          <App />
+        </TooltipProvider>
       </RootErrorBoundary>
-    </React.StrictMode>,
+    </FixedDarkThemeProvider>
   );
+
+  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+    <React.StrictMode>{app}</React.StrictMode>,
+  );
+}
+
+function LegacyIdentityBoundGlobalSurfaces() {
+  const localOpsGuestMode = useLocalOpsGuestMode();
+  if (!isLegacyCompatibilityAdapterActive() || localOpsGuestMode) return null;
+  return <NostrBindConsentDialog />;
 }
 
 async function installE2eBridgeIfConfigured() {
@@ -130,7 +147,9 @@ async function bootstrap() {
   initializeFontSizePreference();
   startLocalStorageSweep();
   await installE2eBridgeIfConfigured();
-  await migrateLegacyCommunityStorageBeforeRender();
+  if (isLegacyCompatibilityAdapterActive()) {
+    await migrateLegacyCommunityStorageBeforeRender();
+  }
   renderApp();
 }
 

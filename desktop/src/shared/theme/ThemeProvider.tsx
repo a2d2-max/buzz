@@ -56,7 +56,7 @@ export const ACCENT_COLORS = [
 
 const DEFAULT_ACCENT = "#3b82f6";
 
-type ThemeContextValue = {
+export type ThemeContextValue = {
   themeName: string;
   selectedThemeName: string;
   isDark: boolean;
@@ -87,7 +87,9 @@ type ThemeProviderProps = {
   defaultTheme?: SyntaxThemeName;
 };
 
-const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
+export const ThemeContext = createContext<ThemeContextValue | undefined>(
+  undefined,
+);
 
 function isValidThemeName(name: string): name is SyntaxThemeName {
   return (SYNTAX_THEMES as readonly string[]).includes(name);

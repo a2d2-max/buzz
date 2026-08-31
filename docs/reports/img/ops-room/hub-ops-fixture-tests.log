@@ -1,0 +1,30 @@
+
+> test:one
+> node --experimental-strip-types --no-warnings=ExperimentalWarning --test tests/hub/testing/ops-room-fixture.test.ts
+
+✔ fresh fixture starts loopback-only with a deterministic redacted complete Ops room (58.219209ms)
+✔ actual fixture Ops snapshot emits only decisions with non-empty public contract text (24.485709ms)
+✔ marked fixture restarts without reseeding and preserves token and public aliases (34.574208ms)
+✔ marked fixture restart preserves evidence counters instead of erasing prior attempts (21.822541ms)
+✔ fixture restart rejects a foreign or forged public alias cache row (22.894ms)
+✔ fixture restart accepts a legitimate subset of emitted public alias cache rows (32.645416ms)
+✔ fixture restart rejects an arbitrary Hub database before private work can be served (26.911708ms)
+✔ fixture restart rejects an added audit reason before legacy snapshot can expose it (16.87775ms)
+✔ fixture restart rejects add, change, or deletion in every canonical Ops seed table (174.830875ms)
+✔ fixture restart rejects self-consistent identity for canonical content that differs from the current seed (21.418416ms)
+✔ fixture restart rejects a schema-deviated database (15.549334ms)
+✔ fixture restart rejects self-consistent identity for schema that differs from the current fixture schema (15.095667ms)
+✔ fixture restart rejects an unreadable database without rewriting it (13.496875ms)
+✔ fixture refuses the production state directory and every unmarked or mismatched existing state (14.722333ms)
+✔ fixture restart refuses a symlinked database (14.271167ms)
+✔ fixture restart refuses a symlinked counters file without changing its target (14.45ms)
+✔ fixture restart refuses a marked state directory with broadened permissions (14.130125ms)
+✔ fixture CLI requires safe environment input and prints only ready and port (196.281375ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 921.483833

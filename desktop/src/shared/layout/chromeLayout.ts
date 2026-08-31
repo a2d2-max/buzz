@@ -15,6 +15,15 @@ export const chromeCssVarDefaults = {
   [chromeCssVars.channelContentTopPadding]: CHANNEL_CONTENT_TOP_PADDING_DEFAULT,
 } as const;
 
+// Fixed px on purpose: these insets clear the fixed-size native macOS traffic
+// lights configured in `tauri.conf.json`. They must not follow Cmd +/- text
+// zoom. Surfaces without a leading rail use the full clearance; surfaces next
+// to the community rail only clear the remaining native-control band.
+export const macTrafficLightClearance = {
+  afterLeadingRail: "pl-[32px]",
+  withoutLeadingRail: "pl-[80px]",
+} as const;
+
 export const channelContentTopPaddingMeasurement = {
   cssVariable: chromeCssVars.channelContentTopPadding,
   resetValue: chromeCssVarDefaults[chromeCssVars.channelContentTopPadding],

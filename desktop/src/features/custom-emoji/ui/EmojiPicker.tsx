@@ -1,7 +1,7 @@
 import Picker from "@emoji-mart/react";
 import * as React from "react";
 
-import { buildCustomEmojiCategory } from "@/features/custom-emoji/emojiMartCategory";
+import { useReactiveCustomEmojiCategory } from "@/features/custom-emoji/emojiMartCategory";
 import { useCustomEmoji } from "@/features/custom-emoji/hooks";
 import { emojiMartData } from "@/features/custom-emoji/ui/emojiMartPrewarm";
 
@@ -92,10 +92,7 @@ export const EmojiPicker = React.memo(function EmojiPicker({
   perLine = 8,
 }: EmojiPickerProps) {
   const customEmoji = useCustomEmoji();
-  const custom = React.useMemo(
-    () => buildCustomEmojiCategory(customEmoji),
-    [customEmoji],
-  );
+  const custom = useReactiveCustomEmojiCategory(customEmoji);
   const hostRef = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {

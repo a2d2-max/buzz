@@ -5,7 +5,7 @@ import { useAvatarPresentation } from "@/features/profile/avatarPresentationStor
 import { parseAnimatedAvatarUrl } from "@/shared/lib/animatedAvatar";
 import { cn } from "@/shared/lib/cn";
 import { getInitials } from "@/shared/lib/initials";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { Avatar, AvatarFallback, AvatarImage } from "@/shared/ui/avatar";
 import { Spinner } from "@/shared/ui/spinner";
 
@@ -73,13 +73,9 @@ export function ProfileAvatar({
   // network-capable scheme is suppressed to the placeholder. This keeps emoji
   // avatars (persisted as inline `data:image/svg+xml`) visible while blocking
   // the up-to-64 attacker-chosen host fetches Carl flagged.
-  const liveSrc = !baseUrl
-    ? null
-    : untrusted
-      ? isInlineDataUrl(baseUrl)
-        ? baseUrl
-        : null
-      : rewriteRelayUrl(baseUrl);
+  const rewritableUrl =
+    untrusted && baseUrl && !isInlineDataUrl(baseUrl) ? null : baseUrl;
+  const liveSrc = useRewrittenRelayUrl(rewritableUrl);
   const [failedSrc, setFailedSrc] = React.useState<string | null>(null);
   const liveFailed = liveSrc !== null && failedSrc === liveSrc;
 

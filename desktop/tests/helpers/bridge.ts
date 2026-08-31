@@ -1,6 +1,7 @@
 import type { Page } from "@playwright/test";
 import type { ChannelTemplate, RelayEvent } from "../../src/shared/api/types";
 import type { MockManagedAgentSeed } from "../../src/testing/e2eBridge";
+import type { DormantOpsModuleName } from "../../src/features/ops-room/opsDormantContracts";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
 export const TEST_IDENTITIES = {
@@ -144,7 +145,23 @@ type MockInstallRuntimeResult = {
   log_path?: string | null;
 };
 
+type MockOpsPage<T extends Record<string, unknown>> = {
+  contract_version: 1;
+  revision: number;
+  generated_at: string;
+  items: T[];
+  next_cursor: string | null;
+};
+type MockOpsPageModule =
+  | "timeline"
+  | "artifacts"
+  | "research"
+  | "repositories"
+  | DormantOpsModuleName;
+
 type MockBridgeOptions = {
+  /** Force local Ops capabilities discovery to fail before data loading. */
+  opsCapabilitiesError?: "disconnected" | "not_configured";
   /** Tauri window label exposed to the app. Defaults to the main window. */
   windowLabel?: string;
   ttsSettings?: {
@@ -472,6 +489,27 @@ type MockBridgeOptions = {
   identityLocked?: boolean;
   /** Delay (ms) applied to identity import so specs can observe pending navigation. */
   identityImportDelayMs?: number;
+  /** Deterministic capabilities returned by the local Ops E2E bridge. */
+  opsCapabilities?: Record<string, unknown>;
+  /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
+  opsSnapshot?: Record<string, unknown>;
+  opsSnapshotError?: "disconnected";
+  /** Strict deterministic page fixtures keyed by the fixed Ops module enum. */
+  opsPages?: Partial<
+    Record<MockOpsPageModule, MockOpsPage<Record<string, unknown>>>
+  >;
+  opsRawPages?: Partial<Record<MockOpsPageModule, unknown>>;
+  /** Typed cursor errors returned by the fixed page command. */
+  opsPageErrors?: Partial<
+    Record<
+      MockOpsPageModule,
+      | "invalid_cursor"
+      | "stale_cursor"
+      | "unavailable"
+      | "disconnected"
+      | "disconnected_once"
+    >
+  >;
   /**
    * Pending community deep links seeded into the mocked Rust-side queue.
    * The frontend drains these on boot into onboarding or an editable Add

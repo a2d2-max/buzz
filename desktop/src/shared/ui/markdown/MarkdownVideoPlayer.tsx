@@ -1,6 +1,6 @@
 import * as React from "react";
 
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 
 import { VideoPlayer, type VideoReviewContext } from "../VideoPlayer";
@@ -46,7 +46,7 @@ export function MarkdownVideoPlayer({
   // Look up poster frame from imeta tags (NIP-71 `image` field).
   // Fall back to `thumb` for compatibility with older events.
   const posterUrl = entry?.image ?? entry?.thumb;
-  const resolvedPoster = posterUrl ? rewriteRelayUrl(posterUrl) : undefined;
+  const resolvedPoster = useRewrittenRelayUrl(posterUrl ?? null) ?? undefined;
   const resolvedReviewContext = React.useMemo(
     () =>
       videoReviewContext

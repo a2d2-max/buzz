@@ -11,6 +11,7 @@ use super::{models, pipeline::maybe_start_stt_pipeline};
 /// existing pipeline if already running.
 #[tauri::command]
 pub async fn start_stt_pipeline(state: State<'_, AppState>) -> Result<(), String> {
+    state.require_active_identity()?;
     let ephemeral_channel_id = {
         let mut hs = state.huddle()?;
         let ephemeral_channel_id = hs

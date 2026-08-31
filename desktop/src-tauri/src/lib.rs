@@ -1,5 +1,6 @@
 #![recursion_limit = "256"] // Deep Tauri command futures exceed the default layout query depth.
 mod app_menu;
+mod app_runtime;
 mod app_state;
 mod archive;
 mod builderlab;
@@ -9,6 +10,7 @@ mod deep_link;
 mod egress_guard;
 mod event_sync;
 mod events;
+mod evidence_offline;
 mod huddle;
 mod identity_storage;
 mod initial_window;
@@ -33,6 +35,7 @@ mod native_websocket_batch;
 mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
+mod ops_bridge;
 mod persona_catalog;
 mod prevent_sleep;
 mod ptt_shortcut;
@@ -96,29 +99,7 @@ use tauri_plugin_window_state::StateFlags;
 use tray_menu::show_main_window;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // mesh-llm async chains overflow tokio's default 2 MiB stacks; run on 8 MiB like upstream.
-    #[cfg(feature = "mesh-llm")]
-    match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(crate::mesh_llm::MESH_WORKER_STACK_SIZE)
-        .build()
-    {
-        Ok(runtime) => {
-            tauri::async_runtime::set(runtime.handle().clone());
-            // Keep the runtime alive for the process lifetime; dropping it
-            // would shut down the workers Tauri now depends on.
-            std::mem::forget(runtime);
-            eprintln!(
-                "buzz-mesh: installed tokio runtime with {} MiB worker stacks",
-                crate::mesh_llm::MESH_WORKER_STACK_SIZE / (1024 * 1024)
-            );
-        }
-        Err(error) => {
-            // Fall back to Tauri's default runtime: the app still works,
-            // only deep mesh-llm futures are at risk of stack overflow.
-            eprintln!("buzz-mesh: failed to build big-stack tokio runtime, using default: {error}");
-        }
-    }
+    app_runtime::install_mesh_runtime();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // Focus the existing window when a duplicate instance launches.
@@ -233,8 +214,25 @@ pub fn run() {
         .manage(native_relay_client::NativeRelayClient::default())
         .manage(observed_unread::ObservedUnreadStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
+        .manage(ops_bridge::OpsBridgeState::from_env())
+        .manage(ops_bridge::OpsArtifactState::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            let evidence_offline = crate::evidence_offline::enabled();
+            if evidence_offline {
+                eprintln!("buzz-desktop: evidence offline mode enabled");
+            }
+            match app_handle.path().app_cache_dir() {
+                Ok(artifact_cache) => {
+                    if let Err(error) = app_handle
+                        .state::<ops_bridge::OpsArtifactState>()
+                        .initialize(artifact_cache)
+                    {
+                        eprintln!("buzz-desktop: artifact cache unavailable: {error}");
+                    }
+                }
+                Err(error) => eprintln!("buzz-desktop: artifact cache unavailable: {error}"),
+            }
             #[cfg(target_os = "macos")]
             {
                 tray_menu::init(&app_handle)?;
@@ -248,6 +246,10 @@ pub fn run() {
             // init_nest_dir is called early here (normally it runs inside
             // run_boot_migrations) so reset::run_boot_reset can call nest_dir().
             let reset_outcome = if let Ok(data_dir) = app_handle.path().app_data_dir() {
+                // Must precede the first SecretStore::shared() call (the boot
+                // reset below) so debug builds resolve the file backend.
+                #[cfg(debug_assertions)]
+                crate::secret_store::init_file_backend_dir(&data_dir);
                 let is_dev_for_reset = data_dir
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -347,10 +349,16 @@ pub fn run() {
             // MeshLLM's native admission and transport.
             #[cfg(feature = "mesh-llm")]
             {
-                // Route mesh-llm's download progress (model weights, runtime)
-                // onto Tauri events so the UI can render real progress.
-                crate::mesh_llm::install_progress_sink(&app_handle);
-                tauri::async_runtime::spawn(crate::mesh_llm::start_coordinator(app_handle.clone()));
+                if evidence_offline {
+                    eprintln!("buzz-desktop: evidence offline mode: mesh coordinator disabled");
+                } else {
+                    // Route mesh-llm's download progress (model weights, runtime)
+                    // onto Tauri events so the UI can render real progress.
+                    crate::mesh_llm::install_progress_sink(&app_handle);
+                    tauri::async_runtime::spawn(crate::mesh_llm::start_coordinator(
+                        app_handle.clone(),
+                    ));
+                }
             }
 
             // Start the localhost media streaming proxy. Uses the shared HTTP
@@ -443,7 +451,16 @@ pub fn run() {
             // has no relay override to the localhost fallback. Preserve the
             // boot-time repos and identity recovery safety gates by only marking
             // restoration pending when both allow it.
-            if restore_agents && !recovery_mode {
+            // Evidence runs must never mutate user/system processes or publish
+            // pending events. Local work under their isolated HOME is allowed,
+            // but managed-agent restore can spawn a child, the system sweep can
+            // kill foreign process groups, and the event loop can publish.
+            let startup_side_effect_policy = crate::evidence_offline::startup_side_effect_policy(
+                evidence_offline,
+                restore_agents,
+                recovery_mode,
+            );
+            if startup_side_effect_policy.allow_managed_agent_restore {
                 state
                     .managed_agent_restore_pending
                     .store(true, Ordering::Release);
@@ -453,40 +470,46 @@ pub fn run() {
             // Catches agents that escaped both the Justfile trap and boot-time
             // reaping (e.g. a `just staging` Ctrl+C leak that only gets collected
             // by a different instance's periodic sweep).
-            let sweep_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use std::collections::HashSet;
-                use std::time::Duration;
-                use tauri::Manager;
-                let instance_id = managed_agents::current_instance_id(&sweep_handle);
-                let state = sweep_handle.state::<AppState>();
-                // Two-tick grace: only reap same-instance orphans seen on two
-                // consecutive sweeps. Prevents killing a legitimately-starting
-                // agent that spawned between the skip-list snapshot and the scan.
-                let mut prev_orphans: HashSet<u32> = HashSet::new();
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    // Collect PIDs of our own live agents to avoid killing them.
-                    let skip_pids: Vec<u32> = state
-                        .managed_agent_processes
-                        .lock()
-                        .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
+            if startup_side_effect_policy.start_periodic_agent_sweep {
+                let sweep_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use std::collections::HashSet;
+                    use std::time::Duration;
+                    use tauri::Manager;
+                    let instance_id = managed_agents::current_instance_id(&sweep_handle);
+                    let state = sweep_handle.state::<AppState>();
+                    // Two-tick grace: only reap same-instance orphans seen on two
+                    // consecutive sweeps. Prevents killing a legitimately-starting
+                    // agent that spawned between the skip-list snapshot and the scan.
+                    let mut prev_orphans: HashSet<u32> = HashSet::new();
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        // Collect PIDs of our own live agents to avoid killing them.
+                        let skip_pids: Vec<u32> = state
+                            .managed_agent_processes
+                            .lock()
+                            .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
+                            .unwrap_or_default();
+                        let prev = prev_orphans.clone();
+                        let inst = instance_id.clone();
+                        // Run the blocking syscall work off the async executor.
+                        let new_orphans = tauri::async_runtime::spawn_blocking(move || {
+                            let orphans = managed_agents::sweep_system_agent_processes_with_grace(
+                                &inst, &skip_pids, &prev,
+                            );
+                            managed_agents::reap_dead_instance_agents(&inst, &skip_pids);
+                            orphans
+                        })
+                        .await
                         .unwrap_or_default();
-                    let prev = prev_orphans.clone();
-                    let inst = instance_id.clone();
-                    // Run the blocking syscall work off the async executor.
-                    let new_orphans = tauri::async_runtime::spawn_blocking(move || {
-                        let orphans = managed_agents::sweep_system_agent_processes_with_grace(
-                            &inst, &skip_pids, &prev,
-                        );
-                        managed_agents::reap_dead_instance_agents(&inst, &skip_pids);
-                        orphans
-                    })
-                    .await
-                    .unwrap_or_default();
-                    prev_orphans = new_orphans;
-                }
-            });
+                        prev_orphans = new_orphans;
+                    }
+                });
+            } else {
+                eprintln!(
+                    "buzz-desktop: evidence offline mode: managed-agent system sweep disabled"
+                );
+            }
 
             // Drain events the retention store flagged `pending_sync` (UI
             // create/edit, delete tombstones, launch reconcile) to the relay.
@@ -495,7 +518,7 @@ pub fn run() {
             // the next sweep.
             // Skipped in recovery mode — flushing under an ephemeral key would
             // publish events attributed to an identity the user doesn't own.
-            if !recovery_mode {
+            if startup_side_effect_policy.start_periodic_event_publish {
                 let flush_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use std::time::Duration;
@@ -513,10 +536,25 @@ pub fn run() {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
                 });
+            } else if evidence_offline {
+                eprintln!("buzz-desktop: evidence offline mode: periodic event publish disabled");
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ops_bridge::ops_bridge_capabilities,
+            ops_bridge::ops_bridge_snapshot,
+            ops_bridge::ops_bridge_page,
+            ops_bridge::ops_bridge_research_detail,
+            ops_bridge::ops_bridge_repository_detail,
+            ops_bridge::ops_bridge_read_artifact,
+            ops_bridge::ops_bridge_read_artifact_handle,
+            ops_bridge::ops_bridge_release_artifact_handle,
+            ops_bridge::ops_bridge_create_draft,
+            ops_bridge::ops_bridge_transition,
+            ops_bridge::ops_bridge_start_watch,
+            ops_bridge::ops_bridge_stop_watch,
+            ops_bridge::ops_bridge_ack_sync,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,
@@ -914,9 +952,27 @@ pub fn run() {
             if is_restart_request(code) {
                 restart_requested.store(true, Ordering::SeqCst);
             }
+            app_handle
+                .state::<ops_bridge::OpsBridgeState>()
+                .stop_watch_now();
+            if let Err(error) = app_handle
+                .state::<ops_bridge::OpsArtifactState>()
+                .shutdown_cleanup()
+            {
+                eprintln!("buzz-desktop: artifact cleanup failed: {error}");
+            }
             shut_down_app(app_handle, &run_shutdown_done);
         }
         RunEvent::Exit => {
+            app_handle
+                .state::<ops_bridge::OpsBridgeState>()
+                .stop_watch_now();
+            if let Err(error) = app_handle
+                .state::<ops_bridge::OpsArtifactState>()
+                .shutdown_cleanup()
+            {
+                eprintln!("buzz-desktop: artifact cleanup failed: {error}");
+            }
             shut_down_app(app_handle, &run_shutdown_done);
             app_handle.state::<ClipboardState>().release();
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
@@ -924,11 +980,8 @@ pub fn run() {
                 relaunch_after_mesh_shutdown(app_handle);
             }
 
-            // AppKit terminates through libc exit(), which runs C++ static
-            // destructors. The embedded ggml/Metal runtime currently aborts in
-            // that destructor phase even after its node has stopped cleanly.
-            // End the process only after Buzz and Mesh shutdown above, while
-            // deliberately skipping those native global destructors.
+            // AppKit's libc exit() runs C++ static destructors; embedded ggml/Metal
+            // aborts there, so skip them only after Buzz and Mesh shut down above.
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
             hard_exit_after_mesh_shutdown();
         }

@@ -245,7 +245,7 @@ test("resolveSnapshotCard: uppercase .AGENT.JSON classifies as snapshot card", (
 
 // ── snapshot card thumbnails ─────────────────────────────────────────────────
 
-test("resolveSnapshotCard: keeps canonical PNG URL for actions", () => {
+test("resolveSnapshotCard: keeps canonical PNG URLs for the reactive card boundary", () => {
   const card = resolveSnapshotCard(
     { m: "image/png", size: 2048, filename: "bot.agent.png", x: SHA256 },
     PNG_URL,
@@ -257,11 +257,7 @@ test("resolveSnapshotCard: keeps canonical PNG URL for actions", () => {
     card.thumb != null,
     "PNG card must have a thumb set from its own URL",
   );
-  assert.notEqual(
-    card.thumb,
-    card.href,
-    "only the display thumbnail may use the local media proxy",
-  );
+  assert.equal(card.thumb, card.href);
 });
 
 test("resolveSnapshotCard: .agent.json without thumb field yields undefined thumb", () => {

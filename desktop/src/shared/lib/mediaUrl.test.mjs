@@ -293,9 +293,10 @@ test("resetMediaCaches: ignores relay origin lookups from the previous generatio
   };
 
   try {
-    // A unique URL triggers module-load fetching with the stale relay lookup
-    // still unresolved, matching a cold launch before applyCommunity finishes.
+    // The legacy media consumer explicitly starts fetching only when it needs
+    // relay classification; RAOU primary imports must remain side-effect-free.
     const mediaUrl = await import(`./mediaUrl.ts?race=${Date.now()}`);
+    mediaUrl.ensureRelayOriginFetch();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     mediaUrl.resetMediaCaches();
@@ -336,12 +337,32 @@ test("rewriteRelayUrl: matches relay origin case-insensitively (uppercase saved 
 
   try {
     const mediaUrl = await import(`./mediaUrl.ts?case=${Date.now()}`);
+    const relayMediaUrl = `https://pending-seed.communities.buzz.xyz/media/${HASH}.png`;
+    assert.equal(mediaUrl.rewriteRelayUrl(relayMediaUrl), relayMediaUrl);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const relayMediaUrl = `https://pending-seed.communities.buzz.xyz/media/${HASH}.png`;
     assert.equal(
       mediaUrl.rewriteRelayUrl(relayMediaUrl),
       `http://127.0.0.1:54321/media/${HASH}.png`,
+    );
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("rewriteRelayUrl: known relay media uses the authenticated fallback while the proxy port is unavailable", async () => {
+  const previousWindow = globalThis.window;
+  globalThis.window = undefined;
+
+  try {
+    const mediaUrl = await import(
+      `./mediaUrl.ts?knownRelayFallback=${Date.now()}`
+    );
+    mediaUrl.beginRelayOriginFetch()("https://relay.example");
+
+    assert.equal(
+      mediaUrl.rewriteRelayUrl(`https://relay.example/media/${HASH}.png`),
+      `buzz-media://localhost/media/${HASH}.png`,
     );
   } finally {
     globalThis.window = previousWindow;
@@ -365,9 +386,10 @@ test("rewriteRelayUrl: still passes external Blossom URLs through unchanged", as
 
   try {
     const mediaUrl = await import(`./mediaUrl.ts?external=${Date.now()}`);
+    const externalUrl = `https://nostr.build/media/${HASH}.png`;
+    assert.equal(mediaUrl.rewriteRelayUrl(externalUrl), externalUrl);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const externalUrl = `https://nostr.build/media/${HASH}.png`;
     assert.equal(mediaUrl.rewriteRelayUrl(externalUrl), externalUrl);
   } finally {
     globalThis.window = previousWindow;

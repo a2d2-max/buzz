@@ -167,12 +167,28 @@ fn identity_from_env() -> Option<Keys> {
 /// must never substitute a redirect-following client on build failure. Shares
 /// the localhost `resolve`/pool config with the app-wide `http_client`.
 pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
         .pool_idle_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(1)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = match crate::evidence_offline::proxy_url() {
+        Some(proxy) => builder.proxy(reqwest::Proxy::all(proxy)?),
+        None => builder,
+    };
+    builder.build()
+}
+
+fn build_app_http_client() -> reqwest::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .pool_idle_timeout(std::time::Duration::from_secs(300))
+        .pool_max_idle_per_host(2);
+    let builder = match crate::evidence_offline::proxy_url() {
+        Some(proxy) => builder.proxy(reqwest::Proxy::all(proxy)?),
+        None => builder,
+    };
+    builder.build()
 }
 
 pub fn build_app_state() -> AppState {
@@ -192,12 +208,13 @@ pub fn build_app_state() -> AppState {
     AppState {
         keys: Mutex::new(keys),
         identity_storage: AtomicU8::new(identity_storage as u8),
-        http_client: reqwest::Client::builder()
-            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-            .pool_idle_timeout(std::time::Duration::from_secs(300))
-            .pool_max_idle_per_host(2)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
+        http_client: build_app_http_client().unwrap_or_else(|error| {
+            assert!(
+                !crate::evidence_offline::enabled(),
+                "evidence offline HTTP client must fail closed: {error}"
+            );
+            reqwest::Client::new()
+        }),
         media_fetch_client: build_media_fetch_client().expect(
             "media_fetch_client must build with redirect::Policy::none(); a \
              redirect-following fallback would forward the minted media auth \
@@ -293,6 +310,14 @@ impl AppState {
             .map(|k| k.clone())
     }
 
+    /// Reject identity-dependent, externally observable commands while the
+    /// durable identity is unavailable. Read-only/local commands do not call
+    /// this guard; command boundaries that can sign, publish, deliver,
+    /// execute a provider, or open a live relay must call it before mutation.
+    pub fn require_active_identity(&self) -> Result<(), String> {
+        self.signing_keys().map(drop)
+    }
+
     /// Emit the current huddle state to the frontend via Tauri event.
     ///
     /// Acquires both locks (app_handle + huddle_state), clones a snapshot,
@@ -364,6 +389,11 @@ pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(
 mod keyring_config;
 pub(crate) use keyring_config::keyring_service;
 
+#[path = "app_state_key_file.rs"]
+mod key_file;
+use key_file::load_key_file;
+pub(crate) use key_file::save_key_file;
+
 #[path = "app_state_pending_channels.rs"]
 mod pending_channels;
 
@@ -433,7 +463,13 @@ fn load_or_create_identity(data_dir: &std::path::Path) -> Result<ResolvedIdentit
     }
 
     let store = crate::secret_store::SecretStore::shared(keyring_service());
-    resolve_identity_with_store(store, &legacy_path, data_dir)
+    let mut resolved = resolve_identity_with_store(store, &legacy_path, data_dir)?;
+    // The debug file backend stores in a plain file — reporting
+    // "system-keyring" to the UI would be a lie.
+    if store.is_file_backed() && resolved.storage == IdentityStorage::SystemKeyring {
+        resolved.storage = IdentityStorage::LocalFile;
+    }
+    Ok(resolved)
 }
 
 /// Identity resolution over an [`IdentityKeyStore`] seam. Split from
@@ -871,7 +907,12 @@ pub(crate) fn persist_imported_identity(
     legacy_path: &std::path::Path,
     data_dir: &std::path::Path,
 ) -> Result<IdentityStorage, String> {
-    persist_imported_identity_impl(store, keys, legacy_path, data_dir)
+    let storage = persist_imported_identity_impl(store, keys, legacy_path, data_dir)?;
+    // See load_or_create_identity: the debug file backend reports local-file.
+    if store.is_file_backed() && storage == IdentityStorage::SystemKeyring {
+        return Ok(IdentityStorage::LocalFile);
+    }
+    Ok(storage)
 }
 
 /// Path of the migration-completed marker within `data_dir`.
@@ -1004,49 +1045,6 @@ fn quarantine_corrupt_key(key_path: &std::path::Path, data_dir: &std::path::Path
     if std::fs::rename(key_path, &bad_path).is_err() {
         let _ = std::fs::remove_file(key_path);
     }
-}
-
-fn load_key_file(path: &std::path::Path) -> Result<Keys, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("read identity.key: {e}"))?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return Err("empty identity.key".to_string());
-    }
-    Keys::parse(trimmed).map_err(|e| format!("parse identity.key: {e}"))
-}
-
-/// Atomically write the key to disk. Uses `atomic-write-file` which:
-/// 1. Writes to a temp file in the same directory
-/// 2. Calls fsync on the file
-/// 3. Renames temp → target (atomic on POSIX, best-effort on Windows)
-/// 4. Calls fsync on the parent directory
-///
-/// On Unix, the file is created with mode 0600 (owner read/write only).
-/// On Windows, default ACLs apply — the app data directory is already
-/// per-user, so the key is not world-readable in practice.
-pub(crate) fn save_key_file(path: &std::path::Path, keys: &Keys) -> Result<(), String> {
-    use atomic_write_file::AtomicWriteFile;
-
-    let nsec = keys
-        .secret_key()
-        .to_bech32()
-        .map_err(|e| format!("encode nsec: {e}"))?;
-
-    let mut file = AtomicWriteFile::open(path)
-        .map_err(|e| format!("open identity.key for atomic write: {e}"))?;
-
-    // Set owner-only permissions before writing the secret.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("set identity.key permissions: {e}"))?;
-    }
-
-    file.write_all(nsec.as_bytes())
-        .map_err(|e| format!("write identity.key: {e}"))?;
-    file.commit()
-        .map_err(|e| format!("commit identity.key: {e}"))
 }
 
 #[cfg(test)]

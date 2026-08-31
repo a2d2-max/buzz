@@ -76,6 +76,13 @@ import {
   resetMediaCaches,
 } from "@/shared/lib/mediaUrl";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { containsAbsolutePath } from "@/features/ops-room/types";
+import {
+  dormantPageItemSchemas,
+  dormantPageRequestSchema,
+  type DormantOpsModuleName,
+} from "@/features/ops-room/opsDormantContracts";
+import { opsTeamsActivityScopeSchema } from "@/features/ops-room/opsTask5Contracts";
 import {
   isValidLinkPreviewSnapshotCanonicalUrl,
   parseLinkPreviewSnapshots,
@@ -184,6 +191,57 @@ type MockHuddleSeed = {
   ttsEnabled?: boolean;
   isCreator?: boolean;
 };
+
+type MockOpsPage<T extends Record<string, unknown>> = {
+  contract_version: 1;
+  revision: number;
+  generated_at: string;
+  items: T[];
+  next_cursor: string | null;
+};
+
+type LegacyMockOpsPages = {
+  timeline?: MockOpsPage<{
+    id: string;
+    timestamp: string;
+    kind: string;
+    author: string;
+    body: string;
+    source?: string;
+    outcome?: string | null;
+    details?: Record<string, unknown>;
+  }>;
+  artifacts?: MockOpsPage<{
+    id: string;
+    work_item_id: string;
+    title: string;
+    kind: string;
+    status: string;
+    version: number;
+    source_event_id: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+  research?: MockOpsPage<{
+    id: string;
+    title: string;
+    status: string;
+    updated_at?: string;
+  }>;
+  repositories?: MockOpsPage<{
+    id: string;
+    name: string;
+    branch: string;
+    clean: boolean;
+    ahead?: number;
+    behind?: number;
+  }>;
+};
+
+type MockOpsPageModule = keyof LegacyMockOpsPages | DormantOpsModuleName;
+type MockOpsPages = Partial<
+  Record<MockOpsPageModule, MockOpsPage<Record<string, unknown>>>
+>;
 
 type E2eConfig = {
   mode?: "mock" | "relay";
@@ -548,6 +606,52 @@ type E2eConfig = {
     identityLocked?: boolean;
     /** Delay (ms) applied to identity import so specs can observe pending navigation. */
     identityImportDelayMs?: number;
+    /** Deterministic capabilities returned by the local Ops E2E bridge. */
+    opsCapabilities?: Record<string, unknown>;
+    /** Force capabilities discovery to fail before any Ops data is read. */
+    opsCapabilitiesError?: "disconnected" | "not_configured";
+    /** Deterministic redacted snapshot returned by the local Ops E2E bridge. */
+    opsSnapshot?: Record<string, unknown>;
+    /** Force a snapshot transport rejection while leaving capabilities/pages healthy. */
+    opsSnapshotError?: "disconnected";
+    /** Strict deterministic page fixtures keyed by the fixed Ops module enum. */
+    opsPages?: MockOpsPages;
+    /** Cursor-indexed strict fixtures; use `first` for the null cursor. */
+    opsPagesByCursor?: Partial<
+      Record<
+        MockOpsPageModule,
+        Record<string, MockOpsPage<Record<string, unknown>>>
+      >
+    >;
+    /** Deliberately malformed client-contract fixtures, never prevalidated. */
+    opsRawPages?: Partial<Record<MockOpsPageModule, unknown>>;
+    /** Typed cursor errors returned by the fixed page command. */
+    opsPageErrors?: Partial<
+      Record<
+        MockOpsPageModule,
+        | "invalid_cursor"
+        | "stale_cursor"
+        | "unavailable"
+        | "disconnected"
+        | "disconnected_once"
+      >
+    >;
+    /** Strict native artifact read fixtures keyed by public artifact identity. */
+    opsArtifactReads?: Record<string, Record<string, unknown>>;
+    /** Delay native artifact reads so loading UI is observable. */
+    opsArtifactReadDelayMs?: number;
+    opsArtifactReadErrors?: Record<
+      string,
+      | "invalid_artifact_request"
+      | "artifact_not_found"
+      | "artifact_version_not_found"
+      | "artifact_read_denied"
+      | "artifact_integrity_mismatch"
+      | "artifact_too_large"
+      | "artifact_media_unsupported"
+    >;
+    /** Strict local-handle chunks keyed by opaque handle token. */
+    opsArtifactHandleChunks?: Record<string, Record<string, unknown>>;
     /**
      * Global agent config returned by `get_global_agent_config`. Defaults to
      * an empty config (no provider, model, or env vars) if not specified.
@@ -1534,6 +1638,526 @@ const SYSTEM_REACTION_TARGET_EVENT_ID = "e".repeat(64);
 const E2E_IDENTITY_OVERRIDE_STORAGE_KEY = "buzz:e2e-identity-override.v1";
 /** Stands in for `tauri.conf.json`'s version, which no mock IPC call can read. */
 const MOCK_APP_VERSION = "0.0.0-e2e";
+const MOCK_OPS_CAPABILITIES = {
+  contract_version: 1,
+  reads: ["snapshot", "events", "artifact"],
+  drafts: ["message", "internal_task", "provider_action"],
+  transitions: ["submit", "approve", "risk_confirm", "deliver", "reject"],
+} as const;
+const MOCK_OPS_SNAPSHOT = {
+  contract_version: 1,
+  revision: 7,
+  event_sequence: "7",
+  generated_at: "2026-08-29T08:00:00.000Z",
+  health: { hub: "ready", orca: "observed", codex: "ready" },
+  room: {
+    channels: [
+      {
+        id: "workspace:redacted",
+        project_id: "project:redacted",
+        label: "Redacted workspace",
+        count: 1,
+      },
+    ],
+    selected_channel_id: "workspace:redacted",
+    threads: [
+      {
+        id: "work:redacted",
+        type: "work",
+        work_item_id: "work:redacted",
+        session_id: null,
+        project_id: "project:redacted",
+        title: "Native Ops parity",
+        status: "in_progress",
+        provider: "codex",
+        updated_at: "2026-08-29T08:00:00.000Z",
+        session_count: 2,
+        approval_count: 1,
+        artifact_count: 1,
+      },
+    ],
+    selected_thread_id: "work:redacted",
+    messages: [
+      {
+        id: "event:completion-redacted",
+        kind: "completion",
+        timestamp: "2026-08-29T08:01:00.000Z",
+        role: "agent",
+        author: "Codex sub",
+        body: "Deterministic parity verification completed.",
+        details: { source: "codex_sub", outcome: "완료", tests: 3 },
+      },
+      {
+        id: "event:approval-redacted",
+        kind: "approval",
+        timestamp: "2026-08-29T08:02:00.000Z",
+        role: "system",
+        author: "Local Ops Hub",
+        body: "External delivery remains disabled in recovery mode.",
+        details: { source: "hub", outcome: "승인 필요" },
+      },
+    ],
+    context: {
+      work_item: {
+        id: "work:redacted",
+        project_id: "project:redacted",
+        title: "Native Ops parity",
+        status: "in_progress",
+        progress: 0.75,
+        last_activity_at: "2026-08-29T08:02:00.000Z",
+        execution_provider: "codex",
+        provider_model: "mock-model",
+        provider_effort: "high",
+        revision: 7,
+        updated_at: "2026-08-29T08:02:00.000Z",
+      },
+      provider_run: null,
+      sessions: [
+        {
+          id: "session:codex-direct-redacted",
+          work_item_id: "work:redacted",
+          project_id: "project:redacted",
+          parent_session_id: null,
+          title: "Codex direct",
+          agent: "Codex",
+          activity: "coordinating",
+          health: "active",
+          health_reason: null,
+          last_activity_at: "2026-08-29T08:02:00.000Z",
+          execution_provider: "codex",
+          provider_model: "mock-model",
+          provider_effort: "high",
+          revision: 7,
+          updated_at: "2026-08-29T08:02:00.000Z",
+        },
+        {
+          id: "session:codex-sub-redacted",
+          work_item_id: "work:redacted",
+          project_id: "project:redacted",
+          parent_session_id: "session:codex-direct-redacted",
+          title: "Codex sub",
+          agent: "Codex sub",
+          activity: "complete",
+          health: "ready",
+          health_reason: null,
+          last_activity_at: "2026-08-29T08:01:00.000Z",
+          execution_provider: "codex",
+          provider_model: "mock-model",
+          provider_effort: "medium",
+          revision: 7,
+          updated_at: "2026-08-29T08:01:00.000Z",
+        },
+      ],
+      approvals: [
+        {
+          id: "approval:redacted",
+          work_item_id: "work:redacted",
+          target_session_id: "session:codex-direct-redacted",
+          draft_text: "[redacted external draft]",
+          action_kind: "deliver",
+          status: "held",
+          hold_reason: "external_action_disabled",
+          risk_class: ["external"],
+          risk_targets: ["redacted-target"],
+          approved_at: null,
+          revision: 7,
+          updated_at: "2026-08-29T08:02:00.000Z",
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact:0123456789abcdef0123456789abcdef",
+          work_item_id: "work:redacted",
+          title: "Parity report",
+          kind: "report",
+          status: "ready",
+          version: 1,
+          source_event_id: "event:completion-redacted",
+          created_at: "2026-08-29T08:01:00.000Z",
+          updated_at: "2026-08-29T08:01:00.000Z",
+        },
+      ],
+    },
+    diagnostics: { fixture: "deterministic-redacted" },
+  },
+  session_tree: [
+    {
+      id: "session:codex-direct-redacted",
+      source: "codex_direct",
+      parent_session_id: null,
+      work_item_id: "work:redacted",
+      title: "Codex direct",
+      activity: "coordinating",
+      health: "active",
+      last_activity_at: "2026-08-29T08:02:00.000Z",
+      child_ids: ["session:codex-sub-redacted"],
+    },
+    {
+      id: "session:codex-sub-redacted",
+      source: "codex_sub",
+      parent_session_id: "session:codex-direct-redacted",
+      work_item_id: "work:redacted",
+      title: "Codex sub",
+      activity: "complete",
+      health: "ready",
+      last_activity_at: "2026-08-29T08:01:00.000Z",
+      child_ids: [],
+    },
+  ],
+  checklist: [
+    {
+      id: "checklist:redacted",
+      work_item_id: "work:redacted",
+      title: "Verify responsive safety parity",
+      status: "done",
+      order: 1,
+    },
+  ],
+  decisions: [
+    {
+      id: "decision:redacted",
+      queue: "user_decision",
+      source: "approval",
+      title: "External action held",
+      question: "Restore identity before any external action.",
+      approval_id: "approval:redacted",
+    },
+  ],
+} as const;
+function emptyMockOpsPage(): MockOpsPage<Record<string, unknown>> {
+  return {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  };
+}
+
+const MOCK_OPS_PAGES: Required<MockOpsPages> = {
+  timeline: {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  },
+  artifacts: {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  },
+  research: {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  },
+  repositories: {
+    contract_version: 1,
+    revision: 1,
+    generated_at: "2026-08-30T00:00:00.000Z",
+    items: [],
+    next_cursor: null,
+  },
+  work_items: emptyMockOpsPage(),
+  sessions: emptyMockOpsPage(),
+  checklist_items: emptyMockOpsPage(),
+  decisions: emptyMockOpsPage(),
+  approval_index: emptyMockOpsPage(),
+  evidence: emptyMockOpsPage(),
+  audit: emptyMockOpsPage(),
+  search: emptyMockOpsPage(),
+};
+
+function isMockOpsRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasMockOpsKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const keys = Object.keys(value);
+  const allowed = new Set([...required, ...optional]);
+  return (
+    required.every((key) => key in value) &&
+    keys.every((key) => allowed.has(key))
+  );
+}
+
+function isMockOpsText(value: unknown, max = 65_536): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= max &&
+    ![...value].some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code <= 31 || code === 127;
+    })
+  );
+}
+
+function parseMockOpsPageRequest(payload: unknown): {
+  cursor: string | null;
+  module: MockOpsPageModule;
+} {
+  if (!isMockOpsRecord(payload) || !hasMockOpsKeys(payload, ["request"])) {
+    throw new Error("ops_bridge_invalid_request");
+  }
+  const request = payload.request;
+  if (
+    !isMockOpsRecord(request) ||
+    !hasMockOpsKeys(request, ["module", "scope", "page_size", "cursor"]) ||
+    !Object.hasOwn(MOCK_OPS_PAGES, String(request.module)) ||
+    !Number.isSafeInteger(request.page_size) ||
+    Number(request.page_size) < 1 ||
+    Number(request.page_size) > 200 ||
+    !(request.cursor === null || isMockOpsText(request.cursor, 4096)) ||
+    !isMockOpsRecord(request.scope)
+  ) {
+    throw new Error("ops_bridge_invalid_request");
+  }
+  const nullableText = (value: unknown) =>
+    value === null || isMockOpsText(value, 256);
+  const scope = request.scope;
+  const validScope = (() => {
+    if (
+      Object.hasOwn(dormantPageItemSchemas, String(request.module)) &&
+      dormantPageRequestSchema.safeParse(request).success
+    ) {
+      return true;
+    }
+    switch (request.module) {
+      case "timeline":
+        return (
+          hasMockOpsKeys(scope, ["channel", "thread", "sort"]) &&
+          nullableText(scope.channel) &&
+          nullableText(scope.thread) &&
+          scope.sort === "occurred_at_desc"
+        );
+      case "artifacts":
+        return (
+          hasMockOpsKeys(scope, ["work_item", "representation", "sort"]) &&
+          nullableText(scope.work_item) &&
+          (scope.representation === null ||
+            scope.representation === "rendered" ||
+            scope.representation === "preview") &&
+          scope.sort === "created_at_desc"
+        );
+      case "research":
+        return (
+          hasMockOpsKeys(scope, ["sort"]) && scope.sort === "created_at_desc"
+        );
+      case "repositories":
+        return (
+          hasMockOpsKeys(scope, ["project", "sort"]) &&
+          nullableText(scope.project) &&
+          scope.sort === "display_name_asc"
+        );
+      case "teams_activity":
+        return opsTeamsActivityScopeSchema.safeParse(scope).success;
+      default:
+        return false;
+    }
+  })();
+  if (!validScope) throw new Error("ops_bridge_invalid_request");
+  return {
+    cursor: request.cursor as string | null,
+    module: request.module as MockOpsPageModule,
+  };
+}
+
+const MOCK_ARTIFACT_ID = "artifact:0123456789abcdef0123456789abcdef";
+const MOCK_ARTIFACT_HANDLE =
+  "artifact-handle:01234567-89ab-4def-8123-456789abcdef";
+const MOCK_ARTIFACT_ERROR_CODES = new Set([
+  "invalid_artifact_request",
+  "artifact_not_found",
+  "artifact_version_not_found",
+  "artifact_read_denied",
+  "artifact_integrity_mismatch",
+  "artifact_too_large",
+  "artifact_media_unsupported",
+]);
+
+function parseMockArtifactReadRequest(payload: unknown) {
+  if (!isMockOpsRecord(payload) || !hasMockOpsKeys(payload, ["request"])) {
+    throw { error: "invalid_artifact_request" };
+  }
+  const request = payload.request;
+  if (
+    !isMockOpsRecord(request) ||
+    !hasMockOpsKeys(request, ["artifact_id", "version", "representation"]) ||
+    typeof request.artifact_id !== "string" ||
+    !/^artifact:[0-9a-f]{32}$/u.test(request.artifact_id) ||
+    !Number.isSafeInteger(request.version) ||
+    Number(request.version) < 1 ||
+    !["rendered", "preview"].includes(String(request.representation))
+  ) {
+    throw { error: "invalid_artifact_request" };
+  }
+  return request as {
+    artifact_id: string;
+    version: number;
+    representation: "rendered" | "preview";
+  };
+}
+
+function artifactFixtureKey(request: {
+  artifact_id: string;
+  version: number;
+  representation: string;
+}) {
+  return `${request.artifact_id}|${request.version}|${request.representation}`;
+}
+
+function parseMockArtifactHandleRequest(payload: unknown) {
+  if (!isMockOpsRecord(payload) || !hasMockOpsKeys(payload, ["request"])) {
+    throw { error: "invalid_artifact_request" };
+  }
+  const request = payload.request;
+  if (
+    !isMockOpsRecord(request) ||
+    !hasMockOpsKeys(request, ["handle", "offset", "length"]) ||
+    typeof request.handle !== "string" ||
+    !/^artifact-handle:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+      request.handle,
+    ) ||
+    !Number.isSafeInteger(request.offset) ||
+    Number(request.offset) < 0 ||
+    !Number.isSafeInteger(request.length) ||
+    Number(request.length) < 1 ||
+    Number(request.length) > 256 * 1024
+  ) {
+    throw { error: "invalid_artifact_request" };
+  }
+  return request as { handle: string; offset: number; length: number };
+}
+
+function validateMockOpsPage(
+  module: MockOpsPageModule,
+  value: unknown,
+): asserts value is MockOpsPage<Record<string, unknown>> {
+  if (
+    !isMockOpsRecord(value) ||
+    !hasMockOpsKeys(value, [
+      "contract_version",
+      "revision",
+      "generated_at",
+      "items",
+      "next_cursor",
+    ]) ||
+    value.contract_version !== 1 ||
+    !Number.isSafeInteger(value.revision) ||
+    Number(value.revision) < 0 ||
+    !isMockOpsText(value.generated_at) ||
+    !Array.isArray(value.items) ||
+    !(value.next_cursor === null || isMockOpsText(value.next_cursor, 4096)) ||
+    containsAbsolutePath(value)
+  ) {
+    throw new Error("ops_bridge_contract_mismatch");
+  }
+  if (Object.hasOwn(dormantPageItemSchemas, module)) {
+    const schema = dormantPageItemSchemas[module as DormantOpsModuleName];
+    if (value.items.some((item) => !schema.safeParse(item).success)) {
+      throw new Error("ops_bridge_contract_mismatch");
+    }
+    return;
+  }
+  const itemKeys = {
+    timeline: {
+      required: ["id", "timestamp", "kind", "author", "body"],
+      optional: ["source", "outcome", "details"],
+    },
+    artifacts: {
+      required: [
+        "id",
+        "work_item_id",
+        "title",
+        "kind",
+        "status",
+        "version",
+        "source_event_id",
+        "created_at",
+        "updated_at",
+      ],
+      optional: [],
+    },
+    research: {
+      required: ["id", "title", "status"],
+      optional: ["updated_at"],
+    },
+    repositories: {
+      required: ["id", "name", "branch", "clean"],
+      optional: ["ahead", "behind"],
+    },
+  } as const;
+  const keys = itemKeys[module as keyof typeof itemKeys];
+  if (
+    value.items.some(
+      (item) =>
+        !isMockOpsRecord(item) ||
+        !hasMockOpsKeys(item, keys.required, keys.optional) ||
+        !isValidMockOpsPageItem(module, item),
+    )
+  ) {
+    throw new Error("ops_bridge_contract_mismatch");
+  }
+}
+
+function isValidMockOpsPageItem(
+  module: MockOpsPageModule,
+  item: Record<string, unknown>,
+): boolean {
+  const safeCount = (value: unknown) =>
+    Number.isSafeInteger(value) && Number(value) >= 0;
+  switch (module) {
+    case "timeline":
+      return (
+        ["id", "timestamp", "kind", "author", "body"].every((key) =>
+          isMockOpsText(item[key]),
+        ) &&
+        (item.source === undefined || isMockOpsText(item.source)) &&
+        (item.outcome === undefined ||
+          item.outcome === null ||
+          isMockOpsText(item.outcome)) &&
+        (item.details === undefined || isMockOpsRecord(item.details))
+      );
+    case "artifacts":
+      return (
+        [
+          "id",
+          "work_item_id",
+          "title",
+          "kind",
+          "status",
+          "created_at",
+          "updated_at",
+        ].every((key) => isMockOpsText(item[key])) &&
+        safeCount(item.version) &&
+        (item.source_event_id === null || isMockOpsText(item.source_event_id))
+      );
+    case "research":
+      return (
+        ["id", "title", "status"].every((key) => isMockOpsText(item[key])) &&
+        (item.updated_at === undefined || isMockOpsText(item.updated_at))
+      );
+    case "repositories":
+      return (
+        ["id", "name", "branch"].every((key) => isMockOpsText(item[key])) &&
+        typeof item.clean === "boolean" &&
+        (item.ahead === undefined || safeCount(item.ahead)) &&
+        (item.behind === undefined || safeCount(item.behind))
+      );
+    default:
+      return false;
+  }
+}
 const DEFAULT_MOCK_IDENTITY = {
   pubkey: "deadbeef".repeat(8),
   display_name: "npub1mock...",
@@ -11507,6 +12131,11 @@ export function maybeInstallE2eTauriMocks() {
       sourceUrl: null;
     };
   }> = [];
+  let mockOpsWatchStarted = false;
+  const mockOpsConsumedPageErrors = new Set<string>();
+  let mockOpsConnectionGeneration = 1;
+  let mockOpsSyncRequired = false;
+  let mockOpsAppliedSequence: string | null = null;
   const handleMockCommand = async (
     command: string,
     payload: unknown,
@@ -11530,7 +12159,198 @@ export function maybeInstallE2eTauriMocks() {
     });
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
+    const recoveryBlockedCommands = new Set([
+      "sign_event",
+      "sign_nostr_identity_binding",
+      "grant_approval",
+      "deny_approval",
+      "ops_bridge_create_draft",
+      "ops_bridge_transition",
+      "start_huddle",
+      "join_huddle",
+      "reconnect_huddle_audio",
+      "start_stt_pipeline",
+      "push_audio_pcm",
+      "speak_agent_message",
+      "preview_pocket_voice",
+      "create_managed_agent",
+      "start_managed_agent",
+      "start_managed_agent_runtime",
+      "restart_managed_agent_runtime",
+      "mesh_start_node",
+    ]);
+    const recoveryIdentity = getActiveIdentity(activeConfig);
+    const identityInRecovery =
+      !recoveryIdentity &&
+      ((!mockIdentityLostCleared &&
+        activeConfig?.mock?.identityLost === true) ||
+        (!mockIdentityLockedCleared &&
+          activeConfig?.mock?.identityLocked === true));
+    if (identityInRecovery && recoveryBlockedCommands.has(command)) {
+      throw new Error(
+        "identity is in recovery mode; event signing is disabled until the identity is restored and Buzz is relaunched",
+      );
+    }
+
     switch (command) {
+      case "ops_bridge_capabilities":
+        if (activeConfig?.mock?.opsCapabilitiesError) {
+          const code =
+            activeConfig.mock.opsCapabilitiesError === "not_configured"
+              ? "ops_bridge_invalid_config"
+              : "disconnected";
+          return Promise.reject(code);
+        }
+        return structuredClone(
+          activeConfig?.mock?.opsCapabilities ?? MOCK_OPS_CAPABILITIES,
+        );
+      case "ops_bridge_snapshot":
+        if (activeConfig?.mock?.opsSnapshotError) {
+          return Promise.reject({ error: activeConfig.mock.opsSnapshotError });
+        }
+        return structuredClone(
+          activeConfig?.mock?.opsSnapshot ?? MOCK_OPS_SNAPSHOT,
+        );
+      case "ops_bridge_page": {
+        const { cursor, module } = parseMockOpsPageRequest(payload);
+        const configuredError = activeConfig?.mock?.opsPageErrors?.[module];
+        if (configuredError) {
+          if (configuredError === "disconnected_once") {
+            if (!mockOpsConsumedPageErrors.has(module)) {
+              mockOpsConsumedPageErrors.add(module);
+              return Promise.reject({ error: "disconnected" });
+            }
+          } else {
+            return Promise.reject({ error: configuredError });
+          }
+        }
+        if (
+          activeConfig?.mock?.opsRawPages &&
+          Object.hasOwn(activeConfig.mock.opsRawPages, module)
+        ) {
+          return structuredClone(activeConfig.mock.opsRawPages[module]);
+        }
+        const cursorFixture =
+          activeConfig?.mock?.opsPagesByCursor?.[module]?.[cursor ?? "first"];
+        const page =
+          cursorFixture ??
+          activeConfig?.mock?.opsPages?.[module] ??
+          MOCK_OPS_PAGES[module];
+        validateMockOpsPage(module, page);
+        return structuredClone(page);
+      }
+      case "ops_bridge_read_artifact": {
+        const request = parseMockArtifactReadRequest(payload);
+        const artifactDelay = activeConfig?.mock?.opsArtifactReadDelayMs ?? 0;
+        if (artifactDelay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, artifactDelay));
+        }
+        const key = artifactFixtureKey(request);
+        const configuredError =
+          activeConfig?.mock?.opsArtifactReadErrors?.[key];
+        if (configuredError && MOCK_ARTIFACT_ERROR_CODES.has(configuredError)) {
+          return Promise.reject({ error: configuredError });
+        }
+        const configured = activeConfig?.mock?.opsArtifactReads?.[key];
+        if (configured) return structuredClone(configured);
+        if (
+          request.artifact_id !== MOCK_ARTIFACT_ID ||
+          request.version !== 1 ||
+          request.representation !== "preview"
+        ) {
+          return Promise.reject({ error: "artifact_not_found" });
+        }
+        return {
+          contract_version: 1,
+          artifact_id: MOCK_ARTIFACT_ID,
+          version: 1,
+          representation: "preview",
+          mime: "text/markdown",
+          total_size: 18,
+          sha256: "a".repeat(64),
+          kind: "inline_text",
+          text: "# Fixture artifact",
+        };
+      }
+      case "ops_bridge_read_artifact_handle": {
+        const request = parseMockArtifactHandleRequest(payload);
+        const chunks = activeConfig?.mock?.opsArtifactHandleChunks;
+        const configured =
+          chunks?.[`${request.handle}|${request.offset}`] ??
+          chunks?.[request.handle];
+        if (configured) return structuredClone(configured);
+        if (request.handle !== MOCK_ARTIFACT_HANDLE) {
+          return Promise.reject({ error: "invalid_artifact_request" });
+        }
+        return {
+          contract_version: 1,
+          handle: MOCK_ARTIFACT_HANDLE,
+          mime: "text/plain",
+          offset: request.offset,
+          next_offset: request.offset,
+          total_size: request.offset,
+          data_base64: "",
+          eof: true,
+        };
+      }
+      case "ops_bridge_release_artifact_handle": {
+        if (
+          !isMockOpsRecord(payload) ||
+          !hasMockOpsKeys(payload, ["request"])
+        ) {
+          throw { error: "invalid_artifact_request" };
+        }
+        const request = payload.request;
+        if (
+          !isMockOpsRecord(request) ||
+          !hasMockOpsKeys(request, ["handle"]) ||
+          typeof request.handle !== "string" ||
+          !/^artifact-handle:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+            request.handle,
+          )
+        ) {
+          throw { error: "invalid_artifact_request" };
+        }
+        return { released: request.handle === MOCK_ARTIFACT_HANDLE };
+      }
+      case "ops_bridge_start_watch": {
+        const started = !mockOpsWatchStarted;
+        mockOpsWatchStarted = true;
+        if (started) mockOpsSyncRequired = true;
+        return {
+          started,
+          connection_generation: mockOpsConnectionGeneration,
+          sync_required: mockOpsSyncRequired,
+          anchor_sequence: null,
+        };
+      }
+      case "ops_bridge_stop_watch": {
+        mockOpsWatchStarted = false;
+        mockOpsConnectionGeneration += 1;
+        mockOpsSyncRequired = false;
+        mockOpsAppliedSequence = null;
+        return null;
+      }
+      case "ops_bridge_ack_sync": {
+        const request = (payload as { request?: Record<string, unknown> })
+          .request;
+        const generation = request?.generation;
+        const appliedSequence = request?.applied_sequence;
+        const accepted =
+          mockOpsSyncRequired &&
+          generation === mockOpsConnectionGeneration &&
+          typeof appliedSequence === "string" &&
+          /^(?:0|[1-9][0-9]*)$/u.test(appliedSequence);
+        if (accepted) {
+          mockOpsAppliedSequence = appliedSequence;
+          mockOpsSyncRequired = false;
+        }
+        return {
+          accepted,
+          connection_generation: mockOpsConnectionGeneration,
+          applied_sequence: mockOpsAppliedSequence,
+        };
+      }
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
         const delayMs = activeConfig?.mock?.huddleStateReadDelayMs ?? 0;
@@ -14541,6 +15361,8 @@ export function maybeInstallE2eTauriMocks() {
         return null;
       case "plugin:window|is_fullscreen":
         return false;
+      case "plugin:window|start_dragging":
+        return null;
       // Settings reads the app version through the app plugin. Without this the
       // bridge throws an unhandled page error on every Settings render, which
       // shows up as noise in unrelated specs.

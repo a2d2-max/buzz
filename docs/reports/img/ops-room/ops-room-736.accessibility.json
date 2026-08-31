@@ -1,0 +1,47 @@
+{
+  "source": "native-tauri-accessibility-tree",
+  "runtime_commit": "7f6ab108339fe6cfad931eb7b3a2a6e1211f4a7b",
+  "viewport": {
+    "width": 736,
+    "height": 900,
+    "scale": 2
+  },
+  "captures": {
+    "drawer_closed": {
+      "tree_text": "App=buzz-desktop (pid <redacted>)\nWindow: \"\", App: buzz-desktop.\n\n0 standard window\n\t1 scroll area\n\t\t2 HTML content\n\t\t\t3 container Local Ops mode\n\t\t\t\t4 text Local Ops mode\n\t\t\t\t5 text Messaging, signed actions, and external actions are unavailable until you restore your identity.\n\t\t\t\t6 button Restore identity\n\t\t\t7 heading Agent Room\n\t\t\t8 container\n\t\t\t\t9 container 작업 범위\n\t\t\t\t\t10 heading 작업 범위\n\t\t\t\t\t11 text 워크스페이스\n\t\t\t\t\t12 container\n\t\t\t\t\t\t13 button 전체 1\n\t\t\t\t\t\t14 button Evidence workspace 1\n\t\t\t\t\t\t15 button 미배정 0\n\t\t\t\t\t16 text 작업 스레드\n\t\t\t\t\t17 button Unified Ops evidence active · 세션 5\n\t\t\t\t18 container 에이전트 세션\n\t\t\t\t\t19 heading 에이전트 세션\n\t\t\t\t\t20 container 에이전트 세션\n\t\t\t\t\t\t21 button (selected) Claude Code reviewer Claude Codeworking\n\t\t\t\t\t\t22 button Codex coordinator Codexworking\n\t\t\t\t\t\t23 button Codex implementation sub-session Codex subworking\n\t\t\t\t\t\t24 button Orca dispatch Orcaworking\n\t\t\t\t\t\t25 button Orca worker pane Orcaworking\n\t\t\t\t26 container 활동 타임라인\n\t\t\t\t\t27 heading 활동 타임라인\n\t\t\t\t\t28 container\n\t\t\t\t\t\t29 container\n\t\t\t\t\t\t\t30 container, Text: 지시 오전 08:50\n\t\t\t\t\t\t\t31 text 사용자\n\t\t\t\t\t\t\t32 text 사용자\n\t\t\t\t\t\t\t33 text Continue the isolated native evidence implementation.\n\t\t\t\t\t\t\t34 summary 세부 정보, Value: 0\n\t\t\t\t\t\t35 container\n\t\t\t\t\t\t\t36 container, Text: 승인 오전 08:51\n\t\t\t\t\t\t\t37 text 마스터 코디네이터\n\t\t\t\t\t\t\t38 text 마스터 코디네이터\n\t\t\t\t\t\t\t39 text Review the isolated evidence contract.\n\t\t\t\t\t\t\t40 summary 세부 정보, Value: 0\n\t\t\t\t\t\t41 container\n\t\t\t\t\t\t\t42 container, Text: 위임 오전 08:52\n\t\t\t\t\t\t\t43 text 마스터 코디네이터\n\t\t\t\t\t\t\t44 text 마스터 코디네이터\n\t\t\t\t\t\t\t45 text @Claude Code에게 Unified Ops evidence 작업을 배정\n\t\t\t\t\t\t\t46 summary 세부 정보, Value: 0\n\t\t\t\t\t\t47 container\n\t\t\t\t\t\t\t48 container, Text: 진행 오전 08:53\n\t\t\t\t\t\t\t49 text Codex\n\t\t\t\t\t\t\t50 text Codex\n\t\t\t\t\t\t\t51 text working\n\t\t\t\t\t\t\t52 summary 세부 정보, Value: 0\n\t\t\t\t\t\t53 container\n\t\t\t\t\t\t\t54 container, Text: 질문 오전 08:54\n\t\t\t\t\t\t\t55 text 에이전트\n\t\t\t\t\t\t\t56 text 에이전트\n\t\t\t\t\t\t\t57 text Is the evidence boundary clear?\n\t\t\t\t\t\t\t58 summary 세부 정보, Value: 0\n\t\t\t\t\t\t59 container\n\t\t\t\t\t\t\t60 container, Text: 완료 Fixture contract verified 오전 08:55\n\t\t\t\t\t\t\t61 text Claude Code\n\t\t\t\t\t\t\t62 text Claude Code\n\t\t\t\t\t\t\t63 text 완료: Fixture contract verified\n\t\t\t\t\t\t\t64 summary 세부 정보, Value: 0\n\t\t\t\t\t\t65 container\n\t\t\t\t\t\t\t66 container, Text: 산출물 오전 08:56\n\t\t\t\t\t\t\t67 text Claude Code\n\t\t\t\t\t\t\t68 text Claude Code\n\t\t\t\t\t\t\t69 text 아티팩트: evidence-summary.md\n\t\t\t\t\t\t\t70 summary 세부 정보, Value: 0\n\t\t\t\t71 button 컨텍스트 열기\n\t\t\t72 container Notifications alt+T\n\t73 close button\n\t74 full screen button, Secondary Actions: zoom the window\n\t75 minimize button\n\nThe focused UI element is 2 HTML content.",
+      "element_count": 76,
+      "coordinate_space": "window",
+      "truncation": {
+        "maxDepthReached": false,
+        "maxDepth": 64,
+        "truncated": false,
+        "maxNodes": 1200
+      },
+      "focused_element_id": 2
+    },
+    "drawer_open": {
+      "tree_text": "App=buzz-desktop (pid <redacted>)\nWindow: \"\", App: buzz-desktop.\n\n0 standard window\n\t1 scroll area\n\t\t2 HTML content\n\t\t\t3 container 작업 컨텍스트\n\t\t\t\t4 button 컨텍스트 닫기\n\t\t\t\t5 container 작업 컨텍스트\n\t\t\t\t\t6 heading 작업 컨텍스트\n\t\t\t\t\t7 heading 작업 항목\n\t\t\t\t\t8 text Unified Ops evidence\n\t\t\t\t\t9 text 활성\n\t\t\t\t\t10 text 75\n\t\t\t\t\t11 text %\n\t\t\t\t\t12 progress indicator 진행률 75%, Value: 75\n\t\t\t\t\t13 heading 실행 환경\n\t\t\t\t\t14 description list\n\t\t\t\t\t\t15 text Provider\n\t\t\t\t\t\t16 text claude_code\n\t\t\t\t\t\t17 text Model\n\t\t\t\t\t\t18 text opus\n\t\t\t\t\t\t19 text Effort\n\t\t\t\t\t\t20 text high\n\t\t\t\t\t\t21 text 상태\n\t\t\t\t\t\t22 text 실행 중\n\t\t\t\t\t23 heading 세션\n\t\t\t\t\t24 container, Text: Claude Code reviewer live fixture-agent · working Codex coordinator Codex implementation sub-session Orca dispatch Orca worker pane\n\t\t\t\t\t25 heading 체크리스트\n\t\t\t\t\t26 container, Text: Validate isolated native evidence 진행 중\n\t\t\t\t\t27 heading 결정\n\t\t\t\t\t28 container, Text: 초안: Review the isolated evidence contract. 이 초안을 승인할까? Orca 질문 Is the evidence boundary clear? Validate isolated native evidence Is the redacted evidence complete?\n\t\t\t\t\t29 heading 승인\n\t\t\t\t\t30 container, Text: message pending_approval\n\t\t\t\t\t31 heading 아티팩트\n\t\t\t\t\t32 container, Text: evidence-summary.md markdown · v 1 · 준비됨\n\t33 close button\n\t34 full screen button, Secondary Actions: zoom the window\n\t35 minimize button\n\nThe focused UI element is 3 container 작업 컨텍스트.",
+      "element_count": 36,
+      "coordinate_space": "window",
+      "truncation": {
+        "maxDepthReached": false,
+        "maxDepth": 64,
+        "truncated": false,
+        "maxNodes": 1200
+      },
+      "focused_element_id": 3
+    },
+    "after_escape": {
+      "tree_text": "App=buzz-desktop (pid <redacted>)\nWindow: \"\", App: buzz-desktop.\n\n0 standard window\n\t1 scroll area\n\t\t2 HTML content\n\t\t\t3 container Local Ops mode\n\t\t\t\t4 text Local Ops mode\n\t\t\t\t5 text Messaging, signed actions, and external actions are unavailable until you restore your identity.\n\t\t\t\t6 button Restore identity\n\t\t\t7 heading Agent Room\n\t\t\t8 container\n\t\t\t\t9 container 작업 범위\n\t\t\t\t\t10 heading 작업 범위\n\t\t\t\t\t11 text 워크스페이스\n\t\t\t\t\t12 container\n\t\t\t\t\t\t13 button 전체 1\n\t\t\t\t\t\t14 button Evidence workspace 1\n\t\t\t\t\t\t15 button 미배정 0\n\t\t\t\t\t16 text 작업 스레드\n\t\t\t\t\t17 button Unified Ops evidence active · 세션 5\n\t\t\t\t18 container 에이전트 세션\n\t\t\t\t\t19 heading 에이전트 세션\n\t\t\t\t\t20 container 에이전트 세션\n\t\t\t\t\t\t21 button (selected) Claude Code reviewer Claude Codeworking\n\t\t\t\t\t\t22 button Codex coordinator Codexworking\n\t\t\t\t\t\t23 button Codex implementation sub-session Codex subworking\n\t\t\t\t\t\t24 button Orca dispatch Orcaworking\n\t\t\t\t\t\t25 button Orca worker pane Orcaworking\n\t\t\t\t26 container 활동 타임라인\n\t\t\t\t\t27 heading 활동 타임라인\n\t\t\t\t\t28 container\n\t\t\t\t\t\t29 container\n\t\t\t\t\t\t\t30 container, Text: 지시 오전 08:50\n\t\t\t\t\t\t\t31 text 사용자\n\t\t\t\t\t\t\t32 text 사용자\n\t\t\t\t\t\t\t33 text Continue the isolated native evidence implementation.\n\t\t\t\t\t\t\t34 summary 세부 정보, Value: 0\n\t\t\t\t\t\t35 container\n\t\t\t\t\t\t\t36 container, Text: 승인 오전 08:51\n\t\t\t\t\t\t\t37 text 마스터 코디네이터\n\t\t\t\t\t\t\t38 text 마스터 코디네이터\n\t\t\t\t\t\t\t39 text Review the isolated evidence contract.\n\t\t\t\t\t\t\t40 summary 세부 정보, Value: 0\n\t\t\t\t\t\t41 container\n\t\t\t\t\t\t\t42 container, Text: 위임 오전 08:52\n\t\t\t\t\t\t\t43 text 마스터 코디네이터\n\t\t\t\t\t\t\t44 text 마스터 코디네이터\n\t\t\t\t\t\t\t45 text @Claude Code에게 Unified Ops evidence 작업을 배정\n\t\t\t\t\t\t\t46 summary 세부 정보, Value: 0\n\t\t\t\t\t\t47 container\n\t\t\t\t\t\t\t48 container, Text: 진행 오전 08:53\n\t\t\t\t\t\t\t49 text Codex\n\t\t\t\t\t\t\t50 text Codex\n\t\t\t\t\t\t\t51 text working\n\t\t\t\t\t\t\t52 summary 세부 정보, Value: 0\n\t\t\t\t\t\t53 container\n\t\t\t\t\t\t\t54 container, Text: 질문 오전 08:54\n\t\t\t\t\t\t\t55 text 에이전트\n\t\t\t\t\t\t\t56 text 에이전트\n\t\t\t\t\t\t\t57 text Is the evidence boundary clear?\n\t\t\t\t\t\t\t58 summary 세부 정보, Value: 0\n\t\t\t\t\t\t59 container\n\t\t\t\t\t\t\t60 container, Text: 완료 Fixture contract verified 오전 08:55\n\t\t\t\t\t\t\t61 text Claude Code\n\t\t\t\t\t\t\t62 text Claude Code\n\t\t\t\t\t\t\t63 text 완료: Fixture contract verified\n\t\t\t\t\t\t\t64 summary 세부 정보, Value: 0\n\t\t\t\t\t\t65 container\n\t\t\t\t\t\t\t66 container, Text: 산출물 오전 08:56\n\t\t\t\t\t\t\t67 text Claude Code\n\t\t\t\t\t\t\t68 text Claude Code\n\t\t\t\t\t\t\t69 text 아티팩트: evidence-summary.md\n\t\t\t\t\t\t\t70 summary 세부 정보, Value: 0\n\t\t\t\t71 button 컨텍스트 열기\n\t\t\t72 container Notifications alt+T\n\t73 close button\n\t74 full screen button, Secondary Actions: zoom the window\n\t75 minimize button\n\nThe focused UI element is 71 button 컨텍스트 열기.",
+      "element_count": 76,
+      "coordinate_space": "window",
+      "truncation": {
+        "maxDepthReached": false,
+        "maxDepth": 64,
+        "truncated": false,
+        "maxNodes": 1200
+      },
+      "focused_element_id": 71
+    }
+  }
+}

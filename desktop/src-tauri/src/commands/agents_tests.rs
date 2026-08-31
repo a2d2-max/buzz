@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    deploy::{
+        deploy_payload_json, ensure_remote_provider_supported, resolve_deploy_model_provider,
+        DeployProjections,
+    },
+    profile::{profile_needs_sync, resolve_legacy_avatar},
+    *,
+};
 use crate::managed_agents::AgentDefinition;
 
 fn bare_agent_record(
@@ -694,4 +701,26 @@ fn owner_only_access_deploy_payload_clamps_stale_access() {
         serde_json::json!([]),
         "owner-only-access deploy payload retained a stale allowlist"
     );
+}
+
+#[test]
+fn managed_agent_create_rejects_lost_and_locked_identity_before_provider_work() {
+    use crate::app_state::build_app_state;
+    use std::sync::atomic::Ordering;
+
+    for (lost, locked) in [(true, false), (false, true)] {
+        let state = build_app_state();
+        state.identity_lost.store(lost, Ordering::Release);
+        state.keyring_locked.store(locked, Ordering::Release);
+        let error = require_managed_agent_command_identity(&state)
+            .expect_err("recovery identity must not create a managed agent");
+        assert!(error.contains("recovery mode"));
+    }
+}
+
+#[test]
+fn managed_agent_create_passes_recovery_gate_for_normal_identity() {
+    let state = crate::app_state::build_app_state();
+    require_managed_agent_command_identity(&state)
+        .expect("normal identity may reach managed-agent validation and provider work");
 }

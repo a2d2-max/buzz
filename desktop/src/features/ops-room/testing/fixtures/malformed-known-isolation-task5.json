@@ -1,0 +1,40 @@
+{
+  "responses": [
+    {
+      "contract_version": 1,
+      "reads": ["snapshot", "events", "artifact"],
+      "drafts": [],
+      "transitions": [],
+      "modules": [
+        { "name": "connections" },
+        { "name": "approvals", "schema_version": 1, "paged": false }
+      ]
+    },
+    {
+      "contract_version": 1,
+      "revision": 1,
+      "generated_at": "2026-08-30T00:00:00Z",
+      "health": { "hub": "ready", "orca": "ready", "codex": "ready" },
+      "room": {
+        "channels": [
+          { "id": "all", "project_id": null, "label": "All", "count": 0 }
+        ],
+        "selected_channel_id": "all",
+        "threads": [],
+        "selected_thread_id": null,
+        "messages": [],
+        "context": {
+          "work_item": null,
+          "provider_run": null,
+          "sessions": [],
+          "approvals": [],
+          "artifacts": []
+        }
+      },
+      "session_tree": [],
+      "checklist": [],
+      "decisions": [],
+      "approvals": []
+    }
+  ]
+}

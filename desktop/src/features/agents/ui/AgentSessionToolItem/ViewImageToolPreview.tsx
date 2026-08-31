@@ -1,7 +1,7 @@
 import * as React from "react";
 
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { SimpleImageLightbox } from "@/shared/ui/SimpleImageLightbox";
-import { resolveToolImageSrc } from "../agentSessionUtils";
 
 export function ViewImageToolPreview({
   src,
@@ -11,11 +11,11 @@ export function ViewImageToolPreview({
   title: string | null;
 }) {
   const [lightboxOpen, setLightboxOpen] = React.useState(false);
-  const [imageFailed, setImageFailed] = React.useState(false);
-  const resolvedSrc = React.useMemo(() => resolveToolImageSrc(src), [src]);
+  const [failedSrc, setFailedSrc] = React.useState<string | null>(null);
+  const resolvedSrc = useRewrittenRelayUrl(src) ?? src;
   const alt = title ?? "Viewed image";
 
-  if (imageFailed) {
+  if (failedSrc === resolvedSrc) {
     return null;
   }
 
@@ -28,7 +28,7 @@ export function ViewImageToolPreview({
         decoding="async"
         loading="lazy"
         onClick={() => setLightboxOpen(true)}
-        onError={() => setImageFailed(true)}
+        onError={() => setFailedSrc(resolvedSrc)}
         src={resolvedSrc}
         title={title ?? undefined}
       />

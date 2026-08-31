@@ -17,6 +17,7 @@ use super::{relay_api, HuddlePhase};
 /// pipeline is cancelled instead of resurrecting a terminal huddle.
 #[tauri::command]
 pub async fn reconnect_huddle_audio(state: State<'_, AppState>) -> Result<(), String> {
+    state.require_active_identity()?;
     let (ephemeral_channel_id, parent_channel_id, session_generation) = {
         let hs = state.huddle()?;
         if matches!(hs.phase, HuddlePhase::Idle | HuddlePhase::Leaving) {

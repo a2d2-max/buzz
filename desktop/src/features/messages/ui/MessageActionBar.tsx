@@ -34,7 +34,7 @@ import { reactionEmojiUrl } from "@/shared/api/customEmoji";
 import { cn } from "@/shared/lib/cn";
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { emojiDisplayName } from "@/shared/lib/emojiName";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { KIND_HUDDLE_STARTED } from "@/shared/constants/kinds";
 import { Button } from "@/shared/ui/button";
 import { HashArrowIn } from "@/shared/ui/icons";
@@ -346,7 +346,7 @@ function QuickReactionButton({
   onSelect: (emoji: string) => void;
 }) {
   const displayName = emojiDisplayName(emoji);
-  const mediaUrl = customEmojiUrl ? rewriteRelayUrl(customEmojiUrl) : null;
+  const mediaUrl = useRewrittenRelayUrl(customEmojiUrl ?? null);
 
   return (
     <Tooltip>

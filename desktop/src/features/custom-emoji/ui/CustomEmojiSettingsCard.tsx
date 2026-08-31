@@ -13,11 +13,23 @@ import {
   suggestShortcodeFromFilename,
 } from "@/shared/api/customEmoji";
 import { pickAndUploadMedia } from "@/shared/api/tauri";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup";
 import { SettingsSectionHeader } from "@/features/settings/ui/SettingsSectionHeader";
+
+function ReactiveEmojiImage({
+  alt,
+  src,
+  ...props
+}: Omit<React.ComponentPropsWithoutRef<"img">, "alt" | "src"> & {
+  alt: string;
+  src: string;
+}) {
+  const mediaUrl = useRewrittenRelayUrl(src);
+  return <img alt={alt} src={mediaUrl ?? src} {...props} />;
+}
 
 /**
  * Custom emoji management (NIP-30, kind:30030). Each member owns their own set:
@@ -158,9 +170,9 @@ export function CustomEmojiSettingsCard() {
               <div className="flex min-w-0 flex-[1_1_16rem] items-center gap-3">
                 <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-md border bg-background">
                   {pendingUpload ? (
-                    <img
+                    <ReactiveEmojiImage
                       alt="Selected custom emoji preview"
-                      src={rewriteRelayUrl(pendingUpload.url)}
+                      src={pendingUpload.url}
                       className="h-14 w-14 object-contain"
                       draggable={false}
                     />
@@ -288,9 +300,9 @@ export function CustomEmojiSettingsCard() {
                   key={e.shortcode}
                   className="flex items-center gap-3 px-4 py-3"
                 >
-                  <img
+                  <ReactiveEmojiImage
                     alt={`:${e.shortcode}:`}
-                    src={rewriteRelayUrl(e.url)}
+                    src={e.url}
                     className="h-6 w-6 shrink-0 object-contain"
                     draggable={false}
                   />
@@ -323,9 +335,9 @@ export function CustomEmojiSettingsCard() {
                   key={e.shortcode}
                   className="flex items-center gap-3 px-4 py-3"
                 >
-                  <img
+                  <ReactiveEmojiImage
                     alt={`:${e.shortcode}:`}
-                    src={rewriteRelayUrl(e.url)}
+                    src={e.url}
                     className="h-6 w-6 shrink-0 object-contain"
                     draggable={false}
                   />

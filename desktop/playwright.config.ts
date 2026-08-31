@@ -187,6 +187,10 @@ export default defineConfig({
         "**/agents-everywhere.live.spec.ts",
         "**/relay-restart.live.spec.ts",
         "**/parity-ancestor-island.spec.ts",
+        "**/ops-room.spec.ts",
+        "**/raou-primary.spec.ts",
+        "**/raou-home-work.spec.ts",
+        "**/raou-source-views.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],

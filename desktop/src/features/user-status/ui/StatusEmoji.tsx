@@ -1,7 +1,7 @@
 import { useCustomEmoji } from "@/features/custom-emoji/hooks";
 import { cn } from "@/shared/lib/cn";
 import { emojiDisplayName } from "@/shared/lib/emojiName";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 
 /**
  * Render a user-status emoji from its stored string. A status emoji is a bare
@@ -27,22 +27,23 @@ const SHORTCODE_RE = /^:([^:\s]+):$/;
 
 export function StatusEmoji({ value, className }: StatusEmojiProps) {
   const customEmoji = useCustomEmoji();
+  const match = value?.match(SHORTCODE_RE);
+  const shortcode = match?.[1].toLowerCase();
+  const found = shortcode
+    ? customEmoji.find((e) => e.shortcode.toLowerCase() === shortcode)
+    : undefined;
+  const mediaUrl = useRewrittenRelayUrl(found?.url ?? null);
 
   if (!value) return null;
 
   const displayName = emojiDisplayName(value);
-  const match = value.match(SHORTCODE_RE);
   if (match) {
-    const shortcode = match[1].toLowerCase();
-    const found = customEmoji.find(
-      (e) => e.shortcode.toLowerCase() === shortcode,
-    );
     if (found) {
       return (
         <img
           alt={value}
           title={displayName}
-          src={rewriteRelayUrl(found.url)}
+          src={mediaUrl ?? found.url}
           className={cn("inline-block object-contain align-middle", className)}
           draggable={false}
         />

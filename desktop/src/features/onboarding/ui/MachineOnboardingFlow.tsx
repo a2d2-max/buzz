@@ -62,6 +62,7 @@ export type PostOnboardingNavigation = {
 
 export function MachineOnboardingFlow({
   complete,
+  continueInLocalOpsMode,
   continueWithIdentity,
   continueWithRecoveredIdentity,
   identityLost,
@@ -70,6 +71,7 @@ export function MachineOnboardingFlow({
   navigateAfterComplete,
 }: {
   complete: (pubkey?: string) => void;
+  continueInLocalOpsMode: () => void;
   continueWithIdentity: (pubkey: string) => void;
   continueWithRecoveredIdentity: (pubkey: string) => void;
   identityLost: boolean;
@@ -420,15 +422,26 @@ export function MachineOnboardingFlow({
                     variant="spotlight"
                   />
                   {identityLost && keyImportStage === "key-entry" ? (
-                    <Button
-                      className={`${ONBOARDING_SECONDARY_CTA_CLASS} mt-2 px-5`}
-                      disabled={isPending || isKeyImporting}
-                      onClick={() => void replaceLostIdentity()}
-                      type="button"
-                      variant="ghost"
-                    >
-                      Start new identity
-                    </Button>
+                    <div className="mt-2 flex flex-col items-center gap-1">
+                      <Button
+                        className={`${ONBOARDING_SECONDARY_CTA_CLASS} px-5`}
+                        disabled={isPending || isKeyImporting}
+                        onClick={continueInLocalOpsMode}
+                        type="button"
+                        variant="ghost"
+                      >
+                        Continue in local Ops mode
+                      </Button>
+                      <Button
+                        className={`${ONBOARDING_SECONDARY_CTA_CLASS} px-5`}
+                        disabled={isPending || isKeyImporting}
+                        onClick={() => void replaceLostIdentity()}
+                        type="button"
+                        variant="ghost"
+                      >
+                        Start new identity
+                      </Button>
+                    </div>
                   ) : null}
                 </div>
               </div>
