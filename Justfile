@@ -241,7 +241,10 @@ desktop-tauri-test-compiled-flags: _ensure-sidecar-stubs
       cargo test compiled_flag_matches_expected -- --ignored --nocapture
     env -u BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY \
       BUZZ_TEST_EXPECTED_AGENT_ACCESS_OWNER_ONLY=false \
-      cargo test --lib
+      cargo test --lib current_build_deploy_payload_forwards_compiled_policy -- --nocapture
+    env -u BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY \
+      BUZZ_TEST_EXPECTED_AGENT_ACCESS_OWNER_ONLY=false \
+      cargo test --lib build_env_ -- --nocapture
     env -u BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY \
       BUZZ_TEST_EXPECTED_AGENT_ACCESS_OWNER_ONLY=false \
       cargo test compiled_policy_matches_expected -- --ignored --nocapture
@@ -251,7 +254,10 @@ desktop-tauri-test-compiled-flags: _ensure-sidecar-stubs
       cargo test compiled_flag_matches_expected -- --ignored --nocapture
     BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY=1 \
       BUZZ_TEST_EXPECTED_AGENT_ACCESS_OWNER_ONLY=true \
-      cargo test --lib
+      cargo test --lib current_build_deploy_payload_forwards_compiled_policy -- --nocapture
+    BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY=1 \
+      BUZZ_TEST_EXPECTED_AGENT_ACCESS_OWNER_ONLY=true \
+      cargo test --lib build_env_ -- --nocapture
     BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY=1 \
       BUZZ_TEST_EXPECTED_AGENT_ACCESS_OWNER_ONLY=true \
       cargo test compiled_policy_matches_expected -- --ignored --nocapture
