@@ -60,7 +60,6 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
 window-vibrancy = "0.6"
 user-idle = { version = "0.6", default-features = false }
-plist = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_Foundation"] }
@@ -139,6 +138,7 @@ flate2 = "1"
 sherpa-onnx = "1.12"
 regex = "1"
 unicode-normalization = "0.1"
+plist = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 axum = "0.8"
 rodio = "0.22"
