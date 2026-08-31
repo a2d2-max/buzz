@@ -339,8 +339,6 @@ export function rewriteRelayUrl(url: string): string {
 
   // Only proxy URLs that belong to our relay. External Blossom URLs
   // (different origin) pass through unchanged — they work fine via WKWebView.
-  // If the relay origin isn't cached yet, fall through to the rewrite path
-  // as a safe default (relay URLs need the proxy to avoid Cloudflare 403s).
   // Compare canonicalized origins: hosts are case-insensitive, and the relay
   // always returns lowercased media URLs even when the saved community URL
   // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
@@ -349,10 +347,16 @@ export function rewriteRelayUrl(url: string): string {
     if (urlOrigin !== cachedRelayOrigin) {
       return url;
     }
-  }
 
-  if (cachedPort && cachedPort > 0) {
-    return mediaProxyUrl(cachedPort, m[1]);
+    if (cachedPort && cachedPort > 0) {
+      return mediaProxyUrl(cachedPort, m[1]);
+    }
+
+    if (!portPromise && typeof window !== "undefined") {
+      ensureRelayOriginFetch();
+    }
+
+    return `buzz-media://localhost/media/${m[1]}`;
   }
 
   if (!portPromise && typeof window !== "undefined") {

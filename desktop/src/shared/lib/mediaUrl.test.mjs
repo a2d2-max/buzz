@@ -350,6 +350,25 @@ test("rewriteRelayUrl: matches relay origin case-insensitively (uppercase saved 
   }
 });
 
+test("rewriteRelayUrl: known relay media uses the authenticated fallback while the proxy port is unavailable", async () => {
+  const previousWindow = globalThis.window;
+  globalThis.window = undefined;
+
+  try {
+    const mediaUrl = await import(
+      `./mediaUrl.ts?knownRelayFallback=${Date.now()}`
+    );
+    mediaUrl.beginRelayOriginFetch()("https://relay.example");
+
+    assert.equal(
+      mediaUrl.rewriteRelayUrl(`https://relay.example/media/${HASH}.png`),
+      `buzz-media://localhost/media/${HASH}.png`,
+    );
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
 test("rewriteRelayUrl: still passes external Blossom URLs through unchanged", async () => {
   const previousWindow = globalThis.window;
 
