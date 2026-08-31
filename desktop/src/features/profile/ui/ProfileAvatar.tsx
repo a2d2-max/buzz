@@ -9,6 +9,16 @@ import { useRewrittenRelayUrl } from "@/shared/lib/useRewrittenRelayUrl";
 import { Avatar, AvatarFallback, AvatarImage } from "@/shared/ui/avatar";
 import { Spinner } from "@/shared/ui/spinner";
 
+/**
+ * A `data:` URL is inlined bytes — rendering it makes no network request, so an
+ * untrusted publisher cannot use it to observe the viewer's IP or browse
+ * timing. Every other scheme (`http(s):`, `blob:`, relative) can reach the
+ * network and is suppressed under `untrusted`.
+ */
+function isInlineDataUrl(url: string): boolean {
+  return /^data:/i.test(url);
+}
+
 type ProfileAvatarProps = {
   avatarUrl: string | null;
   avatarDataUrl?: string | null;
@@ -18,6 +28,17 @@ type ProfileAvatarProps = {
   imageClassName?: string;
   plain?: boolean;
   testId?: string;
+  /**
+   * Suppress every network image request for a publisher-controlled avatar
+   * URL, rendering the initials/icon placeholder instead. Community-catalog
+   * browse projects avatar URLs straight from untrusted publications; loading
+   * them would hand the viewer's IP and browse timing to up to 64 attacker-
+   * chosen hosts before the user adds anything. Inline `data:` avatars (e.g.
+   * emoji avatars, and a trusted locally cached `avatarDataUrl`) carry no
+   * network origin, so they still render — only network-capable schemes are
+   * blocked.
+   */
+  untrusted?: boolean;
 };
 
 export function ProfileAvatar({
@@ -29,6 +50,7 @@ export function ProfileAvatar({
   imageClassName,
   plain = false,
   testId,
+  untrusted = false,
 }: ProfileAvatarProps) {
   const initials = getInitials(label);
   const presentation = useAvatarPresentation(avatarUrl);
@@ -45,8 +67,15 @@ export function ProfileAvatar({
     : presentedAvatarUrl;
 
   // Compute the live (proxied) source. Failures are tracked per resolved URL so
-  // the poster and hover animation can recover independently.
-  const liveSrc = useRewrittenRelayUrl(baseUrl);
+  // the poster and hover animation can recover independently. Under `untrusted`
+  // (publisher-controlled catalog browse) only an inline `data:` URL renders —
+  // it carries no network origin, so it can't leak the viewer's IP; every
+  // network-capable scheme is suppressed to the placeholder. This keeps emoji
+  // avatars (persisted as inline `data:image/svg+xml`) visible while blocking
+  // the up-to-64 attacker-chosen host fetches Carl flagged.
+  const rewritableUrl =
+    untrusted && baseUrl && !isInlineDataUrl(baseUrl) ? null : baseUrl;
+  const liveSrc = useRewrittenRelayUrl(rewritableUrl);
   const [failedSrc, setFailedSrc] = React.useState<string | null>(null);
   const liveFailed = liveSrc !== null && failedSrc === liveSrc;
 
