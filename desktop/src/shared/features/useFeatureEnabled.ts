@@ -137,14 +137,17 @@ export function useFeatureToggle(
  *
  * Stays a no-op for stable features and for preview features that ARE enabled.
  */
-export function usePreviewFeatureWarning(featureId: string): void {
+export function usePreviewFeatureWarning(
+  featureId: string,
+  suppressed = false,
+): void {
   const enabled = useFeatureEnabled(featureId);
   const feature = getFeature(featureId);
 
   useEffect(() => {
     // No-op for stable features (not in manifest) and preview features
     // that ARE enabled. Manifest membership = preview by definition.
-    if (!feature || enabled) return;
+    if (!feature || enabled || suppressed) return;
     let cancelled = false;
     void import("sonner").then(({ toast }) => {
       if (cancelled) return;
@@ -155,7 +158,7 @@ export function usePreviewFeatureWarning(featureId: string): void {
     return () => {
       cancelled = true;
     };
-  }, [feature, enabled]);
+  }, [feature, enabled, suppressed]);
 }
 
 export { resolveEnabled } from "./resolveEnabled";

@@ -21,6 +21,7 @@ import { cn } from "@/shared/lib/cn";
 type SidebarProfileCardProps = {
   activeCommunity: Community | null;
   isPresencePending?: boolean;
+  localWorkspaceMode?: boolean;
   onOpenAddCommunity: () => void;
   onOpenSettings: (section?: SettingsSection) => void;
   onRemoveCommunity: (id: string) => Promise<LeaveCommunityResult | undefined>;
@@ -43,6 +44,7 @@ type SidebarProfileCardProps = {
 export function SidebarProfileCard({
   activeCommunity,
   isPresencePending,
+  localWorkspaceMode = false,
   onOpenAddCommunity,
   onOpenSettings,
   onSendFeedback,
@@ -82,7 +84,9 @@ export function SidebarProfileCard({
     [toggleProfilePopover],
   );
   const hasStatus = Boolean(selfUserStatus?.text || selfUserStatus?.emoji);
-  const communityLabel = activeCommunity?.name ?? "No community";
+  const communityLabel = localWorkspaceMode
+    ? "Local Hub"
+    : (activeCommunity?.name ?? "No community");
   const readonlyCommunityLabel = (
     <span
       className="flex min-w-0 cursor-pointer items-center gap-1 text-xs leading-snug text-sidebar-foreground/70"
@@ -135,8 +139,14 @@ export function SidebarProfileCard({
             size={32}
           >
             <ProfileAvatar
-              avatarDataUrl={selfProfileCache?.avatarDataUrl ?? null}
-              avatarUrl={profile?.avatarUrl ?? null}
+              avatarDataUrl={
+                localWorkspaceMode
+                  ? null
+                  : (selfProfileCache?.avatarDataUrl ?? null)
+              }
+              avatarUrl={
+                localWorkspaceMode ? null : (profile?.avatarUrl ?? null)
+              }
               className="h-full w-full text-xs"
               iconClassName="h-4 w-4"
               label={resolvedDisplayName}
@@ -149,8 +159,12 @@ export function SidebarProfileCard({
           <ProfilePopover
             open={profilePopoverOpen}
             onOpenChange={setProfilePopoverOpen}
-            avatarDataUrl={selfProfileCache?.avatarDataUrl ?? null}
-            avatarUrl={profile?.avatarUrl ?? null}
+            avatarDataUrl={
+              localWorkspaceMode
+                ? null
+                : (selfProfileCache?.avatarDataUrl ?? null)
+            }
+            avatarUrl={localWorkspaceMode ? null : (profile?.avatarUrl ?? null)}
             currentStatus={selfPresenceStatus}
             displayName={resolvedDisplayName}
             isStatusPending={isPresencePending}

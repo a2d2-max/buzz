@@ -6,6 +6,7 @@ import {
   normalizeOpsNavigation,
   type OpsNavigationPort,
 } from "@/features/ops-room/opsRouteState";
+import { useLocalOpsGuestMode } from "@/features/onboarding/localOpsGuestMode";
 import { usePreviewFeatureWarning } from "@/shared/features";
 import { BuzzLoadingState } from "@/shared/ui/BuzzLoadingState";
 
@@ -24,7 +25,8 @@ export const Route = createFileRoute("/ops")({
 });
 
 function OpsRouteComponent() {
-  usePreviewFeatureWarning("nativeOpsRoom");
+  const localOpsGuestMode = useLocalOpsGuestMode();
+  usePreviewFeatureWarning("nativeOpsRoom", localOpsGuestMode);
   const navigate = Route.useNavigate();
   const search = Route.useSearch();
   const navigation = React.useMemo<OpsNavigationPort>(

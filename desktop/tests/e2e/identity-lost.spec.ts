@@ -38,6 +38,16 @@ async function guestCommandLog(page: import("@playwright/test").Page) {
   );
 }
 
+async function guestForbiddenCommandLog(page: import("@playwright/test").Page) {
+  return page.evaluate(
+    (forbiddenCommands) =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).filter(({ command }) =>
+        forbiddenCommands.includes(command),
+      ),
+    [...GUEST_FORBIDDEN_COMMANDS],
+  );
+}
+
 async function emitNostrBind(page: import("@playwright/test").Page) {
   await page.evaluate(async () => {
     await window.__TAURI_INTERNALS__?.invoke?.("plugin:event|emit", {
@@ -142,6 +152,52 @@ test("local Ops guest entry is offered only for a lost identity", async ({
   await expect(localOpsButton).toBeFocused();
 });
 
+test("local Ops guest keeps the complete Buzz shell", async ({ page }) => {
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await enterLocalOpsGuestMode(page);
+
+  await expect(page.getByTestId("app-sidebar-layer")).toBeVisible();
+  await expect(page.getByTestId("app-sidebar")).toBeVisible();
+  await expect(page.getByTestId("ops-room-view")).toBeVisible();
+  await expect(page.getByTestId("raou-workspace-sidebar")).toHaveCount(0);
+  await expect(page.getByTestId("sidebar-relay-unreachable")).toHaveCount(0);
+  await expect(page.getByTestId("sidebar-profile-name")).toHaveText("RAOU");
+  await expect(page.getByTestId("sidebar-profile-card")).toContainText(
+    "Local Hub",
+  );
+  await expect(page.getByTestId("open-ops-view")).toBeVisible();
+  await expect(
+    page.getByText("Native Ops Room is a preview feature", { exact: false }),
+  ).toHaveCount(0);
+});
+
+test("local Ops guest keeps original Buzz navigation without signing", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { identityLost: true },
+    { seedPreviewFeatures: false, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+  await enterLocalOpsGuestMode(page);
+
+  await page.getByTestId("open-agents-view").click();
+
+  await expect(page).toHaveURL(/#\/agents$/);
+  await expect(page.getByTestId("agents-page-content")).toBeVisible();
+  expect(await guestForbiddenCommandLog(page)).toEqual([]);
+
+  await page.getByTestId("global-back").click();
+  await expect(page.getByTestId("ops-room-view")).toBeVisible();
+});
+
 test("normal key-import page never offers local Ops guest entry", async ({
   page,
 }) => {
@@ -181,7 +237,7 @@ test("local Ops guest boundary ignores global Nostr binding requests", async ({
   );
 });
 
-test("local Ops banner clears macOS traffic lights at the minimum window width", async ({
+test("Buzz chrome clears macOS traffic lights in local Ops mode at the minimum window width", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 800, height: 500 });
@@ -196,20 +252,20 @@ test("local Ops banner clears macOS traffic lights at the minimum window width",
   await page.goto("/");
   await enterLocalOpsGuestMode(page);
 
-  const label = page.getByText("Local Ops mode", { exact: true });
-  const restore = page.getByRole("button", { name: "Restore identity" });
-  await expect(label).toBeVisible();
-  await expect(restore).toBeVisible();
-  const labelBox = await label.boundingBox();
-  const restoreBox = await restore.boundingBox();
-  expect(labelBox).not.toBeNull();
-  expect(restoreBox).not.toBeNull();
+  const chrome = page.getByTestId("app-top-chrome");
+  const sidebarToggle = page.getByRole("button", { name: "Toggle Sidebar" });
+  await expect(chrome).toBeVisible();
+  await expect(sidebarToggle).toBeVisible();
+  const chromeBox = await chrome.boundingBox();
+  const toggleBox = await sidebarToggle.boundingBox();
+  expect(chromeBox).not.toBeNull();
+  expect(toggleBox).not.toBeNull();
 
   // With native controls positioned at x:16, their visible right edge is
-  // approximately 72px. Both label text and the restore control must remain
-  // readable inside the minimum supported 800px-wide window.
-  expect(labelBox?.x ?? 0).toBeGreaterThanOrEqual(72);
-  expect((restoreBox?.x ?? 0) + (restoreBox?.width ?? 0)).toBeLessThanOrEqual(
+  // approximately 72px. The canonical Buzz chrome must keep its first control
+  // clear of that native overlay in the minimum supported window.
+  expect(toggleBox?.x ?? 0).toBeGreaterThanOrEqual(72);
+  expect((chromeBox?.x ?? 0) + (chromeBox?.width ?? 0)).toBeLessThanOrEqual(
     800,
   );
 });
@@ -297,13 +353,22 @@ test("clearing local Ops guest mode in another window removes the session fallba
     { seedPreviewFeatures: false, skipOnboardingSeed: true },
   );
   await secondPage.goto("/");
-  await expect(
-    secondPage.getByText("Local Ops mode", { exact: true }),
-  ).toBeVisible();
-  await secondPage.getByRole("button", { name: "Restore identity" }).click();
+  await expect(secondPage.getByTestId("app-sidebar")).toBeVisible();
+  await secondPage.evaluate((storageKey) => {
+    window.localStorage.removeItem(storageKey);
+    window.dispatchEvent(
+      new StorageEvent("storage", {
+        key: storageKey,
+        newValue: null,
+      }),
+    );
+  }, "buzz-local-ops-guest.v1");
 
   await expect(
     page.getByRole("heading", { name: "Enter your private key" }),
+  ).toBeVisible();
+  await expect(
+    secondPage.getByRole("heading", { name: "Enter your private key" }),
   ).toBeVisible();
   await secondPage.close();
 });
@@ -322,16 +387,8 @@ test("local Ops guest mode persists without mutating identity recovery", async (
 
   await expect(page).toHaveURL(/#\/ops\?view=room$/);
   await expect(page.getByRole("heading", { name: "Agent Room" })).toBeVisible();
-  await expect(page.getByText("Local Ops mode", { exact: true })).toBeVisible();
-  await expect(
-    page.getByText(
-      "Messaging, signed actions, and external actions are unavailable until you restore your identity.",
-      { exact: true },
-    ),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Restore identity" }),
-  ).toBeVisible();
+  await expect(page.getByTestId("app-sidebar")).toBeVisible();
+  await expect(page.getByTestId("raou-workspace-sidebar")).toHaveCount(0);
 
   expect(
     await page.evaluate(() =>
@@ -343,37 +400,13 @@ test("local Ops guest mode persists without mutating identity recovery", async (
   );
   expect(recoveryIdentity).toMatchObject({ lost: true });
 
-  const commandsBeforeReload = await guestCommandLog(page);
-  expect(
-    commandsBeforeReload.filter((command) =>
-      GUEST_FORBIDDEN_COMMANDS.includes(
-        command as (typeof GUEST_FORBIDDEN_COMMANDS)[number],
-      ),
-    ),
-  ).toEqual([]);
+  expect(await guestForbiddenCommandLog(page)).toEqual([]);
 
   await page.reload();
   await expect(page).toHaveURL(/#\/ops\?view=room$/);
   await expect(page.getByRole("heading", { name: "Agent Room" })).toBeVisible();
-  await expect(page.getByText("Local Ops mode", { exact: true })).toBeVisible();
-  const commandsAfterReload = await guestCommandLog(page);
-  expect(
-    commandsAfterReload.filter((command) =>
-      GUEST_FORBIDDEN_COMMANDS.includes(
-        command as (typeof GUEST_FORBIDDEN_COMMANDS)[number],
-      ),
-    ),
-  ).toEqual([]);
-
-  await page.getByRole("button", { name: "Restore identity" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Enter your private key" }),
-  ).toBeVisible();
-  expect(
-    await page.evaluate(() =>
-      window.localStorage.getItem("buzz-local-ops-guest.v1"),
-    ),
-  ).toBeNull();
+  await expect(page.getByTestId("app-sidebar")).toBeVisible();
+  expect(await guestForbiddenCommandLog(page)).toEqual([]);
 });
 
 test("lost boot keeps the pairing-code action stable while generating", async ({

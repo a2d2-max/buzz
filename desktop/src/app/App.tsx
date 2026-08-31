@@ -46,10 +46,7 @@ import {
   enableLocalOpsGuestMode,
   useLocalOpsGuestMode,
 } from "@/features/onboarding/localOpsGuestMode";
-import {
-  LocalOpsGuestApp,
-  RaouWorkspaceApp,
-} from "@/features/ops-room/ui/LocalOpsGuestApp";
+import { RaouWorkspaceApp } from "@/features/ops-room/ui/LocalOpsGuestApp";
 import { PendingInviteGate } from "@/features/onboarding/ui/PendingInviteGate";
 import { KeyringLockedScreen } from "@/features/onboarding/ui/KeyringLockedScreen";
 import { RelaunchRequiredScreen } from "@/features/onboarding/ui/RelaunchRequiredScreen";
@@ -357,6 +354,23 @@ function AppReady({
         <RouterProvider router={router} />
       </KnownAgentPubkeysProvider>
     </EncryptedBackupProvider>
+  );
+}
+
+function LocalOpsBuzzApp() {
+  useLayoutEffect(() => {
+    if (router.state.location.pathname === "/ops") return;
+    void router.navigate({
+      replace: true,
+      search: { channel: undefined, thread: undefined, view: "room" },
+      to: "/ops",
+    });
+  }, []);
+
+  return (
+    <KnownAgentPubkeysProvider>
+      <RouterProvider router={router} />
+    </KnownAgentPubkeysProvider>
   );
 }
 
@@ -784,7 +798,7 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   if (machine.stage === "relaunch-required") return <RelaunchRequiredScreen />;
   if (machine.stage === "blocking") return <AppLoadingGate />;
   if (machine.identityLost && localOpsGuestMode) {
-    return <LocalOpsGuestApp onRestoreIdentity={clearLocalOpsGuestMode} />;
+    return <LocalOpsBuzzApp />;
   }
   if (machine.stage === "ready") {
     return (

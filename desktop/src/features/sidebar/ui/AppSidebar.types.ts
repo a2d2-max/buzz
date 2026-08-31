@@ -29,6 +29,7 @@ export type AppSidebarProps = {
   homeBadgeCount: number;
   isAddCommunityOpen?: boolean;
   isLoading: boolean;
+  localWorkspaceMode?: boolean;
   isCreatingChannel: boolean;
   isCreatingForum: boolean;
   profile?: Profile;

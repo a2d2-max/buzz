@@ -90,6 +90,7 @@ import { useAddCommunityDialogState } from "@/features/communities/addCommunityP
 import { useApplyTemplate } from "@/features/channel-templates/useApplyTemplate";
 import { relayClient } from "@/shared/api/relayClient";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { useLocalOpsGuestMode } from "@/features/onboarding/localOpsGuestMode";
 import { useRelayAutoHeal } from "@/shared/api/useRelayAutoHeal";
 import { useDeferredStartup } from "@/shared/hooks/useDeferredStartup";
 import { useWebviewScrollBoundaryLock } from "@/shared/hooks/useWebviewScrollBoundaryLock";
@@ -181,18 +182,20 @@ export function AppShell() {
     : DEFAULT_SETTINGS_SECTION;
   const startupReady = useDeferredStartup();
   const identityQuery = useIdentityQuery();
+  const localOpsGuestMode = useLocalOpsGuestMode();
+  // Hub mode keeps Buzz's shell but never inherits a relay signing identity.
+  const relayPubkey = localOpsGuestMode
+    ? undefined
+    : identityQuery.data?.pubkey;
   const { mutedChannelIds, muteChannel, unmuteChannel } = useChannelMutes(
-    identityQuery.data?.pubkey,
+    relayPubkey,
     communitiesHook.activeCommunity?.relayUrl,
   );
   const { starredChannelIds, starChannel, unstarChannel } = useChannelStars(
-    identityQuery.data?.pubkey,
+    relayPubkey,
     communitiesHook.activeCommunity?.relayUrl,
   );
-  usePersonaSync(
-    identityQuery.data?.pubkey,
-    communitiesHook.activeCommunity?.relayUrl,
-  );
+  usePersonaSync(relayPubkey, communitiesHook.activeCommunity?.relayUrl);
   useAgentsDataRefresh();
   // Chunk F: auto-restart drifted idle agents (per-agent opt-out, default ON).
   useAutoRestartPolicy();
@@ -207,9 +210,7 @@ export function AppShell() {
   // Kind 24200 is relay-ephemeral, so reconciliation runs eagerly (not
   // deferred): seeds kind 24200 for fresh identities, no-ops for explicit
   // opt-outs. Frames before the listener opens are permanently lost.
-  const observerReconciled = useObserverArchiveReconciliation(
-    identityQuery.data?.pubkey,
-  );
+  const observerReconciled = useObserverArchiveReconciliation(relayPubkey);
   // useArchiveSync must wait for reconciliation, or listeners could open
   // before kind 24200 is guaranteed present in the subscription.
   useArchiveSync(observerReconciled);
@@ -218,45 +219,43 @@ export function AppShell() {
   useArchiveAgentMetricsBridge();
   // Kind 44200 is relay-persisted (durable) and stays deferred: missed
   // startup frames can be replayed, so there's no ordering constraint.
-  const deferredPubkey = startupReady ? identityQuery.data?.pubkey : undefined;
+  const deferredPubkey = startupReady ? relayPubkey : undefined;
   useAgentMetricArchiveSeed(deferredPubkey);
   const profileQuery = useProfileQuery();
   useRelayAutoHeal();
   usePresenceSubscription();
   useUserStatusSubscription();
   useCommunityEmojiLiveUpdates();
-  useMembershipNotifications(identityQuery.data?.pubkey);
+  useMembershipNotifications(relayPubkey);
   const presenceSession = usePresenceSession(deferredPubkey);
   const selfStatusQuery = useUserStatusQuery(
     deferredPubkey ? [deferredPubkey] : [],
   );
   const setUserStatusMutation = useSetUserStatusMutation(deferredPubkey);
   const { feedProfilesQuery, homeFeedQuery, notificationSettings } =
-    useHomeFeedNotifications(identityQuery.data?.pubkey);
-  const feedItemState = useFeedItemState(identityQuery.data?.pubkey);
+    useHomeFeedNotifications(relayPubkey);
+  const feedItemState = useFeedItemState(relayPubkey);
   const channelsQuery = useChannelsQuery();
   const channels = channelsQuery.data ?? [];
   useReminderNotifications(
-    identityQuery.data?.pubkey,
+    relayPubkey,
     notificationSettings.settings,
     channels,
   );
   const refetchHomeFeedFromLiveSignal = React.useEffectEvent(() => {
     void homeFeedQuery.refetch();
   });
-  useLiveHomeFeedActions(
-    identityQuery.data?.pubkey,
-    refetchHomeFeedFromLiveSignal,
-  );
+  useLiveHomeFeedActions(relayPubkey, refetchHomeFeedFromLiveSignal);
   const { refetch: refetchChannels } = channelsQuery;
   const channelsErrorMessage =
-    channelsQuery.error instanceof Error
+    !localOpsGuestMode && channelsQuery.error instanceof Error
       ? channelsQuery.error.message
       : undefined;
   const relayConnectionCard = useSidebarRelayConnectionCard(
     channelsErrorMessage,
     communitiesHook.activeCommunity?.relayUrl,
     `${communitiesHook.activeCommunity?.id ?? "none"}-${communitiesHook.reinitKey}`,
+    !localOpsGuestMode,
   );
   const memberChannels = React.useMemo(
     () => channels.filter((channel) => channel.isMember),
@@ -329,7 +328,7 @@ export function AppShell() {
     channelId: selectedChannelId,
     channels,
     locationSearch: location.search,
-    pubkey: identityQuery.data?.pubkey,
+    pubkey: relayPubkey,
     relayUrl: communitiesHook.activeCommunity?.relayUrl,
   });
   const effectiveTerminalContext = terminalContextOverride
@@ -357,7 +356,7 @@ export function AppShell() {
     goHome,
     notificationSettings: notificationSettings.settings,
     openSearchHit,
-    pubkey: identityQuery.data?.pubkey,
+    pubkey: relayPubkey,
     silentChannelIds: huddleBackingChannelIds,
   });
   const {
@@ -365,7 +364,7 @@ export function AppShell() {
     isFollowing: isFollowingThread,
     followThread,
     unfollowThread,
-  } = useThreadFollows(identityQuery.data?.pubkey);
+  } = useThreadFollows(relayPubkey);
   const {
     markAllChannelsRead: markAllChannelReadMarkers,
     markChannelRead,
@@ -392,10 +391,10 @@ export function AppShell() {
     isHuddleRoom ? EMPTY_CHANNELS : sidebarChannels,
     isHuddleRoom ? null : activeChannel,
     {
-      pubkey: identityQuery.data?.pubkey,
+      pubkey: relayPubkey,
       relayClient,
       relayUrl: communitiesHook.activeCommunity?.relayUrl,
-      currentPubkey: identityQuery.data?.pubkey,
+      currentPubkey: relayPubkey,
       mutedChannelIds,
       notifyForActiveChannel: notificationSettings.settings.notifyWhileViewing,
       onChannelMessage: handleChannelNotification,
@@ -449,7 +448,7 @@ export function AppShell() {
   const { homeBadgeCount, homeBadgeCountExcludingHighPriority } =
     useHomeFeedNotificationState(
       homeFeedQuery.data,
-      identityQuery.data?.pubkey,
+      relayPubkey,
       notificationSettings.settings,
       notificationSettings.setDesktopEnabled,
       !isHuddleRoom,
@@ -467,7 +466,7 @@ export function AppShell() {
       huddleBackingChannelIds,
     );
   const dueReminderBadge = useDueReminderBadgeCount(
-    identityQuery.data?.pubkey,
+    relayPubkey,
     notificationSettings.settings.homeBadgeEnabled,
   );
   const isNotifiedForThread = React.useCallback(
@@ -508,7 +507,7 @@ export function AppShell() {
   const openDmMutation = useOpenDmMutation();
   const hideDmMutation = useHideDmMutation();
   useDmResurfaceFromMessages({
-    pubkey: identityQuery.data?.pubkey,
+    pubkey: relayPubkey,
     relayUrl: communitiesHook.activeCommunity?.relayUrl,
     reopen: openDmMutation.mutateAsync,
   });
@@ -746,7 +745,7 @@ export function AppShell() {
           }}
         >
           <AppHuddleShell
-            currentPubkey={identityQuery.data?.pubkey}
+            currentPubkey={relayPubkey}
             isCompanionOpen={isHuddleCompanionOpen}
             isDrawerOpen={isHuddleDrawerOpen}
             isRoom={isHuddleRoom}
@@ -786,7 +785,7 @@ export function AppShell() {
                     <div className="flex min-h-0 flex-1 overflow-hidden">
                       <React.Suspense fallback={null}>
                         <LazySettingsScreen
-                          currentPubkey={identityQuery.data?.pubkey}
+                          currentPubkey={relayPubkey}
                           fallbackDisplayName={identityQuery.data?.displayName}
                           isUpdatingDesktopNotifications={
                             notificationSettings.isUpdatingDesktopEnabled
@@ -828,7 +827,7 @@ export function AppShell() {
                         <AppSidebar
                           activeCommunity={communitiesHook.activeCommunity}
                           channels={sidebarChannels}
-                          currentPubkey={identityQuery.data?.pubkey}
+                          currentPubkey={relayPubkey}
                           errorMessage={channelsErrorMessage}
                           fallbackDisplayName={identityQuery.data?.displayName}
                           homeBadgeCount={homeBadgeCount + dueReminderBadge}
@@ -838,14 +837,14 @@ export function AppShell() {
                           isCreatingChannel={createChannelMutation.isPending}
                           isCreatingForum={createForumMutation.isPending}
                           isLoading={channelsQuery.isLoading}
+                          localWorkspaceMode={localOpsGuestMode}
                           isCreateChannelOpen={isCreateChannelOpen}
                           isHuddleCompanionOpen={isHuddleCompanionOpen}
                           isPresencePending={presenceSession.isPending}
                           onAddCommunity={(community) => {
                             const id = communitiesHook.addCommunity({
                               ...community,
-                              pubkey:
-                                community.pubkey ?? identityQuery.data?.pubkey,
+                              pubkey: community.pubkey ?? relayPubkey,
                             });
                             handleSwitchCommunity(id);
                           }}
@@ -959,7 +958,7 @@ export function AppShell() {
                     activeChannel={managedChannel}
                     browseDialogType={browseDialogType}
                     channels={channels}
-                    currentPubkey={identityQuery.data?.pubkey}
+                    currentPubkey={relayPubkey}
                     isChannelManagementOpen={isChannelManagementOpen}
                     isCreatingBrowseChannel={
                       createChannelMutation.isPending ||

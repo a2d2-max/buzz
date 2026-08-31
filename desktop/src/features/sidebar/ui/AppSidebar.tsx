@@ -84,6 +84,7 @@ export function AppSidebar({
   onBackgroundClick,
   isAddCommunityOpen,
   isLoading,
+  localWorkspaceMode = false,
   isCreatingChannel,
   isCreatingForum,
   profile,
@@ -446,10 +447,11 @@ export function AppSidebar({
     isLoading,
     streamChannels,
   });
-  const resolvedDisplayName =
-    profile?.displayName?.trim() ||
-    fallbackDisplayName?.trim() ||
-    "Current identity";
+  const resolvedDisplayName = localWorkspaceMode
+    ? "RAOU"
+    : profile?.displayName?.trim() ||
+      fallbackDisplayName?.trim() ||
+      "Current identity";
   const isCreatingAny =
     createDialogKind === "stream"
       ? isCreatingChannel
@@ -553,6 +555,7 @@ export function AppSidebar({
               data-testid="sidebar-scroll-content"
             >
               <AppSidebarPrimaryMenu
+                forceOpsVisible={localWorkspaceMode}
                 homeBadgeCount={homeBadgeCount}
                 onSelectAgents={onSelectAgents}
                 onSelectHome={onSelectHome}
@@ -862,7 +865,8 @@ export function AppSidebar({
                   onClearUserStatus={onClearUserStatus}
                   onSwitchCommunity={onSwitchCommunity}
                   onUpdateCommunity={onUpdateCommunity}
-                  profile={profile}
+                  profile={localWorkspaceMode ? undefined : profile}
+                  localWorkspaceMode={localWorkspaceMode}
                   resolvedDisplayName={resolvedDisplayName}
                   selfPresenceStatus={selfPresenceStatus}
                   selfUserStatus={selfUserStatus}

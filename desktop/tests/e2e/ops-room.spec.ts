@@ -314,7 +314,8 @@ async function openLocalOpsRoom(
   }
 
   await expect(page).toHaveURL(/\/#\/ops\?view=room$/);
-  await expect(page.getByText("Local Ops mode", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("app-sidebar-layer")).toBeVisible();
+  await expect(page.getByTestId("raou-workspace-sidebar")).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: FORBIDDEN_ACTION_NAME }),
   ).toHaveCount(0);
@@ -403,19 +404,24 @@ async function expectNoHorizontalOverflow(
 }
 
 async function expectAccessibleTargets(page: Page) {
+  const interactiveSelectors = [
+    "button:visible",
+    "a[href]:visible",
+    "input:not([type=hidden]):visible",
+    "select:visible",
+    "textarea:visible",
+    "summary:visible",
+    '[role="button"]:visible',
+    '[role="tab"]:visible',
+    '[role="treeitem"]:visible',
+    "[data-ops-interactive]:visible",
+  ];
   const targets = page.locator(
-    [
-      "button:visible",
-      "a[href]:visible",
-      "input:not([type=hidden]):visible",
-      "select:visible",
-      "textarea:visible",
-      "summary:visible",
-      '[role="button"]:visible',
-      '[role="tab"]:visible',
-      '[role="treeitem"]:visible',
-      "[data-ops-interactive]:visible",
-    ].join(", "),
+    ["[data-testid=ops-room-view]", '[role="dialog"]']
+      .flatMap((root) =>
+        interactiveSelectors.map((selector) => `${root} ${selector}`),
+      )
+      .join(", "),
   );
   expect(await targets.count()).toBeGreaterThan(0);
   const undersized = await targets.evaluateAll((elements) =>

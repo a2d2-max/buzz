@@ -8,6 +8,8 @@ interface FeatureGateProps {
   children: ReactNode;
   /** Optional fallback when the feature is disabled */
   fallback?: ReactNode;
+  /** Product modes may promote a preview feature to a required surface. */
+  forceEnabled?: boolean;
 }
 
 /**
@@ -22,7 +24,8 @@ export function FeatureGate({
   feature,
   children,
   fallback = null,
+  forceEnabled = false,
 }: FeatureGateProps): ReactNode {
   const enabled = useFeatureEnabled(feature);
-  return enabled ? children : fallback;
+  return forceEnabled || enabled ? children : fallback;
 }

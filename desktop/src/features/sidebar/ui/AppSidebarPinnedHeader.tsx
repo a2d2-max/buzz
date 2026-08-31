@@ -40,6 +40,7 @@ type AppSidebarPinnedHeaderProps = {
 };
 
 type AppSidebarPrimaryMenuProps = {
+  forceOpsVisible?: boolean;
   homeBadgeCount: number;
   onSelectAgents: () => void;
   onSelectHome: () => void;
@@ -91,6 +92,7 @@ export function AppSidebarPinnedHeader({
 }
 
 export function AppSidebarPrimaryMenu({
+  forceOpsVisible = false,
   homeBadgeCount,
   onSelectAgents,
   onSelectHome,
@@ -170,7 +172,7 @@ export function AppSidebarPrimaryMenu({
               <SidebarMenuLabel>Agents</SidebarMenuLabel>
             </SidebarMenuButton>
           </SidebarMenuItem>
-          <FeatureGate feature="nativeOpsRoom">
+          <FeatureGate feature="nativeOpsRoom" forceEnabled={forceOpsVisible}>
             <SidebarMenuItem>
               <SidebarMenuButton
                 className="min-h-11 min-w-11 group-data-[collapsible=icon]:!size-11 md:min-h-0 md:min-w-0"

@@ -64,6 +64,7 @@ export function useSidebarRelayConnectionCard(
   errorMessage?: string,
   relayUrl?: string | null,
   relayLifecycleKey = relaySuccessKey(relayUrl),
+  enabled = true,
 ) {
   const relayConnectionState = useRelayConnection();
   const hasRelayUnreachableError = errorMessage
@@ -94,7 +95,7 @@ export function useSidebarRelayConnectionCard(
     hasActiveRelayUnreachableError || isRelayConnectionStateDegraded;
   const isRelayConnectionSuccess = hasSuccess && isRelayConnectionConnected;
   const canShow = isRelayConnectionActuallyDegraded || isRelayConnectionSuccess;
-  const show = canShow && !isDismissed;
+  const show = enabled && canShow && !isDismissed;
   const outageActiveRef = React.useRef(false);
   const outageRelayLifecycleKeyRef = React.useRef(relayLifecycleKey);
   const wasProblemCardVisibleRef = React.useRef(false);

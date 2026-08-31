@@ -46,7 +46,7 @@ const virtualRoutesSource = await readFile(
 );
 const opsMenuSource =
   appSidebarSource.match(
-    /<FeatureGate feature="nativeOpsRoom">[\s\S]*?<\/FeatureGate>/,
+    /<FeatureGate feature="nativeOpsRoom"[^>]*>[\s\S]*?<\/FeatureGate>/,
   )?.[0] ?? "";
 
 describe("native Ops Room route", () => {
@@ -59,6 +59,7 @@ describe("native Ops Room route", () => {
 
   test("wires the gated Ops selector through navigation and the sidebar", () => {
     assert.match(opsMenuSource, /data-testid="open-ops-view"/);
+    assert.match(opsMenuSource, /forceEnabled=\{forceOpsVisible\}/);
     assert.match(opsMenuSource, /<PanelTop className="h-4 w-4" \/>/);
     assert.match(
       navigationSource,
