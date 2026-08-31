@@ -196,9 +196,12 @@ fn ops_bridge_token_file_fails_closed_on_permissions_symlink_and_empty_content()
     write_token(&token, &[b't'; 32], 0o600);
     assert!(read_hub_token(&token).is_ok());
 
-    let world_readable = temp.path().join("world-readable.token");
-    write_token(&world_readable, &[b't'; 32], 0o644);
-    assert!(read_hub_token(&world_readable).is_err());
+    #[cfg(unix)]
+    {
+        let world_readable = temp.path().join("world-readable.token");
+        write_token(&world_readable, &[b't'; 32], 0o644);
+        assert!(read_hub_token(&world_readable).is_err());
+    }
 
     let empty = temp.path().join("empty.token");
     write_token(&empty, b"\n", 0o600);

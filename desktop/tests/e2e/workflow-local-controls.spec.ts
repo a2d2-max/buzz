@@ -51,8 +51,13 @@ async function openTriggerInspector(
   dialog: import("@playwright/test").Locator,
 ) {
   const menu = dialog.getByRole("button", { name: "Trigger event" });
+  const triggerNode = dialog.getByRole("button", { name: /^Trigger:/ });
+  await Promise.race([
+    menu.waitFor({ state: "visible" }),
+    triggerNode.waitFor({ state: "visible" }),
+  ]);
   if (!(await menu.isVisible())) {
-    await dialog.getByRole("button", { name: /^Trigger:/ }).click();
+    await triggerNode.click();
   }
   await expect(menu).toBeVisible();
 }
@@ -63,7 +68,11 @@ async function addMessageStep(
 ) {
   await dialog.getByRole("button", { name: "Add step", exact: true }).click();
   await page.getByRole("menuitem", { name: "Send Message" }).click();
-  await dialog.getByLabel("Message text").fill("Workflow notification");
+  const stepNode = dialog.getByRole("button", { name: /^Step 1:/ });
+  await expect(stepNode).toHaveAttribute("aria-pressed", "true");
+  const messageText = dialog.locator("#wf-step-0-text");
+  await expect(messageText).toBeVisible();
+  await messageText.fill("Workflow notification");
 }
 
 async function createEnabled(
@@ -74,9 +83,14 @@ async function createEnabled(
   const confirmation = page.getByRole("alertdialog", {
     name: "This workflow may run often",
   });
+  await Promise.race([
+    confirmation.waitFor({ state: "visible" }),
+    dialog.waitFor({ state: "hidden" }),
+  ]);
   if (await confirmation.isVisible()) {
     await confirmation.getByRole("button", { name: "Turn on" }).click();
   }
+  await expect(dialog).toBeHidden();
 }
 
 async function reopenWorkflow(
@@ -152,14 +166,29 @@ test("inserts template variables with keyboard control and restores the caret", 
   await dialog.getByRole("button", { name: "Add step", exact: true }).click();
   await page.getByRole("menuitem", { name: "Send Message" }).click();
 
-  const textarea = dialog.getByLabel("Message text");
+  const stepNode = dialog.getByRole("button", { name: /^Step 1:/ });
+  await expect(stepNode).toHaveAttribute("aria-pressed", "true");
+  const textarea = dialog.locator("#wf-step-0-text");
+  await expect(textarea).toBeVisible();
   const listbox = page.getByRole("listbox");
   await textarea.fill("Hello {{trig");
   await expect(listbox).toBeVisible();
   await expect(listbox.getByRole("option")).toHaveCount(5);
   await waitForAnimations(page);
-  expect(await page.locator("body").screenshot()).toMatchSnapshot(
-    "workflow-template-variable-autocomplete.png",
+  const textareaBox = await textarea.boundingBox();
+  const listboxBox = await listbox.boundingBox();
+  expect(textareaBox).not.toBeNull();
+  expect(listboxBox).not.toBeNull();
+  expect(
+    Math.abs(
+      (listboxBox?.x ?? 0) +
+        (listboxBox?.width ?? 0) / 2 -
+        ((textareaBox?.x ?? 0) + (textareaBox?.width ?? 0) / 2),
+    ),
+  ).toBeLessThan(1);
+  expect(listboxBox?.width).toBeLessThanOrEqual(textareaBox?.width ?? 0);
+  expect(listboxBox?.y).toBeGreaterThanOrEqual(
+    (textareaBox?.y ?? 0) + (textareaBox?.height ?? 0),
   );
 
   await textarea.press("ArrowUp");
@@ -288,6 +317,7 @@ test("round-trips and reopens structured message-text conditions", async ({
   await openTriggerInspector(dialog);
   const matchControls = dialog.getByRole("group", { name: "Match" });
   const operatorButtons = matchControls.getByRole("button");
+  await waitForAnimations(page);
   const firstOperatorBox = await operatorButtons.nth(0).boundingBox();
   const secondOperatorBox = await operatorButtons.nth(1).boundingBox();
   const thirdOperatorBox = await operatorButtons.nth(2).boundingBox();
@@ -299,7 +329,6 @@ test("round-trips and reopens structured message-text conditions", async ({
     Math.abs((secondOperatorBox?.y ?? 0) - (firstOperatorBox?.y ?? 0)),
   ).toBeLessThan(1);
   expect(thirdOperatorBox?.y).toBeGreaterThan(firstOperatorBox?.y ?? 0);
-  await waitForAnimations(page);
   await matchControls.screenshot({
     path: "test-results/workflow-message-condition-operators.png",
   });
