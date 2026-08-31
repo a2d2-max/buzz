@@ -976,8 +976,7 @@ pub fn meaningful_agent_error_from_log(path: &Path) -> Option<AgentLogError> {
                 code: None,
             });
         }
-        // Bare prefixes emitted by older agent binaries whose Display still leaks
-        // unwrapped errors. Promote these so they surface instead of the generic
+        // Promote bare errors from older binaries instead of using the generic
         // "harness exited with status N" fallback.
         if line.starts_with("llm auth:") {
             return Some(AgentLogError {

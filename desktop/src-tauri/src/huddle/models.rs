@@ -655,17 +655,7 @@ impl ModelManager {
 
     // ── Download triggers ─────────────────────────────────────────────────────
 
-    /// Start a background STT model download. No-op if already ready or downloading.
-    ///
-    /// Also schedules a best-effort cleanup of the legacy Moonshine model
-    /// directory — but **only when the new STT model is already on disk and
-    /// Ready**. This covers the "fast-path" upgrade scenario (new model
-    /// installed by a previous build, `download_stt_model` short-circuits, the
-    /// post-install cleanup never runs). For users mid-migration (old model
-    /// present, new model still downloading) we keep the old files until the
-    /// Parakeet install finishes, avoiding unnecessary data loss if the
-    /// ~100 MB download fails. The post-install path inside
-    /// `download_stt_model` handles cleanup once the new install reaches Ready.
+    /// Start a background STT download and clean up Moonshine once the new model is ready.
     pub fn start_stt_download(&self, http_client: reqwest::Client) {
         self.start_stt_download_with_policy(http_client, crate::evidence_offline::enabled());
     }

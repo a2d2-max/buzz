@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    deploy::{
+        deploy_payload_json, ensure_remote_provider_supported, resolve_deploy_model_provider,
+        DeployProjections,
+    },
+    profile::{profile_needs_sync, resolve_legacy_avatar},
+    *,
+};
 use crate::managed_agents::AgentDefinition;
 
 fn bare_agent_record(

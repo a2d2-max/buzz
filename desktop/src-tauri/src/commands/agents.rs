@@ -1176,16 +1176,10 @@ mod deploy;
 pub(super) mod provider_access;
 mod provider_deploy;
 pub(super) use deploy::build_deploy_payload;
-#[cfg(test)]
-use deploy::{deploy_payload_json, DeployProjections};
-#[cfg(test)]
-use deploy::{ensure_remote_provider_supported, resolve_deploy_model_provider};
 
 #[path = "agents_profile.rs"]
 mod profile;
 pub(crate) use profile::*;
-#[cfg(test)]
-use profile::{profile_needs_sync, resolve_legacy_avatar};
 
 #[cfg(test)]
 #[path = "agents_tests.rs"]
