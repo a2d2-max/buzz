@@ -15,6 +15,7 @@ import {
 } from "@/shared/ui/dialog";
 import { useEmojiBurst } from "@/shared/ui/EmojiBurstProvider";
 import { Textarea } from "@/shared/ui/textarea";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 /** A random heart emoji so repeated bursts vary a little. */
 const HEART_BURST_EMOJIS = ["❤️", "🩷", "🧡", "💛", "💚", "💙", "💜", "💖"];
@@ -167,8 +168,8 @@ export function SendFeedbackDialog({
             className="pt-2 text-sm text-muted-foreground"
             data-testid="feedback-privacy-disclosure"
           >
-            Feedback is sent privately to this Buzz deployment and is not posted
-            to a channel. Attachments are uploaded before you send.
+            Feedback is sent privately to this {BRAND_NAME} deployment and is
+            not posted to a channel. Attachments are uploaded before you send.
           </p>
         </DialogHeader>
 

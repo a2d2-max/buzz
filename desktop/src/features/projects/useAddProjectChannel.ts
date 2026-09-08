@@ -17,6 +17,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import { deleteChannel as deleteChannelApi } from "@/shared/api/tauriChannels";
 import type { Channel, ChannelVisibility } from "@/shared/api/types";
 import { KIND_PROJECT_ANNOUNCEMENT } from "@/shared/constants/kinds";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export type AddProjectChannelInput = {
   description?: string;
@@ -93,7 +94,7 @@ export async function addProjectChannel(
     } catch (cleanupError) {
       throw new AggregateError(
         [error, cleanupError],
-        "Buzz could not verify the project after creating the channel, and could not remove the unlinked channel. Delete it manually, then refresh and try again.",
+        `${BRAND_NAME} could not verify the project after creating the channel, and could not remove the unlinked channel. Delete it manually, then refresh and try again.`,
       );
     }
     throw error;

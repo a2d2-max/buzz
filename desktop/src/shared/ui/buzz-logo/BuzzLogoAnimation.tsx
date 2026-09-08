@@ -1,6 +1,7 @@
 import { useId, useLayoutEffect, useRef } from "react";
 import type { CSSProperties } from "react";
 import "./buzz-logo-animation.css";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const LOOP = "indefinite";
 const EASE = ".16 1 .3 1";
@@ -622,7 +623,7 @@ function RestWindowFade({
 }
 
 export default function BuzzLogoAnimation({
-  ariaLabel = "Buzz logo animation",
+  ariaLabel = `${BRAND_NAME} logo animation`,
   className = "",
   fullScreen = true,
   loop = false,

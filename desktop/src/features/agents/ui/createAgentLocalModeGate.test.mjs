@@ -41,6 +41,7 @@ import {
   getBakedProviderInheritLabel,
   resolveInheritedDefault,
 } from "./bakedEnvHelpers.ts";
+import { BRAND_NAME } from "../../../shared/constants/brand.ts";
 
 // ── Core predicate: provider-selection support ─────────────────────────────
 
@@ -860,7 +861,7 @@ test("providerDefaultLabel_globalSetWithWhitespace_trimsAndReturnsInherit", () =
 test("providerDefaultLabel_sharedCompute_neverLeaksInternalId", () => {
   assert.equal(
     getDefaultLlmProviderLabel("buzz-agent", "relay-mesh"),
-    "Use agent defaults (Buzz shared compute)",
+    `Use agent defaults (${BRAND_NAME} shared compute)`,
   );
 });
 

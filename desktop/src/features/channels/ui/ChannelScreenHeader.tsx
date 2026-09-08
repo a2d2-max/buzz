@@ -24,6 +24,7 @@ import {
   toggleTerminalPanel,
   useTerminalPanel,
 } from "@/features/terminal/terminalPanelStore";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const DM_HEADER_AVATAR_SIZE = 32;
 const DM_HEADER_AVATAR_STATUS_GEOMETRY = scaleProfileAvatarStatusGeometry(
@@ -87,11 +88,13 @@ export function ChannelScreenHeader({
   const terminalButton = activeChannel ? (
     <Button
       aria-label={
-        terminalPanel.mode === "closed" ? "Open Buzz Term" : "Hide Buzz Term"
+        terminalPanel.mode === "closed"
+          ? `Open ${BRAND_NAME} Term`
+          : `Hide ${BRAND_NAME} Term`
       }
       onClick={toggleTerminalPanel}
       size="icon"
-      title="Buzz Term (⌘J)"
+      title={`${BRAND_NAME} Term (⌘J)`}
       type="button"
       variant={terminalPanel.mode === "closed" ? "outline" : "secondary"}
     >

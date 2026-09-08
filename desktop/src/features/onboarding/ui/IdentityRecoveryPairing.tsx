@@ -15,6 +15,7 @@ import { startIdentityRecoveryPairing } from "@/shared/api/tauriPairing";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
 import { Button } from "@/shared/ui/button";
 import { StyledQrCode } from "@/shared/ui/styled-qr-code";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type Step = "loading" | "qr" | "sas" | "receiving" | "done" | "error";
 
@@ -188,8 +189,8 @@ export function IdentityRecoveryPairing({
               </p>
             </div>
             <p className="text-xs text-muted-foreground">
-              This gives this desktop permanent access to your Buzz identity.
-              Only continue if you trust it.
+              This gives this desktop permanent access to your {BRAND_NAME}{" "}
+              identity. Only continue if you trust it.
             </p>
             <div className="flex w-full flex-col gap-2">
               <Button

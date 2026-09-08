@@ -1,3 +1,4 @@
+import { BRAND_NAME } from "@/shared/constants/brand";
 export type ProjectRepoUnavailableReason =
   | "missing"
   | "access"
@@ -18,8 +19,7 @@ const PROJECT_REPO_UNAVAILABLE_PRESENTATIONS: Record<
   ProjectRepoUnavailablePresentation
 > = {
   authentication: {
-    description:
-      "Buzz could not authenticate with this repository. Check your access and try again.",
+    description: `${BRAND_NAME} could not authenticate with this repository. Check your access and try again.`,
     title: "Repository access failed",
   },
   missing: {
@@ -48,8 +48,7 @@ const PROJECT_REPO_UNAVAILABLE_PRESENTATIONS: Record<
     title: "Branch unavailable",
   },
   unknown: {
-    description:
-      "Buzz could not load this repository. Try again or contact the project owner.",
+    description: `${BRAND_NAME} could not load this repository. Try again or contact the project owner.`,
     title: "Repository unavailable",
   },
 };

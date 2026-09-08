@@ -3,6 +3,7 @@ import { after, afterEach, before, beforeEach, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 import { setTerminalPanelMode } from "./terminalPanelStore.ts";
+import { BRAND_NAME } from "../../shared/constants/brand.ts";
 
 // `pretendToBeVisual` is what gives jsdom requestAnimationFrame. The banner's
 // animation loop needs it; without it the loop silently never runs and every
@@ -378,7 +379,7 @@ test("opening a tab keeps terminal ownership while its attachment is pending", a
   );
 
   attachResolver = () => {};
-  fireEvent.click(view.getByLabelText("New Buzz Term tab"));
+  fireEvent.click(view.getByLabelText(`New ${BRAND_NAME} Term tab`));
   await waitFor(() => assert.equal(typeof attachResolver, "function"));
   assert.equal(
     substrate.dataset.terminalOwner,

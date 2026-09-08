@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 
 import type { BuzzToolInfo, ToolStatus } from "./agentSessionTypes";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export function normalizeToolStatus(status: string): ToolStatus {
   const normalized = status.toLowerCase();
@@ -148,8 +149,8 @@ export function getBuzzToolInfo(title: string): BuzzToolInfo | null {
     return {
       icon: Workflow,
       label: isRead
-        ? "Reads workflow state from Buzz."
-        : "Updates workflow state in Buzz.",
+        ? `Reads workflow state from ${BRAND_NAME}.`
+        : `Updates workflow state in ${BRAND_NAME}.`,
       tone: isWrite ? "write" : "read",
     };
   }
@@ -174,15 +175,15 @@ export function getBuzzToolInfo(title: string): BuzzToolInfo | null {
     return {
       icon: Users,
       label: isRead
-        ? "Reads Buzz identity or presence data."
-        : "Updates Buzz identity or membership data.",
+        ? `Reads ${BRAND_NAME} identity or presence data.`
+        : `Updates ${BRAND_NAME} identity or membership data.`,
       tone: isWrite ? "write" : "admin",
     };
   }
   if (name.includes("search") || name === "get_feed") {
     return {
       icon: Search,
-      label: "Searches relay-visible Buzz history.",
+      label: `Searches relay-visible ${BRAND_NAME} history.`,
       tone: "read",
     };
   }
@@ -193,14 +194,14 @@ export function getBuzzToolInfo(title: string): BuzzToolInfo | null {
   ) {
     return {
       icon: Send,
-      label: "Publishes relay-visible Buzz activity.",
+      label: `Publishes relay-visible ${BRAND_NAME} activity.`,
       tone: "write",
     };
   }
 
   return {
     icon: MessageSquare,
-    label: isRead ? "Reads from Buzz." : "Writes to Buzz.",
+    label: isRead ? `Reads from ${BRAND_NAME}.` : `Writes to ${BRAND_NAME}.`,
     tone: isWrite ? "write" : "read",
   };
 }

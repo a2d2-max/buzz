@@ -30,6 +30,7 @@ import {
   isHomeBadgeFeedItemUnread,
   shouldCountTowardHomeBadgeSubtotal,
 } from "./lib/homeBadge";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export type { DesktopNotificationPermissionState } from "./lib/desktop";
 
@@ -270,7 +271,7 @@ export function useNotificationSettings(pubkey?: string) {
         }));
         setErrorMessage(
           nextPermission === "denied"
-            ? "Desktop notifications are blocked for Buzz. Enable them in system settings to turn alerts on."
+            ? `Desktop notifications are blocked for ${BRAND_NAME}. Enable them in system settings to turn alerts on.`
             : "Desktop notifications are unavailable in this environment.",
         );
         return false;

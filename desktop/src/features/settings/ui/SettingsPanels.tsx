@@ -36,6 +36,8 @@ import { useCommunities } from "@/features/communities/useCommunities";
 import { Badge } from "@/shared/ui/badge";
 import { isBuzzTheme, useTheme } from "@/shared/theme/ThemeProvider";
 import {
+  BUZZ_DARK_THEME_NAME,
+  BUZZ_THEME_NAME,
   LIGHT_THEMES,
   SYNTAX_THEMES,
   type SyntaxThemeName,
@@ -80,6 +82,7 @@ import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { VoiceSettingsCard } from "./VoiceSettingsCard";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export type SettingsSection =
   | "profile"
@@ -237,6 +240,9 @@ export const settingsSections: SettingsSectionDescriptor[] = [
 ];
 
 function formatThemeLabel(name: string): string {
+  // 1st-party 테마 타일은 테마 id("buzz")가 아니라 제품 이름을 보여 준다.
+  if (name === BUZZ_THEME_NAME) return BRAND_NAME;
+  if (name === BUZZ_DARK_THEME_NAME) return `${BRAND_NAME} Dark`;
   return name
     .split("-")
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
@@ -638,7 +644,7 @@ function ThemeSettingsCard() {
     >
       <SettingsSectionHeader
         title="Appearance"
-        description="Choose how Buzz looks and feels."
+        description={`Choose how ${BRAND_NAME} looks and feels.`}
       />
 
       <SettingsOptionGroupList>
@@ -698,7 +704,7 @@ function ThemeSettingsCard() {
                 className="text-sm font-normal text-muted-foreground/70"
                 data-settings-subcopy
               >
-                Choose the colors used throughout Buzz.
+                Choose the colors used throughout {BRAND_NAME}.
               </p>
             </div>
             <button

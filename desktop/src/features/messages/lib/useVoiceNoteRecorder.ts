@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { encodeVoiceNoteWav } from "./voiceNoteWav";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const MIME_CANDIDATES = [
   "audio/webm;codecs=opus",
@@ -156,7 +157,9 @@ export function useVoiceNoteRecorder() {
                 mountedRef.current &&
                 sessionRef.current === session
               ) {
-                setError("Buzz could not prepare this voice note for upload.");
+                setError(
+                  `${BRAND_NAME} could not prepare this voice note for upload.`,
+                );
               }
             }
           }
@@ -218,8 +221,8 @@ export function useVoiceNoteRecorder() {
         (cause.name === "NotAllowedError" || cause.name === "SecurityError");
       setError(
         denied
-          ? "Allow Buzz to access your microphone to record a voice note."
-          : "Buzz could not start the voice recorder.",
+          ? `Allow ${BRAND_NAME} to access your microphone to record a voice note.`
+          : `${BRAND_NAME} could not start the voice recorder.`,
       );
     }
   }, [status]);

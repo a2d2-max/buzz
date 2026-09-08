@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { projectCloneErrorPresentation } from "./projectGitError.ts";
+import { BRAND_NAME } from "../../../shared/constants/brand.ts";
 
 test("explains unsupported authenticated GitHub clones without exposing git output", () => {
   assert.deepEqual(
@@ -13,8 +14,7 @@ test("explains unsupported authenticated GitHub clones without exposing git outp
     ),
     {
       title: "Repository access required",
-      description:
-        "This repository requires GitHub authentication. Buzz currently clones public GitHub repositories without credentials.",
+      description: `This repository requires GitHub authentication. ${BRAND_NAME} currently clones public GitHub repositories without credentials.`,
     },
   );
 });

@@ -1,7 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 import { installMockBridge } from "../helpers/bridge";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
-const TERM = 'section[aria-label="Buzz Term"]';
+const TERM = `section[aria-label="${BRAND_NAME} Term"]`;
 const NAMED = 0x0100_0000;
 const FG = NAMED | 256;
 const BG = NAMED | 257;

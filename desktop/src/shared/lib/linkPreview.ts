@@ -7,6 +7,7 @@ import {
   parseEntityLink,
   type ParsedEntityLink,
 } from "./entityLink";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export type SupportedLinkPreviewKind =
   | "buzz-pull-request"
@@ -319,7 +320,7 @@ function parseBuzzEntityPreview(href: string): SupportedLinkPreview | null {
     return {
       kind: "buzz-pull-request",
       href: buildPullRequestLink(link),
-      provider: "Buzz",
+      provider: BRAND_NAME,
       title,
       typeLabel: "Review",
     };
@@ -328,7 +329,7 @@ function parseBuzzEntityPreview(href: string): SupportedLinkPreview | null {
     return {
       kind: "buzz-issue",
       href: buildIssueLink(link),
-      provider: "Buzz",
+      provider: BRAND_NAME,
       title,
       typeLabel: "Task",
     };
@@ -337,7 +338,7 @@ function parseBuzzEntityPreview(href: string): SupportedLinkPreview | null {
     return {
       kind: "buzz-project",
       href: buildProjectLink(link),
-      provider: "Buzz",
+      provider: BRAND_NAME,
       title,
       typeLabel: "project",
     };
@@ -345,7 +346,7 @@ function parseBuzzEntityPreview(href: string): SupportedLinkPreview | null {
   return {
     kind: "buzz-repository",
     href: buildRepoLink(link),
-    provider: "Buzz",
+    provider: BRAND_NAME,
     title,
     typeLabel: "repo",
   };
@@ -387,7 +388,7 @@ function parseBuzzGitLink(
   return {
     kind: "buzz-repository",
     href: buildRepoLink({ owner, dtag: repo }),
-    provider: "Buzz",
+    provider: BRAND_NAME,
     title: repo,
     typeLabel: "repo",
   };

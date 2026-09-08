@@ -24,6 +24,7 @@ import {
 } from "@/shared/ui/alert-dialog";
 import { Button, buttonVariants } from "@/shared/ui/button";
 import { PanelSectionGroup } from "@/shared/ui/PanelSectionGroup";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export function UserProfileAgentManagementRows({
   archiveActions,
@@ -278,7 +279,7 @@ function AgentDeleteConfirmDialog({
           </li>
           <li>
             {isProviderAgent
-              ? "Unless the agent is known to be Offline, Buzz first requests shutdown through a channel when available. A failed request cancels deletion. The remote process may still be running even after a successful request."
+              ? `Unless the agent is known to be Offline, ${BRAND_NAME} first requests shutdown through a channel when available. A failed request cancels deletion. The remote process may still be running even after a successful request.`
               : "Stops any local agent process before deleting the record"}
           </li>
         </ul>

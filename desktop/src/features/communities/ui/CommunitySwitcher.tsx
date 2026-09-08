@@ -38,6 +38,7 @@ import {
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
 import { useActiveCommunityIcon } from "@/features/communities/useCommunityIcons";
 import { EditCommunityDialog } from "./EditCommunityDialog";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 // Community actions is a responsive navigation submenu, not an informational
 // disclosure. Keep its short hover dwell explicit rather than inheriting the
@@ -174,8 +175,7 @@ export function CommunitySwitcher({
       setDropdownOpen(false);
       if (result?.status === "already-absent") {
         toast("Community removed", {
-          description:
-            "You were no longer a member, so Buzz removed the community from this device.",
+          description: `You were no longer a member, so ${BRAND_NAME} removed the community from this device.`,
         });
       }
     } catch (error) {

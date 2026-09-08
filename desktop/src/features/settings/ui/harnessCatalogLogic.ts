@@ -6,6 +6,7 @@
  */
 
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 // Builtins that anchor the top of "Your runtimes" — mirrors the old
 // DoctorSettingsPanel RUNTIME_SORT_PRIORITY so the Buzz + Goose rows stay
@@ -164,7 +165,7 @@ export function entryStatusLabel(entry: AcpRuntimeCatalogEntry): string | null {
 export function adapterUpdateWarning(entry: AcpRuntimeCatalogEntry): string {
   if (entry.id === "codex") {
     return (
-      "This replaces the machine-wide codex-acp adapter. Older Buzz " +
+      `This replaces the machine-wide codex-acp adapter. Older ${BRAND_NAME} ` +
       "releases using the legacy adapter may lose community access until " +
       "@zed-industries/codex-acp@0.16.0 is restored."
     );

@@ -15,6 +15,7 @@ import {
   getToolString,
   getToolStringList,
 } from "./agentSessionUtils";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type ToolItem = Extract<TranscriptItem, { type: "tool" }>;
 
@@ -434,13 +435,13 @@ function buzzOperationObject(operation: string) {
   if (isBuzzMessageSend(operation)) return "message";
   if (operation.includes(".")) {
     const [group] = operation.split(".");
-    return group ? group.replace(/[-_]+/g, " ") : "Buzz";
+    return group ? group.replace(/[-_]+/g, " ") : BRAND_NAME;
   }
   const object = operation.replace(
     /^(add|approve|archive|create|delete|edit|get|hide|join|leave|list|open|publish|remove|search|send|set|trigger|unarchive|update|vote)_/,
     "",
   );
-  return object ? object.replace(/[-_]+/g, " ") : "Buzz";
+  return object ? object.replace(/[-_]+/g, " ") : BRAND_NAME;
 }
 
 function buzzCliTone(group: string, verb: string): AgentActivityTone {

@@ -28,6 +28,7 @@ import {
 import { GitHubMark } from "./GitHubMark";
 import { ProjectRepositoryUnavailableState } from "./ProjectRepositoryUnavailableState";
 import { ProjectPanelState } from "./ProjectPanelState";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export function findReadmeFile(files: ProjectRepoFile[]) {
   const readmes = files.filter((file) =>
@@ -211,7 +212,7 @@ export function ReadmePanel({
           </h3>
           <p className="mt-1 max-w-lg text-sm text-muted-foreground">
             Clone this repository locally to explore its files, commits, and
-            contributors in Buzz.
+            contributors in {BRAND_NAME}.
           </p>
           {externalOpenUrl ? (
             <a

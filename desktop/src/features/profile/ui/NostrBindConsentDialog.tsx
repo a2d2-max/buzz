@@ -17,11 +17,12 @@ import { useSystemColorScheme } from "@/shared/theme/useSystemColorScheme";
 import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const COPY_SUCCESS_MESSAGE =
   "Signed response copied. Paste it into the Buzz admin console.";
 const PREVIEW_COPY_SUCCESS_MESSAGE = "Preview response copied.";
-const COPY_FAILURE_MESSAGE = "Buzz couldn't access the clipboard. Try again.";
+const COPY_FAILURE_MESSAGE = `${BRAND_NAME} couldn't access the clipboard. Try again.`;
 const EXPIRED_LINK_MESSAGE =
   "This binding link has expired. Request a new one from the requesting app.";
 const VERIFICATION_CODE_LENGTH = 6;
@@ -298,7 +299,7 @@ export function NostrBindConsentDialog() {
         .catch((error) => {
           console.warn("get_identity for nostr bind failed:", error);
           setIdentity(null);
-          setError("Could not load the current Buzz identity.");
+          setError(`Could not load the current ${BRAND_NAME} identity.`);
         });
     });
 
@@ -652,7 +653,7 @@ export function NostrBindConsentDialog() {
             <StartupWindowDragRegion />
             <div className="m-auto flex w-full max-w-[500px] flex-col items-center text-center">
               <img
-                alt="Buzz"
+                alt={BRAND_NAME}
                 className="h-14 w-14 rounded-xl shadow-xs"
                 src="/app-icon@2x.png"
                 srcSet="/app-icon@2x.png 1x, /app-icon@3x.png 2x"
@@ -675,7 +676,7 @@ export function NostrBindConsentDialog() {
                     id="nostr-bind-description"
                   >
                     {payload.returnMode === "browser_fragment_v1"
-                      ? "Buzz opened your browser to finish verification."
+                      ? `${BRAND_NAME} opened your browser to finish verification.`
                       : "Copy the response below, then paste it into the Buzz website to finish verification."}
                   </DialogPrimitive.Description>
 

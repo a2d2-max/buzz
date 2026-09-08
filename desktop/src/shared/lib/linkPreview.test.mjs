@@ -6,6 +6,7 @@ import {
   isSupportedLinkAutolinkLabel,
   parseSupportedLinkPreview,
 } from "./linkPreview.ts";
+import { BRAND_NAME } from "../constants/brand.ts";
 
 test("parseSupportedLinkPreview parses GitHub pull request URLs", () => {
   assert.deepEqual(
@@ -97,7 +98,7 @@ test("parseSupportedLinkPreview parses Buzz relay git clone URLs", () => {
     {
       kind: "buzz-repository",
       href: `buzz://repo?owner=${BUZZ_OWNER}&d=buzz-world-galaxy`,
-      provider: "Buzz",
+      provider: BRAND_NAME,
       title: "buzz-world-galaxy",
       typeLabel: "repo",
     },
@@ -120,7 +121,7 @@ test("parseSupportedLinkPreview strips .git suffix from clone URLs", () => {
     {
       kind: "buzz-repository",
       href: `buzz://repo?owner=${BUZZ_OWNER}&d=buzz-world`,
-      provider: "Buzz",
+      provider: BRAND_NAME,
       title: "buzz-world",
       typeLabel: "repo",
     },
@@ -186,7 +187,7 @@ test("parseSupportedLinkPreview parses buzz:// PR and issue deep links", () => {
     {
       kind: "buzz-pull-request",
       href: `buzz://pr?id=${BUZZ_EVENT_ID}&owner=${BUZZ_OWNER}&d=buzz-world`,
-      provider: "Buzz",
+      provider: BRAND_NAME,
       title: "buzz-world #c3b589fa",
       typeLabel: "Review",
     },
@@ -202,7 +203,7 @@ test("parseSupportedLinkPreview parses buzz:// PR and issue deep links", () => {
     {
       kind: "buzz-repository",
       href: `buzz://repo?owner=${BUZZ_OWNER}&d=buzz-world`,
-      provider: "Buzz",
+      provider: BRAND_NAME,
       title: "buzz-world",
       typeLabel: "repo",
     },
@@ -217,7 +218,7 @@ test("parseSupportedLinkPreview parses buzz:// project deep links", () => {
     {
       kind: "buzz-project",
       href: `buzz://project?owner=${BUZZ_OWNER}&d=buzz-world`,
-      provider: "Buzz",
+      provider: BRAND_NAME,
       title: "buzz-world",
       typeLabel: "project",
     },

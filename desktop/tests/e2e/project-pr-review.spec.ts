@@ -2,6 +2,7 @@ import { expect, type Locator, test } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const SHOTS = "test-results/project-pr-review";
 const RECOVERY_SHOTS = "test-results/project-pr-conflict-recovery";
@@ -2770,7 +2771,7 @@ test("repository rows identify their git host", async ({ page }) => {
     .getByTestId("repository-host-icon");
   await expect(buzzHostIcon).toHaveAttribute(
     "aria-label",
-    "Buzz-hosted repository",
+    `${BRAND_NAME}-hosted repository`,
   );
   await expect(
     page

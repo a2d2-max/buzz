@@ -1,10 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Buzz">
-  <rect width="512" height="512" rx="96" fill="#0b0b0b"/>
-  <path d="M256 75 334 120v90l-78 45-78-45v-90z" fill="#ffd84d"/>
-  <path d="M178 210 256 255v90l-78 45-78-45v-90z" fill="#ffbd24"/>
-  <path d="M334 210 412 255v90l-78 45-78-45v-90z" fill="#ffb000"/>
-  <path d="M256 300 334 345v90l-78 45-78-45v-90z" fill="#ff8a00"/>
-  <path d="M256 105 306 134l-50 29-50-29z" fill="#ffe680" opacity=".75"/>
-  <path d="M178 240 228 269l-50 29-50-29z" fill="#ffe680" opacity=".55"/>
-  <path d="M334 240 384 269l-50 29-50-29z" fill="#ffe680" opacity=".55"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="a2d2">
+  <rect width="512" height="512" rx="96" fill="#111111"/>
+  <text x="222.59" y="297.17" fill="#FFFFFF" font-family="Futura, 'Avenir Next', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-weight="700" font-size="101.41" text-anchor="middle">a2d2</text>
+  <circle cx="401.65" cy="274.13" r="23.04" fill="#F5B301"/>
 </svg>

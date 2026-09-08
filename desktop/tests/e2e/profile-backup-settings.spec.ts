@@ -3,6 +3,7 @@ import { npubEncode } from "nostr-tools/nip19";
 
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const CURRENT_PUBKEY = "deadbeef".repeat(8);
 const DIFFERENT_PUBKEY = "c0ffee00".repeat(8);
@@ -221,7 +222,7 @@ test("wrong backup password permits a successful retry in the test modal", async
 
   await verifyBackup(page, "correct password");
   await expect(dialog.getByTestId("backup-test-success")).toContainText(
-    "It restores your current Buzz identity.",
+    `It restores your current ${BRAND_NAME} identity.`,
   );
 });
 
@@ -229,7 +230,7 @@ for (const identity of [
   {
     label: "current",
     pubkey: CURRENT_PUBKEY,
-    message: "It restores your current Buzz identity.",
+    message: `It restores your current ${BRAND_NAME} identity.`,
   },
   {
     label: "different",

@@ -14,6 +14,7 @@ import {
 import { Input } from "@/shared/ui/input";
 import { Popover, PopoverAnchor, PopoverContent } from "@/shared/ui/popover";
 import { downloadDisabled, MIN_PASSPHRASE_LEN } from "../lib/encryptedBackup";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 /** Word-count bounds mirroring `key_backup.rs` (Rust clamps regardless). */
 const MIN_GENERATED_WORDS = 3;
@@ -277,8 +278,8 @@ export function EncryptedBackupCreator({
         <DialogHeader className="pr-8">
           <DialogTitle>Create a key backup</DialogTitle>
           <DialogDescription>
-            You can close this window while Buzz finishes the backup in the
-            background.
+            You can close this window while {BRAND_NAME} finishes the backup in
+            the background.
           </DialogDescription>
         </DialogHeader>
         <div
@@ -331,7 +332,8 @@ export function EncryptedBackupCreator({
 
           {!state.downloadPending && !state.savedPassword ? (
             <p className="text-xs leading-5 text-muted-foreground">
-              Keep the file private and save its password somewhere safe — Buzz
+              Keep the file private and save its password somewhere safe —{" "}
+              {BRAND_NAME}
               cannot reset it. Once ready, the backup remains available to
               download for 5 minutes.
             </p>

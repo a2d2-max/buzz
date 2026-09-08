@@ -39,6 +39,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/shared/ui/dialog";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const FUZZY_SURFACE_CLASS =
   "relative left-1/2 w-[min(calc(100%+12rem),calc(100vw-2rem))] max-w-[1040px] -translate-x-1/2 px-20 pb-14 pt-20 !text-[rgb(var(--buzz-hosted-community-surface-fg))] [--buzz-card-textured-min-height:224px]";
@@ -187,7 +188,7 @@ export function HostedCommunityOnboarding({
           hostedCommunityErrorMessage(
             response.error,
             response.correlation_id,
-            "Could not connect the Buzz identity.",
+            `Could not connect the ${BRAND_NAME} identity.`,
           ),
         );
       }
@@ -212,7 +213,7 @@ export function HostedCommunityOnboarding({
           hostedCommunityErrorMessage(
             released.error,
             released.correlation_id,
-            "Could not disconnect the account's previous Buzz identity.",
+            `Could not disconnect the account's previous ${BRAND_NAME} identity.`,
           ),
         );
       }
@@ -221,11 +222,11 @@ export function HostedCommunityOnboarding({
         await loadAccount();
         throw new Error(
           bound.error.code === "pubkey_already_bound"
-            ? "This device's Buzz identity belongs to a different Builderlab account and can't be moved from here. Sign out, then sign in with the account that already owns this identity."
+            ? `This device's ${BRAND_NAME} identity belongs to a different Builderlab account and can't be moved from here. Sign out, then sign in with the account that already owns this identity.`
             : hostedCommunityErrorMessage(
                 bound.error,
                 bound.correlation_id,
-                "Could not connect this device's Buzz identity.",
+                `Could not connect this device's ${BRAND_NAME} identity.`,
               ),
         );
       }
@@ -304,7 +305,7 @@ export function HostedCommunityOnboarding({
           hostedCommunityErrorMessage(
             available.error,
             available.correlation_id,
-            "That Buzz address is already taken.",
+            `That ${BRAND_NAME} address is already taken.`,
           ),
         );
       }
@@ -484,7 +485,7 @@ export function HostedCommunityOnboarding({
               <DialogDescription className="mt-2 text-sm leading-6 text-foreground">
                 Sign in to connect a community you already own or create a new
                 one. We’ll open Builderlab in your browser, then bring you back
-                to Buzz.
+                to {BRAND_NAME}.
               </DialogDescription>
               {errorBox ? <div className="mt-5 w-full">{errorBox}</div> : null}
               {action === "Signing in…" ? (
@@ -506,20 +507,20 @@ export function HostedCommunityOnboarding({
               {/* Quiet breadcrumb: Buzz itself is open source; this hosted
                     relay is the one account-backed piece of the flow. */}
               <p className="mt-6 w-full border-t border-foreground/10 pt-4 text-xs leading-5 text-foreground/45">
-                Buzz is open source. Builderlab hosts the relay for this
+                {BRAND_NAME} is open source. Builderlab hosts the relay for this
                 account.
               </p>
             </>
           ) : !identity ? (
             <>
               <DialogTitle className="text-xl font-medium text-foreground">
-                Finish connecting Buzz
+                Finish connecting {BRAND_NAME}
               </DialogTitle>
               <DialogDescription className="mt-2 text-sm leading-6 text-foreground">
                 Your Builderlab account
                 {auth.email ? ` (${auth.email})` : ""} is ready. Connect this
-                device’s Buzz identity to finish setup. Your private key stays
-                on this device.
+                device’s {BRAND_NAME} identity to finish setup. Your private key
+                stays on this device.
               </DialogDescription>
               {errorBox ? <div className="mt-5 w-full">{errorBox}</div> : null}
               <Button
@@ -536,11 +537,11 @@ export function HostedCommunityOnboarding({
           ) : (
             <>
               <DialogTitle className="text-xl font-medium text-foreground">
-                This account uses a different Buzz identity
+                This account uses a different {BRAND_NAME} identity
               </DialogTitle>
               <DialogDescription className="mt-2 text-sm leading-6 text-foreground">
-                This account is connected to another Buzz identity. Reconnect
-                this device, or sign out to use a different email.
+                This account is connected to another {BRAND_NAME} identity.
+                Reconnect this device, or sign out to use a different email.
               </DialogDescription>
               <p className="mt-4 w-full break-all rounded-xl bg-[rgb(var(--buzz-hosted-community-identity-bg)/0.5)] px-4 py-3 text-left font-mono text-xs text-foreground">
                 Account: {identity.npub ?? boundPubkey}
@@ -586,7 +587,7 @@ export function HostedCommunityOnboarding({
       <p className="mx-auto mt-2 max-w-[560px] text-sm leading-6 text-foreground">
         {hasCommunities
           ? "Connect one you own, or start something new."
-          : "Claim a Buzz address to get started."}
+          : `Claim an ${BRAND_NAME} address to get started.`}
       </p>
 
       <div className="flex w-full flex-1 flex-col justify-center text-left">
