@@ -1,0 +1,282 @@
+/* 10-foot UI 토큰. 1920x1080 고정, 대상 엔진은 Chromium 68(webOS TV 5.x).
+ * - 본문 28px 이상, 선택 대상 54px 이상, 가장자리 20px 이상 여백
+ * - 단일 다크 테마(거실 화면에서 흰 배경은 눈부심)
+ * - 포커스 링은 항상 보인다 — 5-way 모드에서 "포커스 없는 상태"는 금지
+ *
+ * ★크롬 68 제약: flex 컨테이너의 gap(84+)·inset(87+)·:focus-visible(86+)·
+ * :has()·컨테이너 쿼리 전부 금지. 간격은 전부 마진(> * + *)으로 만든다.
+ * CSS 변수(49+)·flex·grid 는 68 에서 된다. */
+
+:root {
+  --bg: #101014;
+  --bg-raised: #1b1b22;
+  --bg-focus: #26263a;
+  --text: #ececf1;
+  --text-dim: #a0a0b0;
+  --accent: #4f9cf9;
+  --danger: #f97066;
+  --edge: 60px;
+  --focus-ring: 5px;
+  font-size: 32px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    "Apple SD Gothic Neo", "Noto Sans KR", "LG Smart UI", system-ui, sans-serif;
+  font-size: 28px;
+  line-height: 1.45;
+  overflow: hidden;
+}
+
+.screen {
+  height: 100vh;
+  padding: var(--edge);
+  display: flex;
+  flex-direction: column;
+}
+
+/* flex gap 대체: 세로 스택 간격 */
+.screen > * + * {
+  margin-top: 24px;
+}
+
+.screen-title {
+  font-size: 44px;
+  font-weight: 700;
+  margin: 0;
+  flex: none;
+}
+
+.screen-subtitle {
+  color: var(--text-dim);
+  font-size: 26px;
+  margin: 0;
+  flex: none;
+}
+
+.scroll-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  /* 포커스 링이 스크롤 컨테이너에 잘리지 않게 안쪽 여백을 준다 */
+  padding: var(--focus-ring);
+}
+
+.scroll-list > * + * {
+  margin-top: 12px;
+}
+
+/* 선택 가능한 행/버튼. 최소 높이 54px 을 훨씬 넘긴다. */
+.focusable {
+  min-height: 72px;
+  padding: 16px 28px;
+  border-radius: 14px;
+  background: var(--bg-raised);
+  border: var(--focus-ring) solid transparent;
+  color: var(--text);
+  font-size: 28px;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+/* flex gap 대체: 행 안의 가로 간격 */
+.focusable > * + * {
+  margin-left: 20px;
+}
+
+.focusable.focused {
+  border-color: var(--accent);
+  background: var(--bg-focus);
+}
+
+.focusable .item-title {
+  font-weight: 600;
+}
+
+.focusable .item-sub {
+  color: var(--text-dim);
+  font-size: 24px;
+}
+
+.message-row {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.message-row > * + * {
+  margin-left: 0;
+  margin-top: 6px;
+}
+
+.message-meta {
+  display: flex;
+  align-items: baseline;
+}
+
+.message-meta > * + * {
+  margin-left: 16px;
+}
+
+.message-author {
+  font-weight: 700;
+  font-size: 26px;
+  color: var(--accent);
+}
+
+.message-time {
+  color: var(--text-dim);
+  font-size: 22px;
+}
+
+.status-line {
+  color: var(--text-dim);
+  font-size: 24px;
+  flex: none;
+}
+
+.status-line.error {
+  color: var(--danger);
+}
+
+/* 마크다운(읽기 전용) */
+.markdown {
+  font-size: 28px;
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.markdown h1 {
+  font-size: 40px;
+}
+.markdown h2 {
+  font-size: 36px;
+}
+.markdown h3 {
+  font-size: 32px;
+}
+
+.markdown pre {
+  background: #0a0a0e;
+  border-radius: 10px;
+  padding: 18px;
+  overflow-x: auto;
+  font-size: 24px;
+}
+
+.markdown code {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.85em;
+}
+
+.markdown a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.markdown img {
+  max-width: 100%;
+}
+
+.markdown table {
+  border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid var(--text-dim);
+  padding: 8px 14px;
+}
+
+.markdown blockquote {
+  border-left: 6px solid var(--text-dim);
+  margin-left: 0;
+  padding-left: 20px;
+  color: var(--text-dim);
+}
+
+/* 설정 화면 입력 */
+.field {
+  display: flex;
+  flex-direction: column;
+}
+
+.field > * + * {
+  margin-top: 10px;
+}
+
+.field > span {
+  font-size: 26px;
+  color: var(--text-dim);
+}
+
+.field input {
+  min-height: 72px;
+  font-size: 28px;
+  padding: 12px 24px;
+  border-radius: 14px;
+  border: var(--focus-ring) solid transparent;
+  background: var(--bg-raised);
+  color: var(--text);
+  outline: none;
+}
+
+.field input:focus {
+  border-color: var(--accent);
+  background: var(--bg-focus);
+}
+
+/* 종료 확인 오버레이 (inset 은 87+ 라 안 쓴다) */
+.overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.dialog {
+  background: var(--bg-raised);
+  border-radius: 20px;
+  padding: 48px 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.dialog > * + * {
+  margin-top: 32px;
+}
+
+.dialog-buttons {
+  display: flex;
+}
+
+.dialog-buttons > * + * {
+  margin-left: 24px;
+}
+
+.dialog-buttons .focusable {
+  min-width: 220px;
+  justify-content: center;
+}

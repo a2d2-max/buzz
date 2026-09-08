@@ -1,0 +1,7 @@
+{
+  "tool_name": "mcp__playwright__browser_wait_for",
+  "tool_input_preview": "{\"text\":\"general\"}",
+  "error": "### Error\nTimeoutError: Timeout 3000ms exceeded.\nCall log:\n\u001b[2m  - waiting for getByText('general').first() to be visible\u001b[22m",
+  "timestamp": "2026-09-08T12:33:08.449Z",
+  "retry_count": 1
+}

@@ -1,0 +1,13 @@
+{
+  "id": "xyz.a2d2.tv",
+  "version": "0.1.0",
+  "vendor": "a2d2",
+  "type": "web",
+  "main": "index.html",
+  "title": "a2d2 TV",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "resolution": "1920x1080",
+  "disableBackHistoryAPI": true,
+  "requiredACG": []
+}
