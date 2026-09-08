@@ -33,7 +33,8 @@ test("write → read round trip, scoped by page id", () => {
     savedAt: 5,
   });
   assert.equal(readDocDraftBackup(storage, "p2"), null);
-  assert.equal(docDraftBackupKey("p1").includes("p1"), true);
+  assert.ok(docDraftBackupKey("p1").startsWith("buzz.docs.draft-backup.v1."));
+  assert.ok(docDraftBackupKey("p1").endsWith(".p1"));
 });
 
 test("clear removes only that page's backup", () => {

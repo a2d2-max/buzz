@@ -100,8 +100,12 @@ afterEach(async () => {
 
 after(() => dom.window.close());
 
-/** Mounts the hook against a relay stub; `versionsByDTag` feeds the `#d` re-read. */
-async function mountDocs({ history, versionsByDTag }) {
+/**
+ * Mounts the hook against a relay stub; `versionsByDTag` feeds the `#d`
+ * re-read, `liveEvents` are delivered by the live subscription before it
+ * reports ready, and `calls` records the order of relay interactions.
+ */
+async function mountDocs({ history, liveEvents = [], versionsByDTag }) {
   const React = await import("react");
   const { QueryClient, QueryClientProvider } = await import(
     "@tanstack/react-query"
@@ -112,6 +116,8 @@ async function mountDocs({ history, versionsByDTag }) {
 
   const published = [];
   const historyRequests = [];
+  const calls = [];
+  const reconnectListeners = [];
   const state = { versionsByDTag };
   const originals = {
     fetchEvents: relayClient.fetchEvents,
@@ -123,16 +129,22 @@ async function mountDocs({ history, versionsByDTag }) {
     const dTags = filter["#d"];
     if (dTags) return state.versionsByDTag[dTags[0]] ?? [];
     historyRequests.push(filter);
+    calls.push("history");
     return history;
   };
   relayClient.publishEvent = async (event) => {
     published.push(event);
   };
-  relayClient.subscribeLive = async (_filter, _onEvent, onReady) => {
+  relayClient.subscribeLive = async (_filter, onEvent, onReady) => {
+    calls.push("subscribe");
+    for (const event of liveEvents) onEvent(event);
     onReady?.("eose");
     return async () => {};
   };
-  relayClient.subscribeToReconnects = () => () => {};
+  relayClient.subscribeToReconnects = (listener) => {
+    reconnectListeners.push(listener);
+    return () => {};
+  };
 
   // gcTime 0: the default 5-minute garbage-collection timer would keep the
   // test process alive long after the assertions finish.
@@ -146,8 +158,10 @@ async function mountDocs({ history, versionsByDTag }) {
     assert.equal(rendered.result.current.isLoading, false, "history loaded"),
   );
   return {
+    calls,
     historyRequests,
     published,
+    reconnectListeners,
     result: rendered.result,
     setVersions(next) {
       state.versionsByDTag = next;
@@ -248,6 +262,7 @@ test("an oversized page is refused before signing", async () => {
     versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2] },
   });
   try {
+    const signedBefore = nextEventSerial;
     await assert.rejects(
       docs.result.current.updatePage(
         PAGE_ID,
@@ -257,6 +272,7 @@ test("an oversized page is refused before signing", async () => {
       (error) => error.name === "DocTooLargeError",
     );
     assert.equal(docs.published.length, 0);
+    assert.equal(nextEventSerial, signedBefore, "nothing was signed");
   } finally {
     docs.restore();
   }
@@ -329,6 +345,50 @@ test("lookupPage resolves a page the history scan never delivered", async () => 
       assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventId, V2.id),
     );
     assert.equal(await docs.result.current.lookupPage("nope"), undefined);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("the live subscription is attached before the history scan starts", async () => {
+  const docs = await mountDocs({
+    history: [V1],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    assert.deepEqual(docs.calls.slice(0, 2), ["subscribe", "history"]);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a version delivered live during startup survives the history merge", async () => {
+  // The scan's snapshot predates v2; the live feed delivered v2 first.
+  const docs = await mountDocs({
+    history: [V1],
+    liveEvents: [V2],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2] },
+  });
+  try {
+    assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventId, V2.id);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a relay reconnect triggers a fresh history fetch", async () => {
+  const docs = await mountDocs({
+    history: [V1],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    assert.equal(docs.historyRequests.length, 1);
+    assert.equal(docs.reconnectListeners.length, 1, "listener registered");
+    const { act, waitFor } = await import("@testing-library/react");
+    await act(async () => {
+      for (const listener of docs.reconnectListeners) listener();
+    });
+    await waitFor(() => assert.equal(docs.historyRequests.length, 2));
   } finally {
     docs.restore();
   }
