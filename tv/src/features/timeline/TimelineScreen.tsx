@@ -128,6 +128,7 @@ export function TimelineScreen({
           <FocusItem
             key={message.id}
             focusKey={`msg-${message.id}`}
+            eventId={message.id}
             onSelect={() => {
               // 읽기 전용 — OK 에 할 일이 없지만, 포커스 이동(스크롤)을
               // 위해 행 자체는 선택 가능해야 한다.

@@ -5,13 +5,13 @@ import { getPublicKey } from "nostr-tools/pure";
 
 import {
   buildSettings,
-  clearSettings,
+  consumeSessionBootstrap,
   decodeSecretKey,
   hexToBytes,
-  loadSettings,
+  loadRelayUrl,
   normalizeRelayUrl,
-  readLaunchParams,
-  saveSettings,
+  purgeLegacySecretSettings,
+  saveRelayUrl,
 } from "./settings.ts";
 
 // 시험용으로만 쓰는 고정 키(실제 어디에도 등록돼 있지 않은 값).
@@ -25,7 +25,7 @@ function makeFakeStorage() {
     setItem: (key, value) => map.set(key, String(value)),
     removeItem: (key) => map.delete(key),
     clear: () => map.clear(),
-    key: () => null,
+    key: (index) => [...map.keys()][index] ?? null,
     get length() {
       return map.size;
     },
@@ -70,41 +70,53 @@ test("buildSettings: 공개키를 유도해 담는다", () => {
   assert.equal(result.settings.pubkeyHex, getPublicKey(hexToBytes(SECRET_HEX)));
 });
 
-test("저장 → 불러오기 → 지우기 왕복", () => {
+test("저장소에는 릴레이 URL 만 남긴다", () => {
   const storage = makeFakeStorage();
   const built = buildSettings("wss://relay.test", SECRET_HEX);
   assert.equal(built.ok, true);
-  assert.equal(saveSettings(built.settings, storage), true);
-
-  const loaded = loadSettings(storage);
-  assert.ok(loaded);
-  assert.equal(loaded.relayUrl, built.settings.relayUrl);
-  assert.equal(loaded.secretKeyHex, SECRET_HEX);
-  assert.equal(loaded.pubkeyHex, built.settings.pubkeyHex);
-
-  clearSettings(storage);
-  assert.equal(loadSettings(storage), null);
+  assert.equal(saveRelayUrl(built.settings.relayUrl, storage), true);
+  assert.equal(loadRelayUrl(storage), built.settings.relayUrl);
+  assert.equal(storage.length, 1);
+  assert.equal(storage.getItem("a2d2-tv-relay-url-v2"), "wss://relay.test/");
+  assert.equal(
+    [
+      ...Array.from({ length: storage.length }, (_, index) =>
+        storage.key(index),
+      ),
+    ]
+      .filter(Boolean)
+      .some((key) => storage.getItem(key).includes(SECRET_HEX)),
+    false,
+  );
 });
 
-test("깨진 저장값은 null (캐시 취급 — 설정 화면으로 돌아가는 근거)", () => {
+test("깨진 릴레이 URL 저장값은 null", () => {
   const storage = makeFakeStorage();
-  storage.setItem("a2d2-tv-settings-v1", "{not json");
-  assert.equal(loadSettings(storage), null);
-  storage.setItem("a2d2-tv-settings-v1", JSON.stringify({ relayUrl: "x" }));
-  assert.equal(loadSettings(storage), null);
+  storage.setItem("a2d2-tv-relay-url-v2", "https://not-a-relay.test");
+  assert.equal(loadRelayUrl(storage), null);
 });
 
-test("readLaunchParams: 해시가 쿼리보다 우선한다", () => {
-  const params = readLaunchParams({
-    search: "?relay=wss%3A%2F%2Fquery.example&key=aaa",
-    hash: "#relay=wss%3A%2F%2Fhash.example&key=bbb",
-  });
-  assert.equal(params.relay, "wss://hash.example");
-  assert.equal(params.key, "bbb");
+test("이전 localStorage 개인키 레코드를 시작할 때 지운다", () => {
+  const storage = makeFakeStorage();
+  storage.setItem(
+    "a2d2-tv-settings-v1",
+    JSON.stringify({ relayUrl: "wss://relay.test", secretKeyHex: SECRET_HEX }),
+  );
+  assert.equal(purgeLegacySecretSettings(storage), true);
+  assert.equal(storage.getItem("a2d2-tv-settings-v1"), null);
 });
 
-test("readLaunchParams: 한쪽만 있어도 읽는다", () => {
-  const params = readLaunchParams({ search: "", hash: "#relay=wss://x" });
-  assert.equal(params.relay, "wss://x");
-  assert.equal(params.key, undefined);
+test("세션 부트스트랩은 메모리에서 한 번만 읽고 즉시 지운다", () => {
+  const scope = {
+    __BUZZ_TV_SESSION__: {
+      relayUrl: "wss://relay.test",
+      secretKeyHex: SECRET_HEX,
+    },
+  };
+  const settings = consumeSessionBootstrap(scope);
+  assert.ok(settings);
+  assert.equal(settings.relayUrl, "wss://relay.test/");
+  assert.equal(settings.secretKeyHex, SECRET_HEX);
+  assert.equal("__BUZZ_TV_SESSION__" in scope, false);
+  assert.equal(consumeSessionBootstrap(scope), null);
 });

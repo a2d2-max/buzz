@@ -27,14 +27,14 @@ ares -V
 cd tv && pnpm build          # dist/ 생성 (target: chrome68, 상대경로 산출물)
 ```
 
-`dist/` 를 릴레이(또는 아무 정적 서버)가 서빙하게 하고, 그 주소를
-`tv/webos/index.html` 의 `TV_APP_URL` 에 적는다.
+`dist/` 는 `https://buzz.a2d2lab.com/tv/index.html`에서 서빙하고,
+`tv/webos/index.html`의 hosted 껍데기도 이 고정 주소로 이동한다.
 ★TV 에는 **반드시 빌드 산출물**(`pnpm build && pnpm preview`)을 물린다 —
 dev 서버(`pnpm dev`)는 트랜스파일 전 최신 문법이라 크롬 68 에서 안 뜬다.
-**릴레이가 tv 번들을 서빙하는 배선은 아직 없다 — 지금은 주소를 손으로 넣는 단계다.**
-
-관전 키 주입: 주소 뒤에 `#relay=wss://…&key=nsec1…` 을 붙이면 설정 화면을
-건너뛴다. 앱이 읽자마자 저장하고 주소창에서 지운다.
+개인키는 URL이나 웹 저장소에 넣지 않는다. 실제 Chromium 68 검증은 아래
+`verify-hosted-chrome68.mjs`가 Secret Manager 값을 프로세스 메모리에서 읽어
+검증 자식의 환경과 CDP 문서 초기화로만 전달한다. TV에서 직접 열 때는 설정
+화면에 넣고, 앱을 닫으면 다시 입력한다.
 
 ## 2. TV 개발자 모드 켜기
 
@@ -77,11 +77,25 @@ dev 서버(`pnpm dev`)는 트랜스파일 전 최신 문법이라 크롬 68 에�
   # 2) 빌드 산출물 + 모의 릴레이 띄우기
   pnpm build && pnpm preview --port 4183 &   # dev 서버는 증거가 안 된다
   pnpm mock-relay &
-  # 3) CDP 로 방향키 흐름을 밟고 스크린샷을 남긴다
+  # 3) 환경변수의 시험 키를 CDP 메모리로만 넘겨 방향키 흐름을 밟는다.
+  #    TV_EXPECTED_*에는 mock-relay.mjs의 공개 fixture 값을 넣는다.
+  # TV_EXPECTED_ 접두어의 공개 fixture 환경변수 11개도 먼저 설정한다.
+  BUZZ_RELAY_URL=ws://localhost:7447 BUZZ_PRIVATE_KEY=<시험용-64자리-hex> \
   node scripts/verify-chrome68.mjs \
     /tmp/chrome68/chrome-mac/Chromium.app/Contents/MacOS/Chromium \
-    "http://localhost:4183/#relay=ws://localhost:7447&key=<아무 64자리 hex>" \
+    "http://localhost:4183/" \
     /tmp/c68-shots
+  ```
+
+- **실제 hosted 릴레이 검증**: `TV_EXPECTED_*` 공개 fixture 값만 환경에 둔 뒤
+  아래처럼 실행한다. 스크립트는 현재 gcloud 계정이 `cs@ailex.co.kr`인지
+  확인하고 Secret Manager `a2d2-buzz-tv-viewer-env`를 메모리로만 읽는다.
+
+  ```bash
+  pnpm verify:hosted -- \
+    /tmp/chrome68/chrome-mac/Chromium.app/Contents/MacOS/Chromium \
+    "https://buzz.a2d2lab.com/tv/index.html" \
+    /Users/sign-x/.buzz/RESEARCH/webos-tv-mvp-screens
   ```
 
 - **webOS TV Emulator (5.0)**: 공식 배포는 있으나 macOS 는 **Intel 전용 —
@@ -94,4 +108,4 @@ dev 서버(`pnpm dev`)는 트랜스파일 전 최신 문법이라 크롬 68 에�
 - **문법 게이트**: `pnpm check` 안의 `scripts/check-chrome68.mjs` 가 dist 를
   acorn 으로 파스해 크롬 68 금지 문법을 전수 검사한다.
 - **모의 릴레이**: `pnpm mock-relay` 가 localhost:7447 에 NIP-42 AUTH 를 포함한
-  가짜 릴레이를 띄운다. `#relay=ws://localhost:7447&key=<아무 hex 키>` 로 접속.
+  가짜 릴레이를 띄운다. 설정 화면이나 검증 러너의 환경변수로 접속한다.

@@ -28,8 +28,13 @@ pnpm dev              # http://localhost:5183 (1920x1080 창 권장)
 pnpm mock-relay       # ws://localhost:7447 모의 릴레이 (NIP-42 포함)
 ```
 
-접속 설정은 화면에서 넣거나 URL 로 주입한다:
-`http://localhost:5183/#relay=ws://localhost:7447&key=<64자리 hex 또는 nsec>`
+접속 설정은 화면에서 넣는다. 릴레이 URL 만 localStorage 에 남고, 개인키는
+현재 앱 메모리에만 있어 앱을 닫으면 사라진다. 이전 버전이 저장한
+`a2d2-tv-settings-v1` 개인키 레코드는 시작할 때 지운다.
+
+실제 hosted 검증은 Secret Manager에서 키를 메모리로 읽어 Chromium 68
+프로세스 환경과 CDP 문서 초기화로만 넘기는 `pnpm verify:hosted`를 쓴다.
+개인키를 URL, 쉘 argv, 파일, 로그에 넣지 않는다.
 
 PC 브라우저에는 리모컨 뒤로가기(키코드 461)가 없어 **Escape** 가 대신한다.
 
@@ -49,7 +54,7 @@ scripts/README.md) — dev 서버는 트랜스파일 전 코드라 **TV 확인�
 ## 구조
 
 ```
-src/shared/lib/       # settings(캐시 취급 localStorage), relay(REQ·NIP-42·재연결), kinds
+src/shared/lib/       # settings(키는 메모리, URL만 저장), relay(REQ·NIP-42·재연결), kinds
 src/features/         # channels(39000) · timeline(9/40002 + 프로필 0) · docs(30623/30078) · settings
 src/remote/           # norigin-spatial-navigation 배선, 키코드 461, cursorStateChange
 webos/                # hosted 껍데기 (appinfo.json + 리다이렉트 index.html + 아이콘)

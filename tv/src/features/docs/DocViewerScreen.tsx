@@ -39,7 +39,12 @@ export function DocViewerScreen({ doc }: { doc: DocListEntry }) {
   }, [focusSelf]);
 
   return (
-    <div className="screen" data-testid="doc-viewer-screen">
+    <div
+      className="screen"
+      data-testid="doc-viewer-screen"
+      data-doc-id={doc.id}
+      data-doc-event-id={doc.eventId}
+    >
       <h1 className="screen-title">
         {doc.icon ? `${doc.icon} ` : ""}
         {doc.title || "(제목 없음)"}
