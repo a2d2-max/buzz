@@ -509,9 +509,10 @@ fn inherited_shared_compute_translates_to_supported_agent_transport() {
         effective.env.get("BUZZ_AGENT_PROVIDER").map(String::as_str),
         Some("openai")
     );
+    // 공유 컴퓨트에서 "auto" 는 와이어에선 가상 모델 "mesh" 로 나간다 (relay_mesh_wire_model).
     assert_eq!(
         effective.env.get("BUZZ_AGENT_MODEL").map(String::as_str),
-        Some("auto")
+        Some(super::super::RELAY_MESH_VIRTUAL_MODEL_ID)
     );
     assert_eq!(
         effective
