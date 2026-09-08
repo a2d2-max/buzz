@@ -7,6 +7,7 @@ import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 
 type ViewLoadingFallbackKind =
   | "agents"
+  | "board"
   | "channel"
   | "forum"
   | "projects"
@@ -405,6 +406,9 @@ export function ViewLoadingFallback({
       {kind === "workflows" ? <CardListLoadingBody /> : null}
       {kind === "projects" ? (
         <BuzzLoadingState fill label="Loading projects" />
+      ) : null}
+      {kind === "board" ? (
+        <BuzzLoadingState fill label="Loading board" />
       ) : null}
       {kind === "channel" ? (
         <ChannelLoadingBody hasHeader={shouldShowChannelHeader} />

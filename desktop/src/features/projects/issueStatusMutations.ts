@@ -9,7 +9,7 @@ import {
   type ProjectIssueStatusWord,
 } from "./lib/issueBoardColumns";
 import type { Repository as Project } from "./hooks";
-import { useProjectIssueWriteInvalidation } from "./issueAssignments";
+import { useProjectIssueWriteInvalidator } from "./issueAssignments";
 import {
   nextProjectIssueStatusCreatedAt,
   type ProjectIssue,
@@ -17,6 +17,13 @@ import {
 
 export type ProjectIssueStatusMutationInput = {
   issue: ProjectIssue;
+  /**
+   * Repository the status event is published against. Optional for the
+   * per-project board, which binds one project to the whole hook; the
+   * community board carries cards from many repositories, so it names the
+   * target per drop instead.
+   */
+  project?: Project;
   signAsManagedOwner: boolean;
   status: IssueBoardDropStatus;
 };
@@ -94,16 +101,20 @@ export async function updateProjectIssueStatus({
   );
 }
 
-export function useUpdateProjectIssueStatusMutation(
-  project: Project | null | undefined,
-) {
-  const invalidate = useProjectIssueWriteInvalidation(project);
+/**
+ * Publishes a board drop as a NIP-34 status event. `project` may be bound here
+ * (per-project board) or supplied per mutate call (community board); the call
+ * variable wins so one hook can write to any repository the viewer may move.
+ */
+export function useUpdateProjectIssueStatusMutation(project?: Project | null) {
+  const invalidate = useProjectIssueWriteInvalidator();
 
   return useMutation({
     mutationFn: (input: ProjectIssueStatusMutationInput) => {
-      if (!project) throw new Error("No project selected.");
-      return updateProjectIssueStatus({ ...input, project });
+      const target = input.project ?? project;
+      if (!target) throw new Error("No project selected.");
+      return updateProjectIssueStatus({ ...input, project: target });
     },
-    onSuccess: invalidate,
+    onSuccess: (_result, input) => invalidate((input.project ?? project)?.id),
   });
 }

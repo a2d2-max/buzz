@@ -118,21 +118,37 @@ async function writeProjectIssueAssignment({
   );
 }
 
+/**
+ * Refetches everything an issue write can change, for a project chosen at call
+ * time. The community board writes to a different project per card, so the
+ * target cannot be bound when the hook is created.
+ */
+export function useProjectIssueWriteInvalidator() {
+  const queryClient = useQueryClient();
+  return React.useCallback(
+    (projectId: string | null | undefined) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["project", projectId ?? "none", "issues"],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["projects", "work-items"],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["projects", "activity-summaries"],
+      });
+    },
+    [queryClient],
+  );
+}
+
 export function useProjectIssueWriteInvalidation(
   project: Project | null | undefined,
 ) {
-  const queryClient = useQueryClient();
-  return React.useCallback(() => {
-    void queryClient.invalidateQueries({
-      queryKey: ["project", project?.id ?? "none", "issues"],
-    });
-    void queryClient.invalidateQueries({
-      queryKey: ["projects", "work-items"],
-    });
-    void queryClient.invalidateQueries({
-      queryKey: ["projects", "activity-summaries"],
-    });
-  }, [project?.id, queryClient]);
+  const invalidate = useProjectIssueWriteInvalidator();
+  return React.useCallback(
+    () => invalidate(project?.id),
+    [invalidate, project?.id],
+  );
 }
 
 function useProjectIssueAssignmentMutation(

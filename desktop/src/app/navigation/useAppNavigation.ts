@@ -127,6 +127,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goBoard = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/board",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProject = React.useCallback(
     (
       projectId: string,
@@ -459,6 +470,7 @@ export function useAppNavigation() {
     closeSettings,
     closeWorkflowDetail,
     goAgents,
+    goBoard,
     goChannel,
     goDuplicateWorkflow,
     goEditWorkflow,

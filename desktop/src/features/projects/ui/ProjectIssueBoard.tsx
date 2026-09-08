@@ -37,7 +37,16 @@ import { cn } from "@/shared/lib/cn";
 import { IssueAssigneeFacepile } from "./IssueAssigneesRow";
 import { ProjectStatusProgressIcon } from "./ProjectStatusProgressIcon";
 
-export type ProjectIssueBoardItem = { issue: ProjectIssue; project: Project };
+export type ProjectIssueBoardItem = {
+  issue: ProjectIssue;
+  project: Project;
+  /**
+   * Shown as a chip on the card. Set by the community board, where cards from
+   * many repositories share one column; left unset by the per-project board,
+   * which already names the project in its own chrome.
+   */
+  projectName?: string;
+};
 
 type IssueCardDragData = { type: "issue-card"; issueId: string };
 type IssueColumnDropData = { type: "issue-column"; status: ProjectIssueStatus };
@@ -88,12 +97,14 @@ function IssueCard({
   issue,
   onOpen,
   profiles,
+  projectName,
 }: {
   draggable: boolean;
   isDragging?: boolean;
   issue: ProjectIssue;
   onOpen: () => void;
   profiles?: UserProfileLookup;
+  projectName?: string;
 }) {
   const visual = issueStatusVisual(issue.status);
   const { attributes, listeners, setActivatorNodeRef, setNodeRef } =
@@ -150,6 +161,14 @@ function IssueCard({
             {issue.title}
           </span>
         </span>
+        {projectName ? (
+          <span
+            className="max-w-full truncate rounded-full bg-muted/60 px-1.5 py-0.5 text-2xs text-muted-foreground"
+            data-testid="project-issue-board-card-project"
+          >
+            {projectName}
+          </span>
+        ) : null}
         <span className="flex w-full items-center justify-between gap-2">
           <span className="text-2xs text-muted-foreground/60">
             #{issue.id.slice(0, 8)}
@@ -344,6 +363,7 @@ export function ProjectIssueBoard({
                   key={item.issue.id}
                   onOpen={() => onOpenIssue(item)}
                   profiles={profiles}
+                  projectName={item.projectName}
                 />
               ))}
             </BoardColumn>
