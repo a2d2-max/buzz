@@ -457,3 +457,48 @@ fn unchanged_session_policy_does_not_require_restart() {
     let thread = snapshot_under(AcpSessionPolicy::Thread);
     assert!(policy_transition_diff(&thread, &snapshot_under(AcpSessionPolicy::Thread)).is_empty());
 }
+
+// ── Per-agent Claude account ─────────────────────────────────────────────────
+
+/// Prospective snapshot for `record` under the default policy.
+fn snapshot_for(record: &ManagedAgentRecord) -> SpawnConfigSnapshot {
+    prospective_spawn_config_snapshot(
+        record,
+        &[],
+        &[],
+        "wss://ws.example",
+        &Default::default(),
+        false,
+        AcpSessionPolicy::Channel,
+    )
+}
+
+#[test]
+fn changing_the_claude_account_requires_restart_and_never_snapshots_the_token() {
+    // The token is injected onto the spawn `Command` straight from the keyring,
+    // so it can never be read back out of `env`; the account id is the only
+    // representation the badge compares. Selecting a different account while an
+    // agent runs must light exactly that entry, in both directions.
+    let mut with_account = record();
+    with_account.claude_account_id = Some("acct-1".into());
+    let app_login = snapshot_for(&record());
+    let selected = snapshot_for(&with_account);
+
+    let forward = policy_transition_diff(&app_login, &selected);
+    assert_eq!(
+        forward.iter().map(|e| e.field.as_str()).collect::<Vec<_>>(),
+        vec!["claude_account_id"],
+    );
+    let reverse = policy_transition_diff(&selected, &app_login);
+    assert_eq!(
+        reverse.iter().map(|e| e.field.as_str()).collect::<Vec<_>>(),
+        vec!["claude_account_id"],
+    );
+
+    assert!(
+        !selected.env.keys().any(|k| k
+            .eq_ignore_ascii_case(crate::managed_agents::claude_accounts::CLAUDE_OAUTH_TOKEN_ENV)),
+        "the OAuth token must never be part of the snapshot env"
+    );
+    assert!(policy_transition_diff(&selected, &snapshot_for(&with_account)).is_empty());
+}

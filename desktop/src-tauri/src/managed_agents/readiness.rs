@@ -74,6 +74,12 @@ pub(crate) struct EffectiveAgentEnv {
     // replaces this resolution path wholesale.
     #[allow(dead_code)]
     pub config_file_path: Option<&'static str>,
+    /// `true` when the spawn will supply an OAuth token for this runtime — a
+    /// stored Claude account on the record, or a non-blank value under the
+    /// runtime's `oauth_token_env_var` in the layered env — so readiness must
+    /// not demand the desktop's own CLI login. Always `false` for runtimes
+    /// without such an env var.
+    pub oauth_token_supplied: bool,
     /// The resolved harness binary name (e.g. `"buzz-agent"`, `"goose"`).
     pub effective_command: String,
 }
@@ -292,10 +298,12 @@ fn resolve_effective_agent_env_with_def(
         effective_model.as_deref(),
     );
 
+    let token_supplied = super::claude_accounts::oauth_token_supplied(record, runtime, &env);
     EffectiveAgentEnv {
         env,
         config_file_path: runtime.and_then(|r| r.config_file_path),
         effective_command,
+        oauth_token_supplied: token_supplied,
     }
 }
 
@@ -449,6 +457,9 @@ fn collect_missing_requirements(
             let file_cfg = read_goose_file_config();
             goose_requirements(effective, file_cfg.as_ref())
         }
+        // A per-agent Claude account (or hand-typed token) is what the spawn
+        // signs in with; the desktop's own CLI login is irrelevant then.
+        "claude" if effective.oauth_token_supplied => vec![],
         "claude" => cli_login::requirements(
             &["claude", "auth", "status"],
             "complete Claude Code authentication by running the Claude CLI",
@@ -680,6 +691,7 @@ mod tests {
             env,
             config_file_path: runtime.and_then(|r| r.config_file_path),
             effective_command: command.to_string(),
+            oauth_token_supplied: false,
         }
     }
 
@@ -1071,6 +1083,7 @@ mod tests {
             required_normalized_fields: &[],
             login_hint: None,
             auth_probe_args: None,
+            oauth_token_env_var: None,
         }
     }
 
@@ -1231,40 +1244,11 @@ mod tests {
         adapter_commands: &'static [&'static str],
         underlying_cli: Option<&'static str>,
     ) -> KnownAcpRuntime {
+        // Same blank stub as `make_cli_runtime`, re-labelled as codex.
         KnownAcpRuntime {
             id: "codex",
             label: "Codex",
-            commands: adapter_commands,
-            aliases: &[],
-            avatar_url: "",
-            mcp_command: None,
-            mcp_hooks: false,
-            underlying_cli,
-            cli_install_commands: &[],
-            cli_install_commands_windows: &[],
-            adapter_install_commands: &[],
-            cli_install_instructions_url: "",
-            adapter_install_instructions_url: "",
-            cli_install_hint: "",
-            adapter_install_hint: "",
-            skill_dir: None,
-            supports_acp_model_switching: false,
-            config_file_path: None,
-            config_file_format: None,
-            model_env_var: None,
-            provider_env_var: None,
-            provider_locked: false,
-            default_env: &[],
-            supports_acp_native_config: false,
-            thinking_env_var: None,
-            effort_normalization: None,
-            effort_accepted_values: None,
-            max_tokens_env_var: None,
-            context_limit_env_var: None,
-            max_rounds_env_var: None,
-            required_normalized_fields: &[],
-            login_hint: None,
-            auth_probe_args: None,
+            ..make_cli_runtime(adapter_commands, underlying_cli)
         }
     }
 
@@ -1550,6 +1534,7 @@ mod tests {
             definition_parallelism: None,
             relay_mesh: None,
             effort_level: None,
+            claude_account_id: None,
         };
 
         let runtime = known_acp_runtime_exact("buzz-agent");
@@ -1701,6 +1686,9 @@ mod tests {
 
     // buzz-agent OpenRouter readiness tests live in a sibling file so this
     // module stays under the desktop file-size ratchet.
+    #[path = "claude_account.rs"]
+    mod claude_account;
+
     #[path = "openrouter_tests.rs"]
     mod openrouter_tests;
 }

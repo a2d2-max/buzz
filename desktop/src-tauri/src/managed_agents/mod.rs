@@ -12,6 +12,10 @@ mod agent_description;
 pub(crate) use agent_description::{effective_agent_description, record_effective_description};
 mod backend;
 pub(crate) mod bestie_assignment;
+pub(crate) mod claude_accounts;
+pub(crate) use claude_accounts::{
+    apply_claude_account_update, detach_claude_account, with_claude_account_store, ClaudeAccount,
+};
 pub(crate) mod claude_config;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;

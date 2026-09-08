@@ -352,6 +352,7 @@ fn bare_record() -> ManagedAgentRecord {
         team_catalog_source: None,
         relay_mesh: None,
         effort_level: None,
+        claude_account_id: None,
         auto_restart_on_config_change: false,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],

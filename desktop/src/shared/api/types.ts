@@ -374,6 +374,11 @@ export type ManagedAgent = {
    * `"allowlist"`. Preserved across mode toggles.
    */
   respondToAllowlist: string[];
+  /**
+   * Stored Claude account (see `ClaudeAccount`) whose OAuth token the spawn
+   * injects for this agent. `null` = the app's own Claude login.
+   */
+  claudeAccountId: string | null;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */
@@ -504,6 +509,12 @@ export type AcpRuntimeCatalogEntry = {
   providerEnvVar: string | null;
   /** Environment variable used to apply thinking effort, when supported. */
   thinkingEnvVar: string | null;
+  /**
+   * Environment variable this runtime reads a subscription OAuth token from
+   * (`CLAUDE_CODE_OAUTH_TOKEN` for Claude Code). Gates the per-agent Claude
+   * account picker; `null` = not applicable to this runtime.
+   */
+  oauthTokenEnvVar: string | null;
   /**
    * Canonical accepted effort values for this runtime, in display order.
    *
@@ -710,6 +721,32 @@ export type UpdateManagedAgentInput = {
   respondToAllowlist?: string[];
   /** Tri-state: absent = don't touch; `null` = clear; `string` = set. Persisted in the locked update so access-change restarts snapshot the new effort. Send only when `effortTouched`. */
   effortLevel?: string | null;
+  /** Tri-state: absent = don't touch; `null` = back to the app's own Claude login; `string` = that stored account's id. */
+  claudeAccountId?: string | null;
+};
+
+/**
+ * A named Claude subscription account. The OAuth token lives in the OS
+ * keyring and never reaches the frontend; `tokenHint` is `…` + its last four.
+ */
+export type ClaudeAccount = {
+  id: string;
+  label: string;
+  createdAt: string;
+  tokenHint: string;
+};
+
+export type ClaudeAccountTestResult = {
+  ok: boolean;
+  /** One short, token-scrubbed line from the CLI or a status sentence. */
+  message: string;
+};
+
+export type RemoveClaudeAccountResult = {
+  /** Agents switched back to the app login because they used the account. */
+  detachedAgentPubkeys: string[];
+  /** Set when the account is gone but its keyring entry could not be deleted. */
+  warning: string | null;
 };
 // Persona (agent definition) types live in a sibling module to keep this
 // file inside the repo-wide size ratchet; re-exported so import paths

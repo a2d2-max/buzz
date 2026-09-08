@@ -17,7 +17,10 @@ applies them; `AcpRuntimeCatalogEntry` exposes them over IPC; and
 `lib/agentConfigCore.ts` projects them into field descriptors. The frontend
 never maintains a rival copy of this table. Setup guidance follows the same
 rule: `requires_external_cli` is derived from `KnownAcpRuntime` and projected
-to the UI rather than inferred from a runtime ID in a component.
+to the UI rather than inferred from a runtime ID in a component. The per-agent
+Claude account picker follows it too: it renders only when the prospective
+runtime's `oauthTokenEnvVar` (from `KnownAcpRuntime::oauth_token_env_var`) is
+set, and spawn injects the picked account's token under that same key.
 
 **Second metadata source: command-keyed execution policy.**
 `harness_max_parallelism` (`managed_agents/parallelism.rs`) maps the harness's

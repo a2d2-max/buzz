@@ -30,6 +30,7 @@ fn base() -> SpawnConfigSnapshot {
         parallelism: 1,
         effort_level: Some("high".into()),
         session_policy: "channel".into(),
+        claude_account_id: None,
     }
 }
 
@@ -74,6 +75,9 @@ fn mutations() -> Vec<Mutation> {
         ("parallelism", |s| s.parallelism = 8),
         ("effort_level", |s| s.effort_level = None),
         ("session_policy", |s| s.session_policy = "thread".into()),
+        ("claude_account_id", |s| {
+            s.claude_account_id = Some("acct-1".into())
+        }),
     ]
 }
 

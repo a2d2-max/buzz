@@ -318,6 +318,7 @@ pub fn build_managed_agent_summary(
         needs_restart,
         restart_diff,
         env_vars: record.env_vars.clone(),
+        claude_account_id: record.claude_account_id.clone(),
         backend: record.backend.clone(),
         backend_agent_id: record.backend_agent_id.clone(),
         status,
@@ -501,6 +502,19 @@ pub fn spawn_agent_child(
             })?;
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
+
+    // Per-agent Claude account: read the OAuth token from the keyring now,
+    // before any side effect, so a dangling account refuses the spawn without
+    // leaving a log marker. The token is written onto the command after the
+    // user env below and never enters `env_vars` or the spawn snapshot.
+    let oauth_token_env_var =
+        known_acp_runtime(effective_command).and_then(|r| r.oauth_token_env_var);
+    let claude_account_token = super::claude_accounts::claude_account_spawn_token(
+        record.claude_account_id.as_deref(),
+        oauth_token_env_var.is_some(),
+        |id| super::claude_accounts::lookup_claude_account_token(app, id),
+    )
+    .map_err(|error| format!("cannot spawn agent {}: {error}", record.pubkey))?;
 
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
@@ -755,6 +769,13 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+    // The picked Claude account wins over a hand-typed token and an ambient
+    // API key in the user env: the picker is the explicit, visible choice.
+    super::claude_accounts::apply_claude_account_env(
+        &mut command,
+        oauth_token_env_var,
+        claude_account_token.as_deref(),
+    );
     // Resolve once and stamp the same value onto the snapshot below.
     let acp_session_policy = super::apply_app_acp_session_policy_env(app, &mut command);
 

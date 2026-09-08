@@ -270,6 +270,10 @@ pub struct UpdateManagedAgentRequest {
     /// the record-scope alias sweep runs atomically with the column write.
     #[serde(default, deserialize_with = "crate::util::double_option")]
     pub effort_level: Option<Option<String>>,
+    /// Claude account selection: absent = untouched, `null` = back to the
+    /// app's own login, id = that stored account.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub claude_account_id: Option<Option<String>>,
 }
 
 #[cfg(test)]

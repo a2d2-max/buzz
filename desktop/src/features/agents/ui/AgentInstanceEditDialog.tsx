@@ -71,12 +71,19 @@ import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { useRequiredCredentialState } from "./useRequiredCredentialState";
 import { RunOnSummarySection } from "./RunOnSummarySection";
-import { PersonaDropdownField } from "./PersonaDropdownField";
 import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
 } from "./usePersonaModelDiscovery";
 import { EditAgentProviderModelFields } from "./EditAgentProviderModelFields";
+import { EditAgentClaudeAccountField } from "./EditAgentClaudeAccountField";
+import { EditAgentRuntimeField } from "./EditAgentRuntimeField";
+import {
+  claudeAccountSelectionValue,
+  hasManualClaudeToken,
+  resolveClaudeAccountSubmission,
+} from "./claudeAccountOptions";
+import { useClaudeAccountsQuery } from "@/features/agents/useClaudeAccounts";
 import {
   getBakedModelInheritLabel,
   getBakedProviderInheritLabel,
@@ -89,7 +96,6 @@ import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
 import { showAgentProfileSyncWarning } from "./agentProfileSyncWarning";
-import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import {
   ADD_CUSTOM_HARNESS_OPTION,
   runtimeDropdownAction,
@@ -187,6 +193,10 @@ export function AgentInstanceEditDialog({
 
   // Tracks whether the user has made an in-dialog runtime selection.
   const runtimeTouched = React.useRef(false);
+  // Claude account picker: `null` = untouched (derived from record + env).
+  const [claudeAccountSelection, setClaudeAccountSelection] = React.useState<
+    string | null
+  >(null);
 
   // Reset form state only when the dialog opens or when switching to a different agent.
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional — including agent fields would re-fire on every 5s poll and wipe edits
@@ -218,6 +228,7 @@ export function AgentInstanceEditDialog({
       setIsAvatarUploadPending(false);
       setIsAddHarnessOpen(false);
       runtimeTouched.current = false;
+      setClaudeAccountSelection(null);
       const matched =
         runtimes.find((r) => r.command?.trim() === agent.agentCommand.trim()) ??
         runtimes.find((r) => r.id === agent.agentCommand.trim());
@@ -322,6 +333,11 @@ export function AgentInstanceEditDialog({
   const prospectiveRuntime = runtimes.find(
     (r) => r.id === prospectiveRuntimeId,
   );
+  // Claude account picker — gated on a catalog capability, not a harness id.
+  const claudeTokenEnvVar = prospectiveRuntime?.oauthTokenEnvVar ?? null;
+  const claudeAccountsQuery = useClaudeAccountsQuery({
+    enabled: open && claudeTokenEnvVar != null,
+  });
   const runtimeCatalogStatus = runtimesQuery.isLoading
     ? ("loading" as const)
     : runtimesQuery.isError
@@ -424,6 +440,17 @@ export function AgentInstanceEditDialog({
     () => ({ ...globalConfig.env_vars, ...inheritedSubmission.envVars }),
     [globalConfig.env_vars, inheritedSubmission.envVars],
   );
+  // Same layered env the spawn reads, so a persona/global token is detected.
+  const claudeManualToken = hasManualClaudeToken(
+    envVarsForDiscovery,
+    claudeTokenEnvVar,
+  );
+  const claudeAccountValue =
+    claudeAccountSelection ??
+    claudeAccountSelectionValue({
+      currentAccountId: agent.claudeAccountId,
+      hasManualToken: claudeManualToken,
+    });
   const effectiveProvider =
     (inheritedSubmission.provider ?? "").trim() ||
     inheritedProviderDefault.value;
@@ -745,6 +772,13 @@ export function AgentInstanceEditDialog({
           respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
             ? respondToAllowlist
             : undefined,
+        // Tri-state like effortLevel (see resolveClaudeAccountSubmission).
+        claudeAccountId: resolveClaudeAccountSubmission({
+          tokenEnvVar: claudeTokenEnvVar,
+          runtimeKnown: prospectiveRuntime != null,
+          selectionValue: claudeAccountValue,
+          initialAccountId: agent.claudeAccountId,
+        }),
       };
 
       // Resolve effort before the update so access-change restarts can
@@ -1010,67 +1044,21 @@ export function AgentInstanceEditDialog({
             />
             <RunOnSummarySection backend={agent.backend} />
 
-            {/* Provider (runtime) */}
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="edit-agent-runtime"
-              >
-                Provider
-              </label>
-              <PersonaDropdownField
-                disabled={isSaving}
-                id="edit-agent-runtime"
-                onValueChange={handleRuntimeDropdownChange}
-                options={runtimeDropdownOptions}
-                placeholder="Choose a provider"
-                value={runtimeDropdownValue}
-              />
-              {selectedRuntime ? (
-                <p className="text-xs text-muted-foreground">
-                  Detected at{" "}
-                  <span className="font-medium">
-                    {selectedRuntime.binaryPath ??
-                      selectedRuntime.command ??
-                      selectedRuntime.id}
-                  </span>
-                </p>
-              ) : null}
-              <AddCustomHarnessDialog
-                onOpenChange={setIsAddHarnessOpen}
-                onSaved={selectSavedHarness}
-                open={isAddHarnessOpen}
-              />
-            </div>
-            {selectedRuntimeId === "custom" && !inheritHarness ? (
-              <div className="space-y-1.5">
-                <label
-                  className="text-sm font-medium text-foreground"
-                  htmlFor="edit-agent-command"
-                >
-                  Agent command
-                </label>
-                <div
-                  className={cn(
-                    "flex min-h-11 items-center px-3",
-                    PERSONA_FIELD_SHELL_CLASS,
-                  )}
-                >
-                  <Input
-                    autoCorrect="off"
-                    className={cn(
-                      "h-8 px-0 py-0 leading-6",
-                      PERSONA_FIELD_CONTROL_CLASS,
-                    )}
-                    disabled={isSaving}
-                    id="edit-agent-command"
-                    onChange={(event) => setAgentCommand(event.target.value)}
-                    placeholder="Full path or shell command"
-                    value={agentCommand}
-                  />
-                </div>
-              </div>
-            ) : null}
+            <EditAgentRuntimeField
+              agentCommand={agentCommand}
+              disabled={isSaving}
+              isAddHarnessOpen={isAddHarnessOpen}
+              onAddHarnessOpenChange={setIsAddHarnessOpen}
+              onAgentCommandChange={setAgentCommand}
+              onHarnessSaved={selectSavedHarness}
+              onValueChange={handleRuntimeDropdownChange}
+              options={runtimeDropdownOptions}
+              selectedRuntime={selectedRuntime}
+              showAgentCommandInput={
+                selectedRuntimeId === "custom" && !inheritHarness
+              }
+              value={runtimeDropdownValue}
+            />
             {/* LLM provider + provider API key + model */}
             <EditAgentProviderModelFields
               disabled={isSaving}
@@ -1104,6 +1092,18 @@ export function AgentInstanceEditDialog({
               onModelChange={setModel}
               modelStatusMessage={modelStatusMessage}
             />
+            {claudeTokenEnvVar ? (
+              <EditAgentClaudeAccountField
+                accounts={claudeAccountsQuery.data ?? null}
+                accountsError={claudeAccountsQuery.isError}
+                currentAccountId={agent.claudeAccountId}
+                disabled={isSaving}
+                hasManualToken={claudeManualToken}
+                onValueChange={setClaudeAccountSelection}
+                tokenEnvVar={claudeTokenEnvVar}
+                value={claudeAccountValue}
+              />
+            ) : null}
 
             <EffortPickerField
               agent={agent}

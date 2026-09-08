@@ -37,6 +37,11 @@ pub(super) fn apply_setup_payload_env(
         env: descriptor.env.clone(),
         config_file_path: runtime_meta.and_then(|r| r.config_file_path),
         effective_command: descriptor.command.clone(),
+        oauth_token_supplied: crate::managed_agents::claude_accounts::oauth_token_supplied(
+            record,
+            runtime_meta,
+            &descriptor.env,
+        ),
     };
     // Compute the optional payload before touching the command.
     let setup_payload_json =

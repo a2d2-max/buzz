@@ -159,6 +159,12 @@ pub(crate) struct KnownAcpRuntime {
     /// CLI args for probing authentication status. `args[0]` is the binary name;
     /// the remainder are the subcommand. `None` for runtimes with no login step.
     pub auth_probe_args: Option<&'static [&'static str]>,
+    /// Env var through which this runtime accepts a subscription OAuth token
+    /// (`CLAUDE_CODE_OAUTH_TOKEN` for Claude Code). `None` = the runtime has no
+    /// such input, so per-agent Claude accounts do not apply to it. Exposed on
+    /// `AcpRuntimeCatalogEntry` so the UI gates the account picker on this
+    /// fact instead of comparing harness ids.
+    pub oauth_token_env_var: Option<&'static str>,
 }
 
 impl KnownAcpRuntime {

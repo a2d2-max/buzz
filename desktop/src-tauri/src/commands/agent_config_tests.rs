@@ -63,6 +63,7 @@ fn goose_runtime() -> &'static KnownAcpRuntime {
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
         auth_probe_args: None,
+        oauth_token_env_var: None,
     };
     &RUNTIME
 }
@@ -123,6 +124,7 @@ fn agent_record() -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        claude_account_id: None,
         agent_command_override: None,
         persona_source_version: None,
         provider: None,
