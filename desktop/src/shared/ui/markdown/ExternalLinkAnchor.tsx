@@ -27,12 +27,15 @@ export function ExternalLinkAnchor({
   href,
   isLinearLink,
   label,
+  openLink,
 }: {
   anchorProps: React.ComponentPropsWithoutRef<"a">;
   children: React.ReactNode;
   href: string | undefined;
   isLinearLink: boolean;
   label: string;
+  /** Replaces the OS opener for "Open link" — links that resolve in-app. */
+  openLink?: () => void;
 }) {
   const [menu, setMenu] = React.useState<MediaContextMenuPosition | null>(null);
   const closeMenu = React.useCallback(() => setMenu(null), []);
@@ -71,6 +74,10 @@ export function ExternalLinkAnchor({
               label: "Open link",
               onSelect: () => {
                 closeMenu();
+                if (openLink) {
+                  openLink();
+                  return;
+                }
                 void openUrl(href).catch(() => {
                   toast.error("Failed to open link");
                 });

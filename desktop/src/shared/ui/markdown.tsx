@@ -52,7 +52,7 @@ import {
   SyntaxHighlightedCode,
 } from "./markdown/CodeBlock";
 import { EntityLinkAnchor, useOpenEntityLink } from "./markdown/entityLinks";
-import { ExternalLinkAnchor } from "./markdown/ExternalLinkAnchor";
+import { FallbackLinkAnchor } from "./markdown/FallbackLinkAnchor";
 import { FileCard } from "./markdown/FileCard";
 import {
   AuthoredDeepLinkAnchor,
@@ -1214,7 +1214,7 @@ export function createMarkdownComponents(
   mediaInset = false,
   blockCode = false,
 ): Components {
-  const listItemClassName = "[&_p]:inline";
+  const liClass = "[&_p]:inline";
   const listClassName = "space-y-1 pl-6 marker:text-muted-foreground/80";
 
   function MarkdownAnchor({
@@ -1366,14 +1366,14 @@ export function createMarkdownComponents(
     const isLinearLink = supportedLinkPreview?.kind === "linear-issue";
 
     return (
-      <ExternalLinkAnchor
+      <FallbackLinkAnchor
         anchorProps={props}
         href={href}
         isLinearLink={isLinearLink}
         label={label}
       >
         {children}
-      </ExternalLinkAnchor>
+      </FallbackLinkAnchor>
     );
   }
 
@@ -1512,7 +1512,7 @@ export function createMarkdownComponents(
       );
     },
     input: MarkdownInput,
-    li: ({ children }) => <li className={listItemClassName}>{children}</li>,
+    li: ({ node: _n, ...props }) => <li {...props} className={liClass} />,
     ol: ({ children }) => (
       <ol className={cn("list-decimal", listClassName)}>{children}</ol>
     ),
