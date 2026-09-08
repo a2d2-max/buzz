@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  deriveShellRoute,
   markAllReadSources,
   activateDesktopNotificationTarget,
   createDesktopNotificationActivationQueue,
@@ -242,4 +243,19 @@ test("markAllReadSources skips the active marker without projected activity", ()
   });
 
   assert.deepEqual(calls, ["channels"]);
+});
+
+test("deriveShellRoute_docsRoutesSelectTheDocsView", () => {
+  assert.deepEqual(deriveShellRoute("/docs"), {
+    selectedChannelId: null,
+    selectedView: "docs",
+  });
+  assert.deepEqual(deriveShellRoute("/docs/3f0c2b1a"), {
+    selectedChannelId: null,
+    selectedView: "docs",
+  });
+});
+
+test("deriveShellRoute_docsPrefixMustBeAPathSegment", () => {
+  assert.equal(deriveShellRoute("/docsx").selectedView, "home");
 });

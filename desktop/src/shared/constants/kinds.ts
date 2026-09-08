@@ -44,7 +44,8 @@ export const KIND_HUDDLE_ENDED = 48103;
 export const KIND_HUDDLE_LIVENESS = 48104;
 // NIP-78 application-specific data. All use kind 30078; the relay
 // differentiates them by d-tag ("read-state:<slotId>", "channel-sections",
-// "channel-mutes", "channel-stars", "channel-sort", "project-sidebar-membership").
+// "channel-mutes", "channel-stars", "channel-sort", "project-sidebar-membership",
+// "doc:<uuid>").
 export const KIND_READ_STATE = 30078;
 export const KIND_CHANNEL_SECTIONS = 30078;
 export const KIND_CHANNEL_MUTES = 30078;
@@ -52,6 +53,13 @@ export const KIND_CHANNEL_STARS = 30078;
 export const KIND_CHANNEL_SORT = 30078;
 export const KIND_PROJECT_SIDEBAR_MEMBERSHIP = 30078;
 export const KIND_COMMUNITY_THEME = 30078;
+// Community-wide wiki pages (the Docs surface). One addressable event per
+// page, keyed by d="doc:<uuid>" and tagged t="community-doc" so a single `#t`
+// filter loads the whole tree. Any member may republish a page; readers
+// resolve last-write-wins across authors by created_at.
+export const KIND_COMMUNITY_DOC = 30078;
+export const COMMUNITY_DOC_TAG = "community-doc";
+export const COMMUNITY_DOC_D_PREFIX = "doc:";
 // NIP-33 persona/team/managed-agent projection events (d-tag keyed). Published
 // backend-side as secrets-stripped snapshots; the inbound sync hook subscribes
 // to all three to patch local records. Mirror of buzz-core's KIND_PERSONA etc.
