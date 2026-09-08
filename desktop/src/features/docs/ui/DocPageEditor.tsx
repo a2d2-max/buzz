@@ -17,12 +17,20 @@ import {
 } from "../lib/docDraftBackup";
 import { DocImageNode } from "../lib/docImageNode";
 import type { DocPage } from "../lib/docPageCodec";
+import { DocConflictError } from "../lib/useCommunityDocs";
 import {
   compareRenderedMarkdown,
   scanUnsupportedMarkdown,
 } from "../lib/markdownFidelity";
 
 export const DOC_AUTOSAVE_DELAY_MS = 1_500;
+/**
+ * Floor between automatic publishes. Every save is a signed event plus a
+ * `#d` re-read against the relay's per-user write budget, so a burst of
+ * typing pauses must not become a burst of publishes. Blur/Done still save
+ * right away.
+ */
+export const DOC_AUTOSAVE_MIN_INTERVAL_MS = 5_000;
 
 export type DocDraft = { title: string; body: string };
 
@@ -151,6 +159,7 @@ export function DocPageEditor({
     () =>
       createAutosaveScheduler<() => DocDraft>({
         delayMs: DOC_AUTOSAVE_DELAY_MS,
+        minIntervalMs: DOC_AUTOSAVE_MIN_INTERVAL_MS,
         onStateChange: (state) => onAutosaveStateRef.current(state),
         save: async (draft) => {
           const materialized = draft();
@@ -162,12 +171,19 @@ export function DocPageEditor({
               ...materialized,
               savedAt: Date.now(),
             });
+            // A conflict is settled by the user, not by retrying: stop the
+            // timer until they pick a side (an explicit flush still works,
+            // and a successful save lifts the pause).
+            if (error instanceof DocConflictError)
+              schedulerRef.current?.pause();
             throw error;
           }
         },
       }),
     [page.id],
   );
+  const schedulerRef = React.useRef<typeof scheduler | null>(null);
+  schedulerRef.current = scheduler;
 
   const scheduleSave = React.useCallback(() => {
     scheduler.schedule(() => ({
@@ -289,9 +305,11 @@ export function DocPageEditor({
       discard: () => {
         discardedRef.current = true;
         scheduler.dispose();
+        // The draft was thrown away on purpose; do not offer it back later.
+        clearDocDraftBackup(safeLocalStorage(), page.id);
       },
     }),
-    [scheduler],
+    [page.id, scheduler],
   );
 
   React.useEffect(

@@ -15,6 +15,13 @@ export type AutosaveScheduler<TDraft> = {
    * attempt failed (the draft stays dirty for a later retry).
    */
   flush: () => Promise<boolean>;
+  /**
+   * Stops the debounce timer until `resume()` or the next successful save.
+   * Drafts are still recorded and `flush()` still works — this only stops
+   * automatic retries while a conflict waits on the user.
+   */
+  pause: () => void;
+  resume: () => void;
   /** Stops future timers and state callbacks. Does not save — flush first. */
   dispose: () => void;
   getState: () => AutosaveState;
@@ -34,14 +41,20 @@ const defaultTimers: AutosaveTimers = {
  * Debounced autosave with a durable retry posture: a failed save keeps the
  * draft dirty (state `error`) until a later flush or edit succeeds, an edit
  * made during a save is saved afterwards, and only one save runs at a time.
+ * `minIntervalMs` spaces automatic saves out (a burst of pauses while typing
+ * must not become a burst of publishes); an explicit `flush()` ignores it.
  */
 export function createAutosaveScheduler<TDraft>({
   delayMs,
+  minIntervalMs = 0,
+  now = () => Date.now(),
   save,
   onStateChange,
   timers = defaultTimers,
 }: {
   delayMs: number;
+  minIntervalMs?: number;
+  now?: () => number;
   save: (draft: TDraft) => Promise<void>;
   onStateChange?: (state: AutosaveState) => void;
   timers?: AutosaveTimers;
@@ -50,8 +63,10 @@ export function createAutosaveScheduler<TDraft>({
   let latestDraft: TDraft | undefined;
   let dirty = false;
   let disposed = false;
+  let paused = false;
   let timer: unknown = null;
   let inFlight: Promise<boolean> | null = null;
+  let lastSaveFinishedAt: number | null = null;
 
   const setState = (next: AutosaveState) => {
     if (state === next) return;
@@ -71,13 +86,29 @@ export function createAutosaveScheduler<TDraft>({
     setState("saving");
     try {
       await save(draft);
+      paused = false;
       setState(dirty ? "dirty" : "saved");
       return true;
     } catch {
       dirty = true;
       setState("error");
       return false;
+    } finally {
+      lastSaveFinishedAt = now();
     }
+  };
+
+  const startTimer = () => {
+    clearTimer();
+    const sinceLastSave =
+      lastSaveFinishedAt === null
+        ? Number.POSITIVE_INFINITY
+        : now() - lastSaveFinishedAt;
+    const delay = Math.max(delayMs, minIntervalMs - sinceLastSave);
+    timer = timers.setTimeout(() => {
+      timer = null;
+      void flush();
+    }, delay);
   };
 
   const flush = async (): Promise<boolean> => {
@@ -96,13 +127,22 @@ export function createAutosaveScheduler<TDraft>({
       latestDraft = draft;
       dirty = true;
       if (state !== "saving") setState("dirty");
-      clearTimer();
-      timer = timers.setTimeout(() => {
-        timer = null;
-        void flush();
-      }, delayMs);
+      if (paused) {
+        clearTimer();
+        return;
+      }
+      startTimer();
     },
     flush,
+    pause: () => {
+      paused = true;
+      clearTimer();
+    },
+    resume: () => {
+      if (!paused) return;
+      paused = false;
+      if (dirty && !disposed) startTimer();
+    },
     dispose: () => {
       disposed = true;
       clearTimer();

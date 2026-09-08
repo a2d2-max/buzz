@@ -56,6 +56,9 @@ function fakeRelay(events, { clamp = 1_000 } = {}) {
         .filter((event) =>
           filter.until === undefined ? true : event.created_at <= filter.until,
         )
+        .filter((event) =>
+          filter.since === undefined ? true : event.created_at >= filter.since,
+        )
         .slice(0, limit);
     },
   };
@@ -160,4 +163,25 @@ test("a relay error propagates instead of masquerading as an empty wiki", async 
     }),
     /relay down/,
   );
+});
+
+test("since: an incremental scan asks only for rows at or after the watermark", async () => {
+  const events = [];
+  for (let index = 0; index < 1_500; index += 1) {
+    events.push(noiseEvent(index, 10_000 + index));
+  }
+  events.push(docEvent("old", 5), docEvent("fresh", 11_400));
+  const relay = fakeRelay(events);
+  const result = await fetchDocPagesToExhaustion({
+    fetchEvents: relay.fetchEvents,
+    pageLimit: 1_000,
+    since: 11_000,
+  });
+  assert.deepEqual(
+    result.pages.map((page) => page.id),
+    ["fresh"],
+  );
+  assert.equal(result.truncated, false);
+  assert.ok(relay.requests.every((request) => request.since === 11_000));
+  assert.equal(relay.requests.length, 1, "500 rows fit in one page");
 });

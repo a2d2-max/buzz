@@ -19,7 +19,16 @@ export type DocsHistoryResult = {
 
 /**
  * Loads every community-doc page version by walking the whole kind-30078
- * window with the `until` time cursor.
+ * window with the `until` time cursor (or the part of it at or after `since`
+ * for an incremental refresh).
+ *
+ * This depends on one relay property: a `kinds`-only REQ for 30078 drops no
+ * SQL row after the fact. That holds today because 30078 sits in none of the
+ * post-filter gates (`AUTHOR_ONLY_KINDS`, `P_GATED_KINDS`,
+ * `RESULT_GATED_KINDS` in buzz-core's kind.rs) and is global-only, so a page
+ * shorter than `limit` really is the end of the window. If the docs kind is
+ * ever added to one of those gates, short pages stop meaning "exhausted" and
+ * this scan must switch to a cursor that survives post-filtering.
  *
  * The relay applies `#t` in memory *after* the SQL `LIMIT` (only `#d`/`#e`/`#p`
  * are pushed down), and kind 30078 is shared with read-state and every other
@@ -39,10 +48,13 @@ export async function fetchDocPagesToExhaustion({
   fetchEvents,
   maxPages = DOCS_HISTORY_MAX_PAGES,
   pageLimit = DOCS_HISTORY_PAGE_LIMIT,
+  since,
 }: {
   fetchEvents: (filter: RelaySubscriptionFilter) => Promise<RelayEvent[]>;
   maxPages?: number;
   pageLimit?: number;
+  /** Inclusive lower bound for an incremental scan; omit for a full one. */
+  since?: number;
 }): Promise<DocsHistoryResult> {
   const pages: DocPage[] = [];
   const seen = new Set<string>();
@@ -58,6 +70,7 @@ export async function fetchDocPagesToExhaustion({
     const batch = await fetchEvents({
       kinds: [KIND_COMMUNITY_DOC],
       limit: pageLimit,
+      ...(since === undefined ? {} : { since }),
       ...(until === undefined ? {} : { until }),
     });
 

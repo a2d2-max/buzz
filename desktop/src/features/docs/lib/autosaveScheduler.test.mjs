@@ -7,11 +7,14 @@ import { createAutosaveScheduler } from "./autosaveScheduler.ts";
 function fakeTimers() {
   let nextId = 1;
   const pending = new Map();
+  const delays = [];
   return {
+    delays,
     timers: {
-      setTimeout: (fn, _ms) => {
+      setTimeout: (fn, ms) => {
         const id = nextId++;
         pending.set(id, fn);
+        delays.push(ms);
         return id;
       },
       clearTimeout: (id) => {
@@ -39,12 +42,14 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function setup({ save } = {}) {
+function setup({ save, minIntervalMs, now } = {}) {
   const clock = fakeTimers();
   const saves = [];
   const states = [];
   const scheduler = createAutosaveScheduler({
     delayMs: 1_500,
+    minIntervalMs,
+    now,
     save:
       save ??
       (async (draft) => {
@@ -207,4 +212,49 @@ test("isDirty: a draft scheduled during a save stays dirty until saved", async (
   assert.equal(scheduler.isDirty(), true);
   await scheduler.flush();
   assert.equal(scheduler.isDirty(), false);
+});
+
+test("minIntervalMs: a draft scheduled right after a save waits out the interval", async () => {
+  let time = 0;
+  const { clock, scheduler } = setup({ minIntervalMs: 5_000, now: () => time });
+  scheduler.schedule({ body: "a" });
+  assert.equal(clock.delays.at(-1), 1_500, "first save uses the idle delay");
+  await scheduler.flush();
+  time = 1_000;
+  scheduler.schedule({ body: "ab" });
+  assert.equal(clock.delays.at(-1), 4_000, "5000 - 1000 since the last save");
+  time = 9_000;
+  scheduler.schedule({ body: "abc" });
+  assert.equal(clock.delays.at(-1), 1_500, "interval already elapsed");
+});
+
+test("pause: drafts are recorded but no timer starts; resume starts one; flush still works", async () => {
+  const { clock, saves, scheduler } = setup();
+  scheduler.pause();
+  scheduler.schedule({ body: "a" });
+  assert.equal(clock.pendingCount, 0);
+  assert.equal(scheduler.isDirty(), true);
+  scheduler.resume();
+  assert.equal(clock.pendingCount, 1);
+  clock.fire();
+  await scheduler.flush();
+  assert.deepEqual(saves, [{ body: "a" }]);
+
+  scheduler.pause();
+  scheduler.schedule({ body: "ab" });
+  await scheduler.flush();
+  assert.deepEqual(
+    saves,
+    [{ body: "a" }, { body: "ab" }],
+    "flush ignores pause",
+  );
+});
+
+test("a successful save lifts a pause", async () => {
+  const { clock, scheduler } = setup();
+  scheduler.pause();
+  scheduler.schedule({ body: "a" });
+  await scheduler.flush();
+  scheduler.schedule({ body: "ab" });
+  assert.equal(clock.pendingCount, 1, "timers run again after the save");
 });

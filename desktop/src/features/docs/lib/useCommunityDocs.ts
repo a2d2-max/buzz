@@ -38,9 +38,35 @@ import {
 export const DOCS_PAGES_QUERY_KEY = ["docs", "pages"] as const;
 
 type DocPageMap = Map<string, DocPage>;
-type DocsSnapshot = { pages: DocPageMap; truncated: boolean };
+type DocsSnapshot = {
+  pages: DocPageMap;
+  truncated: boolean;
+  /** Kind-30078 rows the last scan inspected. */
+  scanned: number;
+  /**
+   * Local time (unix seconds) the last *complete* scan started; `undefined`
+   * after a truncated one. The next scan is incremental from here.
+   */
+  scannedAt: number | undefined;
+};
 const EMPTY_PAGES: DocPageMap = new Map();
-const EMPTY_SNAPSHOT: DocsSnapshot = { pages: EMPTY_PAGES, truncated: false };
+const EMPTY_SNAPSHOT: DocsSnapshot = {
+  pages: EMPTY_PAGES,
+  truncated: false,
+  scanned: 0,
+  scannedAt: undefined,
+};
+
+/**
+ * How far behind the previous scan's start an incremental scan looks. The
+ * relay accepts `created_at` up to 900 s behind its clock, so an event that
+ * arrived after the previous scan can be stamped that far back; 60 s more
+ * covers our clock trailing the relay's.
+ */
+const INCREMENTAL_LOOKBACK_SECONDS = 900 + 60;
+
+/** How long the first load waits for the live subscription before fetching anyway. */
+const SUBSCRIPTION_SETTLE_TIMEOUT_MS = 3_000;
 
 /** The newest known version of this page is stamped too far in the future to build on. */
 export class DocClockSkewError extends Error {
@@ -105,7 +131,15 @@ export type CommunityDocs = {
   isError: boolean;
   /** The history scan hit its bound before the window ended: pages may be missing. */
   truncated: boolean;
+  /** Kind-30078 rows the last scan inspected (for the truncation notice). */
+  scanned: number;
   refetch: () => Promise<unknown>;
+  /**
+   * Fetches one page by `#d` (SQL-pushed, so it cannot be starved like the
+   * history scan) and folds it into the cache. Resolves `undefined` when the
+   * relay holds no version of it.
+   */
+  lookupPage: (id: string) => Promise<DocPage | undefined>;
   createPage: (input: {
     parentId: string | null;
     title?: string;
@@ -153,8 +187,18 @@ export function useCommunityDocs(): CommunityDocs {
     queryKey: DOCS_PAGES_QUERY_KEY,
     enabled: subscriptionSettled,
     queryFn: async (): Promise<DocsSnapshot> => {
+      const previous =
+        queryClient.getQueryData<DocsSnapshot>(DOCS_PAGES_QUERY_KEY);
+      const startedAt = Math.floor(Date.now() / 1_000);
+      // A complete earlier scan lets this one walk only what changed since,
+      // instead of the whole window on every reconnect.
+      const since =
+        previous?.scannedAt !== undefined && !previous.truncated
+          ? previous.scannedAt - INCREMENTAL_LOOKBACK_SECONDS
+          : undefined;
       const history = await fetchDocPagesToExhaustion({
         fetchEvents: (filter) => relayClient.fetchEvents(filter),
+        since,
       });
       // Live events can land while the scan is in flight; keep whichever
       // version is newer per page rather than letting the snapshot win.
@@ -166,6 +210,8 @@ export function useCommunityDocs(): CommunityDocs {
           ...history.pages,
         ]),
         truncated: history.truncated,
+        scanned: history.scanned,
+        scannedAt: history.truncated ? undefined : startedAt,
       };
     },
     staleTime: 60_000,
@@ -178,9 +224,7 @@ export function useCommunityDocs(): CommunityDocs {
         (previous) => {
           const current = previous ?? EMPTY_SNAPSHOT;
           const pages = applyDocPageVersion(current.pages, page);
-          return pages === current.pages
-            ? current
-            : { pages, truncated: current.truncated };
+          return pages === current.pages ? current : { ...current, pages };
         },
       );
     },
@@ -201,6 +245,12 @@ export function useCommunityDocs(): CommunityDocs {
     const settle = () => {
       if (!cancelled) setSubscriptionSettled(true);
     };
+    // A relay that is down must surface as an error, not a long spinner:
+    // fetch after a bounded wait even if the subscription never settles.
+    const settleTimer = window.setTimeout(
+      settle,
+      SUBSCRIPTION_SETTLE_TIMEOUT_MS,
+    );
     relayClient
       .subscribeLive(
         {
@@ -229,6 +279,7 @@ export function useCommunityDocs(): CommunityDocs {
     });
     return () => {
       cancelled = true;
+      window.clearTimeout(settleTimer);
       unsubscribeReconnect();
       if (unsubscribe) void unsubscribe();
     };
@@ -330,15 +381,23 @@ export function useCommunityDocs(): CommunityDocs {
     [publishPage, tree],
   );
 
-  /** Shared write path: re-read, plan, publish. `deleted` marks a tombstone. */
+  /**
+   * Shared write path: re-read, plan, publish. `patch.deleted` sets or clears
+   * the tombstone; left undefined it is carried over from the newest version.
+   * `requireLive` refuses to touch a page that was deleted meanwhile, so a
+   * tree operation racing a delete cannot bring the page back.
+   */
   const republish = React.useCallback(
     async (
       id: string,
       patch: DocPagePatch & { deleted?: boolean },
-      options?: DocUpdateOptions,
+      options?: DocUpdateOptions & { requireLive?: boolean },
     ): Promise<DocPage> => {
       const newest = await fetchNewestVersion(id);
       if (!newest) throw new Error("This page does not exist on the relay.");
+      if (options?.requireLive && newest.deleted) {
+        throw new Error("This page was deleted by someone else.");
+      }
       const plan = planDocPagePublish({
         baseEventId: options?.baseEventId,
         newest,
@@ -350,6 +409,7 @@ export function useCommunityDocs(): CommunityDocs {
           order: newest.order,
           icon: newest.icon,
           createdAt: newest.createdAt,
+          deleted: newest.deleted,
           ...patch,
           updatedAt: Date.now(),
         },
@@ -395,12 +455,13 @@ export function useCommunityDocs(): CommunityDocs {
           );
         }
       }
-      await updatePage(id, {
-        parentId,
-        order: nextOrderAfter(levelPages(tree, parentId)),
-      });
+      await republish(
+        id,
+        { parentId, order: nextOrderAfter(levelPages(tree, parentId)) },
+        { requireLive: true },
+      );
     },
-    [readPages, tree, updatePage],
+    [readPages, republish, tree],
   );
 
   const reorderPage = React.useCallback<CommunityDocs["reorderPage"]>(
@@ -414,9 +475,9 @@ export function useCommunityDocs(): CommunityDocs {
         direction,
       );
       if (order === null) return;
-      await updatePage(id, { order });
+      await republish(id, { order }, { requireLive: true });
     },
-    [tree, updatePage],
+    [republish, tree],
   );
 
   return {
@@ -426,7 +487,9 @@ export function useCommunityDocs(): CommunityDocs {
     isLoading: query.isPending,
     isError: query.isError,
     truncated: snapshot.truncated,
+    scanned: snapshot.scanned,
     refetch: query.refetch,
+    lookupPage: fetchNewestVersion,
     createPage,
     updatePage,
     deletePage,

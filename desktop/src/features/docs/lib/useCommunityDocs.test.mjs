@@ -111,6 +111,7 @@ async function mountDocs({ history, versionsByDTag }) {
   const { useCommunityDocs } = await import("./useCommunityDocs.ts");
 
   const published = [];
+  const historyRequests = [];
   const state = { versionsByDTag };
   const originals = {
     fetchEvents: relayClient.fetchEvents,
@@ -121,6 +122,7 @@ async function mountDocs({ history, versionsByDTag }) {
   relayClient.fetchEvents = async (filter) => {
     const dTags = filter["#d"];
     if (dTags) return state.versionsByDTag[dTags[0]] ?? [];
+    historyRequests.push(filter);
     return history;
   };
   relayClient.publishEvent = async (event) => {
@@ -144,6 +146,7 @@ async function mountDocs({ history, versionsByDTag }) {
     assert.equal(rendered.result.current.isLoading, false, "history loaded"),
   );
   return {
+    historyRequests,
     published,
     result: rendered.result,
     setVersions(next) {
@@ -254,6 +257,78 @@ test("an oversized page is refused before signing", async () => {
       (error) => error.name === "DocTooLargeError",
     );
     assert.equal(docs.published.length, 0);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a refetch after a complete scan is incremental: it carries a since watermark", async () => {
+  const docs = await mountDocs({
+    history: [V1],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    assert.equal(docs.historyRequests.length, 1);
+    assert.equal(
+      docs.historyRequests[0].since,
+      undefined,
+      "first scan is full",
+    );
+    await docs.result.current.refetch();
+    assert.equal(docs.historyRequests.length, 2);
+    const since = docs.historyRequests[1].since;
+    assert.equal(typeof since, "number");
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    assert.ok(
+      since <= nowSeconds - 900,
+      "looks back past the relay drift window",
+    );
+    assert.ok(
+      since >= nowSeconds - 1_200,
+      "but not from the beginning of time",
+    );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a tree operation on a page someone just deleted is refused instead of resurrecting it", async () => {
+  const tombstone = docEvent({
+    id: PAGE_ID,
+    eventId: "v3",
+    author: AUTHOR_THEM,
+    createdAt: 1_200,
+    content: { deleted: true },
+  });
+  const docs = await mountDocs({
+    history: [V1],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2, tombstone] },
+  });
+  try {
+    await assert.rejects(
+      docs.result.current.movePage(PAGE_ID, null),
+      /deleted/,
+    );
+    assert.equal(docs.published.length, 0);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("lookupPage resolves a page the history scan never delivered", async () => {
+  const docs = await mountDocs({
+    history: [],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2] },
+  });
+  try {
+    assert.equal(docs.result.current.pages.has(PAGE_ID), false);
+    const found = await docs.result.current.lookupPage(PAGE_ID);
+    assert.equal(found?.eventId, V2.id);
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() =>
+      assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventId, V2.id),
+    );
+    assert.equal(await docs.result.current.lookupPage("nope"), undefined);
   } finally {
     docs.restore();
   }
