@@ -18,6 +18,7 @@ export const PROJECT_TAB_CRUMB_LABELS: Record<string, string> = {
   activity: "Commits",
   issues: "Tasks",
   prs: "Review",
+  board: "Board",
   contributors: "Contributors",
   channels: "Channels",
 };

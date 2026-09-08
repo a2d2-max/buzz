@@ -67,6 +67,10 @@ function latestStatusForIssue(issue, statusEvents) {
 }
 
 function statusFromEvent(issue, statusEvent) {
+  // An explicit status event is authoritative and must beat the labels — an
+  // issue labeled `in-progress` that is moved back to Backlog (1630) has to
+  // read as Backlog, or the move never lands.
+  if (statusEvent?.kind === 1630) return PROJECT_ISSUE_STATUS.BACKLOG;
   if (statusEvent?.kind === 1631) return PROJECT_ISSUE_STATUS.DONE;
   if (statusEvent?.kind === 1632) return PROJECT_ISSUE_STATUS.CLOSED;
   // NIP-34 calls 1633 "Draft"; we surface it as Triage for issues. The
@@ -212,6 +216,7 @@ export function eventToProjectIssue(
     assigneeOperationHeads: assignmentState.heads,
     status: statusFromEvent(issue, latestStatus),
     statusEventId: latestStatus?.id ?? null,
+    statusCreatedAt: latestStatus?.created_at ?? null,
     updatedAt:
       [
         ...comments,
@@ -241,6 +246,16 @@ export function nextProjectIssueCommentCreatedAt(issue, now, author) {
       .filter((comment) => comment.author.toLowerCase() === normalizedAuthor)
       .map((comment) => comment.createdAt + 1),
   );
+}
+
+/**
+ * Keep consecutive status moves ordered across whole-second Nostr timestamps.
+ * `latestStatusForIssue` picks the newest status event by `created_at`, so a
+ * second move published inside the same second has to claim the next second
+ * or the two orderings are a coin flip.
+ */
+export function nextProjectIssueStatusCreatedAt(issue, now) {
+  return Math.max(now, (issue.statusCreatedAt ?? 0) + 1);
 }
 
 export function buildGitIssueTags({

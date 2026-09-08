@@ -1,14 +1,4 @@
-import {
-  Circle,
-  CircleCheck,
-  CircleDashed,
-  CircleDot,
-  CircleX,
-  MessageSquare,
-  Tag,
-  type LucideIcon,
-  User,
-} from "lucide-react";
+import { CircleDot, MessageSquare, Tag, User } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
@@ -27,6 +17,10 @@ import {
 import { entityDiscussionQuery } from "@/features/projects/lib/discussionChannels";
 import { selectionItemFromTask } from "@/features/projects/lib/projectSelection";
 import { issueShareLink } from "@/features/projects/lib/projectShareLinks";
+import {
+  ISSUE_STATUS_ORDER,
+  issueStatusVisual,
+} from "@/features/projects/lib/issueStatusDisplay";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import {
   projectTaskCategoryLabel,
@@ -50,71 +44,10 @@ import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { ShareLinkButton } from "./ShareLinkButton";
 import { PROJECT_DETAIL_READING_COLUMN_CLASS } from "./projectPanelStyles";
-import {
-  ProjectStatusProgressIcon,
-  type ProjectStatusProgressState,
-} from "./ProjectStatusProgressIcon";
+import { ProjectStatusProgressIcon } from "./ProjectStatusProgressIcon";
 import { ProjectWorkItemGroup } from "./ProjectWorkItemGroup";
 import { ProjectWorkItemRow } from "./ProjectWorkItemRow";
 import { ProjectPanelState } from "./ProjectPanelState";
-
-export function issueStatusClassName(status: ProjectIssue["status"]) {
-  if (status === "Triage" || status === "In Progress") return "text-amber-500";
-  if (status === "Backlog") return "text-muted-foreground";
-  if (status === "In Review") return "text-green-500";
-  if (status === "Done") return "text-purple-400";
-  if (status === "Closed") return "text-destructive";
-  return "text-muted-foreground";
-}
-
-function issueStatusVisual(status: ProjectIssue["status"]): {
-  className: string;
-  icon: LucideIcon;
-  progress: ProjectStatusProgressState;
-} {
-  if (status === "Done") {
-    return {
-      className: "text-purple-400",
-      icon: CircleCheck,
-      progress: "completed",
-    };
-  }
-  if (status === "Closed") {
-    return {
-      className: "text-destructive",
-      icon: CircleX,
-      progress: "canceled",
-    };
-  }
-  if (status === "Backlog") {
-    return {
-      className: issueStatusClassName(status),
-      icon: Circle,
-      progress: "queued",
-    };
-  }
-  if (status === "Triage") {
-    return {
-      className: issueStatusClassName(status),
-      icon: CircleDashed,
-      progress: "queued",
-    };
-  }
-  return {
-    className: issueStatusClassName(status),
-    icon: CircleDot,
-    progress: status === "In Review" ? "review" : "started",
-  };
-}
-
-const ISSUE_STATUS_ORDER: readonly ProjectIssue["status"][] = [
-  "In Review",
-  "In Progress",
-  "Triage",
-  "Backlog",
-  "Done",
-  "Closed",
-];
 
 export type ProjectIssuePanelItem = {
   issue: ProjectIssue;

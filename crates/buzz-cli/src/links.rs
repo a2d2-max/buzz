@@ -10,8 +10,8 @@
 //! `validate_repo_id`); the identifier charsets need no URL encoding.
 //!
 //! Coordinate links additionally accept an optional `&tab=<tab>` parameter
-//! (`files|commits|issues|prs|contributors|channels`) selecting a workspace tab on
-//! the receiving side. The CLI builders emit the canonical no-tab form
+//! (`files|commits|issues|prs|board|contributors|channels`) selecting a workspace
+//! tab on the receiving side. The CLI builders emit the canonical no-tab form
 //! (overview); the parameter exists for the desktop's tab-aware copy-link
 //! button.
 

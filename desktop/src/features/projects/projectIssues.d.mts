@@ -35,6 +35,7 @@ export type ProjectIssue = {
   assigneeOperationHeads: Record<string, string>;
   status: ProjectIssueStatus;
   statusEventId: string | null;
+  statusCreatedAt: number | null;
   updatedAt: number;
   comments: ProjectIssueComment[];
 };
@@ -68,6 +69,10 @@ export function nextProjectIssueCommentCreatedAt(
   issue: ProjectIssue,
   now: number,
   author: string,
+): number;
+export function nextProjectIssueStatusCreatedAt(
+  issue: ProjectIssue,
+  now: number,
 ): number;
 export function buildGitIssueTags(input: {
   repoAddress: string;

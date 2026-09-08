@@ -1,5 +1,6 @@
 import {
   CircleDot,
+  Columns3,
   Files as FilesIcon,
   GitCommitHorizontal,
   GitPullRequest,
@@ -40,6 +41,7 @@ import type { RepoSourceHeaderControls } from "./ProjectRepositorySource";
 import { DiscussionChannelsPanel } from "./DiscussionChannels";
 import { ProjectCommitDetailPanel } from "./ProjectCommitDetailPanel";
 import { ActivityPanel, ContributorsPanel } from "./ProjectDetailFeedPanels";
+import { ProjectIssueBoardPanel } from "./ProjectIssueBoardPanel";
 import { ProjectIssuesPanel } from "./ProjectIssuesPanel";
 import type { OpenMergeRecoveryTerminal } from "./MergePullRequestButton";
 import {
@@ -312,7 +314,9 @@ export function WorkspaceTabs({
 
   React.useEffect(() => {
     if (selectedIssueId) {
-      setSelectedTab("issues");
+      // The board opens task details in place; every other tab defers to the
+      // task list, which is where a share link or breadcrumb lands.
+      setSelectedTab((current) => (current === "board" ? current : "issues"));
     }
   }, [selectedIssueId]);
 
@@ -328,7 +332,8 @@ export function WorkspaceTabs({
       if (nextTab !== "prs") {
         onSelectedPullRequestIdChange(null);
       }
-      if (nextTab !== "issues") {
+      // Both task surfaces can hold a selected task; every other tab drops it.
+      if (nextTab !== "issues" && nextTab !== "board") {
         onSelectedIssueIdChange(null);
       }
       if (nextTab !== "activity") {
@@ -374,6 +379,17 @@ export function WorkspaceTabs({
         className={PROJECT_SECTION_HEADER_CLASS}
         icon={CircleDot}
         title="Tasks"
+      />
+    ) : selectedTab === "board" && !selectedIssueId ? (
+      <ProjectSectionHeader
+        action={{
+          disabled: createIssueAction.pending,
+          label: "Create task",
+          onClick: () => setCreateIssueOpen(true),
+        }}
+        className={PROJECT_SECTION_HEADER_CLASS}
+        icon={Columns3}
+        title="Board"
       />
     ) : selectedTab === "prs" && !selectedPullRequestId ? (
       <ProjectSectionHeader
@@ -562,6 +578,21 @@ export function WorkspaceTabs({
           value="issues"
         >
           <ProjectIssuesPanel
+            onSelectedIssueIdChange={onSelectedIssueIdChange}
+            profiles={profiles}
+            project={project}
+            selectedIssueId={selectedIssueId}
+          />
+        </TabsContent>
+
+        <TabsContent
+          className={`m-0 min-h-0 flex-1 flex-col data-[state=active]:flex ${
+            selectedIssueId ? "" : PROJECT_DETAIL_PANEL_CLASS
+          }`}
+          data-project-detail-panel
+          value="board"
+        >
+          <ProjectIssueBoardPanel
             onSelectedIssueIdChange={onSelectedIssueIdChange}
             profiles={profiles}
             project={project}

@@ -275,6 +275,74 @@ fn build_merged_status_event(
         .map_err(|error| format!("sign merged pull request status: {error}"))
 }
 
+/// A NIP-34 lifecycle status on a root event (pull request or task), signed
+/// by the repository owner. Pull requests and tasks differ only in which
+/// status words they accept and in the noun their errors use, so both go
+/// through here — see [`build_root_status_event`].
+pub(super) struct RootStatusEvent<'a> {
+    /// `pull request` or `task` — used verbatim in error messages.
+    pub noun: &'a str,
+    pub repo_address: &'a str,
+    pub root_id: &'a str,
+    pub root_author: &'a str,
+    /// Status word accepted for this root kind, mapped to its event kind.
+    pub kinds: &'a [(&'a str, u16)],
+    pub status: &'a str,
+    pub created_at: u64,
+}
+
+/// Build and sign the status event. The owner's own `p` tag is included here
+/// but nostr's `EventBuilder` drops `p` tags naming the signer, so the
+/// published event carries only the counterparty.
+pub(super) fn build_root_status_event(
+    keys: &Keys,
+    event: RootStatusEvent<'_>,
+) -> Result<String, String> {
+    let RootStatusEvent {
+        noun,
+        repo_address,
+        root_id,
+        root_author,
+        kinds,
+        status,
+        created_at,
+    } = event;
+    let owner = keys.public_key().to_hex();
+    validate_repo_address(repo_address, &owner)?;
+    let root_id = normalize_event_id(root_id).ok_or_else(|| format!("Invalid {noun} event ID."))?;
+    let root_author =
+        normalize_event_id(root_author).ok_or_else(|| format!("Invalid {noun} author."))?;
+    let kind = kinds
+        .iter()
+        .find(|(word, _)| *word == status)
+        .map(|(_, kind)| Kind::Custom(*kind))
+        .ok_or_else(|| format!("Invalid {noun} lifecycle status."))?;
+    let mut raw_tags = vec![
+        vec!["e", root_id.as_str(), "", "root"],
+        vec!["a", repo_address],
+        vec!["p", owner.as_str()],
+    ];
+    if root_author != owner {
+        raw_tags.push(vec!["p", root_author.as_str()]);
+    }
+    let tags = raw_tags
+        .into_iter()
+        .map(Tag::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("build {noun} status tags: {error}"))?;
+    EventBuilder::new(kind, "")
+        .tags(tags)
+        .custom_created_at(Timestamp::from(created_at.max(Timestamp::now().as_secs())))
+        .sign_with_keys(keys)
+        .map(|event| event.as_json())
+        .map_err(|error| format!("sign {noun} status: {error}"))
+}
+
+/// NIP-34 lifecycle states the desktop publishes for a pull request. Merged
+/// (1631) is intentionally absent — merges happen through git.
+const PULL_REQUEST_STATUS_KINDS: [(&str, u16); 3] =
+    [("open", 1630), ("closed", 1632), ("draft", 1633)];
+
 fn build_pull_request_status_event(
     keys: &Keys,
     repo_address: &str,
@@ -283,34 +351,18 @@ fn build_pull_request_status_event(
     status: &str,
     created_at: u64,
 ) -> Result<String, String> {
-    let owner = keys.public_key().to_hex();
-    let (pull_request_id, pull_request_author) =
-        validate_merge_status_metadata(repo_address, &owner, pull_request_id, pull_request_author)?;
-    let kind = match status {
-        "open" => Kind::Custom(1630),
-        "closed" => Kind::Custom(1632),
-        "draft" => Kind::Custom(1633),
-        _ => return Err("Invalid pull request lifecycle status.".to_string()),
-    };
-    let mut raw_tags = vec![
-        vec!["e", pull_request_id.as_str(), "", "root"],
-        vec!["a", repo_address],
-        vec!["p", owner.as_str()],
-    ];
-    if pull_request_author != owner {
-        raw_tags.push(vec!["p", pull_request_author.as_str()]);
-    }
-    let tags = raw_tags
-        .into_iter()
-        .map(Tag::parse)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("build pull request status tags: {error}"))?;
-    EventBuilder::new(kind, "")
-        .tags(tags)
-        .custom_created_at(Timestamp::from(created_at.max(Timestamp::now().as_secs())))
-        .sign_with_keys(keys)
-        .map(|event| event.as_json())
-        .map_err(|error| format!("sign pull request status: {error}"))
+    build_root_status_event(
+        keys,
+        RootStatusEvent {
+            noun: "pull request",
+            repo_address,
+            root_id: pull_request_id,
+            root_author: pull_request_author,
+            kinds: &PULL_REQUEST_STATUS_KINDS,
+            status,
+            created_at,
+        },
+    )
 }
 
 fn same_repository(left: &str, right: &str) -> bool {

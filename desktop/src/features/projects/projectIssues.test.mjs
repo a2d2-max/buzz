@@ -9,6 +9,7 @@ import {
   ISSUE_ASSIGNMENT_LABEL,
   ISSUE_UNASSIGNMENT_LABEL,
   nextProjectIssueCommentCreatedAt,
+  nextProjectIssueStatusCreatedAt,
   PROJECT_ISSUE_STATUS,
 } from "./projectIssues.mjs";
 
@@ -468,4 +469,57 @@ test("orders consecutive issue comments across whole-second timestamps", () => {
 
   assert.equal(nextProjectIssueCommentCreatedAt(issue, 200, AUTHOR), 202);
   assert.equal(nextProjectIssueCommentCreatedAt(issue, 300, AUTHOR), 300);
+});
+
+test("a status move published now claims the second after the last one", () => {
+  const issue = eventToProjectIssue(issueEvent(), [
+    statusEvent({ kind: 1633, pubkey: AUTHOR, createdAt: 300 }),
+    statusEvent({ kind: 1632, pubkey: OWNER, createdAt: 400 }),
+  ]);
+
+  assert.equal(issue.statusCreatedAt, 400);
+  // Two moves inside the same wall-clock second must not tie: the second one
+  // has to outrank the first or latestStatusForIssue picks arbitrarily.
+  assert.equal(nextProjectIssueStatusCreatedAt(issue, 400), 401);
+  assert.equal(nextProjectIssueStatusCreatedAt(issue, 900), 900);
+  assert.equal(
+    nextProjectIssueStatusCreatedAt(eventToProjectIssue(issueEvent()), 900),
+    900,
+  );
+});
+
+test("an explicit status event outranks the label heuristics", () => {
+  // [status kind, root labels, expected status]
+  const cases = [
+    [1630, [], PROJECT_ISSUE_STATUS.BACKLOG],
+    [1630, ["in-progress"], PROJECT_ISSUE_STATUS.BACKLOG],
+    [1630, ["in-review"], PROJECT_ISSUE_STATUS.BACKLOG],
+    [1630, ["triage"], PROJECT_ISSUE_STATUS.BACKLOG],
+    [1633, ["in-progress"], PROJECT_ISSUE_STATUS.TRIAGE],
+    [1631, ["in-progress"], PROJECT_ISSUE_STATUS.DONE],
+    [1632, ["in-progress"], PROJECT_ISSUE_STATUS.CLOSED],
+    // With no status event the labels still decide.
+    [null, ["in-progress"], PROJECT_ISSUE_STATUS.IN_PROGRESS],
+    [null, ["in-review"], PROJECT_ISSUE_STATUS.IN_REVIEW],
+    [null, [], PROJECT_ISSUE_STATUS.BACKLOG],
+  ];
+
+  for (const [kind, labels, expected] of cases) {
+    const root = issueEvent({
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["subject", "Something is broken"],
+        ...labels.map((label) => ["t", label]),
+      ],
+    });
+    const statuses =
+      kind === null
+        ? []
+        : [statusEvent({ kind, pubkey: AUTHOR, createdAt: 300 })];
+    assert.equal(
+      eventToProjectIssue(root, statuses).status,
+      expected,
+      `${kind} + ${labels.join(",") || "no labels"}`,
+    );
+  }
 });
