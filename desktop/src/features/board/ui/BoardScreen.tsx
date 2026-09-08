@@ -6,17 +6,17 @@ import {
   parseBoardTab,
 } from "@/features/board/boardTabs";
 import { PROJECT_TAB_TRIGGER_CLASS } from "@/features/projects/ui/ProjectWorkspaceTabList";
-import { ProjectPanelState } from "@/features/projects/ui/ProjectPanelState";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { useHistorySearchState } from "@/shared/hooks/useHistorySearchState";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { CommunityIssueBoardPanel } from "./CommunityIssueBoardPanel";
+import { CommunityTasksBoardPanel } from "./CommunityTasksBoardPanel";
 
 const BOARD_SEARCH_KEYS = ["issue", "tab"] as const;
 
 /**
  * Community-wide board: every issue from every project on one kanban, plus
- * a placeholder for a future tasks surface. Tab and open issue live in the
+ * a community task board for cards not tied to any repository. Tab and open issue live in the
  * URL so back/forward and reloads restore them.
  */
 export function BoardScreen() {
@@ -80,12 +80,7 @@ export function BoardScreen() {
         className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
         value="tasks"
       >
-        <ProjectPanelState
-          description="A community-wide task board is on the way."
-          panel={false}
-          testId="community-board-tasks-placeholder"
-          title="Coming soon"
-        />
+        <CommunityTasksBoardPanel />
       </TabsContent>
     </Tabs>
   );
