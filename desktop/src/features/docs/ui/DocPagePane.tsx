@@ -22,7 +22,15 @@ type DocPagePaneProps = {
   onCreateChild: (parentId: string) => void;
   onNavigate: (id: string | null) => void;
   onRestore: (id: string) => Promise<unknown>;
-  onSave: (id: string, draft: DocDraft) => Promise<DocPage>;
+  /**
+   * Publishes the draft on top of `baseEventId`, the version the editor was
+   * loaded from; rejects with a conflict when the relay holds a newer one.
+   */
+  onSave: (
+    id: string,
+    draft: DocDraft,
+    baseEventId: string,
+  ) => Promise<DocPage>;
   page: DocPage;
 };
 
@@ -86,16 +94,28 @@ export function DocPagePane({
   const handleSave = React.useCallback(
     async (draft: DocDraft) => {
       try {
-        const saved = await onSave(page.id, draft);
+        const saved = await onSave(page.id, draft, baseEventId);
         setSaveError(null);
         setBaseEventId(saved.eventId);
       } catch (error) {
+        // A conflict has already put the newer version into the cache, so
+        // `page.eventId` moves and the banner below offers the two ways out.
         setSaveError(errorMessage(error));
         throw error;
       }
     },
-    [onSave, page.id],
+    [baseEventId, onSave, page.id],
   );
+
+  /** "Keep mine": rebase the draft onto the version that beat it, then save over it. */
+  const overwriteRemoteVersion = React.useCallback(() => {
+    setBaseEventId(page.eventId);
+    setDismissedEventId(page.eventId);
+    setSaveError(null);
+    // The base above lands on the next render; flush after it so the retry
+    // carries the new base.
+    window.setTimeout(() => void editorRef.current?.flush(), 0);
+  }, [page.eventId]);
 
   const enterEdit = React.useCallback(() => {
     setBaseEventId(page.eventId);
@@ -259,7 +279,7 @@ export function DocPagePane({
                 it back with your edits.
               </span>
               <Button
-                onClick={() => void editorRef.current?.flush()}
+                onClick={overwriteRemoteVersion}
                 size="xs"
                 type="button"
                 variant="outline"
@@ -294,7 +314,7 @@ export function DocPagePane({
                 Load their version
               </Button>
               <Button
-                onClick={() => setDismissedEventId(page.eventId)}
+                onClick={overwriteRemoteVersion}
                 size="xs"
                 type="button"
                 variant="ghost"
@@ -303,7 +323,7 @@ export function DocPagePane({
               </Button>
               <span className="text-xs text-muted-foreground">
                 Loading theirs drops your unsaved edits; keeping yours
-                overwrites theirs on save.
+                overwrites their version.
               </span>
             </div>
           ) : null}

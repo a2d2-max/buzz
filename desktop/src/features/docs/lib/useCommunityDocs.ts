@@ -12,10 +12,14 @@ import {
 import {
   buildDocPageEventInput,
   createDocPageId,
+  DOC_MAX_CONTENT_BYTES,
   type DocPage,
   type DocPageContent,
+  docPageDTag,
+  measureDocPageContentBytes,
   parseDocPageEvent,
 } from "./docPageCodec";
+import { planDocPagePublish } from "./docPublishPlan";
 import { fetchDocPagesToExhaustion } from "./docsHistory";
 import {
   applyDocPageVersion,
@@ -51,9 +55,46 @@ export class DocClockSkewError extends Error {
   }
 }
 
+/** A newer version than the one the edit was based on exists; nothing was published. */
+export class DocConflictError extends Error {
+  readonly newest: DocPage;
+
+  constructor(newest: DocPage) {
+    super("Someone else saved a newer version of this page.");
+    this.name = "DocConflictError";
+    this.newest = newest;
+  }
+}
+
+/** The page would exceed the relay's content ceiling; nothing was signed. */
+export class DocTooLargeError extends Error {
+  readonly bytes: number;
+
+  constructor(bytes: number) {
+    super(
+      `This page is too large to save (${Math.ceil(bytes / 1024)} KB; the limit is ${DOC_MAX_CONTENT_BYTES / 1024} KB).`,
+    );
+    this.name = "DocTooLargeError";
+    this.bytes = bytes;
+  }
+}
+
 export type DocPagePatch = Partial<
   Pick<DocPageContent, "title" | "body" | "parentId" | "order" | "icon">
 >;
+
+export type DocUpdateOptions = {
+  /**
+   * Event id of the version the edit was built on. When given and the relay
+   * holds a newer version, the write is refused with {@link DocConflictError}
+   * instead of overwriting it. Omit for tree operations, which rebase onto
+   * the newest version.
+   */
+  baseEventId?: string;
+};
+
+/** How many versions of one page (one per author) the pre-write re-read asks for. */
+const PAGE_VERSIONS_LIMIT = 200;
 
 export type CommunityDocs = {
   pages: DocPageMap;
@@ -69,8 +110,16 @@ export type CommunityDocs = {
     parentId: string | null;
     title?: string;
   }) => Promise<DocPage>;
-  /** Republishes `id` with `patch`; also resurrects a tombstoned page. */
-  updatePage: (id: string, patch: DocPagePatch) => Promise<DocPage>;
+  /**
+   * Republishes `id` with `patch` on top of the newest version the relay
+   * holds; also resurrects a tombstoned page. Resolves to the newest version
+   * without publishing when nothing visible would change.
+   */
+  updatePage: (
+    id: string,
+    patch: DocPagePatch,
+    options?: DocUpdateOptions,
+  ) => Promise<DocPage>;
   deletePage: (id: string) => Promise<void>;
   restorePage: (id: string) => Promise<DocPage>;
   movePage: (id: string, parentId: string | null) => Promise<void>;
@@ -203,9 +252,41 @@ export function useCommunityDocs(): CommunityDocs {
     [queryClient],
   );
 
+  /**
+   * Re-reads every author's version of one page. `#d` is pushed down to SQL
+   * for NIP-33 kinds, so unlike the shared-window history scan this cannot
+   * be starved by read-state traffic. Whatever comes back is folded into the
+   * cache so the UI sees the same version the write is judged against.
+   */
+  const fetchNewestVersion = React.useCallback(
+    async (id: string): Promise<DocPage | undefined> => {
+      const events = await relayClient.fetchEvents({
+        kinds: [KIND_COMMUNITY_DOC],
+        "#d": [docPageDTag(id)],
+        limit: PAGE_VERSIONS_LIMIT,
+      });
+      const versions: DocPage[] = [];
+      for (const event of events) {
+        const page = parseDocPageEvent(event);
+        if (page && page.id === id) versions.push(page);
+      }
+      const cached = readPages().get(id);
+      const newest = pickLatestDocPages(
+        cached ? [cached, ...versions] : versions,
+      ).get(id);
+      if (newest) applyPage(newest);
+      return newest;
+    },
+    [applyPage, readPages],
+  );
+
   const publishPage = React.useCallback(
-    async (content: DocPageContent & { id: string }): Promise<DocPage> => {
-      const known = readPages().get(content.id);
+    async (
+      content: DocPageContent & { id: string },
+      known: DocPage | undefined,
+    ): Promise<DocPage> => {
+      const bytes = measureDocPageContentBytes(content);
+      if (bytes > DOC_MAX_CONTENT_BYTES) throw new DocTooLargeError(bytes);
       const createdAt = nextDocEventCreatedAt(
         Math.floor(Date.now() / 1_000),
         known?.eventCreatedAt,
@@ -227,63 +308,72 @@ export function useCommunityDocs(): CommunityDocs {
       applyPage(page);
       return page;
     },
-    [applyPage, readPages],
+    [applyPage],
   );
 
   const createPage = React.useCallback<CommunityDocs["createPage"]>(
     async ({ parentId, title }) => {
       const now = Date.now();
-      return publishPage({
-        id: createDocPageId(),
-        title: title?.trim() ?? "",
-        body: "",
-        parentId,
-        order: nextOrderAfter(levelPages(tree, parentId)),
-        createdAt: now,
-        updatedAt: now,
-      });
+      return publishPage(
+        {
+          id: createDocPageId(),
+          title: title?.trim() ?? "",
+          body: "",
+          parentId,
+          order: nextOrderAfter(levelPages(tree, parentId)),
+          createdAt: now,
+          updatedAt: now,
+        },
+        undefined,
+      );
     },
     [publishPage, tree],
   );
 
-  const updatePage = React.useCallback<CommunityDocs["updatePage"]>(
-    async (id, patch) => {
-      const current = readPages().get(id);
-      if (!current) throw new Error("This page is not loaded.");
-      // A tombstoned `current` is fine: the new version carries no `deleted`
-      // flag and, being newer, brings the page back.
-      return publishPage({
-        id,
-        title: current.title,
-        body: current.body,
-        parentId: current.parentId,
-        order: current.order,
-        icon: current.icon,
-        createdAt: current.createdAt,
-        ...patch,
-        updatedAt: Date.now(),
+  /** Shared write path: re-read, plan, publish. `deleted` marks a tombstone. */
+  const republish = React.useCallback(
+    async (
+      id: string,
+      patch: DocPagePatch & { deleted?: boolean },
+      options?: DocUpdateOptions,
+    ): Promise<DocPage> => {
+      const newest = await fetchNewestVersion(id);
+      if (!newest) throw new Error("This page does not exist on the relay.");
+      const plan = planDocPagePublish({
+        baseEventId: options?.baseEventId,
+        newest,
+        next: {
+          id,
+          title: newest.title,
+          body: newest.body,
+          parentId: newest.parentId,
+          order: newest.order,
+          icon: newest.icon,
+          createdAt: newest.createdAt,
+          ...patch,
+          updatedAt: Date.now(),
+        },
       });
+      if (plan.kind === "conflict") throw new DocConflictError(plan.newest);
+      if (plan.kind === "noop") return plan.newest;
+      return publishPage(plan.content, newest);
     },
-    [publishPage, readPages],
+    [fetchNewestVersion, publishPage],
+  );
+
+  const updatePage = React.useCallback<CommunityDocs["updatePage"]>(
+    // A tombstoned newest version is fine: the republished copy carries no
+    // `deleted` flag and, being newer, brings the page back.
+    (id, patch, options) =>
+      republish(id, { ...patch, deleted: false }, options),
+    [republish],
   );
 
   const deletePage = React.useCallback<CommunityDocs["deletePage"]>(
     async (id) => {
-      const current = readPages().get(id);
-      if (!current || current.deleted) return;
-      await publishPage({
-        id,
-        title: current.title,
-        body: current.body,
-        parentId: current.parentId,
-        order: current.order,
-        icon: current.icon,
-        createdAt: current.createdAt,
-        updatedAt: Date.now(),
-        deleted: true,
-      });
+      await republish(id, { deleted: true });
     },
-    [publishPage, readPages],
+    [republish],
   );
 
   const restorePage = React.useCallback<CommunityDocs["restorePage"]>(

@@ -167,8 +167,13 @@ export function applyDocPageVersion(
   return next;
 }
 
-/** How far ahead of the local clock a version may sit before we stop chasing it. */
-export const DOC_MAX_CLOCK_SKEW_SECONDS = 300;
+/**
+ * How far ahead of the local clock a version may sit before we stop chasing
+ * it. The relay rejects any event whose `created_at` is more than 900 s from
+ * server time (`MAX_TIMESTAMP_DRIFT_SECS` in buzz-relay's ingest); 840 leaves
+ * a margin for a client clock that runs ahead of the server's.
+ */
+export const DOC_MAX_CLOCK_SKEW_SECONDS = 840;
 
 /**
  * `created_at` for a new version: the current time, bumped past the newest
