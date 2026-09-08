@@ -59,6 +59,25 @@ const V2 = docEvent({
   createdAt: 1_100,
   content: { title: "Theirs", body: "their body" },
 });
+const OTHER_PAGE_ID = "9d2e4c6a-1b3f-4a5c-8e7d-0f1a2b3c4d5e";
+// A body the way an imported page carries it: an in-app link to another page,
+// an external link, and a footnote reference.
+const LINKED = docEvent({
+  id: PAGE_ID,
+  eventId: "linked",
+  author: AUTHOR_THEM,
+  createdAt: 1_200,
+  content: {
+    title: "Linked",
+    body: [
+      `Go to [Next](/#/docs/${OTHER_PAGE_ID}) or [Elsewhere](https://example.com/#/docs/${OTHER_PAGE_ID}).`,
+      "",
+      "A claim[^1].",
+      "",
+      "[^1]: The footnote.",
+    ].join("\n"),
+  },
+});
 
 class NoopObserver {
   disconnect() {}
@@ -162,6 +181,8 @@ async function mountDocsScreen({
   history,
   lookupFailure = null,
   pageId,
+  routerEntries = ["/docs"],
+  routerIndex,
   versionsByDTag,
 }) {
   const React = await import("react");
@@ -176,6 +197,7 @@ async function mountDocsScreen({
   } = await import("@tanstack/react-router");
   const { render } = await import("@testing-library/react");
   const { relayClient } = await import("@/shared/api/relayClient");
+  const { TooltipProvider } = await import("@/shared/ui/tooltip");
   const { DocsScreen } = await import("./DocsScreen.tsx");
 
   const published = [];
@@ -206,28 +228,38 @@ async function mountDocsScreen({
   };
   relayClient.subscribeToReconnects = () => () => {};
 
-  // The router only has to exist: useAppNavigation reads its context and no
-  // navigation is exercised here.
+  // A real router over memory history: link clicks and "Go back" are asserted
+  // on the history it moves, not on a stubbed navigation callback.
   const router = createRouter({
     routeTree: createRootRoute(),
-    history: createMemoryHistory({ initialEntries: ["/docs"] }),
+    history: createMemoryHistory({
+      initialEntries: routerEntries,
+      initialIndex: routerIndex,
+    }),
   });
   const client = new QueryClient({
     defaultOptions: { queries: { gcTime: 0, retry: false } },
   });
+  // Links in a page body carry a hover tooltip, which needs the provider the
+  // app root supplies.
   const view = render(
     React.createElement(
       QueryClientProvider,
       { client },
       React.createElement(
-        RouterContextProvider,
-        { router },
-        React.createElement(DocsScreen, { pageId }),
+        TooltipProvider,
+        null,
+        React.createElement(
+          RouterContextProvider,
+          { router },
+          React.createElement(DocsScreen, { pageId }),
+        ),
       ),
     ),
   );
   return {
     published,
+    router,
     view,
     restore() {
       view.unmount();
@@ -311,6 +343,125 @@ test("a page the relay really does not hold is reported missing after the lookup
   });
   try {
     await waitFor(() => docs.view.getByText(/doesn't exist or was deleted/));
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a Docs link in the page body moves the app to that page instead of leaving it", async () => {
+  const { fireEvent, waitFor } = await import("@testing-library/react");
+  const docs = await mountDocsScreen({
+    history: [LINKED],
+    pageId: PAGE_ID,
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [LINKED] },
+  });
+  try {
+    await waitFor(() => docs.view.getByTestId("doc-page-view"));
+    const link = docs.view.getByRole("link", { name: "Next" });
+    const browserDefaultKept = fireEvent.click(link);
+    assert.equal(
+      browserDefaultKept,
+      false,
+      "the click must be taken over: the webview would open it in a new window",
+    );
+    await waitFor(() =>
+      assert.equal(
+        docs.router.history.location.pathname,
+        `/docs/${OTHER_PAGE_ID}`,
+      ),
+    );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("Cmd+click on a Docs link keeps the anchor's own behaviour", async () => {
+  const { fireEvent, waitFor } = await import("@testing-library/react");
+  const docs = await mountDocsScreen({
+    history: [LINKED],
+    pageId: PAGE_ID,
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [LINKED] },
+  });
+  try {
+    await waitFor(() => docs.view.getByTestId("doc-page-view"));
+    const link = docs.view.getByRole("link", { name: "Next" });
+    assert.equal(fireEvent.click(link, { metaKey: true }), true);
+    assert.equal(fireEvent.click(link, { ctrlKey: true }), true);
+    assert.equal(fireEvent.click(link, { button: 1 }), true);
+    assert.equal(docs.router.history.location.pathname, "/docs");
+  } finally {
+    docs.restore();
+  }
+});
+
+test("the same route on another host stays an external link", async () => {
+  const { fireEvent, waitFor } = await import("@testing-library/react");
+  const docs = await mountDocsScreen({
+    history: [LINKED],
+    pageId: PAGE_ID,
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [LINKED] },
+  });
+  try {
+    await waitFor(() => docs.view.getByTestId("doc-page-view"));
+    const link = docs.view.getByRole("link", { name: "Elsewhere" });
+    assert.equal(link.getAttribute("target"), "_blank");
+    assert.equal(fireEvent.click(link), true);
+    assert.equal(docs.router.history.location.pathname, "/docs");
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a footnote reference scrolls within the page instead of changing the route", async () => {
+  const { fireEvent, waitFor } = await import("@testing-library/react");
+  const docs = await mountDocsScreen({
+    history: [LINKED],
+    pageId: PAGE_ID,
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [LINKED] },
+  });
+  const scrolledTo = [];
+  const previousScrollIntoView =
+    dom.window.HTMLElement.prototype.scrollIntoView;
+  dom.window.HTMLElement.prototype.scrollIntoView = function record() {
+    scrolledTo.push(this.id);
+  };
+  try {
+    await waitFor(() => docs.view.getByTestId("doc-page-view"));
+    const reference = docs.view.container.querySelector("a[data-footnote-ref]");
+    assert.ok(reference, "remark-gfm renders the footnote reference");
+    assert.notEqual(
+      reference.getAttribute("target"),
+      "_blank",
+      "an in-page fragment must not be handed to the new-window path",
+    );
+    assert.equal(fireEvent.click(reference), false);
+    assert.deepEqual(scrolledTo, ["user-content-fn-1"]);
+    assert.equal(docs.router.history.location.pathname, "/docs");
+  } finally {
+    dom.window.HTMLElement.prototype.scrollIntoView = previousScrollIntoView;
+    docs.restore();
+  }
+});
+
+test("a missing page names itself and offers the way back to where the link was", async () => {
+  const { fireEvent, waitFor } = await import("@testing-library/react");
+  const docs = await mountDocsScreen({
+    history: [],
+    pageId: "nope",
+    routerEntries: [`/docs/${PAGE_ID}`, "/docs/nope"],
+    routerIndex: 1,
+    versionsByDTag: {},
+  });
+  try {
+    await waitFor(() => docs.view.getByText(/doesn't exist or was deleted/));
+    assert.ok(
+      docs.view.getByTestId("docs-placeholder").textContent.includes("nope"),
+      "the notice must say which page it could not find",
+    );
+    fireEvent.click(docs.view.getByRole("button", { name: "Go back" }));
+    await waitFor(() =>
+      assert.equal(docs.router.history.location.pathname, `/docs/${PAGE_ID}`),
+    );
   } finally {
     docs.restore();
   }

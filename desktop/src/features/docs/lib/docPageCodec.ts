@@ -5,6 +5,7 @@ import {
   KIND_COMMUNITY_DOC,
   KIND_COMMUNITY_DOC_LEGACY,
 } from "@/shared/constants/kinds";
+import { DOC_PAGE_ID_PATTERN } from "@/shared/lib/docsPageLink";
 
 export {
   COMMUNITY_DOC_TAG,
@@ -65,7 +66,8 @@ export type DocPage = DocPageContent & {
  * leading punctuation. UUIDs pass; anything a hostile publisher could use to
  * shape a URL does not.
  */
-const PAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** The id rule lives with the link parser so both agree on what a page id is. */
+const PAGE_ID_PATTERN = DOC_PAGE_ID_PATTERN;
 
 export function docPageDTag(id: string): string {
   return `${COMMUNITY_DOC_D_PREFIX}${id}`;
