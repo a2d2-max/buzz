@@ -11,6 +11,8 @@ export type PublicImportReport = {
   publish?: {
     mode: "dry-run";
     complete: boolean;
+    validationPassed: boolean;
+    readyForSigning: boolean;
     readyToPublish: false;
     inputPageCount: number;
     unsignedEventCount: number;
@@ -21,6 +23,8 @@ export type PublicImportReport = {
     maxFailureBytes: number | null;
     livePublished: false;
     failures: PublishFailure[];
+    contentLimit: DryRunOutput["contentLimit"];
+    assetPreparation: DryRunOutput["assetPreparation"];
   };
   notes: {
     restoredLinkDefinition: string;
@@ -45,6 +49,8 @@ export function buildPublicReport(
           publish: {
             mode: "dry-run" as const,
             complete: dryRun.complete,
+            validationPassed: dryRun.validationPassed,
+            readyForSigning: dryRun.readyForSigning,
             readyToPublish: false as const,
             inputPageCount: dryRun.inputPageCount,
             unsignedEventCount: dryRun.events.length,
@@ -61,6 +67,8 @@ export function buildPublicReport(
                 : Math.max(...dryRun.failures.map((failure) => failure.bytes)),
             livePublished: false as const,
             failures: dryRun.failures,
+            contentLimit: dryRun.contentLimit,
+            assetPreparation: dryRun.assetPreparation,
           },
         }
       : {}),
@@ -148,15 +156,40 @@ export function renderMarkdownReport(
           "|---|---:|",
           metric("입력 페이지", dryRun.inputPageCount),
           metric("unsigned kind-30623 입력", dryRun.events.length),
-          metric("256 KiB 상한 초과", dryRun.failures.length),
+          metric(
+            "적용 content 상한 (bytes)",
+            dryRun.contentLimit.effectiveMaxContentBytes,
+          ),
+          metric("적용 content 상한 초과", dryRun.failures.length),
           metric("상한 초과 부모 페이지", dryRun.rejectedParentCount),
           metric(
             "실패 페이지를 parentId로 가진 unsigned 입력",
             dryRun.dependentEventCount,
           ),
+          metric("본문 data URL 참조", dryRun.assetPreparation.occurrenceCount),
+          metric(
+            "새 로컬 asset 파일",
+            dryRun.assetPreparation.uniqueAssetCount,
+          ),
+          metric(
+            "ZIP 첨부와 같은 새 asset SHA",
+            dryRun.assetPreparation.zipAttachmentMatchedUniqueAssetCount,
+          ),
+          metric(
+            "복원 SHA를 확인한 페이지",
+            dryRun.assetPreparation.reconstructionVerifiedPageCount,
+          ),
           "",
-          `배치 완료: ${dryRun.complete ? "예" : "아니오"}. 발행 준비 완료: 아니오.`,
-          "서명, 키 조회, 릴레이 연결, 실제 발행은 하지 않았다. unsigned 입력은 발행 완료 이벤트가 아니다.",
+          `배치 완료: ${dryRun.complete ? "예" : "아니오"}. 이벤트 검증: ${dryRun.validationPassed ? "통과" : "실패"}. 서명 준비: ${dryRun.readyForSigning ? "예" : "아니오"}. 발행 준비 완료: 아니오.`,
+          `한도 출처: ${dryRun.contentLimit.source}; verified=${dryRun.contentLimit.limitVerified}; reason=${dryRun.contentLimit.reason}; endpoint=${dryRun.contentLimit.relayInfoEndpoint}; info-status=${dryRun.contentLimit.infoEndpointHttpStatus}; used-status=${dryRun.contentLimit.relayInfoHttpStatus}.`,
+          `광고값: ${dryRun.contentLimit.advertisedMaxContentBytes ?? "없음"}; 운영 광고 확인: ${dryRun.contentLimit.operationalAdvertisementConfirmed ? "예" : "아니오"}.`,
+          "NIP-11 metadata GET만 수행했다. 서명, 키 조회, WebSocket 연결, 실제 발행은 하지 않았다. unsigned 입력은 발행 완료 이벤트가 아니다.",
+          ...(dryRun.assetPreparation.assetBindingsComplete
+            ? ["본문 data URL의 미완료 asset binding: 없음."]
+            : [
+                `본문 data URL ${dryRun.assetPreparation.occurrenceCount.toLocaleString("en-US")}개를 ${dryRun.assetPreparation.uniqueAssetCount.toLocaleString("en-US")}개 로컬 파일로 뺐다. 업로드와 최종 URL binding을 하지 않아 서명하거나 발행할 수 없다.`,
+                `ZIP 첨부 ${dryRun.assetPreparation.zipAttachmentFileCount.toLocaleString("en-US")}개와 기존 본문 첨부 참조 ${dryRun.assetPreparation.existingAttachmentReferenceCount.toLocaleString("en-US")}개는 새 로컬 asset 분모와 따로 센다.`,
+              ]),
           ...(dryRun.failures.length === 0
             ? ["크기 상한 실패: 없음"]
             : [

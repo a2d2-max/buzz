@@ -1,5 +1,7 @@
 export const IMPORT_FORMAT_VERSION = 1;
 
+import type { PublicDataUrlManifest } from "./dataUrlAssets.ts";
+
 export type ImportedPage = {
   id: string;
   idSource: "notion" | "path-hash";
@@ -128,12 +130,32 @@ export type PublishFailure = {
   reason: "page-content-too-large";
 };
 
+export type ContentLimitProvenance = {
+  advertisedMaxContentBytes: number | null;
+  effectiveMaxContentBytes: number;
+  source: "advertised" | "legacy-assumption";
+  reason:
+    | "max-content-length-advertised"
+    | "max-content-length-not-advertised"
+    | "relay-info-endpoint-unsupported";
+  limitVerified: boolean;
+  operationalAdvertisementConfirmed: false;
+  relayInfoUrl: string;
+  relayInfoEndpoint: "/" | "/info";
+  relayInfoHttpStatus: number;
+  infoEndpointHttpStatus: number;
+};
+
 export type DryRunOutput = {
   version: 1;
   mode: "dry-run";
   complete: boolean;
+  validationPassed: boolean;
+  readyForSigning: boolean;
   readyToPublish: false;
   inputPageCount: number;
+  contentLimit: ContentLimitProvenance;
+  assetPreparation: PublicDataUrlManifest;
   rejectedParentCount: number;
   dependentEventCount: number;
   relay: string | null;

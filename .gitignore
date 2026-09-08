@@ -34,6 +34,8 @@ Thumbs.db
 # Notion import output contains private source documents and unsigned events.
 /notion-import-output/
 /desktop/notion-import-output/
+**/notion-inline-assets/
+**/notion-data-url-assets.private.json
 
 # Playwright artifacts
 playwright-report/

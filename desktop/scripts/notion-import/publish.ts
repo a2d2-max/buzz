@@ -1,11 +1,16 @@
 import {
   buildDocPageEventInput,
-  DOC_MAX_CONTENT_BYTES,
   docPageDTag,
   docPageIdFromDTag,
   measureDocPageContentBytes,
 } from "../../src/features/docs/lib/docPageCodec.ts";
-import type { DryRunOutput, ImportedPage, NotionImport } from "./types.ts";
+import type {
+  ContentLimitProvenance,
+  DryRunOutput,
+  ImportedPage,
+  NotionImport,
+} from "./types.ts";
+import type { PublicDataUrlManifest } from "./dataUrlAssets.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -88,16 +93,23 @@ function normalizeRelay(relay: string | undefined): string | null {
   if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
     throw new Error("invalid-relay-url");
   }
-  return relay;
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw new Error("invalid-relay-url");
+  }
+  return `${parsed.protocol}//${parsed.host}`;
 }
 
 /** Builds signer inputs only. It never opens a socket or asks for a key. */
 export function buildDryRun({
   imported,
+  assetPreparation,
+  contentLimit,
   relay,
   createdAt = Math.floor(Date.now() / 1_000),
 }: {
   imported: NotionImport;
+  assetPreparation: PublicDataUrlManifest;
+  contentLimit: ContentLimitProvenance;
   relay?: string;
   createdAt?: number;
 }): DryRunOutput {
@@ -105,8 +117,12 @@ export function buildDryRun({
     version: 1,
     mode: "dry-run",
     complete: false,
+    validationPassed: false,
+    readyForSigning: false,
     readyToPublish: false,
     inputPageCount: imported.pages.length,
+    contentLimit,
+    assetPreparation,
     rejectedParentCount: 0,
     dependentEventCount: 0,
     relay: normalizeRelay(relay),
@@ -124,7 +140,7 @@ export function buildDryRun({
       updatedAt: page.updatedAt,
     };
     const bytes = measureDocPageContentBytes(content);
-    if (bytes > DOC_MAX_CONTENT_BYTES) {
+    if (bytes > contentLimit.effectiveMaxContentBytes) {
       output.failures.push({
         pageId: page.id,
         bytes,
@@ -153,5 +169,8 @@ export function buildDryRun({
   }
   output.rejectedParentCount = rejectedParents.size;
   output.complete = output.failures.length === 0;
+  output.validationPassed = output.complete;
+  output.readyForSigning =
+    output.validationPassed && assetPreparation.assetBindingsComplete;
   return output;
 }
