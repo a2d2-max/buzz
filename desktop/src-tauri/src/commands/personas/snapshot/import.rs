@@ -661,6 +661,7 @@ pub async fn confirm_agent_snapshot_import(
             definition_parallelism: minted_parallelism,
             relay_mesh: None,
             effort_level: None,
+            claude_account_id: None,
             runtime: snapshot.definition.runtime.clone(),
             name_pool: snapshot.definition.name_pool.clone(),
         };

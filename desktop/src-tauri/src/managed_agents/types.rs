@@ -168,6 +168,7 @@ impl AgentDefinition {
             definition_parallelism: self.parallelism,
             relay_mesh: None,
             effort_level: None,
+            claude_account_id: None,
         }
     }
 }
@@ -476,6 +477,11 @@ pub struct ManagedAgentRecord {
     /// switches (invalid values skip-as-absent at projection time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
+    /// Stored Claude account (see `claude_accounts`) whose OAuth token the
+    /// spawn injects as `CLAUDE_CODE_OAUTH_TOKEN`. `None` = the app's own
+    /// Claude login. Only the id is persisted; the token stays in the keyring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -586,6 +592,9 @@ pub struct ManagedAgentSummary {
     pub log_path: String,
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
+    /// Selected Claude account id, `None` for the app's own login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -662,6 +671,10 @@ pub struct AcpRuntimeCatalogEntry {
     pub provider_env_var: Option<String>,
     /// Environment variable used to apply thinking effort, when supported.
     pub thinking_env_var: Option<String>,
+    /// Env var this runtime reads a subscription OAuth token from; drives the
+    /// per-agent Claude account picker. `None` = not applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_token_env_var: Option<String>,
     /// Canonical accepted effort values for this runtime, in display order.
     /// Serialized from `KnownAcpRuntime::effort_normalization.canonical` for
     /// runtimes with a static finite vocabulary (e.g. Goose). `None` for

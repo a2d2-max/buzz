@@ -23,6 +23,12 @@ import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 import { PubKey } from "@/shared/ui/PubKey";
 import { SubsectionLabel } from "@/shared/ui/PageHeader";
 import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
+import { useAcpRuntimesQuery } from "@/features/agents/hooks";
+import { useClaudeAccountsQuery } from "@/features/agents/useClaudeAccounts";
+import {
+  findRuntimeForCommand,
+  resolveClaudeAccountLabel,
+} from "./claudeAccountOptions";
 import { RestartDiffBadge } from "./RestartDiffBadge";
 
 export function ManagedAgentRow({
@@ -402,17 +408,37 @@ function RuntimeBlock({
   agent: ManagedAgent;
   runtimeSource: string | null;
 }) {
+  // Shared, cached queries; only agents that picked an account fetch them.
+  // The label is gated on the effective runtime's OAuth-token capability so a
+  // stale id on an agent moved to another harness never labels its row.
+  const hasAccount = agent.claudeAccountId != null;
+  const runtimesQuery = useAcpRuntimesQuery({ enabled: hasAccount });
+  const claudeAccountsQuery = useClaudeAccountsQuery({ enabled: hasAccount });
+  const readsToken =
+    findRuntimeForCommand(runtimesQuery.data ?? [], agent.agentCommand)
+      ?.oauthTokenEnvVar != null;
+  const accountLabel = readsToken
+    ? resolveClaudeAccountLabel(
+        agent.claudeAccountId,
+        claudeAccountsQuery.data ?? null,
+      )
+    : null;
   return (
     <div className="space-y-1 lg:pt-0.5">
       <SubsectionLabel className="lg:hidden">Runtime</SubsectionLabel>
       <p className="truncate font-mono text-xs text-foreground">
         {agent.agentCommand}
       </p>
-      {runtimeSource || agent.model ? (
+      {runtimeSource || agent.model || accountLabel ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           {runtimeSource ? <span>{runtimeSource}</span> : null}
           {agent.model ? (
             <span>{resolveModelLabel(agent.model, null, agent.provider)}</span>
+          ) : null}
+          {accountLabel ? (
+            <span data-testid="managed-agent-claude-account">
+              Claude account: {accountLabel}
+            </span>
           ) : null}
         </div>
       ) : null}

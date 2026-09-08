@@ -687,6 +687,7 @@ pub async fn create_managed_agent(
                 relay_mesh.clone()
             },
             effort_level: None,
+            claude_account_id: None,
         };
 
         records.push(record);

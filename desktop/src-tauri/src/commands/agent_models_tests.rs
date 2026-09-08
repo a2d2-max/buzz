@@ -541,6 +541,25 @@ fn update_request_turn_timeout_parses_for_wire_compat() {
     assert_eq!(req.turn_timeout_seconds, Some(9999));
 }
 
+#[test]
+fn update_request_claude_account_id_is_tri_state() {
+    // Absent → don't touch; null → clear; string → set. The dialog sends the
+    // field only when the picker changed, so an absent key must not clear a
+    // stored account.
+    let absent: crate::managed_agents::UpdateManagedAgentRequest =
+        serde_json::from_str(r#"{"pubkey": "abc"}"#).expect("absent parses");
+    assert_eq!(absent.claude_account_id, None);
+
+    let cleared: crate::managed_agents::UpdateManagedAgentRequest =
+        serde_json::from_str(r#"{"pubkey": "abc", "claudeAccountId": null}"#).expect("null parses");
+    assert_eq!(cleared.claude_account_id, Some(None));
+
+    let set: crate::managed_agents::UpdateManagedAgentRequest =
+        serde_json::from_str(r#"{"pubkey": "abc", "claudeAccountId": "acct-1"}"#)
+            .expect("string parses");
+    assert_eq!(set.claude_account_id, Some(Some("acct-1".to_string())));
+}
+
 // ---------------------------------------------------------------------------
 // Linked-instance write guard (model/provider/prompt)
 // ---------------------------------------------------------------------------

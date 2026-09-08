@@ -16,6 +16,7 @@ mod runtime_metadata;
 #[macro_use]
 mod windows_install;
 mod catalog;
+pub(crate) use bounded_command::output_with_timeout;
 pub(crate) use catalog::KNOWN_ACP_RUNTIMES;
 pub use login_shell::{find_nvm_default_bin, login_shell_path};
 pub(crate) use login_shell::{find_via_login_shell, refresh_login_shell_path};
@@ -151,6 +152,18 @@ pub(crate) fn known_acp_runtime(command: &str) -> Option<&'static KnownAcpRuntim
                 .any(|command| normalized == normalize_command_identity(command))
             || runtime.aliases.iter().any(|alias| normalized == *alias)
     })
+}
+
+/// The OAuth-token env var a harness with this STATIC definition command reads,
+/// projected the way spawn resolves it (`known_acp_runtime` on the command, so
+/// a custom or preset harness wrapping `claude` counts). Every catalog
+/// constructor uses this — the UI's capability model must match what spawn
+/// injects, or a per-agent Claude account is cleared/hidden while the token
+/// is still being sent.
+pub(crate) fn oauth_token_env_var_for_command(command: &str) -> Option<String> {
+    known_acp_runtime(command)
+        .and_then(|runtime| runtime.oauth_token_env_var)
+        .map(str::to_string)
 }
 
 pub(crate) fn known_acp_runtime_exact(id: &str) -> Option<&'static KnownAcpRuntime> {
@@ -1039,6 +1052,7 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             model_env_var: runtime.model_env_var.map(str::to_string),
             provider_env_var: runtime.provider_env_var.map(str::to_string),
             thinking_env_var: runtime.thinking_env_var.map(str::to_string),
+            oauth_token_env_var: runtime.oauth_token_env_var.map(str::to_string),
             effort_canonical_values: runtime
                 .effort_normalization
                 .map(|norm| norm.canonical.iter().map(|s| s.to_string()).collect()),
@@ -1181,6 +1195,7 @@ pub fn discover_acp_runtimes_from(
                 model_env_var: None,
                 provider_env_var: None,
                 thinking_env_var: None,
+                oauth_token_env_var: oauth_token_env_var_for_command(&def.command),
                 effort_canonical_values: None,
                 max_tokens_env_var: None,
                 context_limit_env_var: None,

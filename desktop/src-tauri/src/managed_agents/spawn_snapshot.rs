@@ -152,6 +152,11 @@ pub(crate) struct SpawnConfigSnapshot {
     /// via layered env), so it must be captured explicitly rather than read back
     /// out of `env`.
     pub session_policy: String,
+    /// The stored Claude account whose token the spawn injected, by id. The
+    /// token itself goes straight from the keyring onto the `Command` and is
+    /// never part of `env`, so the id is the only thing the badge can compare:
+    /// picking a different account while the agent runs must badge.
+    pub claude_account_id: Option<String>,
 }
 
 /// The startup effort a spawn actually applied, read from the single effort key
@@ -258,6 +263,7 @@ impl SpawnConfigSnapshot {
             // what launched regardless of which tier supplied the value.
             effort_level: effective_effort(descriptor),
             session_policy: session_policy.as_str().to_string(),
+            claude_account_id: record.claude_account_id.clone(),
         }
     }
 

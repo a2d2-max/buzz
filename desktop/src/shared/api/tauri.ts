@@ -155,6 +155,7 @@ export type RawManagedAgent = {
   // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
+  claude_account_id?: string | null;
 };
 
 type RawCreateManagedAgentResponse = {
@@ -181,6 +182,7 @@ export type RawAcpRuntimeCatalogEntry = {
   model_env_var?: string | null;
   provider_env_var?: string | null;
   thinking_env_var?: string | null;
+  oauth_token_env_var?: string | null;
   max_tokens_env_var?: string | null;
   context_limit_env_var?: string | null;
   max_rounds_env_var?: string | null;
@@ -668,6 +670,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     backendAgentId: agent.backend_agent_id,
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
+    claudeAccountId: agent.claude_account_id ?? null,
   };
 }
 
@@ -686,6 +689,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     modelEnvVar: entry.model_env_var ?? null,
     providerEnvVar: entry.provider_env_var ?? null,
     thinkingEnvVar: entry.thinking_env_var ?? null,
+    oauthTokenEnvVar: entry.oauth_token_env_var ?? null,
     maxTokensEnvVar: entry.max_tokens_env_var ?? null,
     contextLimitEnvVar: entry.context_limit_env_var ?? null,
     maxRoundsEnvVar: entry.max_rounds_env_var ?? null,

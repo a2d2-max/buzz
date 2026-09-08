@@ -315,6 +315,7 @@ mod tests {
             definition_parallelism: None,
             relay_mesh: None,
             effort_level: None,
+            claude_account_id: None,
         }
     }
 

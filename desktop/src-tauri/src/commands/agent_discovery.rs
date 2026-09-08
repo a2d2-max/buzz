@@ -1,7 +1,7 @@
 use crate::managed_agents::{
-    command_availability, is_npm_global_install, AcpRuntimeCatalogEntry,
-    DiscoverManagedAgentPrereqsRequest, InstallRuntimeResult, ManagedAgentPrereqsInfo,
-    DEFAULT_ACP_COMMAND,
+    command_availability, find_command, is_npm_global_install, normalize_agent_args,
+    oauth_token_env_var_for_command, AcpRuntimeCatalogEntry, DiscoverManagedAgentPrereqsRequest,
+    InstallRuntimeResult, ManagedAgentPrereqsInfo, DEFAULT_ACP_COMMAND,
 };
 
 mod forced_single_flight;
@@ -124,18 +124,16 @@ pub async fn save_custom_harness(
     custom_harnesses::save_and_warm(&custom_dir, &definition, rename_old_id.as_deref())?;
 
     // Resolve availability for the returned catalog entry.
-    let (availability, command_opt, binary_path) =
-        match crate::managed_agents::find_command(&definition.command) {
-            Some(path) => (
-                AcpAvailabilityStatus::Available,
-                Some(definition.command.clone()),
-                Some(path.display().to_string()),
-            ),
-            None => (AcpAvailabilityStatus::NotInstalled, None, None),
-        };
+    let (availability, command_opt, binary_path) = match find_command(&definition.command) {
+        Some(path) => (
+            AcpAvailabilityStatus::Available,
+            Some(definition.command.clone()),
+            Some(path.display().to_string()),
+        ),
+        None => (AcpAvailabilityStatus::NotInstalled, None, None),
+    };
 
-    let default_args =
-        crate::managed_agents::normalize_agent_args(&definition.command, definition.args.clone());
+    let default_args = normalize_agent_args(&definition.command, definition.args.clone());
 
     Ok(AcpRuntimeCatalogEntry {
         id: definition.id,
@@ -149,6 +147,7 @@ pub async fn save_custom_harness(
         model_env_var: None,
         provider_env_var: None,
         thinking_env_var: None,
+        oauth_token_env_var: oauth_token_env_var_for_command(&definition.command),
         effort_canonical_values: None,
         max_tokens_env_var: None,
         context_limit_env_var: None,
