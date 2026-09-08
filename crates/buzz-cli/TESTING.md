@@ -617,11 +617,12 @@ buzz channels delete --channel "$FORUM_ID" | jq .
 | 52 | `repos protect list` | ☐ | Empty/populated rules; unknown rules visible; malformed rule reported in validation_error |
 | 53 | `repos protect set` | ☐ | Create and replace complete exact-ref rule; verify metadata is preserved |
 | 54 | `repos protect remove` | ☐ | Remove exact ref; missing rule → NotFound |
-| 55 | `upload file` | ☐ | |
-| 56 | `pack validate` | ☐ | Local, no relay |
-| 57 | `pack inspect` | ☐ | Local, no relay |
-| 58 | `notes set` | ☐ | First publish, edit/carry, --clear-tags, ambiguity, empty-stdin guard |
-| 59 | `notes get` | ☐ | By name, by naddr, --content-only, cross-author, ambiguous → exit 1 |
-| 60 | `notes ls` | ☐ | Own, --author all, --tag, --limit |
-| 61 | `notes rm` | ☐ | Delete→get 404, double-delete idempotent, missing slug → NotFound |
-| 62 | `users set-status` | ☐ | Text+emoji, text only, emoji-only (`--text ""`), `--clear`, `--clear` + `--text` → exit 1 |
+| 55 | `repos delete` | ☐ | Own repo → `{deleted:true,...}` then `repos get` empty; re-run → NotFound; another owner's id → NotFound; re-announce same id works |
+| 56 | `upload file` | ☐ | |
+| 57 | `pack validate` | ☐ | Local, no relay |
+| 58 | `pack inspect` | ☐ | Local, no relay |
+| 59 | `notes set` | ☐ | First publish, edit/carry, --clear-tags, ambiguity, empty-stdin guard |
+| 60 | `notes get` | ☐ | By name, by naddr, --content-only, cross-author, ambiguous → exit 1 |
+| 61 | `notes ls` | ☐ | Own, --author all, --tag, --limit |
+| 62 | `notes rm` | ☐ | Delete→get 404, double-delete idempotent, missing slug → NotFound |
+| 63 | `users set-status` | ☐ | Text+emoji, text only, emoji-only (`--text ""`), `--clear`, `--clear` + `--text` → exit 1 |

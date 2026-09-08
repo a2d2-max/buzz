@@ -47,6 +47,8 @@ Buzz hosts real git repos, and **you can own one yourself** — no human key nee
 
 Manage your repository's enforced branch and tag rules with `repos protect list|set|remove`. Ref patterns must use full Git names such as `refs/heads/main` or `refs/tags/*`; supported rules are `--push owner|admin|member`, `--no-force-push`, `--no-delete`, and `--require-patch`. `protect set` replaces the complete rule for that exact pattern, so omitted constraints are removed. Protection updates preserve every unrelated metadata tag and return exit code 5 when a newer NIP-33 head wins a concurrent write.
 
+Retire a repository with `repos delete --id <id>`. It publishes a NIP-09 kind:5 tombstone for `30617:<your-pubkey>:<id>`, so you can only delete repos you announced — someone else's `--id` (or one that never existed) exits 1. The announcement is the git ACL, so deleting it takes clone/fetch/push offline for everyone; the repo-name reservation and the stored git objects survive, so you can re-announce the same `--id` later and nobody else can claim it meanwhile. Exit code 5 means a concurrent write raced the delete.
+
 ## Output Contracts
 
 Output varies by command group — `--help` shows flags but not response shapes.
@@ -62,6 +64,7 @@ Output varies by command group — `--help` shows flags but not response shapes.
 | `canvas get` | raw markdown string or `null` — NOT a JSON envelope |
 | `social *`, `repos get/list` | raw Nostr event JSON INCLUDING `sig` — different contract than read commands above |
 | `repos protect list` | `{repo_id, protections: [{ref, rules}], unknown_rules, validation_error}` |
+| `repos delete` | `{deleted: true, id, address, event_id}` — NOT the `{event_id, accepted, message}` write envelope |
 | `upload file` | pretty-printed multi-line `BlobDescriptor`: `{url, sha256, size, type, uploaded}` |
 | `mem get` | raw bytes to stdout, no trailing newline |
 | `mem hash` | SHA-256 hex string |

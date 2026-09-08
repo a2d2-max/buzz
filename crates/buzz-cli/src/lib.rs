@@ -1234,6 +1234,22 @@ pub enum ReposCmd {
         #[arg(long)]
         channel: String,
     },
+    /// Delete one of your own repository announcements via NIP-09 (kind:5).
+    ///
+    /// Emits an a-tag-only deletion targeting the addressable coordinate
+    /// `30617:<your pubkey>:<id>` (no `e` tag — an `e` tag would route around
+    /// the relay's coordinate soft-delete and leave the announcement alive).
+    /// Only your own repositories can be deleted, so there is no `--owner`.
+    ///
+    /// The announcement is what the relay's git gate reads, so deleting it
+    /// takes clone/fetch/push offline for everyone. The repo-name reservation
+    /// and the stored git objects are NOT removed: you can re-announce the
+    /// same `--id` later, and nobody else can claim it in the meantime.
+    Delete {
+        /// Repository identifier (d-tag). Only your own repos can be deleted.
+        #[arg(long)]
+        id: String,
+    },
     /// Manage branch and tag protection rules on one of your repositories.
     #[command(subcommand)]
     Protect(ReposProtectCmd),
@@ -2399,7 +2415,7 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "repos"),
-            vec!["bind", "create", "get", "list", "protect"]
+            vec!["bind", "create", "delete", "get", "list", "protect"]
         );
         let repos = cmd
             .get_subcommands()
@@ -2476,7 +2492,7 @@ mod tests {
             ("pr", 5),
             ("projects", 8),
             ("reactions", 3),
-            ("repos", 5),
+            ("repos", 6),
             ("social", 7),
             ("upload", 1),
             ("users", 5),
