@@ -25,7 +25,7 @@ function docEvent({ id, eventId, author, createdAt, content }) {
     id: eventId.padEnd(64, "0"),
     pubkey: author,
     created_at: createdAt,
-    kind: 30078,
+    kind: 30623,
     tags: [
       ["d", `doc:${id}`],
       ["t", "community-doc"],

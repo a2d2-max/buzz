@@ -6,11 +6,12 @@ import { signRelayEvent } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import {
   COMMUNITY_DOC_TAG,
-  KIND_COMMUNITY_DOC,
+  KIND_COMMUNITY_DOC_LEGACY,
 } from "@/shared/constants/kinds";
 
 import {
   buildDocPageEventInput,
+  COMMUNITY_DOC_QUERY_KINDS,
   createDocPageId,
   DOC_MAX_CONTENT_BYTES,
   type DocPage,
@@ -41,7 +42,7 @@ type DocPageMap = Map<string, DocPage>;
 type DocsSnapshot = {
   pages: DocPageMap;
   truncated: boolean;
-  /** Kind-30078 rows the last scan inspected. */
+  /** Doc-kind rows (30623 + legacy 30078) the last scan inspected. */
   scanned: number;
   /**
    * Largest relay-validated `created_at` any complete scan has seen;
@@ -135,7 +136,7 @@ export type CommunityDocs = {
   isError: boolean;
   /** The history scan hit its bound before the window ended: pages may be missing. */
   truncated: boolean;
-  /** Kind-30078 rows the last scan inspected (for the truncation notice). */
+  /** Doc-kind rows the last scan inspected (for the truncation notice). */
   scanned: number;
   refetch: () => Promise<unknown>;
   /**
@@ -174,7 +175,8 @@ function levelPages(tree: DocTreeNode[], parentId: string | null): DocPage[] {
 /**
  * Community-wide page store.
  *
- * Startup order: the live subscription on `kind:30078 #t=community-doc` is
+ * Startup order: the live subscription on the doc kinds (30623 + legacy
+ * 30078) with `#t=community-doc` is
  * opened first, and only once it is ready does the history scan run — so the
  * two overlap and nothing published in between is missed. Every fetched or
  * live version is collapsed to the newest per page id across all authors.
@@ -275,7 +277,7 @@ export function useCommunityDocs(): CommunityDocs {
     relayClient
       .subscribeLive(
         {
-          kinds: [KIND_COMMUNITY_DOC],
+          kinds: [...COMMUNITY_DOC_QUERY_KINDS],
           "#t": [COMMUNITY_DOC_TAG],
           limit: 0,
         },
@@ -333,7 +335,7 @@ export function useCommunityDocs(): CommunityDocs {
   const fetchNewestVersion = React.useCallback(
     async (id: string): Promise<DocPage | undefined> => {
       const events = await relayClient.fetchEvents({
-        kinds: [KIND_COMMUNITY_DOC],
+        kinds: [...COMMUNITY_DOC_QUERY_KINDS],
         "#d": [docPageDTag(id)],
         limit: PAGE_VERSIONS_LIMIT,
       });
@@ -382,6 +384,60 @@ export function useCommunityDocs(): CommunityDocs {
     },
     [applyPage],
   );
+
+  /**
+   * One-shot migration off the legacy shared kind: after a complete scan,
+   * every page whose newest version still sits on kind 30078 is republished
+   * verbatim onto the dedicated kind. The copy carries identical content
+   * (timestamps included) and an event `created_at` bumped past the legacy
+   * version, so last-write-wins always prefers it — nothing readers see
+   * changes, and nothing is lost if this pass dies halfway (the legacy rows
+   * stay readable and the next mount retries). Each page is re-read by `#d`
+   * first so a page another client migrated or edited meanwhile is skipped.
+   */
+  const migrationStartedRef = React.useRef(false);
+  const migrateLegacyPages = React.useCallback(
+    async (candidates: DocPage[]) => {
+      for (const cached of candidates) {
+        try {
+          const newest = await fetchNewestVersion(cached.id);
+          if (!newest || newest.eventKind !== KIND_COMMUNITY_DOC_LEGACY) {
+            continue;
+          }
+          await publishPage(
+            {
+              id: newest.id,
+              title: newest.title,
+              body: newest.body,
+              parentId: newest.parentId,
+              order: newest.order,
+              ...(newest.icon ? { icon: newest.icon } : {}),
+              createdAt: newest.createdAt,
+              updatedAt: newest.updatedAt,
+              ...(newest.deleted ? { deleted: true } : {}),
+            },
+            newest,
+          );
+        } catch {
+          // Best-effort: a failed republish (offline, clock skew) leaves the
+          // page on the legacy window, which is still read. Retried next mount.
+        }
+      }
+    },
+    [fetchNewestVersion, publishPage],
+  );
+  const snapshotForMigration = query.data;
+  React.useEffect(() => {
+    if (migrationStartedRef.current) return;
+    // A truncated scan may have missed the dedicated-kind successor of a
+    // legacy row; only a complete window is safe to migrate from.
+    if (!snapshotForMigration || snapshotForMigration.truncated) return;
+    migrationStartedRef.current = true;
+    const candidates = [...snapshotForMigration.pages.values()].filter(
+      (page) => page.eventKind === KIND_COMMUNITY_DOC_LEGACY,
+    );
+    if (candidates.length > 0) void migrateLegacyPages(candidates);
+  }, [migrateLegacyPages, snapshotForMigration]);
 
   const createPage = React.useCallback<CommunityDocs["createPage"]>(
     async ({ parentId, title }) => {

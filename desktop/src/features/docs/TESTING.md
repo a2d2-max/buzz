@@ -10,14 +10,23 @@ cd desktop && node --import ./test-loader.mjs --experimental-strip-types \
 
 - `lib/docPageCodec.test.mjs`, `lib/docTree.test.mjs` — event codec, tree
   building (tombstones, orphans, cycles), version ordering, sibling reorder.
-- `lib/docsHistory.test.mjs` — the kinds-only `until` cursor scan against a
-  fake relay that, like buzz-relay, applies `#t` *after* the SQL `LIMIT`.
-  Re-adding `#t` to the request reproduces the starvation and fails 4 tests.
+  Writes go to the dedicated kind 30623; the codec still parses legacy
+  kind-30078 pages and records provenance in `eventKind`.
+- `lib/docsHistory.test.mjs` — the kinds-only `until` cursor scan (over
+  30623 + legacy 30078) against a fake relay that, like buzz-relay, applies
+  `#t` *after* the SQL `LIMIT`. Re-adding `#t` to the request reproduces the
+  starvation and fails 4 tests; dropping the legacy kind fails the
+  legacy-coverage test.
 - `lib/docPublishPlan.test.mjs`, `lib/useCommunityDocs.test.mjs` — the write
   path: `#d` re-read before every publish, conflict on a stale
-  `baseEventId`, no-op for identical content, 256 KB refusal before signing,
-  subscription-before-scan ordering, reconnect refetch, incremental
-  watermark anchored on relay-stamped `created_at`.
+  `baseEventId`, no-op for identical content (dedicated-kind versions only —
+  an identical write on a legacy version still publishes, migrating the
+  page), 256 KB refusal before signing, subscription-before-scan ordering,
+  reconnect refetch, incremental watermark anchored on relay-stamped
+  `created_at`, and the one-shot legacy migration: after a complete scan,
+  pages stranded on 30078 are republished verbatim onto 30623 (tombstones
+  included), skipped when a dedicated-kind successor exists, and never run
+  from a truncated scan.
 - `lib/autosaveScheduler.test.mjs`, `lib/docDraftBackup.test.mjs`,
   `lib/markdownFidelity.test.mjs`, `lib/docEditorMarkdown.test.mjs` —
   debounce/flush/pause semantics, localStorage draft mirror, the
@@ -72,13 +81,16 @@ PGHOST=127.0.0.1 PGPORT=5433 PGUSER=postgres PGDATABASE=buzz \
 in this setup). Tear down with `pg_ctl stop`, `redis-cli -p 6380 shutdown`
 and by removing `$LAB`.
 
-If the relay binary is older than the checkout you are validating, first
-confirm the four relay properties the scan depends on are unchanged at HEAD
-— a green run against an old binary proves nothing about a relay that
-changed them:
+A relay binary that predates the dedicated kind rejects kind 30623 at
+ingest (`restricted: unknown event kind`), so the probe cannot run against
+an old binary at all — build from the checkout under test. If the binary is
+merely a few commits behind, first confirm the four relay properties the
+scan depends on are unchanged at HEAD — a green run against an old binary
+proves nothing about a relay that changed them:
 
 ```bash
-# 1. kind 30078 sits in no post-filter gate list.
+# 1. Neither doc kind (30623, legacy 30078) sits in a post-filter gate list.
+#    (`community_doc_sits_in_no_read_gate` in kind.rs pins 30623 in CI.)
 grep -n -A6 -E 'pub const (AUTHOR_ONLY|P_GATED|RESULT_GATED|SHARED_GATED)_KINDS' crates/buzz-core/src/kind.rs
 # 2. `#t` is still not pushed down to SQL (only d/e tags are).
 grep -n -E 'pub (d_tags|e_tags|t_tags):' crates/buzz-db/src/store/event.rs
@@ -91,7 +103,8 @@ grep -n -E 'DEFAULT_MAX_PAGE_LIMIT: i64|created_at DESC, id ASC' crates/buzz-db/
 ### 2. Protocol probe — `scripts/docs-relay-probe.mjs`
 
 Runs `fetchDocPagesToExhaustion` and the codec over a raw NIP-42 WebSocket
-client. Publishes 3 pages, then 1100 newer kind-30078 rows spread over 25
+client. Publishes 3 pages on the dedicated kind (30623) plus 1 page on the
+legacy kind (30078), then 1100 newer kind-30078 rows spread over 25
 identities (the per-user write budget), then checks:
 
 ```bash
@@ -100,12 +113,15 @@ cd desktop && RELAY_URL=ws://localhost:3100 node --import ./test-loader.mjs \
 ```
 
 Expected (recorded 2026-09-08 against `target/debug/buzz-relay` built from
-`571c1902d`):
+this branch — the relay must know kind 30623, so build it from the checkout
+under test):
 
 ```
-PASS  #t-filtered REQ starves behind >1000 newer rows (the bug)  — returned 0/3 pages
+PASS  relay accepts and stores the dedicated doc kind  — kind 30623
+PASS  #t-filtered REQ on legacy 30078 starves behind >1000 newer rows (the bug)  — returned 0/1 legacy pages
 PASS  kinds-only REQ returns exactly the 1000-row window  — 1000 rows
-PASS  paged kinds-only scan finds every page  — 3 pages, 2 REQs, scanned 1103 rows, truncated=false
+PASS  dedicated-kind REQ window holds only doc pages, noise cannot starve it  — 3/3 rows are docs
+PASS  paged scan over both kinds finds every page, legacy included  — 4 pages, 2 REQs, scanned 1104 rows, truncated=false
 PASS  #d lookup returns every author's version and resolves the newest  — 2 versions
 PASS  incremental scan (since = newestSeen − 1860) sees the pages and B's version  — 2 REQs
 PASS  live #t subscription delivers another author's new page

@@ -3,12 +3,15 @@ import test from "node:test";
 
 import {
   buildDocPageEventInput,
+  COMMUNITY_DOC_QUERY_KINDS,
   COMMUNITY_DOC_TAG,
   createDocPageId,
   DOC_MAX_CONTENT_BYTES,
   docPageContentEquals,
   docPageDTag,
   docPageIdFromDTag,
+  KIND_COMMUNITY_DOC,
+  KIND_COMMUNITY_DOC_LEGACY,
   measureDocPageContentBytes,
   parseDocPageEvent,
 } from "./docPageCodec.ts";
@@ -20,7 +23,7 @@ function makeEvent(overrides = {}) {
     id: "e".repeat(64),
     pubkey: "a".repeat(64),
     created_at: 1_700_000_000,
-    kind: 30078,
+    kind: KIND_COMMUNITY_DOC,
     tags: [
       ["d", `doc:${PAGE_ID}`],
       ["t", "community-doc"],
@@ -77,6 +80,7 @@ test("parseDocPageEvent: valid event yields a page with event provenance", () =>
     author: "a".repeat(64),
     eventId: "e".repeat(64),
     eventCreatedAt: 1_700_000_000,
+    eventKind: KIND_COMMUNITY_DOC,
     title: "Onboarding",
     body: "# Welcome\n\nHello.",
     parentId: null,
@@ -86,6 +90,21 @@ test("parseDocPageEvent: valid event yields a page with event provenance", () =>
     updatedAt: 1_700_000_500_000,
     deleted: false,
   });
+});
+
+test("parseDocPageEvent: a legacy kind-30078 page still parses, marked legacy", () => {
+  // Pre-migration pages live on the shared NIP-78 kind; losing them would be
+  // data loss, so the codec accepts both kinds and records which one it saw.
+  const page = parseDocPageEvent(
+    makeEvent({ kind: KIND_COMMUNITY_DOC_LEGACY }),
+  );
+  assert.ok(page);
+  assert.equal(page.eventKind, KIND_COMMUNITY_DOC_LEGACY);
+  assert.equal(page.id, PAGE_ID);
+  assert.deepEqual(COMMUNITY_DOC_QUERY_KINDS, [
+    KIND_COMMUNITY_DOC,
+    KIND_COMMUNITY_DOC_LEGACY,
+  ]);
 });
 
 test("parseDocPageEvent: wrong kind, missing t tag, or foreign d-tag → null", () => {
@@ -220,7 +239,7 @@ test("parseDocPageEvent: non-string icon is dropped, not fatal", () => {
 
 // ── buildDocPageEventInput ───────────────────────────────────────────────────
 
-test("buildDocPageEventInput: kind 30078 with doc d-tag and community-doc t-tag", () => {
+test("buildDocPageEventInput: dedicated kind with doc d-tag and community-doc t-tag", () => {
   const input = buildDocPageEventInput({
     id: PAGE_ID,
     title: "Roadmap",
@@ -230,7 +249,12 @@ test("buildDocPageEventInput: kind 30078 with doc d-tag and community-doc t-tag"
     createdAt: 1,
     updatedAt: 2,
   });
-  assert.equal(input.kind, 30078);
+  assert.equal(input.kind, KIND_COMMUNITY_DOC);
+  assert.equal(
+    input.kind,
+    30623,
+    "writes go to the dedicated kind, never 30078",
+  );
   assert.deepEqual(input.tags, [
     ["d", `doc:${PAGE_ID}`],
     ["t", "community-doc"],

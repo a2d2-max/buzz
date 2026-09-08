@@ -5,12 +5,12 @@ import { fetchDocPagesToExhaustion } from "./docsHistory.ts";
 
 const AUTHOR = "a".repeat(64);
 
-function docEvent(id, createdAt, title = id) {
+function docEvent(id, createdAt, title = id, kind = 30623) {
   return {
     id: id.padEnd(64, "0"),
     pubkey: AUTHOR,
     created_at: createdAt,
-    kind: 30078,
+    kind,
     tags: [
       ["d", `doc:${id}`],
       ["t", "community-doc"],
@@ -20,7 +20,12 @@ function docEvent(id, createdAt, title = id) {
   };
 }
 
-/** Same kind, different `t`: the read-state traffic that crowds the window. */
+/** A pre-migration page still sitting on the legacy shared kind. */
+function legacyDocEvent(id, createdAt, title = id) {
+  return docEvent(id, createdAt, title, 30078);
+}
+
+/** Legacy kind, different `t`: the read-state traffic that crowds the window. */
 function noiseEvent(index, createdAt) {
   return {
     id: `noise${index}`.padEnd(64, "0"),
@@ -71,7 +76,11 @@ function fakeRelay(events, { clamp = 1_000, rotateTies = false } = {}) {
     requests,
     fetchEvents: async (filter) => {
       requests.push(filter);
-      assert.deepEqual(filter.kinds, [30078]);
+      assert.deepEqual(
+        filter.kinds,
+        [30623, 30078],
+        "the scan must cover the dedicated kind AND the legacy window",
+      );
       const limit = Math.min(filter.limit, clamp);
       let rows = sorted
         .filter((event) =>
@@ -166,6 +175,27 @@ test("a full page that cannot advance the cursor is reported as truncated, not l
   );
   assert.equal(result.truncated, true);
   assert.equal(relay.requests.length, 2, "stops the moment the cursor stalls");
+});
+
+test("legacy 30078 pages are found alongside dedicated-kind pages", async () => {
+  // Dropping the legacy kind from the scan would silently lose every page
+  // published before the migration — the codec marks provenance instead.
+  const relay = fakeRelay([
+    docEvent("new-kind", 400),
+    legacyDocEvent("pre-migration", 200),
+    noiseEvent(1, 300),
+  ]);
+  const result = await fetchDocPagesToExhaustion({
+    fetchEvents: relay.fetchEvents,
+    pageLimit: 1_000,
+  });
+  assert.deepEqual(result.pages.map((page) => page.id).sort(), [
+    "new-kind",
+    "pre-migration",
+  ]);
+  const byId = new Map(result.pages.map((page) => [page.id, page]));
+  assert.equal(byId.get("new-kind").eventKind, 30623);
+  assert.equal(byId.get("pre-migration").eventKind, 30078);
 });
 
 test("boundary rows re-returned by the inclusive cursor are deduplicated", async () => {

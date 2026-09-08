@@ -4,11 +4,15 @@
  * Runs the production scan (`fetchDocPagesToExhaustion`) and codec over a
  * plain WebSocket NIP-01/NIP-42 client, so what is measured is the relay's
  * actual REQ behaviour, not the fake relay from the unit tests:
- *   1. `#t`-filtered REQ starves once >1000 newer kind-30078 rows exist.
- *   2. The kinds-only paged scan still finds every page.
- *   3. `#d` lookup returns every author's version of one page.
- *   4. An incremental (`since`) scan finds pages in one request.
- *   5. A live `#t` subscription delivers a page published by someone else.
+ *   1. The relay accepts and stores the dedicated doc kind (30623).
+ *   2. `#t`-filtered REQ on the legacy shared kind (30078) starves once
+ *      >1000 newer rows exist — the bug that motivated the dedicated kind.
+ *   3. The dedicated kind's window holds only doc pages: one small REQ
+ *      returns them all, no noise.
+ *   4. The paged scan over both kinds finds every page, legacy included.
+ *   5. `#d` lookup returns every author's version of one page.
+ *   6. An incremental (`since`) scan finds pages in one request.
+ *   7. A live subscription delivers a page published by someone else.
  *
  * Usage (from desktop/): RELAY_URL=ws://localhost:3100 node --import ./test-loader.mjs \
  *   --experimental-strip-types <this file>
@@ -197,11 +201,12 @@ console.log(
   `authenticated A=${authorA.pk.slice(0, 8)} B=${authorB.pk.slice(0, 8)} at ${RELAY_URL}`,
 );
 
-// 1. Three pages, stamped older than the noise that will follow.
+// 1. Three pages on the dedicated kind, plus one pre-migration page on the
+//    legacy shared kind — all stamped older than the noise that will follow.
 const base = now() - 300;
 const pageIds = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
 for (const [index, id] of pageIds.entries()) {
-  await authorA.publish(
+  const accepted = await authorA.publish(
     docTemplate({
       id,
       title: `Doc ${index + 1}`,
@@ -210,8 +215,26 @@ for (const [index, id] of pageIds.entries()) {
       order: index,
     }),
   );
+  if (index === 0) {
+    check(
+      "relay accepts and stores the dedicated doc kind",
+      accepted.kind === 30623,
+      `kind ${accepted.kind}`,
+    );
+  }
 }
-console.log("published 3 pages");
+const legacyPageId = crypto.randomUUID();
+await authorA.publish({
+  ...docTemplate({
+    id: legacyPageId,
+    title: "Legacy page",
+    body: "# Legacy\n\npre-migration",
+    createdAt: base - 10,
+  }),
+  kind: 30078,
+});
+const allPageIds = [...pageIds, legacyPageId];
+console.log("published 3 dedicated-kind pages + 1 legacy-kind page");
 
 // 2. Noise: kind 30078 rows with another `t`, newer than the pages, spread
 //    across identities so the per-user write budget is not the bottleneck.
@@ -250,7 +273,9 @@ console.log(
 );
 for (const conn of noiseConns) conn.close();
 
-// 3. Starvation: the `#t`-filtered REQ the first implementation used.
+// 3. Starvation on the legacy shared kind: the `#t`-filtered REQ the first
+//    implementation used. The legacy page sits behind >1000 newer 30078
+//    rows, so the filtered window never reaches it.
 const starved = await authorA.req({
   kinds: [30078],
   "#t": ["community-doc"],
@@ -258,9 +283,9 @@ const starved = await authorA.req({
 });
 const starvedDocs = starved.map(parseDocPageEvent).filter(Boolean);
 check(
-  "#t-filtered REQ starves behind >1000 newer rows (the bug)",
-  starvedDocs.length < pageIds.length,
-  `returned ${starvedDocs.length}/${pageIds.length} pages`,
+  "#t-filtered REQ on legacy 30078 starves behind >1000 newer rows (the bug)",
+  starvedDocs.length < 1,
+  `returned ${starvedDocs.length}/1 legacy pages`,
 );
 const window1000 = await authorA.req({ kinds: [30078], limit: 1_000 });
 check(
@@ -269,7 +294,18 @@ check(
   `${window1000.length} rows`,
 );
 
-// 4. The fix: kinds-only paged scan through the production code.
+// 3b. The dedicated kind's window holds only doc pages: even a small REQ
+//     sees every page despite the 30078 noise being far newer.
+const dedicatedWindow = await authorA.req({ kinds: [30623], limit: 50 });
+const dedicatedDocs = dedicatedWindow.map(parseDocPageEvent).filter(Boolean);
+check(
+  "dedicated-kind REQ window holds only doc pages, noise cannot starve it",
+  dedicatedDocs.length === dedicatedWindow.length &&
+    pageIds.every((id) => dedicatedDocs.some((page) => page.id === id)),
+  `${dedicatedDocs.length}/${dedicatedWindow.length} rows are docs`,
+);
+
+// 4. The paged scan through the production code, covering both kinds.
 let requests = 0;
 const countingFetch = (filter) => {
   requests += 1;
@@ -278,8 +314,8 @@ const countingFetch = (filter) => {
 const scan = await fetchDocPagesToExhaustion({ fetchEvents: countingFetch });
 const found = pickLatestDocPages(scan.pages);
 check(
-  "paged kinds-only scan finds every page",
-  pageIds.every((id) => found.has(id)) && !scan.truncated,
+  "paged scan over both kinds finds every page, legacy included",
+  allPageIds.every((id) => found.has(id)) && !scan.truncated,
   `${found.size} pages, ${requests} REQs, scanned ${scan.scanned} rows, truncated=${scan.truncated}, newestSeen=${scan.newestSeen}`,
 );
 
@@ -293,7 +329,7 @@ const bVersion = await authorB.publish(
   }),
 );
 const versions = await authorA.req({
-  kinds: [30078],
+  kinds: [30623, 30078],
   "#d": [docPageDTag(pageIds[0])],
   limit: 200,
 });
@@ -322,11 +358,12 @@ check(
   `${incrementalRequests} REQs, scanned ${incremental.scanned}`,
 );
 
-// 7. Live subscription with `#t` delivers another author's page.
+// 7. Live subscription (both kinds, `#t`) delivers another author's page —
+//    the same filter shape the production hook opens.
 const liveArrival = deferred();
 const livePageId = crypto.randomUUID();
 await authorA.req(
-  { kinds: [30078], "#t": ["community-doc"], limit: 0 },
+  { kinds: [30623, 30078], "#t": ["community-doc"], limit: 0 },
   {
     onLive: (event) => {
       const page = parseDocPageEvent(event);

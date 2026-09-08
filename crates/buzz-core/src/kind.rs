@@ -448,6 +448,34 @@ pub const KIND_WORKFLOW_DEF: u32 = 30620;
 /// `hidden_at` per viewer; this is the only Nostr-visible projection of it.
 pub const KIND_DM_VISIBILITY: u32 = 30622;
 
+/// Community doc page — the Docs surface's wiki page (parameterized
+/// replaceable, `d="doc:<uuid>"`, `t="community-doc"`).
+///
+/// One addressable event per page; any member may republish a page, and
+/// readers resolve last-write-wins across authors by `created_at`. Content is
+/// a JSON body (title, markdown body, parent id, sibling order, tombstone).
+/// Stored globally (channel_id = NULL) — docs belong to the community, not to
+/// a channel.
+///
+/// Docs previously rode on kind 30078 (NIP-78 app data) behind a `#t` filter.
+/// Because the relay applies `#t` *after* the SQL `LIMIT`, every docs refetch
+/// had to walk the whole shared 30078 window (read-state and every other
+/// per-user blob included). A dedicated kind makes a `kinds`-only REQ exact
+/// again: the window holds only doc pages.
+///
+/// # Deliberately in NO read gate
+///
+/// This kind must stay out of [`AUTHOR_ONLY_KINDS`], [`P_GATED_KINDS`],
+/// [`RESULT_GATED_KINDS`], and [`SHARED_GATED_KINDS`]:
+///
+/// - Docs are the community's shared wiki — every member reads every page,
+///   so none of the privacy gates describe them.
+/// - The client's history scan additionally relies on "no post-filter gate":
+///   only then does a short page mean the window is exhausted. Adding this
+///   kind to any gate would silently break that exhaustion signal (see
+///   `community_doc_sits_in_no_read_gate` below, which pins this).
+pub const KIND_COMMUNITY_DOC: u32 = 30623;
+
 /// Lower bound of the NIP-33 parameterized replaceable range (30000–39999).
 pub const PARAM_REPLACEABLE_KIND_MIN: u32 = 30000;
 /// Upper bound of the NIP-33 parameterized replaceable range (30000–39999).
@@ -728,6 +756,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_AGENT_TURN_METRIC,
     KIND_WORKFLOW_DEF,
+    KIND_COMMUNITY_DOC,
     KIND_LONG_FORM,
     KIND_USER_STATUS,
     KIND_READ_STATE,
@@ -865,6 +894,7 @@ const _: () = assert!(is_parameterized_replaceable(KIND_WORKFLOW_DEF)); // 30620
 const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 30300 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_PROJECT)); // 30621 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_COMMUNITY_DOC)); // 30623 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
 
@@ -1073,6 +1103,33 @@ mod tests {
         );
         let foreign = [0u8; 32];
         assert!(is_unshared_gated_event(&ev, &foreign));
+    }
+
+    /// The Docs client walks the community-doc window with a `kinds`-only
+    /// REQ and treats a short page as "window exhausted". That only holds
+    /// while no post-filter read gate can drop rows after the SQL `LIMIT` —
+    /// and community docs are community-readable wiki content, so no privacy
+    /// gate describes them either. If this test starts failing, the docs
+    /// history scan in `desktop/src/features/docs/lib/docsHistory.ts` must
+    /// switch to a cursor that survives post-filtering before the gate ships.
+    #[test]
+    fn community_doc_sits_in_no_read_gate() {
+        assert!(!AUTHOR_ONLY_KINDS.contains(&KIND_COMMUNITY_DOC));
+        assert!(!P_GATED_KINDS.contains(&KIND_COMMUNITY_DOC));
+        assert!(!RESULT_GATED_KINDS.contains(&KIND_COMMUNITY_DOC));
+        assert!(!SHARED_GATED_KINDS.contains(&KIND_COMMUNITY_DOC));
+        assert!(!is_shared_gated_kind(KIND_COMMUNITY_DOC));
+    }
+
+    /// Community docs are ordinary stored NIP-33 events: addressable per
+    /// page, client-published, never relay-only, never a command.
+    #[test]
+    fn community_doc_is_a_plain_addressable_kind() {
+        assert!(is_parameterized_replaceable(KIND_COMMUNITY_DOC));
+        assert!(!is_ephemeral(KIND_COMMUNITY_DOC));
+        assert!(!is_replaceable(KIND_COMMUNITY_DOC));
+        assert!(!is_relay_only_kind(KIND_COMMUNITY_DOC));
+        assert!(!is_command_kind(KIND_COMMUNITY_DOC));
     }
 
     #[test]

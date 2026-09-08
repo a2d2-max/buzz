@@ -32,12 +32,12 @@ function signedEvent(input) {
   };
 }
 
-function docEvent({ id, eventId, author, createdAt, content }) {
+function docEvent({ id, eventId, author, createdAt, content, kind = 30623 }) {
   return {
     id: eventId.padEnd(64, "0"),
     pubkey: author,
     created_at: createdAt,
-    kind: 30078,
+    kind,
     tags: [
       ["d", `doc:${id}`],
       ["t", "community-doc"],
@@ -421,6 +421,170 @@ test("a relay reconnect triggers a fresh history fetch", async () => {
       for (const listener of docs.reconnectListeners) listener();
     });
     await waitFor(() => assert.equal(docs.historyRequests.length, 2));
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a page stranded on the legacy kind is republished onto the dedicated kind after a complete scan", async () => {
+  // The migration copy must change nothing readers see: identical content,
+  // only the event kind and created_at move.
+  const legacy = docEvent({
+    id: PAGE_ID,
+    eventId: "legacy1",
+    author: AUTHOR_THEM,
+    createdAt: 1_000,
+    content: { body: "legacy body", icon: "📘" },
+    kind: 30078,
+  });
+  const docs = await mountDocs({
+    history: [legacy],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [legacy] },
+  });
+  try {
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() => assert.equal(docs.published.length, 1));
+    const migrated = docs.published[0];
+    assert.equal(migrated.kind, 30623);
+    assert.ok(migrated.created_at > legacy.created_at);
+    const content = JSON.parse(migrated.content);
+    assert.equal(content.body, "legacy body");
+    assert.equal(content.icon, "📘");
+    assert.equal(content.updatedAt, 2, "visible timestamps are untouched");
+    await waitFor(() =>
+      assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventKind, 30623),
+    );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a legacy tombstone is migrated too, and stays a tombstone", async () => {
+  const legacyTombstone = docEvent({
+    id: PAGE_ID,
+    eventId: "legacy-del",
+    author: AUTHOR_THEM,
+    createdAt: 1_000,
+    content: { deleted: true },
+    kind: 30078,
+  });
+  const docs = await mountDocs({
+    history: [legacyTombstone],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [legacyTombstone] },
+  });
+  try {
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() => assert.equal(docs.published.length, 1));
+    assert.equal(docs.published[0].kind, 30623);
+    assert.equal(JSON.parse(docs.published[0].content).deleted, true);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("migration skips a page another client already moved to the dedicated kind", async () => {
+  const legacy = docEvent({
+    id: PAGE_ID,
+    eventId: "legacy1",
+    author: AUTHOR_THEM,
+    createdAt: 1_000,
+    content: {},
+    kind: 30078,
+  });
+  // The scan saw only the legacy row, but the pre-publish `#d` re-read finds
+  // the dedicated-kind successor someone else published meanwhile.
+  const alreadyMigrated = docEvent({
+    id: PAGE_ID,
+    eventId: "migrated",
+    author: AUTHOR_ME,
+    createdAt: 1_001,
+    content: {},
+  });
+  const docs = await mountDocs({
+    history: [legacy],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [legacy, alreadyMigrated] },
+  });
+  try {
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() =>
+      assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventKind, 30623),
+    );
+    assert.equal(docs.published.length, 0, "nothing to republish");
+  } finally {
+    docs.restore();
+  }
+});
+
+test("an identical save on top of a legacy version still publishes, migrating the page", async () => {
+  // planDocPagePublish treats "identical" as a noop only on the dedicated
+  // kind — otherwise an untouched page could sit on the shared 30078 window
+  // forever.
+  const legacyV2 = docEvent({
+    id: PAGE_ID,
+    eventId: "v2legacy",
+    author: AUTHOR_THEM,
+    createdAt: 1_100,
+    content: { body: "v2 body (theirs)", title: "Theirs" },
+    kind: 30078,
+  });
+  const docs = await mountDocs({
+    history: [],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [legacyV2] },
+  });
+  try {
+    const saved = await docs.result.current.updatePage(
+      PAGE_ID,
+      { title: "Theirs", body: "v2 body (theirs)" },
+      { baseEventId: legacyV2.id },
+    );
+    assert.ok(docs.published.length >= 1);
+    assert.equal(docs.published[0].kind, 30623);
+    assert.equal(saved.eventKind, 30623);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a truncated scan does not start the legacy migration", async () => {
+  // A truncated window may have missed the dedicated-kind successor of a
+  // legacy row; migrating from it could resurrect a superseded version.
+  const legacy = docEvent({
+    id: PAGE_ID,
+    eventId: "legacy1",
+    author: AUTHOR_THEM,
+    createdAt: 1_000,
+    content: {},
+    kind: 30078,
+  });
+  const busyRow = (createdAt) => ({
+    id: `busy${createdAt}`.padEnd(64, "0"),
+    pubkey: AUTHOR_THEM,
+    created_at: createdAt,
+    kind: 30078,
+    tags: [
+      ["d", `read-state:${String(createdAt).padStart(32, "0")}`],
+      ["t", "read-state"],
+    ],
+    content: "x",
+    sig: "f".repeat(128),
+  });
+  const docs = await mountDocs({
+    // Every page is full and the cursor keeps moving: the scan burns its
+    // whole budget and reports truncation.
+    history: (filter) => {
+      const top = Math.min(filter.until ?? 60_000, 60_000);
+      const rows = Array.from({ length: filter.limit - 1 }, (_, index) =>
+        busyRow(top - index),
+      );
+      return [legacy, ...rows];
+    },
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [legacy] },
+  });
+  try {
+    assert.equal(docs.result.current.truncated, true);
+    // Give a wrongly-scheduled migration a chance to fire before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(docs.published.length, 0);
   } finally {
     docs.restore();
   }
