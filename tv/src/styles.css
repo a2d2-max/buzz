@@ -1,0 +1,249 @@
+/* 10-foot UI 토큰. 1920x1080 고정 화면 기준.
+ * - 본문 28px 이상, 선택 대상 54px 이상, 가장자리 20px 이상 여백
+ *   (근거: 리서치 문서 4절 — LG UI 가이드/overscan 문서)
+ * - TV 는 단일 다크 테마로 고정한다(거실 화면에서 흰 배경은 눈부심).
+ * - 포커스 링은 항상 보인다 — 5-way 모드에서 "포커스 없는 상태"는 금지. */
+
+:root {
+  --bg: #101014;
+  --bg-raised: #1b1b22;
+  --bg-focus: #26263a;
+  --text: #ececf1;
+  --text-dim: #a0a0b0;
+  --accent: #4f9cf9;
+  --danger: #f97066;
+  --edge: 60px;
+  --focus-ring: 5px;
+  font-size: 32px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    "Apple SD Gothic Neo", "Noto Sans KR", "LG Smart UI", system-ui, sans-serif;
+  font-size: 28px;
+  line-height: 1.45;
+  overflow: hidden;
+}
+
+.screen {
+  height: 100vh;
+  padding: var(--edge);
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.screen-title {
+  font-size: 44px;
+  font-weight: 700;
+  margin: 0;
+  flex: none;
+}
+
+.screen-subtitle {
+  color: var(--text-dim);
+  font-size: 26px;
+  margin: 0;
+  flex: none;
+}
+
+.scroll-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 포커스 링이 스크롤 컨테이너에 잘리지 않게 안쪽 여백을 준다 */
+  padding: var(--focus-ring);
+}
+
+/* 선택 가능한 행/버튼. 최소 높이 54px 을 훨씬 넘긴다. */
+.focusable {
+  min-height: 72px;
+  padding: 16px 28px;
+  border-radius: 14px;
+  background: var(--bg-raised);
+  border: var(--focus-ring) solid transparent;
+  color: var(--text);
+  font-size: 28px;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  cursor: pointer;
+}
+
+.focusable.focused {
+  border-color: var(--accent);
+  background: var(--bg-focus);
+}
+
+.focusable .item-title {
+  font-weight: 600;
+}
+
+.focusable .item-sub {
+  color: var(--text-dim);
+  font-size: 24px;
+}
+
+.message-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.message-meta {
+  display: flex;
+  gap: 16px;
+  align-items: baseline;
+}
+
+.message-author {
+  font-weight: 700;
+  font-size: 26px;
+  color: var(--accent);
+}
+
+.message-time {
+  color: var(--text-dim);
+  font-size: 22px;
+}
+
+.status-line {
+  color: var(--text-dim);
+  font-size: 24px;
+  flex: none;
+}
+
+.status-line.error {
+  color: var(--danger);
+}
+
+/* 마크다운(읽기 전용) */
+.markdown {
+  font-size: 28px;
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.markdown h1 {
+  font-size: 40px;
+}
+.markdown h2 {
+  font-size: 36px;
+}
+.markdown h3 {
+  font-size: 32px;
+}
+
+.markdown pre {
+  background: #0a0a0e;
+  border-radius: 10px;
+  padding: 18px;
+  overflow-x: auto;
+  font-size: 24px;
+}
+
+.markdown code {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.85em;
+}
+
+.markdown a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.markdown img {
+  max-width: 100%;
+}
+
+.markdown table {
+  border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid var(--text-dim);
+  padding: 8px 14px;
+}
+
+.markdown blockquote {
+  border-left: 6px solid var(--text-dim);
+  margin-left: 0;
+  padding-left: 20px;
+  color: var(--text-dim);
+}
+
+/* 설정 화면 입력 */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.field > span {
+  font-size: 26px;
+  color: var(--text-dim);
+}
+
+.field input {
+  min-height: 72px;
+  font-size: 28px;
+  padding: 12px 24px;
+  border-radius: 14px;
+  border: var(--focus-ring) solid transparent;
+  background: var(--bg-raised);
+  color: var(--text);
+  outline: none;
+}
+
+.field input:focus {
+  border-color: var(--accent);
+  background: var(--bg-focus);
+}
+
+/* 종료 확인 오버레이 */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.dialog {
+  background: var(--bg-raised);
+  border-radius: 20px;
+  padding: 48px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+  align-items: center;
+}
+
+.dialog-buttons {
+  display: flex;
+  gap: 24px;
+}
+
+.dialog-buttons .focusable {
+  min-width: 220px;
+  justify-content: center;
+}
