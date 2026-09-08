@@ -10,6 +10,7 @@ import {
 } from "@/shared/ui/dialog";
 import { ONBOARDING_INK_ICON_CLASS } from "./OnboardingChrome";
 import { OnboardingFooter } from "./OnboardingFooter";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const IDENTITY_KEY_HELP_SEEN_STORAGE_KEY =
   "buzz.machine-onboarding.identity-key-help-seen.v1";
@@ -82,18 +83,19 @@ export function IdentityKeyHelpDialog() {
           >
             <div>
               <p>
-                Buzz uses an identity key instead of a traditional account. It’s
-                created on your device and represents you whenever you use Buzz.
+                {BRAND_NAME} uses an identity key instead of a traditional
+                account. It’s created on your device and represents you whenever
+                you use {BRAND_NAME}.
               </p>
               <p>
-                Your identity belongs to you, not Buzz. There’s no password to
-                reset, and Buzz can’t recover your key if you lose it. Keep a
-                backup somewhere safe and never share it. Anyone with your key
-                can act as you.
+                Your identity belongs to you, not {BRAND_NAME}. There’s no
+                password to reset, and {BRAND_NAME} can’t recover your key if
+                you lose it. Keep a backup somewhere safe and never share it.
+                Anyone with your key can act as you.
               </p>
               <p>
-                If you’re new to Buzz, create a new identity key. If you already
-                have a Nostr identity, use your existing key.
+                If you’re new to {BRAND_NAME}, create a new identity key. If you
+                already have a Nostr identity, use your existing key.
               </p>
             </div>
           </DialogDescription>

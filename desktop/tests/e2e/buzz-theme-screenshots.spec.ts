@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const SHOTS = "test-results/buzz-theme";
 const THEME_STORAGE_KEY = "buzz-theme";
@@ -758,7 +759,7 @@ test("app font size and conversation density apply independently", async ({
   await expect(comfortable).toHaveAttribute("aria-pressed", "true");
   await expect(defaultSize).toHaveAttribute("aria-pressed", "true");
   await expect(densityDescription).toHaveText(
-    "Spacing in conversations and Markdown content across Buzz",
+    `Spacing in conversations and Markdown content across ${BRAND_NAME}`,
   );
   await expect(fontSizeDescription).toHaveText(
     "Applies across conversations and interface text",

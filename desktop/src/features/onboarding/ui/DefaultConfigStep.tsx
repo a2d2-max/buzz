@@ -32,6 +32,7 @@ import {
   getVisibleOnboardingRuntimes,
 } from "./onboardingRuntimeSelection";
 import type { DefaultConfigDraft, DefaultConfigStepActions } from "./types";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type DefaultConfigStepProps = {
   actions: DefaultConfigStepActions;
@@ -43,7 +44,7 @@ type DefaultConfigStepProps = {
 
 function formatHarnessLabel(runtime: AcpRuntimeCatalogEntry | undefined) {
   if (!runtime) return "Select a harness";
-  return runtime.id === "buzz-agent" ? "Buzz" : runtime.label;
+  return runtime.id === "buzz-agent" ? BRAND_NAME : runtime.label;
 }
 
 function AgentDefaultsSection({
@@ -357,9 +358,9 @@ export function DefaultConfigStep({
           Configure your default model settings
         </h1>
         <p className="mx-auto mt-3 max-w-[440px] text-sm leading-5 text-foreground/80">
-          This will be set as your default model configuration across Buzz. You
-          can always change this in your Settings or give specific agents a
-          different configuration.
+          This will be set as your default model configuration across{" "}
+          {BRAND_NAME}. You can always change this in your Settings or give
+          specific agents a different configuration.
         </p>
       </div>
 

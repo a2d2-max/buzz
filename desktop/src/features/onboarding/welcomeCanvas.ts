@@ -1,6 +1,7 @@
 import { getCanvas, setCanvas } from "@/shared/api/tauri";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
-export const WELCOME_CANVAS_CONTENT = `# Welcome to Buzz
+export const WELCOME_CANVAS_CONTENT = `# Welcome to ${BRAND_NAME}
 
 This private channel is your home base for getting oriented. Fizz, Honey, and Pollen can help you learn the app, troubleshoot setup, and work through something you are building.
 

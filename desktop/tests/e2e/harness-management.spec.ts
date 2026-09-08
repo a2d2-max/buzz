@@ -22,6 +22,7 @@ import { expect, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { passThroughBackupStep } from "../helpers/onboarding";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 // ── Shared catalog fixtures ───────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ const HERMES_AVAILABLE = {
   binary_path: "/usr/local/bin/hermes-acp",
   default_args: [],
   mcp_command: null,
-  install_hint: "Buzz talks to Hermes Agent through its hermes-acp command.",
+  install_hint: `${BRAND_NAME} talks to Hermes Agent through its hermes-acp command.`,
   install_instructions_url: "https://hermes-agent.nousresearch.com",
   can_auto_install: false,
   requires_external_cli: true,
@@ -55,8 +56,7 @@ const OPENCLAW_NOT_INSTALLED = {
   binary_path: null,
   default_args: ["acp"],
   mcp_command: null,
-  install_hint:
-    "Buzz talks to OpenClaw through its ACP mode (openclaw acp), which relies on the OpenClaw Gateway daemon. Follow the setup guide to install both.",
+  install_hint: `${BRAND_NAME} talks to OpenClaw through its ACP mode (openclaw acp), which relies on the OpenClaw Gateway daemon. Follow the setup guide to install both.`,
   install_instructions_url: "https://docs.openclaw.ai/start/getting-started",
   can_auto_install: false,
   requires_external_cli: true,
@@ -78,7 +78,7 @@ const CURSOR_AVAILABLE = {
   binary_path: "/usr/local/bin/cursor-agent",
   default_args: [],
   mcp_command: null,
-  install_hint: "Buzz talks to Cursor through the cursor-agent CLI's ACP mode.",
+  install_hint: `${BRAND_NAME} talks to Cursor through the cursor-agent CLI's ACP mode.`,
   install_instructions_url: "https://cursor.com/cli",
   can_auto_install: false,
   requires_external_cli: true,

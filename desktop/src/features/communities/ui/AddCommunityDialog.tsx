@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/shared/ui/dialog";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type AddCommunityDialogProps = {
   prefill?: AddCommunityPrefillRequest | null;
@@ -146,7 +147,7 @@ export function AddCommunityDialog({
                     Create a new community
                   </span>
                   <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
-                    Claim a Buzz address for your team.
+                    Claim an {BRAND_NAME} address for your team.
                   </span>
                 </span>
                 <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60" />

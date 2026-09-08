@@ -4,6 +4,7 @@ import type {
 } from "@/shared/api/types";
 import { BUZZ_AGENT_THINKING_EFFORT } from "./buzzAgentConfig";
 import type { RuntimeFileConfigSubset } from "@/shared/api/tauri";
+import { BRAND_NAME } from "@/shared/constants/brand";
 // Dialogs import getDefaultPersonaRuntime via this re-export; lib code imports
 // directly from lib/resolvePersonaRuntime.
 export { getDefaultPersonaRuntime } from "../lib/resolvePersonaRuntime";
@@ -147,7 +148,7 @@ export const PERSONA_LLM_PROVIDER_OPTIONS: readonly PersonaModelOption[] = [
   { id: "openai", label: "OpenAI" },
   { id: "openai-compat", label: "OpenAI-compatible" },
   { id: "openrouter", label: "OpenRouter" },
-  { id: "relay-mesh", label: "Buzz shared compute" },
+  { id: "relay-mesh", label: `${BRAND_NAME} shared compute` },
   { id: "databricks", label: "Databricks" },
   { id: "databricks_v2", label: "Databricks v2" },
 ];
@@ -314,7 +315,7 @@ export function providerRequiresExplicitModel(
 export function providerDisplayLabel(providerId: string) {
   const trimmedProvider = providerId.trim();
   return trimmedProvider === "relay-mesh"
-    ? "Buzz shared compute"
+    ? `${BRAND_NAME} shared compute`
     : trimmedProvider;
 }
 

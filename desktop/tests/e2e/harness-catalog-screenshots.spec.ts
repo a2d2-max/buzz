@@ -2,6 +2,7 @@ import { test, expect } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const SHOTS = "test-results/byoh-after";
 
@@ -13,7 +14,7 @@ const SHOTS = "test-results/byoh-after";
 const CATALOG = [
   {
     id: "buzz-agent",
-    label: "Buzz Agent",
+    label: `${BRAND_NAME} Agent`,
     avatar_url: "",
     availability: "available",
     command: "buzz-agent",
@@ -70,8 +71,7 @@ const CATALOG = [
     binary_path: "/usr/local/bin/cursor-agent",
     default_args: ["acp"],
     mcp_command: null,
-    install_hint:
-      "Buzz talks to Cursor through the cursor-agent CLI's ACP mode.",
+    install_hint: `${BRAND_NAME} talks to Cursor through the cursor-agent CLI's ACP mode.`,
     install_instructions_url: "https://cursor.com/downloads",
     can_auto_install: false,
     underlying_cli_path: null,
@@ -88,8 +88,7 @@ const CATALOG = [
     binary_path: null,
     default_args: ["acp"],
     mcp_command: null,
-    install_hint:
-      "Buzz talks to Oh My Pi through its CLI's ACP mode (omp acp).",
+    install_hint: `${BRAND_NAME} talks to Oh My Pi through its CLI's ACP mode (omp acp).`,
     install_instructions_url: "https://github.com/can1357/oh-my-pi",
     can_auto_install: false,
     underlying_cli_path: null,
@@ -106,8 +105,7 @@ const CATALOG = [
     binary_path: null,
     default_args: ["acp"],
     mcp_command: null,
-    install_hint:
-      "Buzz talks to OpenCode through its CLI's ACP mode (opencode acp).",
+    install_hint: `${BRAND_NAME} talks to OpenCode through its CLI's ACP mode (opencode acp).`,
     install_instructions_url: "https://opencode.ai/docs",
     can_auto_install: false,
     underlying_cli_path: null,

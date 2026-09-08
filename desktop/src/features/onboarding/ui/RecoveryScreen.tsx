@@ -3,6 +3,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { useSystemColorScheme } from "@/shared/theme/useSystemColorScheme";
 import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export function RecoveryScreen({
   testId,
@@ -33,7 +34,7 @@ export function RecoveryScreen({
           }}
           type="button"
         >
-          Relaunch Buzz
+          Relaunch {BRAND_NAME}
         </Button>
       </div>
     </div>

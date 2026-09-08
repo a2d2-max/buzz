@@ -43,6 +43,7 @@ import {
 import { Switch } from "@/shared/ui/switch";
 import { SettingsOptionRow } from "./SettingsOptionGroup";
 import { SegmentedControl } from "@/shared/ui/segmented-control";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 /** Buzz navigation can use either its production tint or a stronger tab. */
 export function ProminentActiveTabSetting() {
@@ -234,7 +235,7 @@ export function ConversationDisplaySettings() {
             className="text-sm font-normal text-muted-foreground/70"
             data-settings-subcopy
           >
-            Spacing in conversations and Markdown content across Buzz
+            Spacing in conversations and Markdown content across {BRAND_NAME}
           </p>
         </div>
         <SegmentedControl
@@ -668,7 +669,7 @@ export function AccentPickerContent({
           className="text-sm font-normal text-muted-foreground/70"
           data-settings-subcopy
         >
-          Choose the highlight color used throughout Buzz.
+          Choose the highlight color used throughout {BRAND_NAME}.
         </p>
       </div>
       <div

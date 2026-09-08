@@ -4,6 +4,7 @@ import { Badge } from "@/shared/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import type { RestartDiffEntry, RestartChange } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 // ── Auto-restart copy ─────────────────────────────────────────────────────────
 
@@ -11,8 +12,7 @@ import { cn } from "@/shared/lib/cn";
  * Shared blurb strings for the auto-restart state. Exported so the Runtime-tab
  * banner can import the same constants — the two surfaces must never drift.
  */
-export const AUTO_RESTART_ON_BLURB =
-  "Configuration changed since this agent started. Buzz can restart it automatically after ~3 minutes idle, or stop and respawn it to apply now.";
+export const AUTO_RESTART_ON_BLURB = `Configuration changed since this agent started. ${BRAND_NAME} can restart it automatically after ~3 minutes idle, or stop and respawn it to apply now.`;
 
 export const AUTO_RESTART_OFF_BLURB =
   "Configuration changed since this agent started. Automatic restart is off for this agent — stop and respawn it to apply the changes.";

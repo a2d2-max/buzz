@@ -10,6 +10,7 @@ import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import { PubKey } from "@/shared/ui/PubKey";
 import { Spinner } from "@/shared/ui/spinner";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type BackupTestStage = "drop" | "password" | "success";
 
@@ -264,7 +265,7 @@ export function BackupTestFlow({
           </p>
           <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
             {result.matchesCurrentIdentity
-              ? "It restores your current Buzz identity."
+              ? `It restores your current ${BRAND_NAME} identity.`
               : "It restores a different identity than the one signed in here."}
           </p>
           <div className="mt-3 flex justify-center">

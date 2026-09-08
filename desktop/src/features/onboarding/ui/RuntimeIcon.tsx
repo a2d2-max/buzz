@@ -6,6 +6,7 @@ import { cn } from "@/shared/lib/cn";
 import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
 import claudeLogoUrl from "../assets/harness-logos/claude.png?inline";
 import { RUNTIME_MARKS } from "./HarnessMarks";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 // Bundled logos for compiled-in runtimes (inline base64, no network fetch).
 // Monochrome marks live in RUNTIME_MARKS instead — inline SVGs that follow
@@ -35,7 +36,7 @@ function isBuzzRuntime(runtime: AcpRuntimeCatalogEntry): boolean {
 export function getRuntimeDisplayLabel(
   runtime: AcpRuntimeCatalogEntry,
 ): string {
-  return isBuzzRuntime(runtime) ? "Buzz" : runtime.label;
+  return isBuzzRuntime(runtime) ? BRAND_NAME : runtime.label;
 }
 
 function getRuntimeLogoUrl(runtime: AcpRuntimeCatalogEntry): string | null {

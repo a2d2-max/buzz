@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, afterEach, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
+import { BRAND_NAME } from "../shared/constants/brand.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -77,7 +78,7 @@ test("root boundary shows recovery UI without exposing error details", async () 
     createElement(RootErrorBoundary, null, createElement(ThrowingProvider)),
   );
 
-  assert.ok(screen.getByText("Buzz failed to start"));
+  assert.ok(screen.getByText(`${BRAND_NAME} failed to start`));
   assert.ok(screen.getByRole("button", { name: "Reload" }));
   assert.equal(document.body.textContent.includes(diagnostic), false);
   assert.match(document.body.textContent, /contact support/i);

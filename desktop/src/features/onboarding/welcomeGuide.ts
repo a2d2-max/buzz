@@ -21,6 +21,7 @@ import type {
   UpdateManagedAgentInput,
 } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export const WELCOME_GUIDE_AGENT_NAME = "Fizz";
 export const WELCOME_GUIDE_PERSONA_ID = "builtin:fizz";
@@ -29,8 +30,7 @@ export const WELCOME_GUIDE_INTRO_MARKER = "buzz-welcome-intro.v1";
 const LEGACY_WELCOME_GUIDE_AGENT_NAME = "Kit";
 export const LEGACY_WELCOME_GUIDE_SYSTEM_PROMPT =
   "You are Kit, Sprout's friendly welcome guide. Help new users understand the community, channels, messages, and agents. Keep introductions concise, practical, and warm.";
-export const WELCOME_GUIDE_INTRO_MESSAGE =
-  "Hi, I'm Fizz. Welcome to Buzz.\n\nI can help you get oriented, answer questions, and make the first few steps feel less mysterious.\n\nFeel free to ask me what else you can do in Buzz, or just talk through what you want to build.";
+export const WELCOME_GUIDE_INTRO_MESSAGE = `Hi, I'm Fizz. Welcome to ${BRAND_NAME}.\n\nI can help you get oriented, answer questions, and make the first few steps feel less mysterious.\n\nFeel free to ask me what else you can do in ${BRAND_NAME}, or just talk through what you want to build.`;
 
 export type WelcomeTeamRole = "lead" | "teammate";
 

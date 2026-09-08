@@ -30,6 +30,7 @@ import {
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { SignOutSection } from "./SignOutSection";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type ProfileSettingsCardProps = {
   currentPubkey?: string;
@@ -486,7 +487,7 @@ export function ProfileSettingsCard({
       <div>
         <SettingsSectionHeader
           title="Profile"
-          description="Update how your name, avatar, and bio appear across Buzz."
+          description={`Update how your name, avatar, and bio appear across ${BRAND_NAME}.`}
         />
 
         <div className="space-y-3">

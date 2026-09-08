@@ -21,6 +21,7 @@ import { StyledQrCode } from "@/shared/ui/styled-qr-code";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type PairingStep =
   | "idle"
@@ -126,7 +127,8 @@ function PairingSteps({ step }: { step: PairingStep }) {
             className="mt-1 text-sm text-muted-foreground/70"
             data-settings-subcopy
           >
-            Open Buzz on your mobile device and scan the code shown here.
+            Open {BRAND_NAME} on your mobile device and scan the code shown
+            here.
           </p>
         </div>
       </li>
@@ -397,9 +399,9 @@ export function MobilePairingCard({
         title="Mobile"
         description={
           <>
-            Connect the Buzz mobile app to this relay by scanning a QR code. The
-            connection is secured with end-to-end encryption and a verification
-            code.
+            Connect the {BRAND_NAME} mobile app to this relay by scanning a QR
+            code. The connection is secured with end-to-end encryption and a
+            verification code.
           </>
         }
       />

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { formatMessageNotification } from "./notificationFormat.ts";
 import { senderNameFromSummary } from "./senderName.ts";
+import { BRAND_NAME } from "../../../shared/constants/brand.ts";
 
 test("DM title is the sender name when resolved", () => {
   const { title, body } = formatMessageNotification({
@@ -125,7 +126,7 @@ test("approval and needs-action titles match the home-feed conventions", () => {
     }),
     {
       title: "Needs Action",
-      body: "Something in Buzz needs your attention.",
+      body: `Something in ${BRAND_NAME} needs your attention.`,
     },
   );
 });

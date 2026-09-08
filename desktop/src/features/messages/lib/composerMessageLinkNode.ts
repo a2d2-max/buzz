@@ -22,6 +22,7 @@ import {
 import { buildChannelLink, parseChannelLink } from "./channelLink";
 import { getMessageLinkLabel } from "./messageLinkLabel";
 import { buildMessageLink, parseMessageLink } from "./messageLink";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export const COMPOSER_MESSAGE_LINK_NODE_NAME = "composerMessageLink";
 
@@ -383,11 +384,11 @@ function composerLinkPresentation(
   const entity = parseEntityLink(href);
   if (!entity.ok) {
     return {
-      ariaLabel: "Buzz link",
+      ariaLabel: `${BRAND_NAME} link`,
       channelName: "",
       dataAttributes: {},
       icon: "message",
-      label: "Buzz link",
+      label: `${BRAND_NAME} link`,
     };
   }
 

@@ -15,6 +15,7 @@ import {
 import { markCommunityDiscoveryAfterLeave } from "@/features/communities/communityStorage";
 import type { useCommunities } from "@/features/communities/useCommunities";
 import { leaveCommunity } from "@/features/communities/leaveCommunity";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type Communities = ReturnType<typeof useCommunities>;
 type ShellRoute = ReturnType<typeof deriveShellRoute>;
@@ -98,7 +99,7 @@ export function useCommunityNavigationTransitions({
       if (!fallback) {
         if (!markCommunityDiscoveryAfterLeave()) {
           throw new Error(
-            "Membership was removed, but community discovery state could not be saved. Restart Buzz and try again.",
+            `Membership was removed, but community discovery state could not be saved. Restart ${BRAND_NAME} and try again.`,
           );
         }
         await goHome({ replace: true });

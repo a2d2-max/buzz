@@ -7,6 +7,7 @@ import {
   openProjectRepositoryFolder,
 } from "@/shared/api/projectGit";
 import { useOpenProjectTerminal } from "./useOpenProjectTerminal";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type MergeRecoveryInput = {
   expectedCommit: string;
@@ -41,7 +42,7 @@ export function useProjectRepositoryOpenActions({
     const cloneUrl = repository?.cloneUrls[0];
     if (!localRepositoryPath || !repository || !cloneUrl) {
       toast.error("Couldn’t open repository folder", {
-        description: "Buzz could not find this repository’s local checkout.",
+        description: `${BRAND_NAME} could not find this repository’s local checkout.`,
       });
       return;
     }
@@ -53,7 +54,7 @@ export function useProjectRepositoryOpenActions({
       });
     } catch {
       toast.error("Couldn’t open repository folder", {
-        description: "Buzz could not open this checkout in your file browser.",
+        description: `${BRAND_NAME} could not open this checkout in your file browser.`,
       });
     }
   }, [localRepositoryPath, repository, reposDir]);

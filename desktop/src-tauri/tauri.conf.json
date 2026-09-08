@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Buzz",
+  "productName": "a2d2",
   "version": "0.5.23",
   "identifier": "xyz.block.buzz.app",
   "build": {

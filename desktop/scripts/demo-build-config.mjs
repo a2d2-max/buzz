@@ -10,7 +10,7 @@ const DEMO_BUILD_ID_SUFFIX_LENGTH = 17;
 const MAX_DEMO_NAME_LENGTH = MAX_DEMO_SLUG_LENGTH - DEMO_BUILD_ID_SUFFIX_LENGTH;
 
 export const productionBuildIdentity = Object.freeze({
-  productName: "Buzz",
+  productName: "a2d2",
   identifier: PRODUCTION_IDENTIFIER,
   deepLinkScheme: "buzz",
   keyringService: "buzz-desktop",
@@ -47,7 +47,7 @@ export function demoBuildConfig(
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
   const slug = `${readableSlug}-${buildId}`;
-  const productName = `Buzz ${name}`;
+  const productName = `a2d2 ${name}`;
   return {
     name,
     slug,

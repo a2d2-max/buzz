@@ -17,6 +17,7 @@ import { Checkbox } from "@/shared/ui/checkbox";
 import { Input } from "@/shared/ui/input";
 import { Spinner } from "@/shared/ui/spinner";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 /**
  * The exact phrase the user must type before the destructive sign-out button
@@ -162,8 +163,8 @@ export function SignOutSection() {
             <AlertDialogTitle>Sign out and wipe all data?</AlertDialogTitle>
             <AlertDialogDescription>
               This will delete your identity key, all agent settings, and cached
-              data from this device, then relaunch Buzz into first-run setup.
-              This cannot be undone.
+              data from this device, then relaunch {BRAND_NAME} into first-run
+              setup. This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
 

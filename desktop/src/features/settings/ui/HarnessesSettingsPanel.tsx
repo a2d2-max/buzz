@@ -14,6 +14,7 @@ import { HarnessCatalogDialog } from "./HarnessCatalogDialog";
 import { HarnessRow } from "./HarnessRow";
 import { stableRowOrder, yourHarnessEntries } from "./harnessCatalogLogic";
 import { SettingsOptionGroup } from "./SettingsOptionGroup";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 function GitBashCard({
   prerequisite,
@@ -113,7 +114,7 @@ export function HarnessesSettingsPanel() {
   return (
     <SettingsOptionGroup
       data-testid="settings-harnesses"
-      description="Choose which agent tools Buzz can use on this device."
+      description={`Choose which agent tools ${BRAND_NAME} can use on this device.`}
       headerAction={
         <Button
           disabled={isRefreshing}

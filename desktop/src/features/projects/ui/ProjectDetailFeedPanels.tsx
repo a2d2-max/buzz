@@ -35,6 +35,7 @@ import { PROJECT_DETAIL_PANEL_CLASS } from "./projectPanelStyles";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectWorkItemRow } from "./ProjectWorkItemRow";
 import { ProjectPanelState } from "./ProjectPanelState";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 function pluralize(count: number, singular: string, plural = `${singular}s`) {
   return `${count} ${count === 1 ? singular : plural}`;
@@ -96,7 +97,9 @@ export function ContributorsPanel({
       profileLinked: matchedPubkey !== null,
       reviewCount: signedCounts?.reviews ?? null,
       role: signedPubkey
-        ? matchedProfile?.nip05Handle || contributor.email || "Buzz contributor"
+        ? matchedProfile?.nip05Handle ||
+          contributor.email ||
+          `${BRAND_NAME} contributor`
         : heuristicProfile
           ? `${
               heuristicProfile.profile.nip05Handle ||
@@ -135,7 +138,7 @@ export function ContributorsPanel({
         reviewCount: signedCounts.reviews,
         role:
           profile?.nip05Handle ||
-          (isAgent ? "Agent contributor" : "Buzz contributor"),
+          (isAgent ? "Agent contributor" : `${BRAND_NAME} contributor`),
         taskCount: signedCounts.tasks,
       };
     });

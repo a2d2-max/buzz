@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
 import { openSettings } from "../helpers/settings";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const SHOTS = "test-results/screenshots-doctor";
 
@@ -33,7 +34,7 @@ const GOOSE_AVAILABLE = {
 /** buzz-agent is always available and has no auth step. */
 const BUZZ_AGENT_AVAILABLE = {
   id: "buzz-agent",
-  label: "Buzz Agent",
+  label: `${BRAND_NAME} Agent`,
   avatar_url: "",
   availability: "available",
   command: "buzz-agent",
@@ -83,7 +84,7 @@ const CODEX_NOT_INSTALLED = {
   binary_path: null,
   default_args: [],
   mcp_command: null,
-  install_hint: "Buzz talks to Codex through the Codex CLI.",
+  install_hint: `${BRAND_NAME} talks to Codex through the Codex CLI.`,
   install_instructions_url: "https://developers.openai.com/codex/cli/",
   can_auto_install: true,
   underlying_cli_path: null,
@@ -222,7 +223,7 @@ test.describe("Doctor panel state screenshots", () => {
       0,
     );
     await expect(page.getByTestId("doctor-runtime-codex")).not.toContainText(
-      "Buzz talks to Codex through the Codex CLI.",
+      `${BRAND_NAME} talks to Codex through the Codex CLI.`,
     );
 
     await runtimeList.scrollIntoViewIfNeeded();
@@ -471,10 +472,9 @@ test.describe("Doctor panel state screenshots", () => {
               command: "discover codex",
               success: false,
               stdout: "",
-              stderr:
-                "The installer finished, but Buzz still could not use codex (observed: NotInstalled).",
+              stderr: `The installer finished, but ${BRAND_NAME} still could not use codex (observed: NotInstalled).`,
               exit_code: null,
-              hint: "Buzz requires the vendor CLI executable, not only its desktop app. If the CLI was installed while Buzz was open, restart Buzz and check again.",
+              hint: `${BRAND_NAME} requires the vendor CLI executable, not only its desktop app. If the CLI was installed while ${BRAND_NAME} was open, restart ${BRAND_NAME} and check again.`,
             },
           ],
         },
@@ -828,7 +828,7 @@ test.describe("Doctor panel state screenshots", () => {
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toContainText("Update Codex adapter?");
     await expect(dialog).toContainText(
-      "Older Buzz releases using the legacy adapter may lose community access",
+      `Older ${BRAND_NAME} releases using the legacy adapter may lose community access`,
     );
     await expect(page.getByTestId("doctor-runtime-loading-codex")).toHaveCount(
       0,

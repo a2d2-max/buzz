@@ -34,11 +34,11 @@ fn failure(
         success: false,
         stdout: String::new(),
         stderr: format!(
-            "The installer finished, but Buzz still could not use {runtime_id} (observed: {observed})."
+            "The installer finished, but a2d2 still could not use {runtime_id} (observed: {observed})."
         ),
         exit_code: None,
         hint: Some(
-            "Buzz requires the vendor CLI executable, not only its desktop app. If the CLI was installed while Buzz was open, restart Buzz and check again."
+            "a2d2 requires the vendor CLI executable, not only its desktop app. If the CLI was installed while a2d2 was open, restart a2d2 and check again."
                 .to_string(),
         ),
     })

@@ -32,6 +32,7 @@ import { getProfile } from "@/shared/api/tauriProfiles";
 import type { Channel, ManagedAgent, RelayEvent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { useQueryClient } from "@tanstack/react-query";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export const WELCOME_KICKOFF_OPENER_MARKER = "buzz-welcome-kickoff.opener.v1";
 export const WELCOME_KICKOFF_CLOSER_MARKER = "buzz-welcome-kickoff.closer.v1";
@@ -179,10 +180,10 @@ export function buildWelcomeKickoffOpener(
   if (introTeammates.length === 0) {
     const teammateNames = formatAgentNames(allTeammates);
     const teammatePhrase = teammateNames ? ` with ${teammateNames}` : "";
-    return `${greeting} Welcome to Buzz. This is your private home base, and I'm here${teammatePhrase} to help you get oriented or work through something you're building.\n\n${WELCOME_KICKOFF_CTA}`;
+    return `${greeting} Welcome to ${BRAND_NAME}. This is your private home base, and I'm here${teammatePhrase} to help you get oriented or work through something you're building.\n\n${WELCOME_KICKOFF_CTA}`;
   }
 
-  return `${greeting} Welcome to Buzz. This is your private home base, and we're here to help you get oriented or work through something you're building.\n\n${introNames}, introduce ${introTeammates.length === 1 ? "yourself" : "yourselves"} in a sentence or two — share what you're good at and when to bring you in. Don't start any work yet.`;
+  return `${greeting} Welcome to ${BRAND_NAME}. This is your private home base, and we're here to help you get oriented or work through something you're building.\n\n${introNames}, introduce ${introTeammates.length === 1 ? "yourself" : "yourselves"} in a sentence or two — share what you're good at and when to bring you in. Don't start any work yet.`;
 }
 
 export function onlineWelcomeTeammates(

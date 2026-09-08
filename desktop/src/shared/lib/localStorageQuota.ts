@@ -1,3 +1,4 @@
+import { BRAND_NAME } from "@/shared/constants/brand";
 /**
  * Quota-aware localStorage writes with pure-cache eviction recovery.
  *
@@ -132,8 +133,7 @@ function notifyStorageFull(): void {
   import("sonner")
     .then(({ toast }) => {
       toast.error("Local storage is full", {
-        description:
-          "Buzz could not save some local data — read positions may not persist across restarts.",
+        description: `${BRAND_NAME} could not save some local data — read positions may not persist across restarts.`,
       });
     })
     .catch(() => {});

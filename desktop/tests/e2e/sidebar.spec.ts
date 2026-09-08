@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "buzz-sidebar-width";
 const COMMUNITY_ONBOARDING_STORAGE_KEY =
@@ -251,7 +252,7 @@ test("automatically shows community join requirements near the community URL", a
 
   const ageConfirmation = page.getByLabel("I am 18 years of age or older.");
   const agreementConfirmation = page.getByLabel(
-    "I agree to the Buzz Terms of Service and Privacy Policy.",
+    `I agree to the ${BRAND_NAME} Terms of Service and Privacy Policy.`,
   );
   await expect(ageConfirmation).toBeVisible();
   await expect(agreementConfirmation).toBeVisible();

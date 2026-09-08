@@ -32,6 +32,7 @@ import {
   OnboardingSlideTransition,
 } from "./OnboardingSlideTransition";
 import type { SetupStepActions, SetupStepState } from "./types";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 type SetupStepProps = {
   actions: SetupStepActions;
@@ -370,8 +371,8 @@ function RuntimeDetails({ runtime }: { runtime: AcpRuntimeCatalogEntry }) {
           <code className="rounded bg-white/10 px-0.5 font-mono text-xs text-white">
             codex-acp
           </code>{" "}
-          adapter. Older Buzz releases using the legacy adapter contract may
-          lose community access until{" "}
+          adapter. Older {BRAND_NAME} releases using the legacy adapter contract
+          may lose community access until{" "}
           <code className="rounded bg-white/10 px-0.5 font-mono text-xs text-white">
             @zed-industries/codex-acp@0.16.0
           </code>{" "}
@@ -661,8 +662,8 @@ function RuntimeProvidersSection({
           Set up your agent harnesses
         </h1>
         <p className="mx-auto mt-3 max-w-[760px] text-sm leading-6 text-foreground/90">
-          Buzz checks for command-line harnesses on this machine. Install the
-          CLI or sign in to at least one to continue.
+          {BRAND_NAME} checks for command-line harnesses on this machine.
+          Install the CLI or sign in to at least one to continue.
         </p>
       </div>
 

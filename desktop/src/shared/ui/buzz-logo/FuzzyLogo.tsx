@@ -2,6 +2,7 @@ import { cn } from "@/shared/lib/cn";
 import BuzzLogoAnimation, {
   type BuzzLogoAnimationProps,
 } from "./BuzzLogoAnimation";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export type FuzzyLogoProps = {
   /** When false, skips the looping feTurbulence texture filter and uses a CSS pulse instead. */
@@ -25,7 +26,7 @@ export type FuzzyLogoProps = {
 export function FuzzyLogo({
   fuzz = true,
   className,
-  ariaLabel = "Buzz logo",
+  ariaLabel = `${BRAND_NAME} logo`,
   loop = false,
   loopRestSeconds = 0,
   pulse = true,

@@ -7,6 +7,7 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { getErrorMessage } from "./useMentionSendFlow.helpers";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 /**
  * Detached starts still in flight, keyed by the full tenant scope the wake
@@ -151,7 +152,7 @@ export function useDetachedAgentStart(): (
         // communities.
         warnAgentMayNotRespond(
           agent.name,
-          "Buzz is still connecting to this community — mention the agent again in a moment.",
+          `${BRAND_NAME} is still connecting to this community — mention the agent again in a moment.`,
         );
         return false;
       }

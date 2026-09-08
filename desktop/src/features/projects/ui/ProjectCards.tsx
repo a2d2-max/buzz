@@ -53,6 +53,7 @@ import { CopyShareLinkMenuItem } from "./CopyShareLinkMenuItem";
 import { ProjectEntityListRow } from "./ProjectEntityListRow";
 import { PROJECT_GRID_CARD_BODY_CLASS } from "./projectGridCardStyles";
 import { ProjectListRowMenu } from "./ProjectListRowMenu";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export function ProjectPeopleStack({
   pubkeys,
@@ -255,7 +256,7 @@ function RepositoryUnavailableIndicator({
   if (!reason) return null;
   const status = {
     authentication: {
-      description: "Buzz could not authenticate with this repository.",
+      description: `${BRAND_NAME} could not authenticate with this repository.`,
       label: "Access failed",
     },
     missing: {
@@ -281,7 +282,7 @@ function RepositoryUnavailableIndicator({
       label: "Branch missing",
     },
     unknown: {
-      description: "Buzz could not load this repository.",
+      description: `${BRAND_NAME} could not load this repository.`,
       label: "Unavailable",
     },
   } satisfies Record<

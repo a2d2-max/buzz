@@ -67,6 +67,7 @@ import { uploadMediaBytes } from "@/shared/api/tauri";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { Spinner } from "@/shared/ui/spinner";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export function AnimatedAvatarCapture({
   disabled = false,
@@ -378,7 +379,7 @@ export function AnimatedAvatarCapture({
       } catch {
         releaseCamera();
         setErrorMessage(
-          "Could not access the camera. Check Buzz's camera permission and try again.",
+          `Could not access the camera. Check ${BRAND_NAME}'s camera permission and try again.`,
         );
         setPhase("idle");
       }

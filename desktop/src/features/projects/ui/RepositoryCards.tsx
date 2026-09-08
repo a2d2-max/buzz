@@ -42,6 +42,7 @@ import { GitHubMark } from "./GitHubMark";
 import { ProjectListRowMenu } from "./ProjectListRowMenu";
 import { PROJECT_GRID_CARD_BODY_CLASS } from "./projectGridCardStyles";
 import { projectTerminalLabel } from "./useOpenProjectTerminal";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export type RepositoryListItem = {
   project: Project;
@@ -67,7 +68,7 @@ function RepositoryHostIcon({
   const host = projectRepoHostForRepository(repository, useRelayOrigin());
   const label =
     host.kind === "buzz"
-      ? "Buzz-hosted repository"
+      ? `${BRAND_NAME}-hosted repository`
       : host.kind === "external"
         ? `Git data hosted on ${host.host}`
         : "Repository host";

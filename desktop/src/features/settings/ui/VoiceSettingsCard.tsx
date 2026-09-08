@@ -34,6 +34,7 @@ import {
   voiceOptionLabel,
   voicesForBackend,
 } from "./voiceSettingsLogic";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 export type TtsSettings = {
   version: number;
@@ -188,7 +189,7 @@ export function VoiceSettingsCard() {
     <section className="min-w-0" data-testid="settings-voice">
       <SettingsSectionHeader
         title="Voice"
-        description="Choose whether Buzz reads new agent responses aloud during an active huddle."
+        description={`Choose whether ${BRAND_NAME} reads new agent responses aloud during an active huddle.`}
       />
 
       <SettingsOptionGroupList>

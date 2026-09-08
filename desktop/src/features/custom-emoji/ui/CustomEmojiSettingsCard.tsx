@@ -18,6 +18,7 @@ import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup";
 import { SettingsSectionHeader } from "@/features/settings/ui/SettingsSectionHeader";
+import { BRAND_NAME } from "@/shared/constants/brand";
 
 /**
  * Custom emoji management (NIP-30, kind:30030). Each member owns their own set:
@@ -231,8 +232,8 @@ export function CustomEmojiSettingsCard() {
                     className="text-sm font-normal text-muted-foreground/70"
                     data-settings-subcopy
                   >
-                    Choose an image first; Buzz will suggest a name from the
-                    filename.
+                    Choose an image first; {BRAND_NAME} will suggest a name from
+                    the filename.
                   </p>
                 ) : ownDuplicate ? (
                   <p
