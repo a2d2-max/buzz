@@ -129,6 +129,36 @@ export function parseDocPageEvent(event: RelayEvent): DocPage | null {
   return page;
 }
 
+/**
+ * Relay ceiling on event content (`MAX_EVENT_CONTENT_BYTES` in buzz-relay's
+ * ingest). Anything larger is rejected — and a page that also overflows the
+ * WebSocket frame limit drops the connection instead of answering, so the
+ * client must measure before it signs.
+ */
+export const DOC_MAX_CONTENT_BYTES = 256 * 1024;
+
+/** True when the two would render and sort identically; timestamps are ignored. */
+export function docPageContentEquals(
+  a: DocPageContent,
+  b: DocPageContent,
+): boolean {
+  return (
+    a.title === b.title &&
+    a.body === b.body &&
+    a.parentId === b.parentId &&
+    a.order === b.order &&
+    (a.icon ?? undefined) === (b.icon ?? undefined) &&
+    Boolean(a.deleted) === Boolean(b.deleted)
+  );
+}
+
+/** UTF-8 size of the event content the page would be published with. */
+export function measureDocPageContentBytes(
+  page: DocPageContent & { id: string },
+): number {
+  return new TextEncoder().encode(buildDocPageEventInput(page).content).length;
+}
+
 /** Unsigned event input for `signRelayEvent`; `createdAt` is chosen by the caller. */
 export function buildDocPageEventInput(page: DocPageContent & { id: string }): {
   kind: number;

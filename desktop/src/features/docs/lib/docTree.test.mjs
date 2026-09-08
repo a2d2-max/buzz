@@ -242,11 +242,11 @@ test("nextDocEventCreatedAt: now, unless a known version is at or ahead of it", 
   assert.equal(nextDocEventCreatedAt(1_000, 1_200), 1_201);
 });
 
-test("nextDocEventCreatedAt: refuses to ratchet past the skew allowance", () => {
-  // Default allowance: 300 s. A version stamped further ahead than that is
-  // unreachable rather than something to chase into the future.
-  assert.equal(nextDocEventCreatedAt(1_000, 1_299), 1_300);
-  assert.equal(nextDocEventCreatedAt(1_000, 1_300), null);
+test("nextDocEventCreatedAt: stays inside the relay's drift window", () => {
+  // The relay rejects |created_at - server now| > 900 s. The default allowance
+  // is 840 s: 900 minus a margin for the client clock running ahead.
+  assert.equal(nextDocEventCreatedAt(1_000, 1_839), 1_840);
+  assert.equal(nextDocEventCreatedAt(1_000, 1_840), null);
   assert.equal(nextDocEventCreatedAt(1_000, 5_000), null);
   assert.equal(
     nextDocEventCreatedAt(1_000, 1_050, 10),

@@ -5,8 +5,11 @@ import {
   buildDocPageEventInput,
   COMMUNITY_DOC_TAG,
   createDocPageId,
+  DOC_MAX_CONTENT_BYTES,
+  docPageContentEquals,
   docPageDTag,
   docPageIdFromDTag,
+  measureDocPageContentBytes,
   parseDocPageEvent,
 } from "./docPageCodec.ts";
 
@@ -300,4 +303,73 @@ test("buildDocPageEventInput → parseDocPageEvent round trip", () => {
   assert.equal(page.createdAt, 10);
   assert.equal(page.updatedAt, 20);
   assert.equal(page.deleted, false);
+});
+
+// ── docPageContentEquals / measureDocPageContentBytes ───────────────────────
+
+const BASE_CONTENT = {
+  title: "T",
+  body: "b",
+  parentId: null,
+  order: 1,
+  createdAt: 1,
+  updatedAt: 2,
+};
+
+test("docPageContentEquals: same visible fields, timestamps ignored", () => {
+  assert.equal(
+    docPageContentEquals(BASE_CONTENT, {
+      ...BASE_CONTENT,
+      createdAt: 99,
+      updatedAt: 100,
+    }),
+    true,
+  );
+  assert.equal(
+    docPageContentEquals(BASE_CONTENT, { ...BASE_CONTENT, deleted: false }),
+    true,
+    "absent and false tombstone flags are the same thing",
+  );
+});
+
+test("docPageContentEquals: any visible field difference counts", () => {
+  assert.equal(
+    docPageContentEquals(BASE_CONTENT, { ...BASE_CONTENT, body: "c" }),
+    false,
+  );
+  assert.equal(
+    docPageContentEquals(BASE_CONTENT, { ...BASE_CONTENT, order: 2 }),
+    false,
+  );
+  assert.equal(
+    docPageContentEquals(BASE_CONTENT, { ...BASE_CONTENT, parentId: "p" }),
+    false,
+  );
+  assert.equal(
+    docPageContentEquals(BASE_CONTENT, { ...BASE_CONTENT, icon: "x" }),
+    false,
+  );
+  assert.equal(
+    docPageContentEquals(BASE_CONTENT, { ...BASE_CONTENT, deleted: true }),
+    false,
+  );
+});
+
+test("measureDocPageContentBytes: counts UTF-8 bytes of the serialized content", () => {
+  const ascii = measureDocPageContentBytes({
+    ...BASE_CONTENT,
+    id: PAGE_ID,
+    body: "abcd",
+  });
+  const hangul = measureDocPageContentBytes({
+    ...BASE_CONTENT,
+    id: PAGE_ID,
+    body: "가나다라",
+  });
+  assert.equal(hangul - ascii, 4 * 3 - 4, "each Hangul syllable is 3 bytes");
+  assert.equal(
+    DOC_MAX_CONTENT_BYTES,
+    256 * 1024,
+    "mirrors the relay's MAX_EVENT_CONTENT_BYTES",
+  );
 });
