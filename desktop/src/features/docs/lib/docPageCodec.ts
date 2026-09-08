@@ -154,14 +154,6 @@ export function parseDocPageEvent(event: RelayEvent): DocPage | null {
   return page;
 }
 
-/**
- * Relay ceiling on event content (`MAX_EVENT_CONTENT_BYTES` in buzz-relay's
- * ingest). Anything larger is rejected — and a page that also overflows the
- * WebSocket frame limit drops the connection instead of answering, so the
- * client must measure before it signs.
- */
-export const DOC_MAX_CONTENT_BYTES = 256 * 1024;
-
 /** True when the two would render and sort identically; timestamps are ignored. */
 export function docPageContentEquals(
   a: DocPageContent,

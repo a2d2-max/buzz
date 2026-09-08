@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::DEFAULT_MAX_EVENT_CONTENT_BYTES;
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_FRAME_BYTES;
 
@@ -85,6 +86,10 @@ pub struct GifDescriptor {
 pub struct RelayLimitation {
     /// Maximum WebSocket frame size in bytes.
     pub max_message_length: Option<u64>,
+    /// Maximum UTF-8 byte length accepted for an event's `content` field.
+    /// Buzz intentionally reports its byte-based ingest rule here even though
+    /// NIP-11 describes this field in Unicode characters.
+    pub max_content_length: Option<u64>,
     /// Maximum number of concurrent subscriptions per connection.
     pub max_subscriptions: Option<u32>,
     /// Maximum number of filters per subscription.
@@ -129,6 +134,7 @@ fn relay_limitation(max_message_length: usize) -> RelayLimitation {
 
     RelayLimitation {
         max_message_length: Some(max_message_length as u64),
+        max_content_length: Some(DEFAULT_MAX_EVENT_CONTENT_BYTES as u64),
         max_subscriptions: Some(1024),
         max_filters: Some(10),
         max_limit: Some(buzz_db::DEFAULT_MAX_PAGE_LIMIT as u32),
@@ -293,6 +299,9 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         admin_api.as_deref(),
         state.config.klipy.as_ref().map(|_| "klipy"),
     );
+    if let Some(limitation) = info.limitation.as_mut() {
+        limitation.max_content_length = Some(state.config.max_event_content_bytes as u64);
+    }
     let tenant_host = if state.config.push_enabled {
         crate::tenant::bind_community(&state.db, raw_host)
             .await
@@ -558,6 +567,10 @@ mod tests {
         let info = RelayInfo::build(None, None, false, 262_144, None, None, None);
         let limitation = info.limitation.expect("limitation");
         assert_eq!(limitation.max_message_length, Some(262_144));
+        assert_eq!(
+            limitation.max_content_length,
+            Some(DEFAULT_MAX_EVENT_CONTENT_BYTES as u64)
+        );
     }
 
     #[test]

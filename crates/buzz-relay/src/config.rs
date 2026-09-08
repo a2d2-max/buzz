@@ -13,6 +13,12 @@ use tracing::warn;
 /// NIP-44 encryption overhead.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 512 * 1024;
 
+/// Default maximum UTF-8 byte length of one Nostr event's `content` field.
+pub const DEFAULT_MAX_EVENT_CONTENT_BYTES: usize = 256 * 1024;
+
+/// Minimum WebSocket envelope headroom above the accepted event content.
+pub const EVENT_CONTENT_FRAME_HEADROOM_BYTES: usize = 64 * 1024;
+
 /// Errors that can occur while loading relay configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -174,6 +180,8 @@ pub struct Config {
     pub send_buffer_size: usize,
     /// Maximum inbound WebSocket frame size in bytes.
     pub max_frame_bytes: usize,
+    /// Maximum UTF-8 byte length accepted for one event's `content` field.
+    pub max_event_content_bytes: usize,
     /// Number of consecutive buffer-full events tolerated before cancelling a slow client.
     pub slow_client_grace_limit: u8,
     /// Authentication provider configuration.
@@ -378,6 +386,20 @@ fn positive_u64_from_env(name: &str, default: u64) -> Result<u64, ConfigError> {
     match std::env::var(name) {
         Ok(raw) => raw
             .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| ConfigError::InvalidValue(format!("{name} must be a positive integer"))),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidValue(format!(
+            "{name} must be valid Unicode"
+        ))),
+    }
+}
+
+fn positive_usize_from_env(name: &str, default: usize) -> Result<usize, ConfigError> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
             .ok()
             .filter(|value| *value > 0)
             .ok_or_else(|| ConfigError::InvalidValue(format!("{name} must be a positive integer"))),
@@ -653,6 +675,23 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_MAX_FRAME_BYTES);
+        let max_event_content_bytes = positive_usize_from_env(
+            "BUZZ_MAX_EVENT_CONTENT_BYTES",
+            DEFAULT_MAX_EVENT_CONTENT_BYTES,
+        )?;
+        let minimum_frame_bytes = max_event_content_bytes
+            .checked_add(EVENT_CONTENT_FRAME_HEADROOM_BYTES)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(
+                    "BUZZ_MAX_EVENT_CONTENT_BYTES is too large to leave 65536 bytes of WebSocket envelope headroom"
+                        .to_string(),
+                )
+            })?;
+        if max_frame_bytes < minimum_frame_bytes {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_MAX_FRAME_BYTES ({max_frame_bytes}) must be at least BUZZ_MAX_EVENT_CONTENT_BYTES ({max_event_content_bytes}) + {EVENT_CONTENT_FRAME_HEADROOM_BYTES} bytes"
+            )));
+        }
 
         let slow_client_grace_limit = std::env::var("BUZZ_SLOW_CLIENT_GRACE_LIMIT")
             .ok()
@@ -1216,6 +1255,7 @@ impl Config {
             max_concurrent_handlers,
             send_buffer_size,
             max_frame_bytes,
+            max_event_content_bytes,
             slow_client_grace_limit,
             auth,
             require_auth_token,
@@ -1346,6 +1386,10 @@ mod tests {
         assert!(config.max_connections > 0);
         assert!(config.send_buffer_size > 0);
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
+        assert_eq!(
+            config.max_event_content_bytes,
+            DEFAULT_MAX_EVENT_CONTENT_BYTES
+        );
         assert!(config.slow_client_grace_limit > 0);
         assert!(
             !config.pubkey_allowlist_enabled,
@@ -2327,10 +2371,64 @@ mod tests {
     #[test]
     fn max_frame_bytes_can_be_configured() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("BUZZ_MAX_FRAME_BYTES", "262144");
+        std::env::set_var("BUZZ_MAX_FRAME_BYTES", "393216");
         let config = Config::from_env().expect("config");
         std::env::remove_var("BUZZ_MAX_FRAME_BYTES");
-        assert_eq!(config.max_frame_bytes, 262_144);
+        assert_eq!(config.max_frame_bytes, 393_216);
+    }
+
+    #[test]
+    fn max_event_content_bytes_can_be_configured_with_exact_frame_headroom() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_MAX_EVENT_CONTENT_BYTES", "1048576");
+        std::env::set_var("BUZZ_MAX_FRAME_BYTES", "1114112");
+        let config = Config::from_env().expect("config");
+        std::env::remove_var("BUZZ_MAX_EVENT_CONTENT_BYTES");
+        std::env::remove_var("BUZZ_MAX_FRAME_BYTES");
+        assert_eq!(config.max_event_content_bytes, 1_048_576);
+        assert_eq!(config.max_frame_bytes, 1_114_112);
+    }
+
+    #[test]
+    fn max_event_content_bytes_rejects_blank_zero_invalid_and_overflow_values() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for raw in ["", "0", "not-a-number", "18446744073709551616"] {
+            std::env::set_var("BUZZ_MAX_EVENT_CONTENT_BYTES", raw);
+            let result = Config::from_env();
+            assert!(
+                matches!(result, Err(ConfigError::InvalidValue(ref message)) if message.contains("BUZZ_MAX_EVENT_CONTENT_BYTES must be a positive integer")),
+                "unexpected result for {raw:?}: {result:?}"
+            );
+        }
+        std::env::remove_var("BUZZ_MAX_EVENT_CONTENT_BYTES");
+    }
+
+    #[test]
+    fn frame_limit_below_content_plus_headroom_is_rejected() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_MAX_EVENT_CONTENT_BYTES", "1048576");
+        std::env::set_var("BUZZ_MAX_FRAME_BYTES", "1114111");
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_MAX_EVENT_CONTENT_BYTES");
+        std::env::remove_var("BUZZ_MAX_FRAME_BYTES");
+        assert!(
+            matches!(result, Err(ConfigError::InvalidValue(ref message)) if message.contains("BUZZ_MAX_FRAME_BYTES (1114111) must be at least BUZZ_MAX_EVENT_CONTENT_BYTES (1048576) + 65536 bytes")),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn max_event_content_bytes_rejects_headroom_overflow() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_MAX_EVENT_CONTENT_BYTES", usize::MAX.to_string());
+        std::env::set_var("BUZZ_MAX_FRAME_BYTES", usize::MAX.to_string());
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_MAX_EVENT_CONTENT_BYTES");
+        std::env::remove_var("BUZZ_MAX_FRAME_BYTES");
+        assert!(
+            matches!(result, Err(ConfigError::InvalidValue(ref message)) if message.contains("too large to leave 65536 bytes")),
+            "unexpected result: {result:?}"
+        );
     }
 
     #[test]

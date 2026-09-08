@@ -18,6 +18,15 @@ const AUTHOR_ME = "a".repeat(64);
 const AUTHOR_THEM = "b".repeat(64);
 const PAGE_ID = "3f0c2b1a-7d4e-4c9a-9b1e-2a6f8d5c4e10";
 const TEST_RELAY_URL = "ws://test-relay.example";
+const originalFetch = globalThis.fetch;
+let relayInfoDocument = {};
+let relayUrlReads = [];
+let activeRelayUrl = TEST_RELAY_URL;
+let fetchRelayInfo = async () =>
+  new Response(JSON.stringify(relayInfoDocument), {
+    headers: { "Content-Type": "application/nostr+json" },
+  });
+let signEvent = async (args) => JSON.stringify(signedEvent(args));
 
 let nextEventSerial = 0;
 function signedEvent(input) {
@@ -78,6 +87,7 @@ before(() => {
   });
   Object.assign(globalThis, {
     document: dom.window.document,
+    fetch: (...args) => fetchRelayInfo(...args),
     HTMLElement: dom.window.HTMLElement,
     IS_REACT_ACT_ENVIRONMENT: true,
     window: dom.window,
@@ -85,10 +95,10 @@ before(() => {
   globalThis.__TAURI_INTERNALS__ = {
     invoke: (command, args) => {
       if (command === "sign_event") {
-        return Promise.resolve(JSON.stringify(signedEvent(args)));
+        return signEvent(args);
       }
       if (command === "get_relay_ws_url") {
-        return Promise.resolve(TEST_RELAY_URL);
+        return Promise.resolve(relayUrlReads.shift() ?? activeRelayUrl);
       }
       return Promise.reject(new Error(`unmocked: ${command}`));
     },
@@ -103,9 +113,20 @@ afterEach(async () => {
   // The kind-support verdict is keyed by relay URL in localStorage; one
   // test's "this relay rejects 30623" must not leak into the next.
   dom.window.localStorage.clear();
+  relayInfoDocument = {};
+  relayUrlReads = [];
+  activeRelayUrl = TEST_RELAY_URL;
+  fetchRelayInfo = async () =>
+    new Response(JSON.stringify(relayInfoDocument), {
+      headers: { "Content-Type": "application/nostr+json" },
+    });
+  signEvent = async (args) => JSON.stringify(signedEvent(args));
 });
 
-after(() => dom.window.close());
+after(() => {
+  globalThis.fetch = originalFetch;
+  dom.window.close();
+});
 
 /**
  * Mounts the hook against a relay stub; `versionsByDTag` feeds the `#d`
@@ -294,6 +315,157 @@ test("an oversized page is refused before signing", async () => {
     );
     assert.equal(docs.published.length, 0);
     assert.equal(nextEventSerial, signedBefore, "nothing was signed");
+  } finally {
+    docs.restore();
+  }
+});
+
+test("the production save seam accepts 524288 content bytes and rejects 524289 before signing", async () => {
+  const { measureDocPageContentBytes } = await import("./docPageCodec.ts");
+  relayInfoDocument = {
+    limitation: { max_content_length: 524_288 },
+  };
+  const pageAtSize = (targetBytes) => {
+    const base = {
+      id: PAGE_ID,
+      title: "Theirs",
+      body: "",
+      parentId: null,
+      order: 0,
+      createdAt: 1,
+      updatedAt: 1_700_000_000_000,
+    };
+    const emptyBytes = measureDocPageContentBytes(base);
+    assert.ok(emptyBytes < targetBytes);
+    const content = { ...base, body: "x".repeat(targetBytes - emptyBytes) };
+    assert.equal(measureDocPageContentBytes(content), targetBytes);
+    return content;
+  };
+  const docs = await mountDocs({
+    history: [V2],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V2] },
+  });
+  try {
+    const atLimit = pageAtSize(524_288);
+    await docs.result.current.updatePage(PAGE_ID, { body: atLimit.body });
+    assert.equal(
+      new TextEncoder().encode(docs.published[0].content).length,
+      524_288,
+    );
+
+    const signedBefore = nextEventSerial;
+    const aboveLimit = pageAtSize(524_289);
+    await assert.rejects(
+      docs.result.current.updatePage(PAGE_ID, { body: aboveLimit.body }),
+      (error) => {
+        assert.equal(error.name, "DocTooLargeError");
+        assert.equal(error.maxContentBytes, 524_288);
+        assert.match(error.message, /relay limit is 524288 bytes/);
+        return true;
+      },
+    );
+    assert.equal(nextEventSerial, signedBefore, "limit + 1 was not signed");
+    assert.equal(docs.published.length, 1, "limit + 1 was not published");
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a community switch during NIP-11 lookup aborts before signing the old page", async () => {
+  const oldRelay = "ws://old-relay.example";
+  const newRelay = "ws://new-relay.example";
+  // publishPage reads once for kind support; the content-limit guard then
+  // captures oldRelay and observes newRelay after the metadata response.
+  relayUrlReads = [oldRelay, oldRelay, newRelay];
+  relayInfoDocument = {
+    limitation: { max_content_length: 524_288 },
+  };
+  const docs = await mountDocs({
+    history: [V2],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V2] },
+  });
+  try {
+    const signedBefore = nextEventSerial;
+    await assert.rejects(
+      docs.result.current.updatePage(PAGE_ID, { body: "do not cross relays" }),
+      /active community changed/,
+    );
+    assert.equal(
+      nextEventSerial,
+      signedBefore,
+      "old-community page was not signed",
+    );
+    assert.equal(
+      docs.published.length,
+      0,
+      "old-community page was not published",
+    );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a stalled NIP-11 request falls back and the production save signs", async () => {
+  fetchRelayInfo = async () => new Promise(() => {});
+  const docs = await mountDocs({
+    history: [V2],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V2] },
+  });
+  const nativeSetTimeout = globalThis.setTimeout;
+  try {
+    const signedBefore = nextEventSerial;
+    globalThis.setTimeout = (callback, delay, ...args) =>
+      nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
+    const save = docs.result.current.updatePage(PAGE_ID, {
+      body: "fallback still saves",
+    });
+    const outcome = await Promise.race([
+      save.then(() => "saved"),
+      new Promise((resolve) => nativeSetTimeout(() => resolve("pending"), 100)),
+    ]);
+    assert.equal(outcome, "saved");
+    assert.equal(nextEventSerial, signedBefore + 1);
+    assert.equal(docs.published.length, 1);
+  } finally {
+    globalThis.setTimeout = nativeSetTimeout;
+    docs.restore();
+  }
+});
+
+test("a community switch while signing aborts with zero publish attempts", async () => {
+  const oldRelay = "ws://old-relay.example";
+  const newRelay = "ws://new-relay.example";
+  activeRelayUrl = oldRelay;
+  relayInfoDocument = {
+    limitation: { max_content_length: 524_288 },
+  };
+  let releaseSigner;
+  let signerStarted;
+  const started = new Promise((resolve) => {
+    signerStarted = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseSigner = resolve;
+  });
+  signEvent = async (args) => {
+    signerStarted();
+    await release;
+    return JSON.stringify(signedEvent(args));
+  };
+  const docs = await mountDocs({
+    history: [V2],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V2] },
+  });
+  try {
+    const save = docs.result.current.updatePage(PAGE_ID, {
+      body: "do not cross relays while signing",
+    });
+    await started;
+    activeRelayUrl = newRelay;
+    releaseSigner();
+    await assert.rejects(save, /active community changed/);
+    assert.equal(docs.attempts.length, 0);
+    assert.equal(docs.published.length, 0);
   } finally {
     docs.restore();
   }
