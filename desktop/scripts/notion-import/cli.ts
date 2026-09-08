@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
 import { convertNotionArchive } from "./convert.ts";
@@ -24,6 +24,7 @@ import {
   type PublicationCompatibilityReport,
 } from "./publicationCompatibility.ts";
 import { buildDryRun, parseIntermediate } from "./publish.ts";
+import { writePublicationEvidenceVerification } from "./evidenceVerification.ts";
 import {
   fetchRelayContentLimit,
   RelayContentLimitError,
@@ -434,9 +435,6 @@ function publicationMarkdownReport(
     `- source upload bytes=${compatibility.summary.sourceBytes}`,
     `- source max bytes=${compatibility.summary.maxSourceBytes}`,
     `- format-blocked assets=${compatibility.summary.formatBlockedCount}`,
-    `- native readback-blocked assets=${compatibility.summary.nativeReadbackBlockedCount}`,
-    `- format/readback blocked unique assets=${compatibility.summary.formatOrReadbackBlockedCount}`,
-    `- Node/Tauri host-blocked assets=${compatibility.summary.nodeTauriHostBlockedCount}`,
     `- Buzz CLI execution adapter implemented=${compatibility.buzzCliExecutionAdapterImplemented}`,
     `- Buzz CLI readback-blocked assets=${compatibility.summary.buzzCliReadbackBlockedCount}`,
     "",
@@ -583,7 +581,6 @@ async function runPreparePublication(args: string[]): Promise<void> {
     const compatibility = buildPublicationCompatibilityReport({
       publicManifest: prepared.publicManifest,
       privateManifest: prepared.privateManifest,
-      outputDirectory: output,
     });
     const status = {
       version: 1,
@@ -840,14 +837,51 @@ async function runExecutePublication(args: string[]): Promise<void> {
   );
 }
 
+async function runVerifyEvidence(args: string[]): Promise<void> {
+  const parsed = parseArgs({
+    args,
+    options: {
+      input: { type: "string" },
+      zip: { type: "string" },
+      output: { type: "string" },
+      receipt: { type: "string" },
+    },
+    strict: true,
+  });
+  const sourceIntermediatePath = required(parsed.values.input, "--input");
+  const sourceArchivePath = required(parsed.values.zip, "--zip");
+  const outputDirectory = required(parsed.values.output, "--output");
+  const receiptPath = required(parsed.values.receipt, "--receipt");
+  const repoRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../..",
+  );
+  const receipt = await writePublicationEvidenceVerification({
+    repoRoot,
+    sourceArchivePath,
+    sourceIntermediatePath,
+    outputDirectory,
+    receiptPath,
+  });
+  process.stdout.write(
+    `Evidence complete=${receipt.complete}; artifacts=${receipt.artifacts.length}; pages=${receipt.pageIdentities.originalApproved.pageCount}.\n`,
+  );
+  if (!receipt.complete) {
+    throw new Error(
+      `publication-evidence-invalid:${receipt.failures.join(",")}`,
+    );
+  }
+}
+
 export async function run(argv: string[]): Promise<void> {
   const [command, ...args] = argv;
   if (command === "convert") return runConvert(args);
   if (command === "publish") return runPublish(args);
   if (command === "prepare-publication") return runPreparePublication(args);
   if (command === "execute-publication") return runExecutePublication(args);
+  if (command === "verify-evidence") return runVerifyEvidence(args);
   throw new Error(
-    "usage: notion-import <convert|publish|prepare-publication|execute-publication> [options]",
+    "usage: notion-import <convert|publish|prepare-publication|execute-publication|verify-evidence> [options]",
   );
 }
 

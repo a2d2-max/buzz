@@ -18,12 +18,11 @@ function uploadAsset(hash, bytes, mime) {
   };
 }
 
-test("reports per-asset format/readback overlaps without claiming runtime verification", () => {
+test("reports only active Node and Buzz CLI blockers without claiming runtime verification", () => {
   const hashes = ["a", "b", "c", "d", "e"].map((value) => value.repeat(64));
   const extensions = [".m4a", ".mov", ".mp4", ".svg", ".png"];
   const sizes = [1, 60 * 1024 * 1024, 60 * 1024 * 1024, 4, 5];
   const report = buildPublicationCompatibilityReport({
-    outputDirectory: "/private/notion-prep",
     publicManifest: {
       uploadAssets: hashes.map((hash, index) =>
         uploadAsset(hash, sizes[index], "application/octet-stream"),
@@ -38,19 +37,16 @@ test("reports per-asset format/readback overlaps without claiming runtime verifi
     },
   });
 
-  assert.equal(report.evidenceScope, "code-inferred-and-local-host-smoke-only");
+  assert.equal(report.evidenceScope, "node-buzz-cli-source-audit-only");
   assert.equal(report.deployedUploadLimitsRuntimeVerified, false);
   assert.equal(report.buzzCliExecutionAdapterImplemented, true);
+  assert.equal("buzzCliRuntimeIntegrationVerified" in report, false);
   assert.equal(report.operationalUploadReady, false);
   assert.deepEqual(report.summary, {
     assetCount: 5,
     sourceBytes: sizes.reduce((sum, value) => sum + value, 0),
     maxSourceBytes: 60 * 1024 * 1024,
-    sourceOutsideTempCount: 5,
-    nodeTauriHostBlockedCount: 5,
     formatBlockedCount: 3,
-    nativeReadbackBlockedCount: 2,
-    formatOrReadbackBlockedCount: 4,
     buzzCliReadbackBlockedCount: 0,
     mp4RuntimeValidationRequiredCount: 1,
     svgBlockedCount: 1,
@@ -59,7 +55,14 @@ test("reports per-asset format/readback overlaps without claiming runtime verifi
     report.assets[0].reasons.includes("m4a-audio-iso-bmff-unsupported"),
   );
   assert.ok(report.assets[1].reasons.includes("mov-container-unsupported"));
-  assert.ok(report.assets[1].reasons.includes("native-readback-over-50-mib"));
+  assert.equal(
+    report.assets.some((asset) =>
+      asset.reasons.some((reason) =>
+        /^(?:desktop-|native-|node-tauri-)/.test(reason),
+      ),
+    ),
+    false,
+  );
   assert.ok(
     report.assets[2].reasons.includes(
       "video-format-runtime-validation-required",

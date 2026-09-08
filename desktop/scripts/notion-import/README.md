@@ -221,32 +221,62 @@ by repeating the exact same `executePublication(...)` call and journal path;
 already-read-back assets/pages are skipped and a signed-but-ambiguous event is
 re-read before the identical signed event is retried.
 
-The Desktop adapter has two current operational constraints that must remain
-on the handoff checklist: `upload_media` accepts a path already staged beneath
-the OS temp directory, and `fetch_media_bytes` caps a single readback at 50
-MiB. A batch containing a larger retained file cannot become complete through
-this adapter until an existing bounded large-file readback seam is available.
-
-There is no executable Node/Tauri host bridge in this importer. The
-executor and journal use Node filesystem APIs, while the Desktop adapter uses
-renderer-only Tauri globals. The credential-free smoke test proves the adapter
-module loads in Node but `getCurrentRelay()` cannot run there; it deliberately
-does not call the signer. Run it with:
+The earlier Desktop/Tauri inventory is historical context, not the active
+publication path. Its renderer-only globals, OS-temp upload staging, and 50 MiB
+readback cap do not constrain the selected Node-to-Buzz-CLI adapter. The smoke
+test remains as a regression guard against accidentally presenting the Tauri
+adapter as Node-runnable:
 
 ```bash
 node --import ./test-loader.mjs --experimental-strip-types --test \
   scripts/notion-import/desktopPublicationAdapter.test.mjs
 ```
 
-`notion-publication-compatibility.json` records this Desktop-specific host gap,
-the Node-compatible Buzz CLI adapter, and separate Desktop/CLI upload and
-readback compatibility for every source hash. Code defaults for relay media
-limits are not evidence of deployed values, and `/info` does not advertise
-media upload limits. The current source set still contains relay-incompatible
-M4A, MOV, and SVG files, so a runnable adapter does not make this corpus a
-usable publisher: `operationalUploadReady`, `readyForSigning`, and
-`readyToPublish` remain false until those assets, the target, the signer, and
-production bindings are resolved and revalidated.
+`notion-publication-compatibility.json` now records only active Node and Buzz
+CLI constraints for every source hash. Code defaults for relay media limits are
+not evidence of deployed values, and `/info` does not advertise media upload
+limits. The current source set still contains 41 relay-incompatible M4A, MOV,
+and SVG assets, while 8 MP4 assets require deployed-relay validation. A runnable
+adapter does not make this corpus a usable publisher: `operationalUploadReady`,
+`readyForSigning`, and `readyToPublish` remain false until those assets, the
+target, the signer, production bindings, and live authorization are resolved
+and revalidated.
+
+Recompute every reported source, artifact, corpus, and page-identity hash from
+bytes after a preparation run:
+
+```bash
+node --import ./test-loader.mjs --experimental-strip-types \
+  ./scripts/notion-import/cli.ts verify-evidence \
+  --input /private/path/notion-import.json \
+  --zip /private/path/notion-export.zip \
+  --output /private/path/notion-publication-prep \
+  --receipt /private/path/notion-publication-prep/notion-publication-evidence.json
+```
+
+The receipt hashes nine generated artifacts, recomputes the production
+preflight corpus hash, and compares the exact ordered `(id,parentId)` array from
+the original approved intermediate with prepared and final corpora. A mismatch
+is persisted in `failures` and the command exits non-zero.
+
+The combined runtime integration is opt-in because it builds and directly
+executes the real Rust binary. It uses one synthetic PDF, the explicit `00...01`
+test secret, a private temporary HOME/TMPDIR, and a loopback-only HTTP fixture:
+
+```bash
+cargo build -p buzz-cli
+cd desktop
+BUZZ_CLI_REAL_BINARY="$PWD/../target/debug/buzz" \
+BUZZ_REAL_INTEGRATION_RECEIPT=/private/path/real-cli-integration.json \
+node --import ./test-loader.mjs --experimental-strip-types --test \
+  scripts/notion-import/realCliPublicationIntegration.test.mjs
+```
+
+It forces the first event readback to fail after acceptance, then repeats the
+same importer invocation and journal. The test asserts one upload, one media
+readback, one event publish, one unique stored event, valid Blossom/NIP-98
+signatures, and a complete resumed journal. No source document or production
+endpoint is involved.
 
 The converter reads one Markdown or CSV entry at a time and never extracts
 attachments. It bounds archive entries and text bytes, rejects unsafe or

@@ -146,7 +146,15 @@ test("prepare-publication extracts all sources, applies simulated URLs, and only
     assert.equal(preflight.codecValidatedPageCount, 12);
     assert.equal(preflight.events.length, 12);
     assert.equal(compatibility.summary.assetCount, 2);
-    assert.equal(compatibility.nodeTauriExecutionHostBridgeAvailable, false);
+    assert.equal(
+      compatibility.evidenceScope,
+      "node-buzz-cli-source-audit-only",
+    );
+    assert.equal("buzzCliRuntimeIntegrationVerified" in compatibility, false);
+    assert.equal(
+      "nodeTauriExecutionHostBridgeAvailable" in compatibility,
+      false,
+    );
     assert.equal(compatibility.buzzCliExecutionAdapterImplemented, true);
     assert.equal(compatibility.operationalUploadReady, false);
     assert.equal(compatibility.liveUploadCount, 0);
@@ -221,7 +229,7 @@ test("execute-publication stays locked before reading inputs or invoking Buzz", 
   });
 });
 
-test("execute-publication uses the CLI adapter and resumes a deterministic signed fixture", async () => {
+test("execute-publication resumes through a deterministic fake CLI unit fixture", async () => {
   const execution = path.join(scratch, "execute-fixture");
   const statePath = path.join(execution, "relay-state.json");
   const buzzPath = path.join(execution, "fixture-buzz.mjs");

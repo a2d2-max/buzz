@@ -1,4 +1,3 @@
-import os from "node:os";
 import path from "node:path";
 
 import type {
@@ -8,11 +7,8 @@ import type {
 
 export type PublicationCompatibilityReason =
   | "buzz-cli-readback-over-500-mib"
-  | "desktop-upload-source-outside-temp"
   | "m4a-audio-iso-bmff-unsupported"
   | "mov-container-unsupported"
-  | "native-readback-over-50-mib"
-  | "node-tauri-execution-host-bridge-missing"
   | "production-upload-not-runtime-verified"
   | "svg-active-content-rejected"
   | "video-format-runtime-validation-required";
@@ -24,8 +20,6 @@ export type PublicationAssetCompatibility = {
   sourceExtensions: string[];
   entryCount: number;
   referenceCount: number;
-  uploadCompatibility: "blocked" | "unverified";
-  readbackCompatibility: "blocked" | "unverified";
   buzzCliUploadCompatibility: "blocked" | "wired-unverified";
   buzzCliReadbackCompatibility: "blocked" | "wired-unverified";
   operationalUploadReady: false;
@@ -35,27 +29,19 @@ export type PublicationAssetCompatibility = {
 export type PublicationCompatibilityReport = {
   version: 1;
   mode: "source-code-compatibility-audit";
-  evidenceScope: "code-inferred-and-local-host-smoke-only";
+  evidenceScope: "node-buzz-cli-source-audit-only";
   deployedUploadLimitsRuntimeVerified: false;
   liveUploadCount: 0;
   liveReadbackCount: 0;
   liveSignedEventCount: 0;
   livePublishedEventCount: 0;
-  standaloneNodeAdapterLoaded: true;
-  tauriRuntimeAvailableInStandaloneNode: false;
-  nodeTauriExecutionHostBridgeAvailable: false;
   buzzCliExecutionAdapterImplemented: true;
-  retainedOutputInsideOsTemp: boolean;
   operationalUploadReady: false;
   summary: {
     assetCount: number;
     sourceBytes: number;
     maxSourceBytes: number;
-    sourceOutsideTempCount: number;
-    nodeTauriHostBlockedCount: number;
     formatBlockedCount: number;
-    nativeReadbackBlockedCount: number;
-    formatOrReadbackBlockedCount: number;
     buzzCliReadbackBlockedCount: number;
     mp4RuntimeValidationRequiredCount: number;
     svgBlockedCount: number;
@@ -68,14 +54,7 @@ export type PublicationCompatibilityReport = {
   assets: PublicationAssetCompatibility[];
 };
 
-const NATIVE_READBACK_MAX_BYTES = 50 * 1024 * 1024;
 const BUZZ_CLI_READBACK_MAX_BYTES = 500 * 1024 * 1024;
-
-function retainedOutputInsideOsTemp(outputDirectory: string): boolean {
-  const output = path.resolve(outputDirectory);
-  const temp = path.resolve(os.tmpdir());
-  return output === temp || output.startsWith(`${temp}${path.sep}`);
-}
 
 function extensionsByHash(
   privateManifest: PrivatePublicationAssetManifest,
@@ -100,23 +79,18 @@ function extensionsByHash(
 export function buildPublicationCompatibilityReport({
   publicManifest,
   privateManifest,
-  outputDirectory,
 }: {
   publicManifest: PublicPublicationAssetManifest;
   privateManifest: PrivatePublicationAssetManifest;
-  outputDirectory: string;
 }): PublicationCompatibilityReport {
-  const insideTemp = retainedOutputInsideOsTemp(outputDirectory);
   const sourceExtensions = extensionsByHash(privateManifest);
   const assets = publicManifest.uploadAssets.map((asset) => {
     const extensions = [
       ...(sourceExtensions.get(asset.sourceSha256) ?? []),
     ].sort();
     const reasons = new Set<PublicationCompatibilityReason>([
-      "node-tauri-execution-host-bridge-missing",
       "production-upload-not-runtime-verified",
     ]);
-    if (!insideTemp) reasons.add("desktop-upload-source-outside-temp");
     if (extensions.includes(".m4a")) {
       reasons.add("m4a-audio-iso-bmff-unsupported");
     }
@@ -127,18 +101,9 @@ export function buildPublicationCompatibilityReport({
     if (extensions.includes(".svg")) {
       reasons.add("svg-active-content-rejected");
     }
-    if (asset.bytes > NATIVE_READBACK_MAX_BYTES) {
-      reasons.add("native-readback-over-50-mib");
-    }
     if (asset.bytes > BUZZ_CLI_READBACK_MAX_BYTES) {
       reasons.add("buzz-cli-readback-over-500-mib");
     }
-    const hardUploadBlock =
-      reasons.has("node-tauri-execution-host-bridge-missing") ||
-      reasons.has("desktop-upload-source-outside-temp") ||
-      reasons.has("m4a-audio-iso-bmff-unsupported") ||
-      reasons.has("mov-container-unsupported") ||
-      reasons.has("svg-active-content-rejected");
     const buzzCliUploadBlocked =
       reasons.has("m4a-audio-iso-bmff-unsupported") ||
       reasons.has("mov-container-unsupported") ||
@@ -150,10 +115,6 @@ export function buildPublicationCompatibilityReport({
       sourceExtensions: extensions,
       entryCount: asset.entryCount,
       referenceCount: asset.referenceCount,
-      uploadCompatibility: hardUploadBlock ? "blocked" : "unverified",
-      readbackCompatibility: reasons.has("native-readback-over-50-mib")
-        ? "blocked"
-        : "unverified",
       buzzCliUploadCompatibility: buzzCliUploadBlocked
         ? "blocked"
         : "wired-unverified",
@@ -180,11 +141,6 @@ export function buildPublicationCompatibilityReport({
       )
       .map((asset) => asset.sourceSha256),
   );
-  const readbackBlocked = new Set(
-    assets
-      .filter((asset) => hasReason(asset, "native-readback-over-50-mib"))
-      .map((asset) => asset.sourceSha256),
-  );
   const buzzCliReadbackBlocked = new Set(
     assets
       .filter((asset) => hasReason(asset, "buzz-cli-readback-over-500-mib"))
@@ -193,17 +149,13 @@ export function buildPublicationCompatibilityReport({
   return {
     version: 1,
     mode: "source-code-compatibility-audit",
-    evidenceScope: "code-inferred-and-local-host-smoke-only",
+    evidenceScope: "node-buzz-cli-source-audit-only",
     deployedUploadLimitsRuntimeVerified: false,
     liveUploadCount: 0,
     liveReadbackCount: 0,
     liveSignedEventCount: 0,
     livePublishedEventCount: 0,
-    standaloneNodeAdapterLoaded: true,
-    tauriRuntimeAvailableInStandaloneNode: false,
-    nodeTauriExecutionHostBridgeAvailable: false,
     buzzCliExecutionAdapterImplemented: true,
-    retainedOutputInsideOsTemp: insideTemp,
     operationalUploadReady: false,
     summary: {
       assetCount: assets.length,
@@ -212,14 +164,7 @@ export function buildPublicationCompatibilityReport({
         (maximum, asset) => Math.max(maximum, asset.sourceBytes),
         0,
       ),
-      sourceOutsideTempCount: insideTemp ? 0 : assets.length,
-      nodeTauriHostBlockedCount: assets.length,
       formatBlockedCount: formatBlocked.size,
-      nativeReadbackBlockedCount: readbackBlocked.size,
-      formatOrReadbackBlockedCount: new Set([
-        ...formatBlocked,
-        ...readbackBlocked,
-      ]).size,
       buzzCliReadbackBlockedCount: buzzCliReadbackBlocked.size,
       mp4RuntimeValidationRequiredCount: assets.filter((asset) =>
         hasReason(asset, "video-format-runtime-validation-required"),
@@ -229,16 +174,6 @@ export function buildPublicationCompatibilityReport({
       ).length,
     },
     sourceCodeEvidence: [
-      {
-        path: "desktop/src-tauri/src/commands/media.rs",
-        symbol: "upload_media",
-        fact: "requires an already-opened source beneath the OS temp directory",
-      },
-      {
-        path: "desktop/src-tauri/src/commands/media_download.rs",
-        symbol: "MAX_DOWNLOAD_BYTES",
-        fact: "caps authenticated byte readback at 50 MiB",
-      },
       {
         path: "crates/buzz-media/src/validation.rs",
         symbol: "validate_video_file",
@@ -250,9 +185,9 @@ export function buildPublicationCompatibilityReport({
         fact: "code defaults are 500 MiB video and 100 MiB generic, not deployed proof",
       },
       {
-        path: "desktop/scripts/notion-import/desktopPublicationAdapter.ts",
-        symbol: "createDesktopPublicationApi",
-        fact: "binds Tauri renderer APIs while the journal executor uses Node filesystem APIs",
+        path: "crates/buzz-cli/src/client.rs",
+        symbol: "upload_file/download_media",
+        fact: "provides bounded authenticated Blossom upload and media readback for the Node adapter",
       },
       {
         path: "desktop/scripts/notion-import/buzzCliPublicationAdapter.ts",
