@@ -15,6 +15,12 @@ export type DocsHistoryResult = {
   truncated: boolean;
   /** Kind-30078 rows inspected, docs or not. */
   scanned: number;
+  /**
+   * Largest `created_at` among the inspected rows (docs or not), or
+   * `undefined` when the scan saw nothing. Relay-validated time, so callers
+   * can anchor an incremental follow-up on it without trusting a local clock.
+   */
+  newestSeen: number | undefined;
 };
 
 /**
@@ -61,6 +67,7 @@ export async function fetchDocPagesToExhaustion({
   let until: number | undefined;
   let truncated = false;
   let scanned = 0;
+  let newestSeen: number | undefined;
 
   for (let pageIndex = 0; ; pageIndex += 1) {
     if (pageIndex >= maxPages) {
@@ -78,6 +85,9 @@ export async function fetchDocPagesToExhaustion({
     let added = 0;
     for (const event of batch) {
       if (event.created_at < oldest) oldest = event.created_at;
+      if (newestSeen === undefined || event.created_at > newestSeen) {
+        newestSeen = event.created_at;
+      }
       if (seen.has(event.id)) continue;
       seen.add(event.id);
       added += 1;
@@ -94,5 +104,5 @@ export async function fetchDocPagesToExhaustion({
     until = oldest;
   }
 
-  return { pages, truncated, scanned };
+  return { newestSeen, pages, scanned, truncated };
 }

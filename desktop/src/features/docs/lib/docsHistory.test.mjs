@@ -217,3 +217,21 @@ test("since: an incremental scan asks only for rows at or after the watermark", 
   assert.ok(relay.requests.every((request) => request.since === 11_000));
   assert.equal(relay.requests.length, 1, "500 rows fit in one page");
 });
+
+test("newestSeen is the largest created_at the scan inspected, docs or not", async () => {
+  const relay = fakeRelay([
+    docEvent("p1", 100),
+    noiseEvent(1, 7_000),
+    docEvent("p2", 300),
+  ]);
+  const result = await fetchDocPagesToExhaustion({
+    fetchEvents: relay.fetchEvents,
+    pageLimit: 1_000,
+  });
+  assert.equal(result.newestSeen, 7_000);
+  const empty = await fetchDocPagesToExhaustion({
+    fetchEvents: fakeRelay([]).fetchEvents,
+    pageLimit: 1_000,
+  });
+  assert.equal(empty.newestSeen, undefined);
+});

@@ -86,8 +86,10 @@ export function createAutosaveScheduler<TDraft>({
     setState("saving");
     try {
       await save(draft);
-      paused = false;
       setState(dirty ? "dirty" : "saved");
+      // The conflict (or whatever paused us) is settled: re-arm the timer for
+      // anything typed while this save was in flight.
+      resume();
       return true;
     } catch {
       dirty = true;
@@ -96,6 +98,12 @@ export function createAutosaveScheduler<TDraft>({
     } finally {
       lastSaveFinishedAt = now();
     }
+  };
+
+  const resume = () => {
+    if (!paused) return;
+    paused = false;
+    if (dirty && !disposed) startTimer();
   };
 
   const startTimer = () => {
@@ -138,11 +146,7 @@ export function createAutosaveScheduler<TDraft>({
       paused = true;
       clearTimer();
     },
-    resume: () => {
-      if (!paused) return;
-      paused = false;
-      if (dirty && !disposed) startTimer();
-    },
+    resume,
     dispose: () => {
       disposed = true;
       clearTimer();

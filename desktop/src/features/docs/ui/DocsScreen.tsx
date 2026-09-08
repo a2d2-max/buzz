@@ -41,30 +41,33 @@ export function DocsScreen({ pageId }: DocsScreenProps) {
 
   // A deep link to a page the history scan did not deliver (truncated window,
   // or the page is newer than the cache) gets one authoritative `#d` lookup
-  // before the screen is allowed to say the page does not exist.
-  const [lookedUpPageId, setLookedUpPageId] = React.useState<string | null>(
-    null,
-  );
+  // before the screen is allowed to say the page does not exist. "The relay
+  // did not answer" is kept apart from "the relay has no such page".
+  const [lookup, setLookup] = React.useState<{
+    pageId: string;
+    status: "answered" | "failed";
+  } | null>(null);
+  const lookupSettled =
+    lookup !== null && lookup.pageId === pageId ? lookup.status : null;
   const needsLookup =
-    Boolean(pageId) &&
-    !docs.isLoading &&
-    !selected &&
-    lookedUpPageId !== pageId;
+    Boolean(pageId) && !docs.isLoading && !selected && lookupSettled === null;
   React.useEffect(() => {
     if (!needsLookup || !pageId) return;
     let cancelled = false;
-    lookupPage(pageId)
-      .catch((error) => {
+    lookupPage(pageId).then(
+      () => {
+        if (!cancelled) setLookup({ pageId, status: "answered" });
+      },
+      (error: unknown) => {
         console.warn("[docs] page lookup failed", error);
-        return undefined;
-      })
-      .finally(() => {
-        if (!cancelled) setLookedUpPageId(pageId);
-      });
+        if (!cancelled) setLookup({ pageId, status: "failed" });
+      },
+    );
     return () => {
       cancelled = true;
     };
   }, [lookupPage, needsLookup, pageId]);
+  const retryLookup = React.useCallback(() => setLookup(null), []);
   const ancestors = React.useMemo(
     () => (pageId ? findDocTreePath(docs.tree, pageId).slice(0, -1) : []),
     [docs.tree, pageId],
@@ -204,10 +207,12 @@ export function DocsScreen({ pageId }: DocsScreenProps) {
           <DocsPlaceholder
             isError={docs.isError}
             isLoading={docs.isLoading || needsLookup}
-            missingPage={Boolean(pageId) && lookedUpPageId === pageId}
+            lookupFailed={lookupSettled === "failed"}
+            missingPage={lookupSettled === "answered"}
             onBack={() => navigate(null)}
             onCreate={() => void handleCreate(null)}
             onRetry={() => void docs.refetch()}
+            onRetryLookup={retryLookup}
           />
         )}
       </section>
@@ -218,20 +223,42 @@ export function DocsScreen({ pageId }: DocsScreenProps) {
 function DocsPlaceholder({
   isError,
   isLoading,
+  lookupFailed,
   missingPage,
   onBack,
   onCreate,
   onRetry,
+  onRetryLookup,
 }: {
   isError: boolean;
   isLoading: boolean;
+  lookupFailed: boolean;
   missingPage: boolean;
   onBack: () => void;
   onCreate: () => void;
   onRetry: () => void;
+  onRetryLookup: () => void;
 }) {
   if (isLoading) {
     return <BuzzLoadingState fill label="Loading docs" />;
+  }
+  if (lookupFailed) {
+    return (
+      <div
+        className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-sm text-muted-foreground"
+        data-testid="docs-placeholder"
+      >
+        <p>Couldn't check the relay for this page.</p>
+        <Button
+          onClick={onRetryLookup}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          Try again
+        </Button>
+      </div>
+    );
   }
   return (
     <div

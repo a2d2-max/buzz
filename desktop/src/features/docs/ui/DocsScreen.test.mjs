@@ -150,7 +150,12 @@ afterEach(async () => {
 
 after(() => dom.window.close());
 
-async function mountDocsScreen({ history, pageId, versionsByDTag }) {
+async function mountDocsScreen({
+  history,
+  lookupFailure = null,
+  pageId,
+  versionsByDTag,
+}) {
   const React = await import("react");
   const { QueryClient, QueryClientProvider } = await import(
     "@tanstack/react-query"
@@ -172,9 +177,16 @@ async function mountDocsScreen({ history, pageId, versionsByDTag }) {
     subscribeLive: relayClient.subscribeLive,
     subscribeToReconnects: relayClient.subscribeToReconnects,
   };
+  let lookupAttempts = 0;
   relayClient.fetchEvents = async (filter) => {
     const dTags = filter["#d"];
-    if (dTags) return versionsByDTag[dTags[0]] ?? [];
+    if (dTags) {
+      lookupAttempts += 1;
+      if (lookupFailure && lookupAttempts <= lookupFailure.times) {
+        throw new Error(lookupFailure.message);
+      }
+      return versionsByDTag[dTags[0]] ?? [];
+    }
     return history;
   };
   relayClient.publishEvent = async (event) => {
@@ -253,6 +265,44 @@ test("an edit based on an older version is refused, then published only after 'K
     await waitFor(() =>
       assert.equal(docs.view.queryByTestId("doc-remote-change"), null),
     );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a failed page lookup asks to try again instead of declaring the page missing", async () => {
+  const { fireEvent, waitFor } = await import("@testing-library/react");
+  const docs = await mountDocsScreen({
+    history: [],
+    lookupFailure: { message: "relay timeout", times: 1 },
+    pageId: PAGE_ID,
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V2] },
+  });
+  try {
+    const retry = await waitFor(() =>
+      docs.view.getByRole("button", { name: "Try again" }),
+    );
+    assert.equal(
+      docs.view.queryByText(/doesn't exist or was deleted/),
+      null,
+      "an unanswered lookup is not a missing page",
+    );
+    fireEvent.click(retry);
+    await waitFor(() => docs.view.getByTestId("doc-page-view"));
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a page the relay really does not hold is reported missing after the lookup", async () => {
+  const { waitFor } = await import("@testing-library/react");
+  const docs = await mountDocsScreen({
+    history: [],
+    pageId: "nope",
+    versionsByDTag: {},
+  });
+  try {
+    await waitFor(() => docs.view.getByText(/doesn't exist or was deleted/));
   } finally {
     docs.restore();
   }

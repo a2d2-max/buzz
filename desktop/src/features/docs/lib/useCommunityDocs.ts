@@ -44,26 +44,30 @@ type DocsSnapshot = {
   /** Kind-30078 rows the last scan inspected. */
   scanned: number;
   /**
-   * Local time (unix seconds) the last *complete* scan started; `undefined`
-   * after a truncated one. The next scan is incremental from here.
+   * Largest relay-validated `created_at` any complete scan has seen;
+   * `undefined` after a truncated one or before the first scan. The next
+   * scan is incremental from here. Never the local clock: a client running
+   * ahead of the relay would otherwise push `since` into the server's future
+   * and silently miss every later edit.
    */
-  scannedAt: number | undefined;
+  watermark: number | undefined;
 };
 const EMPTY_PAGES: DocPageMap = new Map();
 const EMPTY_SNAPSHOT: DocsSnapshot = {
   pages: EMPTY_PAGES,
   truncated: false,
   scanned: 0,
-  scannedAt: undefined,
+  watermark: undefined,
 };
 
 /**
- * How far behind the previous scan's start an incremental scan looks. The
- * relay accepts `created_at` up to 900 s behind its clock, so an event that
- * arrived after the previous scan can be stamped that far back; 60 s more
- * covers our clock trailing the relay's.
+ * How far below the watermark an incremental scan starts. The relay accepts
+ * `created_at` within ±900 s of its own clock at ingest, so the watermark
+ * (the newest row seen) may sit up to 900 s ahead of server time, and an
+ * event ingested after that scan may be stamped up to 900 s behind server
+ * time: two windows apart at worst. 60 s more for good measure.
  */
-const INCREMENTAL_LOOKBACK_SECONDS = 900 + 60;
+const INCREMENTAL_LOOKBACK_SECONDS = 2 * 900 + 60;
 
 /** How long the first load waits for the live subscription before fetching anyway. */
 const SUBSCRIPTION_SETTLE_TIMEOUT_MS = 3_000;
@@ -189,12 +193,11 @@ export function useCommunityDocs(): CommunityDocs {
     queryFn: async (): Promise<DocsSnapshot> => {
       const previous =
         queryClient.getQueryData<DocsSnapshot>(DOCS_PAGES_QUERY_KEY);
-      const startedAt = Math.floor(Date.now() / 1_000);
       // A complete earlier scan lets this one walk only what changed since,
       // instead of the whole window on every reconnect.
       const since =
-        previous?.scannedAt !== undefined && !previous.truncated
-          ? previous.scannedAt - INCREMENTAL_LOOKBACK_SECONDS
+        previous?.watermark !== undefined && !previous.truncated
+          ? Math.max(0, previous.watermark - INCREMENTAL_LOOKBACK_SECONDS)
           : undefined;
       const history = await fetchDocPagesToExhaustion({
         fetchEvents: (filter) => relayClient.fetchEvents(filter),
@@ -211,7 +214,16 @@ export function useCommunityDocs(): CommunityDocs {
         ]),
         truncated: history.truncated,
         scanned: history.scanned,
-        scannedAt: history.truncated ? undefined : startedAt,
+        // A shorter incremental scan must not pull the watermark back.
+        watermark: history.truncated
+          ? undefined
+          : [previous?.watermark, history.newestSeen]
+              .filter((value): value is number => value !== undefined)
+              .reduce<number | undefined>(
+                (max, value) =>
+                  max === undefined ? value : Math.max(max, value),
+                undefined,
+              ),
       };
     },
     staleTime: 60_000,

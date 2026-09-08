@@ -258,3 +258,26 @@ test("a successful save lifts a pause", async () => {
   scheduler.schedule({ body: "ab" });
   assert.equal(clock.pendingCount, 1, "timers run again after the save");
 });
+
+test("typing while the save that lifts a pause is in flight re-arms the timer", async () => {
+  const gate = deferred();
+  const saves = [];
+  const { clock, scheduler } = setup({
+    save: async (draft) => {
+      saves.push(draft);
+      if (saves.length === 1) await gate.promise;
+    },
+  });
+  scheduler.pause();
+  scheduler.schedule({ body: "v1" });
+  const first = scheduler.flush(); // "Keep mine": explicit flush while paused
+  scheduler.schedule({ body: "v2" }); // user keeps typing during the save
+  assert.equal(clock.pendingCount, 0, "still paused while the save runs");
+  gate.resolve();
+  await first;
+  assert.equal(clock.pendingCount, 1, "the successful save re-arms autosave");
+  clock.fire();
+  await scheduler.flush();
+  assert.deepEqual(saves, [{ body: "v1" }, { body: "v2" }]);
+  assert.equal(scheduler.getState(), "saved");
+});

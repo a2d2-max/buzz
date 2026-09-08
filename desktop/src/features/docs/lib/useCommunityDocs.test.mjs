@@ -278,9 +278,19 @@ test("an oversized page is refused before signing", async () => {
   }
 });
 
-test("a refetch after a complete scan is incremental: it carries a since watermark", async () => {
+test("a refetch after a complete scan is incremental, anchored on relay-stamped time", async () => {
+  // The watermark must come from created_at values the relay accepted, never
+  // from this machine's clock: a client running 16 minutes fast would
+  // otherwise push `since` into the server's future and miss every edit.
+  const newest = docEvent({
+    id: "other-page",
+    eventId: "newest",
+    author: AUTHOR_THEM,
+    createdAt: 50_000,
+    content: {},
+  });
   const docs = await mountDocs({
-    history: [V1],
+    history: [V1, newest],
     versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
   });
   try {
@@ -290,19 +300,41 @@ test("a refetch after a complete scan is incremental: it carries a since waterma
       undefined,
       "first scan is full",
     );
-    await docs.result.current.refetch();
+    const realNow = Date.now;
+    // A wildly wrong local clock must not move the watermark.
+    Date.now = () => 9_999_999_000;
+    try {
+      await docs.result.current.refetch();
+    } finally {
+      Date.now = realNow;
+    }
     assert.equal(docs.historyRequests.length, 2);
-    const since = docs.historyRequests[1].since;
-    assert.equal(typeof since, "number");
-    const nowSeconds = Math.floor(Date.now() / 1_000);
-    assert.ok(
-      since <= nowSeconds - 900,
-      "looks back past the relay drift window",
-    );
-    assert.ok(
-      since >= nowSeconds - 1_200,
-      "but not from the beginning of time",
-    );
+    // 50_000 − (2 × 900 + 60): two drift windows (the newest row may be
+    // stamped 900 s ahead; a later event may be stamped 900 s behind).
+    assert.equal(docs.historyRequests[1].since, 50_000 - 1_860);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("an incremental scan that sees nothing newer keeps the earlier watermark", async () => {
+  const newest = docEvent({
+    id: "other-page",
+    eventId: "newest",
+    author: AUTHOR_THEM,
+    createdAt: 50_000,
+    content: {},
+  });
+  const docs = await mountDocs({
+    history: [V1, newest],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    await docs.result.current.refetch();
+    assert.equal(docs.historyRequests[1].since, 50_000 - 1_860);
+    // The stub replays the same rows: the watermark must not regress.
+    await docs.result.current.refetch();
+    assert.equal(docs.historyRequests[2].since, 50_000 - 1_860);
   } finally {
     docs.restore();
   }
