@@ -183,22 +183,31 @@ pub async fn test_claude_account(
         command.env_remove("ANTHROPIC_API_KEY");
         command.env(CLAUDE_OAUTH_TOKEN_ENV, &token);
 
-        let Some(output) = output_with_timeout(command, TEST_TIMEOUT) else {
-            return Ok(ClaudeAccountTestResult {
-                ok: false,
-                message: format!("no response within {}s", TEST_TIMEOUT.as_secs()),
-            });
-        };
-        let ok = output.status.success();
-        let raw = if ok || output.stderr.is_empty() {
-            output.stdout
-        } else {
-            output.stderr
-        };
-        let message = summarize_probe_output(&String::from_utf8_lossy(&raw), &token, ok);
-        Ok(ClaudeAccountTestResult { ok, message })
+        Ok(finish_claude_account_probe(command, &token))
     })
     .await
+}
+
+/// Execute the exact command assembled by `test_claude_account` and reduce its
+/// bounded output to the public, token-scrubbed result.
+fn finish_claude_account_probe(
+    command: std::process::Command,
+    token: &str,
+) -> ClaudeAccountTestResult {
+    let Some(output) = output_with_timeout(command, TEST_TIMEOUT) else {
+        return ClaudeAccountTestResult {
+            ok: false,
+            message: format!("no response within {}s", TEST_TIMEOUT.as_secs()),
+        };
+    };
+    let ok = output.status.success();
+    let raw = if ok || output.stderr.is_empty() {
+        output.stdout
+    } else {
+        output.stderr
+    };
+    let message = summarize_probe_output(&String::from_utf8_lossy(&raw), token, ok);
+    ClaudeAccountTestResult { ok, message }
 }
 
 /// First non-empty line of the CLI output, with the token (and anything else
@@ -241,7 +250,31 @@ fn scrub_secrets(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::summarize_probe_output;
+    use super::{finish_claude_account_probe, summarize_probe_output};
+
+    #[cfg(unix)]
+    fn failing_probe_command(secret: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "printf 'rejected %s key=sk-ant-other-secret\\n' \"$PROBE_SECRET\" >&2; exit 7",
+            ])
+            .env("PROBE_SECRET", secret);
+        command
+    }
+
+    #[cfg(windows)]
+    fn failing_probe_command(secret: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("cmd");
+        command
+            .args([
+                "/C",
+                "echo rejected %PROBE_SECRET% key=sk-ant-other-secret 1>&2 & exit /B 7",
+            ])
+            .env("PROBE_SECRET", secret);
+        command
+    }
 
     #[test]
     fn probe_summary_scrubs_the_token_and_takes_the_first_line() {
@@ -280,5 +313,16 @@ mod tests {
         let message = summarize_probe_output(&long, "tok-0123456789abcdef", true);
         assert_eq!(message.chars().count(), 201);
         assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn production_probe_marks_nonzero_as_failed_and_scrubs_captured_stderr() {
+        let token = "sk-ant-account-verify-dummy";
+        let result = finish_claude_account_probe(failing_probe_command(token), token);
+
+        assert!(!result.ok, "a nonzero CLI exit must never report success");
+        assert_eq!(result.message, "rejected … key=…");
+        assert!(!result.message.contains(token));
+        assert!(!result.message.contains("sk-ant-"));
     }
 }

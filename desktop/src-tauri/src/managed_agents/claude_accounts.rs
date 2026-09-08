@@ -148,18 +148,42 @@ impl<'a> ProviderAccountStore<'a> {
     /// written first: an account whose token never reached the keyring must
     /// not exist, and a failed metadata write rolls the token back.
     pub(crate) fn add(&self, label: &str, token: &str) -> Result<ProviderAccount, String> {
-        self.add_with_secret(AccountProvider::Claude, None, label, Some(token))
+        self.add_with_secret(
+            uuid::Uuid::new_v4().to_string(),
+            AccountProvider::Claude,
+            None,
+            label,
+            Some(token),
+        )
     }
 
     /// Store a Codex account. `api_key` is required for `ApiKey` accounts and
     /// must be absent for `Chatgpt` ones (their login lives in the account's
     /// `CODEX_HOME` directory, not the keyring).
+    #[cfg(test)]
     pub(crate) fn add_codex(
         &self,
         auth_kind: CodexAuthKind,
         label: &str,
         api_key: Option<&str>,
     ) -> Result<ProviderAccount, String> {
+        self.add_codex_with_id(uuid::Uuid::new_v4().to_string(), auth_kind, label, api_key)
+    }
+
+    /// Store a Codex account with a caller-reserved id. The Tauri add command
+    /// uses this to prepare the app-owned `CODEX_HOME` before either account
+    /// metadata or a keyring secret becomes durable.
+    pub(crate) fn add_codex_with_id(
+        &self,
+        id: String,
+        auth_kind: CodexAuthKind,
+        label: &str,
+        api_key: Option<&str>,
+    ) -> Result<ProviderAccount, String> {
+        let valid_id = uuid::Uuid::parse_str(&id).is_ok_and(|parsed| parsed.to_string() == id);
+        if !valid_id {
+            return Err("invalid Codex account id".to_string());
+        }
         match (auth_kind, api_key) {
             (CodexAuthKind::ApiKey, None) => {
                 Err("an API key is required for this account type".to_string())
@@ -167,12 +191,13 @@ impl<'a> ProviderAccountStore<'a> {
             (CodexAuthKind::Chatgpt, Some(_)) => {
                 Err("a ChatGPT-login account does not take an API key".to_string())
             }
-            _ => self.add_with_secret(AccountProvider::Codex, Some(auth_kind), label, api_key),
+            _ => self.add_with_secret(id, AccountProvider::Codex, Some(auth_kind), label, api_key),
         }
     }
 
     fn add_with_secret(
         &self,
+        id: String,
         provider: AccountProvider,
         auth_kind: Option<CodexAuthKind>,
         label: &str,
@@ -184,7 +209,7 @@ impl<'a> ProviderAccountStore<'a> {
         ensure_unique_label(&file.accounts, provider, &label, None)?;
 
         let account = ProviderAccount {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             label,
             created_at: crate::util::now_iso(),
             token_hint: secret.as_deref().map(token_hint).unwrap_or_default(),
@@ -198,7 +223,11 @@ impl<'a> ProviderAccountStore<'a> {
         file.accounts.push(account.clone());
         if let Err(error) = self.write(&file) {
             if secret.is_some() {
-                let _ = self.tokens.delete(&name);
+                if let Err(cleanup_error) = self.tokens.delete(&name) {
+                    return Err(format!(
+                        "{error}; failed to roll back the account's keyring entry: {cleanup_error}"
+                    ));
+                }
             }
             return Err(error);
         }
