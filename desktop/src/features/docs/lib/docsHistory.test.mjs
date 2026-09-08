@@ -37,26 +37,59 @@ function noiseEvent(index, createdAt) {
 }
 
 /**
- * Relay stand-in: newest first, `until` inclusive, `limit` clamped like the
- * real thing. Records each request so tests can assert the paging shape.
+ * Relay stand-in that behaves like buzz-relay's REQ lane: newest first,
+ * `since`/`until` inclusive, `limit` clamped at 1000, and — the part that
+ * matters — a `#t` filter applied in memory AFTER the SQL LIMIT, so a `#t`
+ * request only ever sees the newest `limit` rows of the kind. Rows that share
+ * a second come back in an order the client must not rely on
+ * (`rotateTies` shuffles them per request the way a real tiebreak might).
  */
-function fakeRelay(events, { clamp = 1_000 } = {}) {
+function fakeRelay(events, { clamp = 1_000, rotateTies = false } = {}) {
   const sorted = [...events].sort(
     (a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1),
   );
   const requests = [];
+  const rotateRuns = (rows, turn) => {
+    const out = [];
+    let index = 0;
+    while (index < rows.length) {
+      let end = index + 1;
+      while (
+        end < rows.length &&
+        rows[end].created_at === rows[index].created_at
+      ) {
+        end += 1;
+      }
+      const run = rows.slice(index, end);
+      const shift = run.length > 1 ? (turn * 37) % run.length : 0;
+      out.push(...run.slice(shift), ...run.slice(0, shift));
+      index = end;
+    }
+    return out;
+  };
   return {
     requests,
     fetchEvents: async (filter) => {
       requests.push(filter);
       assert.deepEqual(filter.kinds, [30078]);
-      assert.equal("#t" in filter, false, "kinds-only so LIMIT sees every row");
       const limit = Math.min(filter.limit, clamp);
-      return sorted
+      let rows = sorted
         .filter((event) =>
           filter.until === undefined ? true : event.created_at <= filter.until,
         )
-        .slice(0, limit);
+        .filter((event) =>
+          filter.since === undefined ? true : event.created_at >= filter.since,
+        );
+      if (rotateTies) rows = rotateRuns(rows, requests.length);
+      const page = rows.slice(0, limit);
+      const wantedT = filter["#t"];
+      return wantedT
+        ? page.filter((event) =>
+            event.tags.some(
+              (tag) => tag[0] === "t" && wantedT.includes(tag[1]),
+            ),
+          )
+        : page;
     },
   };
 }
@@ -114,13 +147,15 @@ test("the page cap bounds the scan and reports truncation", async () => {
 });
 
 test("a full page that cannot advance the cursor is reported as truncated, not looped", async () => {
-  // 1200 rows in one second: `until` can never move below it.
+  // 1200 rows in one second: `until` can never move below it. The relay's
+  // tiebreak hands back a different subset each time, so "nothing new
+  // arrived" is not a stop condition the client can count on.
   const events = [];
   for (let index = 0; index < 1_200; index += 1) {
     events.push(noiseEvent(index, 500));
   }
   events.push(docEvent("visible", 900), docEvent("hidden", 1));
-  const relay = fakeRelay(events);
+  const relay = fakeRelay(events, { rotateTies: true });
   const result = await fetchDocPagesToExhaustion({
     fetchEvents: relay.fetchEvents,
     pageLimit: 1_000,
@@ -130,7 +165,7 @@ test("a full page that cannot advance the cursor is reported as truncated, not l
     ["visible"],
   );
   assert.equal(result.truncated, true);
-  assert.ok(relay.requests.length <= 3, "gives up instead of spinning");
+  assert.equal(relay.requests.length, 2, "stops the moment the cursor stalls");
 });
 
 test("boundary rows re-returned by the inclusive cursor are deduplicated", async () => {
@@ -160,4 +195,43 @@ test("a relay error propagates instead of masquerading as an empty wiki", async 
     }),
     /relay down/,
   );
+});
+
+test("since: an incremental scan asks only for rows at or after the watermark", async () => {
+  const events = [];
+  for (let index = 0; index < 1_500; index += 1) {
+    events.push(noiseEvent(index, 10_000 + index));
+  }
+  events.push(docEvent("old", 5), docEvent("fresh", 11_400));
+  const relay = fakeRelay(events);
+  const result = await fetchDocPagesToExhaustion({
+    fetchEvents: relay.fetchEvents,
+    pageLimit: 1_000,
+    since: 11_000,
+  });
+  assert.deepEqual(
+    result.pages.map((page) => page.id),
+    ["fresh"],
+  );
+  assert.equal(result.truncated, false);
+  assert.ok(relay.requests.every((request) => request.since === 11_000));
+  assert.equal(relay.requests.length, 1, "500 rows fit in one page");
+});
+
+test("newestSeen is the largest created_at the scan inspected, docs or not", async () => {
+  const relay = fakeRelay([
+    docEvent("p1", 100),
+    noiseEvent(1, 7_000),
+    docEvent("p2", 300),
+  ]);
+  const result = await fetchDocPagesToExhaustion({
+    fetchEvents: relay.fetchEvents,
+    pageLimit: 1_000,
+  });
+  assert.equal(result.newestSeen, 7_000);
+  const empty = await fetchDocPagesToExhaustion({
+    fetchEvents: fakeRelay([]).fetchEvents,
+    pageLimit: 1_000,
+  });
+  assert.equal(empty.newestSeen, undefined);
 });

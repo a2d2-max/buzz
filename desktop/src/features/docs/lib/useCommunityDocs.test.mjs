@@ -100,8 +100,12 @@ afterEach(async () => {
 
 after(() => dom.window.close());
 
-/** Mounts the hook against a relay stub; `versionsByDTag` feeds the `#d` re-read. */
-async function mountDocs({ history, versionsByDTag }) {
+/**
+ * Mounts the hook against a relay stub; `versionsByDTag` feeds the `#d`
+ * re-read, `liveEvents` are delivered by the live subscription before it
+ * reports ready, and `calls` records the order of relay interactions.
+ */
+async function mountDocs({ history, liveEvents = [], versionsByDTag }) {
   const React = await import("react");
   const { QueryClient, QueryClientProvider } = await import(
     "@tanstack/react-query"
@@ -111,6 +115,9 @@ async function mountDocs({ history, versionsByDTag }) {
   const { useCommunityDocs } = await import("./useCommunityDocs.ts");
 
   const published = [];
+  const historyRequests = [];
+  const calls = [];
+  const reconnectListeners = [];
   const state = { versionsByDTag };
   const originals = {
     fetchEvents: relayClient.fetchEvents,
@@ -121,16 +128,23 @@ async function mountDocs({ history, versionsByDTag }) {
   relayClient.fetchEvents = async (filter) => {
     const dTags = filter["#d"];
     if (dTags) return state.versionsByDTag[dTags[0]] ?? [];
-    return history;
+    historyRequests.push(filter);
+    calls.push("history");
+    return typeof history === "function" ? history(filter) : history;
   };
   relayClient.publishEvent = async (event) => {
     published.push(event);
   };
-  relayClient.subscribeLive = async (_filter, _onEvent, onReady) => {
+  relayClient.subscribeLive = async (_filter, onEvent, onReady) => {
+    calls.push("subscribe");
+    for (const event of liveEvents) onEvent(event);
     onReady?.("eose");
     return async () => {};
   };
-  relayClient.subscribeToReconnects = () => () => {};
+  relayClient.subscribeToReconnects = (listener) => {
+    reconnectListeners.push(listener);
+    return () => {};
+  };
 
   // gcTime 0: the default 5-minute garbage-collection timer would keep the
   // test process alive long after the assertions finish.
@@ -144,7 +158,10 @@ async function mountDocs({ history, versionsByDTag }) {
     assert.equal(rendered.result.current.isLoading, false, "history loaded"),
   );
   return {
+    calls,
+    historyRequests,
     published,
+    reconnectListeners,
     result: rendered.result,
     setVersions(next) {
       state.versionsByDTag = next;
@@ -245,6 +262,7 @@ test("an oversized page is refused before signing", async () => {
     versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2] },
   });
   try {
+    const signedBefore = nextEventSerial;
     await assert.rejects(
       docs.result.current.updatePage(
         PAGE_ID,
@@ -254,6 +272,223 @@ test("an oversized page is refused before signing", async () => {
       (error) => error.name === "DocTooLargeError",
     );
     assert.equal(docs.published.length, 0);
+    assert.equal(nextEventSerial, signedBefore, "nothing was signed");
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a refetch after a complete scan is incremental, anchored on relay-stamped time", async () => {
+  // The watermark must come from created_at values the relay accepted, never
+  // from this machine's clock: a client running 16 minutes fast would
+  // otherwise push `since` into the server's future and miss every edit.
+  const newest = docEvent({
+    id: "other-page",
+    eventId: "newest",
+    author: AUTHOR_THEM,
+    createdAt: 50_000,
+    content: {},
+  });
+  const docs = await mountDocs({
+    history: [V1, newest],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    assert.equal(docs.historyRequests.length, 1);
+    assert.equal(
+      docs.historyRequests[0].since,
+      undefined,
+      "first scan is full",
+    );
+    const realNow = Date.now;
+    // A wildly wrong local clock must not move the watermark.
+    Date.now = () => 9_999_999_000;
+    try {
+      await docs.result.current.refetch();
+    } finally {
+      Date.now = realNow;
+    }
+    assert.equal(docs.historyRequests.length, 2);
+    // 50_000 − (2 × 900 + 60): two drift windows (the newest row may be
+    // stamped 900 s ahead; a later event may be stamped 900 s behind).
+    assert.equal(docs.historyRequests[1].since, 50_000 - 1_860);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("an incremental scan that sees nothing newer keeps the earlier watermark", async () => {
+  const newest = docEvent({
+    id: "other-page",
+    eventId: "newest",
+    author: AUTHOR_THEM,
+    createdAt: 50_000,
+    content: {},
+  });
+  const docs = await mountDocs({
+    history: [V1, newest],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    await docs.result.current.refetch();
+    assert.equal(docs.historyRequests[1].since, 50_000 - 1_860);
+    // The stub replays the same rows: the watermark must not regress.
+    await docs.result.current.refetch();
+    assert.equal(docs.historyRequests[2].since, 50_000 - 1_860);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a tree operation on a page someone just deleted is refused instead of resurrecting it", async () => {
+  const tombstone = docEvent({
+    id: PAGE_ID,
+    eventId: "v3",
+    author: AUTHOR_THEM,
+    createdAt: 1_200,
+    content: { deleted: true },
+  });
+  const docs = await mountDocs({
+    history: [V1],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2, tombstone] },
+  });
+  try {
+    await assert.rejects(
+      docs.result.current.movePage(PAGE_ID, null),
+      /deleted/,
+    );
+    assert.equal(docs.published.length, 0);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("lookupPage resolves a page the history scan never delivered", async () => {
+  const docs = await mountDocs({
+    history: [],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2] },
+  });
+  try {
+    assert.equal(docs.result.current.pages.has(PAGE_ID), false);
+    const found = await docs.result.current.lookupPage(PAGE_ID);
+    assert.equal(found?.eventId, V2.id);
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() =>
+      assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventId, V2.id),
+    );
+    assert.equal(await docs.result.current.lookupPage("nope"), undefined);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("the live subscription is attached before the history scan starts", async () => {
+  const docs = await mountDocs({
+    history: [V1],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    assert.deepEqual(docs.calls.slice(0, 2), ["subscribe", "history"]);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a version delivered live during startup survives the history merge", async () => {
+  // The scan's snapshot predates v2; the live feed delivered v2 first.
+  const docs = await mountDocs({
+    history: [V1],
+    liveEvents: [V2],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2] },
+  });
+  try {
+    assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventId, V2.id);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a relay reconnect triggers a fresh history fetch", async () => {
+  const docs = await mountDocs({
+    history: [V1],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    assert.equal(docs.historyRequests.length, 1);
+    assert.equal(docs.reconnectListeners.length, 1, "listener registered");
+    const { act, waitFor } = await import("@testing-library/react");
+    await act(async () => {
+      for (const listener of docs.reconnectListeners) listener();
+    });
+    await waitFor(() => assert.equal(docs.historyRequests.length, 2));
+  } finally {
+    docs.restore();
+  }
+});
+
+test("an incremental scan that overflows its page budget falls back to one full scan", async () => {
+  // A 31-minute window can hold more than 30 pages of read-state churn in a
+  // large community. That must not end as a "pages may be missing" banner
+  // plus a full rescan on the *next* load: the store retries as a full scan
+  // right away, which here is short and complete.
+  const newest = docEvent({
+    id: "other-page",
+    eventId: "newest",
+    author: AUTHOR_THEM,
+    createdAt: 50_000,
+    content: {},
+  });
+  // One distinct row per second going back from 60_000: every incremental
+  // page is full and the cursor keeps moving, so the scan spends its whole
+  // page budget before it can reach `since`.
+  const busyRow = (createdAt) => ({
+    id: `busy${createdAt}`.padEnd(64, "0"),
+    pubkey: AUTHOR_THEM,
+    created_at: createdAt,
+    kind: 30078,
+    tags: [
+      ["d", `read-state:${String(createdAt).padStart(32, "0")}`],
+      ["t", "read-state"],
+    ],
+    content: "x",
+    sig: "f".repeat(128),
+  });
+  const docs = await mountDocs({
+    history: (filter) => {
+      if (filter.since === undefined) return [V1, newest];
+      const top = Math.min(filter.until ?? 60_000, 60_000);
+      return Array.from({ length: filter.limit }, (_, index) =>
+        busyRow(top - index),
+      );
+    },
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    assert.equal(docs.result.current.truncated, false);
+    await docs.result.current.refetch();
+    const incremental = docs.historyRequests.filter(
+      (filter) => filter.since !== undefined,
+    );
+    const full = docs.historyRequests.filter(
+      (filter) => filter.since === undefined,
+    );
+    assert.equal(
+      incremental.length,
+      30,
+      "the incremental scan ran to its budget",
+    );
+    assert.equal(
+      full.length,
+      2,
+      "then one full scan, on top of the initial one",
+    );
+    assert.equal(docs.result.current.truncated, false, "no false alarm");
+    assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventId, V1.id);
+    // The full scan restored a usable watermark: the next refetch starts
+    // incremental again (and, with this busy stub, falls back once more).
+    const before = docs.historyRequests.length;
+    await docs.result.current.refetch();
+    assert.notEqual(docs.historyRequests[before].since, undefined);
   } finally {
     docs.restore();
   }

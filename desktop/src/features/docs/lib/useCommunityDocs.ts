@@ -38,9 +38,39 @@ import {
 export const DOCS_PAGES_QUERY_KEY = ["docs", "pages"] as const;
 
 type DocPageMap = Map<string, DocPage>;
-type DocsSnapshot = { pages: DocPageMap; truncated: boolean };
+type DocsSnapshot = {
+  pages: DocPageMap;
+  truncated: boolean;
+  /** Kind-30078 rows the last scan inspected. */
+  scanned: number;
+  /**
+   * Largest relay-validated `created_at` any complete scan has seen;
+   * `undefined` after a truncated one or before the first scan. The next
+   * scan is incremental from here. Never the local clock: a client running
+   * ahead of the relay would otherwise push `since` into the server's future
+   * and silently miss every later edit.
+   */
+  watermark: number | undefined;
+};
 const EMPTY_PAGES: DocPageMap = new Map();
-const EMPTY_SNAPSHOT: DocsSnapshot = { pages: EMPTY_PAGES, truncated: false };
+const EMPTY_SNAPSHOT: DocsSnapshot = {
+  pages: EMPTY_PAGES,
+  truncated: false,
+  scanned: 0,
+  watermark: undefined,
+};
+
+/**
+ * How far below the watermark an incremental scan starts. The relay accepts
+ * `created_at` within ±900 s of its own clock at ingest, so the watermark
+ * (the newest row seen) may sit up to 900 s ahead of server time, and an
+ * event ingested after that scan may be stamped up to 900 s behind server
+ * time: two windows apart at worst. 60 s more for good measure.
+ */
+const INCREMENTAL_LOOKBACK_SECONDS = 2 * 900 + 60;
+
+/** How long the first load waits for the live subscription before fetching anyway. */
+const SUBSCRIPTION_SETTLE_TIMEOUT_MS = 3_000;
 
 /** The newest known version of this page is stamped too far in the future to build on. */
 export class DocClockSkewError extends Error {
@@ -105,7 +135,15 @@ export type CommunityDocs = {
   isError: boolean;
   /** The history scan hit its bound before the window ended: pages may be missing. */
   truncated: boolean;
+  /** Kind-30078 rows the last scan inspected (for the truncation notice). */
+  scanned: number;
   refetch: () => Promise<unknown>;
+  /**
+   * Fetches one page by `#d` (SQL-pushed, so it cannot be starved like the
+   * history scan) and folds it into the cache. Resolves `undefined` when the
+   * relay holds no version of it.
+   */
+  lookupPage: (id: string) => Promise<DocPage | undefined>;
   createPage: (input: {
     parentId: string | null;
     title?: string;
@@ -153,9 +191,27 @@ export function useCommunityDocs(): CommunityDocs {
     queryKey: DOCS_PAGES_QUERY_KEY,
     enabled: subscriptionSettled,
     queryFn: async (): Promise<DocsSnapshot> => {
-      const history = await fetchDocPagesToExhaustion({
+      const previous =
+        queryClient.getQueryData<DocsSnapshot>(DOCS_PAGES_QUERY_KEY);
+      // A complete earlier scan lets this one walk only what changed since,
+      // instead of the whole window on every reconnect.
+      const since =
+        previous?.watermark !== undefined && !previous.truncated
+          ? Math.max(0, previous.watermark - INCREMENTAL_LOOKBACK_SECONDS)
+          : undefined;
+      let history = await fetchDocPagesToExhaustion({
         fetchEvents: (filter) => relayClient.fetchEvents(filter),
+        since,
       });
+      // An incremental window can hold more rows than the page budget in a
+      // busy community. Rather than warn about missing pages and leave the
+      // next load to rescan everything, do the full scan now; only its own
+      // truncation is worth a banner.
+      if (since !== undefined && history.truncated) {
+        history = await fetchDocPagesToExhaustion({
+          fetchEvents: (filter) => relayClient.fetchEvents(filter),
+        });
+      }
       // Live events can land while the scan is in flight; keep whichever
       // version is newer per page rather than letting the snapshot win.
       const cached =
@@ -166,6 +222,17 @@ export function useCommunityDocs(): CommunityDocs {
           ...history.pages,
         ]),
         truncated: history.truncated,
+        scanned: history.scanned,
+        // A shorter incremental scan must not pull the watermark back.
+        watermark: history.truncated
+          ? undefined
+          : [previous?.watermark, history.newestSeen]
+              .filter((value): value is number => value !== undefined)
+              .reduce<number | undefined>(
+                (max, value) =>
+                  max === undefined ? value : Math.max(max, value),
+                undefined,
+              ),
       };
     },
     staleTime: 60_000,
@@ -178,9 +245,7 @@ export function useCommunityDocs(): CommunityDocs {
         (previous) => {
           const current = previous ?? EMPTY_SNAPSHOT;
           const pages = applyDocPageVersion(current.pages, page);
-          return pages === current.pages
-            ? current
-            : { pages, truncated: current.truncated };
+          return pages === current.pages ? current : { ...current, pages };
         },
       );
     },
@@ -201,6 +266,12 @@ export function useCommunityDocs(): CommunityDocs {
     const settle = () => {
       if (!cancelled) setSubscriptionSettled(true);
     };
+    // A relay that is down must surface as an error, not a long spinner:
+    // fetch after a bounded wait even if the subscription never settles.
+    const settleTimer = window.setTimeout(
+      settle,
+      SUBSCRIPTION_SETTLE_TIMEOUT_MS,
+    );
     relayClient
       .subscribeLive(
         {
@@ -229,6 +300,7 @@ export function useCommunityDocs(): CommunityDocs {
     });
     return () => {
       cancelled = true;
+      window.clearTimeout(settleTimer);
       unsubscribeReconnect();
       if (unsubscribe) void unsubscribe();
     };
@@ -330,15 +402,23 @@ export function useCommunityDocs(): CommunityDocs {
     [publishPage, tree],
   );
 
-  /** Shared write path: re-read, plan, publish. `deleted` marks a tombstone. */
+  /**
+   * Shared write path: re-read, plan, publish. `patch.deleted` sets or clears
+   * the tombstone; left undefined it is carried over from the newest version.
+   * `requireLive` refuses to touch a page that was deleted meanwhile, so a
+   * tree operation racing a delete cannot bring the page back.
+   */
   const republish = React.useCallback(
     async (
       id: string,
       patch: DocPagePatch & { deleted?: boolean },
-      options?: DocUpdateOptions,
+      options?: DocUpdateOptions & { requireLive?: boolean },
     ): Promise<DocPage> => {
       const newest = await fetchNewestVersion(id);
       if (!newest) throw new Error("This page does not exist on the relay.");
+      if (options?.requireLive && newest.deleted) {
+        throw new Error("This page was deleted by someone else.");
+      }
       const plan = planDocPagePublish({
         baseEventId: options?.baseEventId,
         newest,
@@ -350,6 +430,7 @@ export function useCommunityDocs(): CommunityDocs {
           order: newest.order,
           icon: newest.icon,
           createdAt: newest.createdAt,
+          deleted: newest.deleted,
           ...patch,
           updatedAt: Date.now(),
         },
@@ -395,12 +476,13 @@ export function useCommunityDocs(): CommunityDocs {
           );
         }
       }
-      await updatePage(id, {
-        parentId,
-        order: nextOrderAfter(levelPages(tree, parentId)),
-      });
+      await republish(
+        id,
+        { parentId, order: nextOrderAfter(levelPages(tree, parentId)) },
+        { requireLive: true },
+      );
     },
-    [readPages, tree, updatePage],
+    [readPages, republish, tree],
   );
 
   const reorderPage = React.useCallback<CommunityDocs["reorderPage"]>(
@@ -414,9 +496,9 @@ export function useCommunityDocs(): CommunityDocs {
         direction,
       );
       if (order === null) return;
-      await updatePage(id, { order });
+      await republish(id, { order }, { requireLive: true });
     },
-    [tree, updatePage],
+    [republish, tree],
   );
 
   return {
@@ -426,7 +508,9 @@ export function useCommunityDocs(): CommunityDocs {
     isLoading: query.isPending,
     isError: query.isError,
     truncated: snapshot.truncated,
+    scanned: snapshot.scanned,
     refetch: query.refetch,
+    lookupPage: fetchNewestVersion,
     createPage,
     updatePage,
     deletePage,

@@ -76,7 +76,14 @@ export function DocPagePane({
   const [saveState, setSaveState] = React.useState<AutosaveState>("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
   // Event id the editor's content is based on; bumps after every own save.
-  const [baseEventId, setBaseEventId] = React.useState(page.eventId);
+  // The ref is the value a save reads, so a rebase applies to the very next
+  // flush without waiting for a render.
+  const [baseEventId, setBaseEventIdState] = React.useState(page.eventId);
+  const baseEventIdRef = React.useRef(baseEventId);
+  const setBaseEventId = React.useCallback((eventId: string) => {
+    baseEventIdRef.current = eventId;
+    setBaseEventIdState(eventId);
+  }, []);
   // "Keep mine" hides the banner for exactly this remote version.
   const [dismissedEventId, setDismissedEventId] = React.useState<string | null>(
     null,
@@ -94,7 +101,7 @@ export function DocPagePane({
   const handleSave = React.useCallback(
     async (draft: DocDraft) => {
       try {
-        const saved = await onSave(page.id, draft, baseEventId);
+        const saved = await onSave(page.id, draft, baseEventIdRef.current);
         setSaveError(null);
         setBaseEventId(saved.eventId);
       } catch (error) {
@@ -104,7 +111,7 @@ export function DocPagePane({
         throw error;
       }
     },
-    [baseEventId, onSave, page.id],
+    [onSave, page.id, setBaseEventId],
   );
 
   /** "Keep mine": rebase the draft onto the version that beat it, then save over it. */
@@ -112,10 +119,8 @@ export function DocPagePane({
     setBaseEventId(page.eventId);
     setDismissedEventId(page.eventId);
     setSaveError(null);
-    // The base above lands on the next render; flush after it so the retry
-    // carries the new base.
-    window.setTimeout(() => void editorRef.current?.flush(), 0);
-  }, [page.eventId]);
+    void editorRef.current?.flush();
+  }, [page.eventId, setBaseEventId]);
 
   const enterEdit = React.useCallback(() => {
     setBaseEventId(page.eventId);
@@ -124,7 +129,7 @@ export function DocPagePane({
     setSaveState("idle");
     setSaveError(null);
     setMode("edit");
-  }, [page.eventId]);
+  }, [page.eventId, setBaseEventId]);
 
   const finishEdit = React.useCallback(async () => {
     const saved = await editorRef.current?.flush();
@@ -144,7 +149,7 @@ export function DocPagePane({
     setEditorSession((session) => session + 1);
     setSaveState("idle");
     setSaveError(null);
-  }, [page.eventId]);
+  }, [page.eventId, setBaseEventId]);
 
   const discardEdits = React.useCallback(() => {
     editorRef.current?.discard();
