@@ -1,3 +1,4 @@
+import { useCanGoBack, useRouter } from "@tanstack/react-router";
 import { AlertTriangle, BookOpen, Plus } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -35,6 +36,11 @@ export function DocsScreen({ pageId }: DocsScreenProps) {
     updatePage,
   } = docs;
   const { goDocs } = useAppNavigation();
+  // A link inside a page can point at a page the relay does not hold; the
+  // notice must lead back to where that link was, not to the overview.
+  const router = useRouter();
+  const canGoBack = useCanGoBack();
+  const goBack = React.useCallback(() => router.history.back(), [router]);
 
   // Tombstoned pages stay reachable by URL so they can be restored.
   const selected = (pageId ? docs.pages.get(pageId) : undefined) ?? null;
@@ -205,14 +211,16 @@ export function DocsScreen({ pageId }: DocsScreenProps) {
           />
         ) : (
           <DocsPlaceholder
+            backLabel={canGoBack ? "Go back" : "Back to Docs"}
             isError={docs.isError}
             isLoading={docs.isLoading || needsLookup}
             lookupFailed={lookupSettled === "failed"}
             missingPage={lookupSettled === "answered"}
-            onBack={() => navigate(null)}
+            onBack={canGoBack ? goBack : () => navigate(null)}
             onCreate={() => void handleCreate(null)}
             onRetry={() => void docs.refetch()}
             onRetryLookup={retryLookup}
+            pageId={pageId ?? null}
           />
         )}
       </section>
@@ -221,6 +229,7 @@ export function DocsScreen({ pageId }: DocsScreenProps) {
 }
 
 function DocsPlaceholder({
+  backLabel,
   isError,
   isLoading,
   lookupFailed,
@@ -229,7 +238,9 @@ function DocsPlaceholder({
   onCreate,
   onRetry,
   onRetryLookup,
+  pageId,
 }: {
+  backLabel: string;
   isError: boolean;
   isLoading: boolean;
   lookupFailed: boolean;
@@ -238,6 +249,7 @@ function DocsPlaceholder({
   onCreate: () => void;
   onRetry: () => void;
   onRetryLookup: () => void;
+  pageId: string | null;
 }) {
   if (isLoading) {
     return <BuzzLoadingState fill label="Loading docs" />;
@@ -274,9 +286,12 @@ function DocsPlaceholder({
         </>
       ) : missingPage ? (
         <>
-          <p>This page doesn't exist or was deleted.</p>
+          <p>
+            {pageId ? `Page "${pageId}"` : "This page"} doesn't exist or was
+            deleted.
+          </p>
           <Button onClick={onBack} size="sm" type="button" variant="outline">
-            Back to Docs
+            {backLabel}
           </Button>
         </>
       ) : (

@@ -376,27 +376,46 @@ export function useMentions(
     if (mentionQuery === null) {
       return [];
     }
-    return rankMentionCandidates(
-      mentionCandidatesWithTeams,
-      mentionQuery,
-      activePersonaIds,
-    )
-      .slice(0, MENTION_SUGGESTION_LIMIT)
-      .map(({ candidate, label }) =>
-        mapMentionCandidateToSuggestion({
-          agentProvenanceReady: agentDirectoriesReady,
-          candidate,
-          label,
-          channelType: options?.channelType,
-          currentPubkey,
-          ownerProfiles: ownerProfilesQuery.data?.profiles,
-          profiles,
-        }),
-      );
+    const normalizedQuery = mentionQuery.trim().toLowerCase();
+    const allSuggestion: MentionSuggestion[] =
+      options?.channelType !== "dm" &&
+      (normalizedQuery === "" ||
+        "all".startsWith(normalizedQuery) ||
+        "channel".startsWith(normalizedQuery))
+        ? [
+            {
+              kind: "all",
+              displayName: "all",
+              isAgent: false,
+              secondaryLabel: `channel members (${memberPubkeys.size})`,
+            },
+          ]
+        : [];
+    return [
+      ...allSuggestion,
+      ...rankMentionCandidates(
+        mentionCandidatesWithTeams,
+        mentionQuery,
+        activePersonaIds,
+      )
+        .slice(0, MENTION_SUGGESTION_LIMIT)
+        .map(({ candidate, label }) =>
+          mapMentionCandidateToSuggestion({
+            agentProvenanceReady: agentDirectoriesReady,
+            candidate,
+            label,
+            channelType: options?.channelType,
+            currentPubkey,
+            ownerProfiles: ownerProfilesQuery.data?.profiles,
+            profiles,
+          }),
+        ),
+    ].slice(0, MENTION_SUGGESTION_LIMIT);
   }, [
     activePersonaIds,
     agentDirectoriesReady,
     currentPubkey,
+    memberPubkeys.size,
     mentionCandidatesWithTeams,
     mentionQuery,
     options?.channelType,

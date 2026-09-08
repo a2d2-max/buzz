@@ -12,6 +12,56 @@ import { MENTION_REFERENCE_TAG } from "@/shared/lib/resolveMentionNames";
 
 export { MENTION_REFERENCE_TAG };
 
+const MENTION_CAP = 50;
+
+const ALL_MENTION_ALIASES = new Set(["all", "channel"]);
+
+const isAllBoundaryBefore = (value: string, index: number): boolean => {
+  if (index <= 0) return true;
+  return /[\s*_~`>|([{]/.test(value[index - 1] ?? "");
+};
+
+const isAllBoundaryAfter = (value: string, index: number): boolean => {
+  if (index >= value.length) return true;
+  return /[^A-Za-z0-9._-]/.test(value[index] ?? "");
+};
+
+const stripCodeRegionsForAllMention = (value: string): string =>
+  value.replace(/```[\s\S]*?```/g, " ").replace(/`[^`]*`/g, " ");
+
+export const containsAllMention = (content: string): boolean => {
+  const stripped = stripCodeRegionsForAllMention(content);
+  for (const match of stripped.matchAll(/@([A-Za-z][A-Za-z0-9._-]*)/g)) {
+    const start = match.index ?? 0;
+    const tokenText = match[1] ?? "";
+    const token = tokenText.replace(/[._-]+$/g, "").toLowerCase();
+    const end = start + 1 + tokenText.length;
+    if (
+      ALL_MENTION_ALIASES.has(token) &&
+      isAllBoundaryBefore(stripped, start) &&
+      isAllBoundaryAfter(stripped, end)
+    ) {
+      return true;
+    }
+  }
+  return false;
+};
+
+export const allMentionRecipients = (
+  memberPubkeys: string[],
+  existingPubkeys: string[] = [],
+): string[] => {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const pubkey of [...existingPubkeys, ...memberPubkeys]) {
+    if (!pubkey || seen.has(pubkey)) continue;
+    seen.add(pubkey);
+    merged.push(pubkey);
+    if (merged.length >= MENTION_CAP) break;
+  }
+  return merged;
+};
+
 /**
  * A detached managed-agent wake queued while the send path prepared a
  * message. Queued wakes are flushed fire-and-forget only after the relay

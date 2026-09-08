@@ -234,6 +234,9 @@ enum Cmd {
     /// Upload files to the relay's Blossom store
     #[command(subcommand)]
     Upload(UploadCmd),
+    /// Narrow operational bridge for durable community Docs publication
+    #[command(subcommand)]
+    Publication(PublicationCmd),
     /// Agent engram management — persistent memory per NIP-AE
     #[command(subcommand)]
     Mem(MemCmd),
@@ -398,6 +401,9 @@ pub enum MessagesCmd {
         /// Pubkey to mention (hex or npub; repeatable). Supplying any explicit identity permits unresolved or ambiguous @Name text as presentation-only; uniquely resolved member names still notify.
         #[arg(long = "mention")]
         mentions: Vec<String>,
+        /// Mention every current channel member. Also implied by @all or @channel in content.
+        #[arg(long, default_value_t = false)]
+        all: bool,
     },
     /// Send a code diff / patch to a channel
     SendDiff {
@@ -1824,6 +1830,33 @@ pub enum MediaCmd {
     },
 }
 
+#[derive(Subcommand)]
+pub enum PublicationCmd {
+    /// Print the configured public relay and signer identity without a network request
+    Identity,
+    /// Query all current and legacy versions of one community Docs page
+    #[command(name = "query-doc")]
+    QueryDoc {
+        /// Stable Docs page identifier (without the doc: prefix)
+        #[arg(long)]
+        page_id: String,
+    },
+    /// Sign one file-backed kind:30623 Docs event input
+    #[command(name = "sign-doc")]
+    SignDoc {
+        /// JSON file containing kind, content, tags, and createdAt
+        #[arg(long)]
+        input: String,
+    },
+    /// Publish one previously signed, file-backed kind:30623 Docs event
+    #[command(name = "publish-doc")]
+    PublishDoc {
+        /// JSON file containing the complete signed event
+        #[arg(long)]
+        input: String,
+    },
+}
+
 /// Subcommands for `buzz mem`.
 #[derive(Subcommand)]
 pub enum MemCmd {
@@ -2122,6 +2155,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Pr(sub) => commands::pr::dispatch(sub, &client).await,
         Cmd::Media(sub) => commands::upload::dispatch_media(sub, &client).await,
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
+        Cmd::Publication(sub) => commands::publication::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
@@ -2182,6 +2216,36 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn publication_commands_are_narrow_and_file_backed() {
+        assert!(Cli::try_parse_from(["buzz", "publication", "identity"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "publication",
+            "query-doc",
+            "--page-id",
+            "fixture-page",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "publication",
+            "sign-doc",
+            "--input",
+            "/tmp/unsigned.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "publication",
+            "publish-doc",
+            "--input",
+            "/tmp/signed.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["buzz", "publication", "raw-event"]).is_err());
     }
 
     #[test]
@@ -2269,6 +2333,7 @@ mod tests {
             "patches",
             "pr",
             "projects",
+            "publication",
             "reactions",
             "repos",
             "social",
@@ -2442,6 +2507,10 @@ mod tests {
             vec!["assign", "create", "get", "list", "status", "unassign"]
         );
         assert_eq!(names(&cmd, "media"), vec!["get"]);
+        assert_eq!(
+            names(&cmd, "publication"),
+            vec!["identity", "publish-doc", "query-doc", "sign-doc"]
+        );
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
         assert_eq!(names(&cmd, "pack"), vec!["inspect", "validate"]);
         assert_eq!(
@@ -2475,6 +2544,7 @@ mod tests {
             ("patches", 4),
             ("pr", 5),
             ("projects", 8),
+            ("publication", 4),
             ("reactions", 3),
             ("repos", 5),
             ("social", 7),

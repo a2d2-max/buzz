@@ -1,4 +1,7 @@
-import { DOC_MAX_CONTENT_BYTES } from "../../src/features/docs/lib/docPageCodec.ts";
+import {
+  DOC_DEFAULT_MAX_CONTENT_BYTES,
+  resolveMaxContentBytes,
+} from "../../src/features/docs/lib/docContentLimit.ts";
 import type { ContentLimitProvenance } from "./types.ts";
 
 export const RELAY_INFO_TIMEOUT_MS = 5_000;
@@ -10,7 +13,11 @@ export type RelayContentLimit = ContentLimitProvenance;
 
 type ParsedRelayContentLimit = Pick<
   RelayContentLimit,
-  "advertisedMaxContentBytes" | "effectiveMaxContentBytes" | "reason" | "source"
+  | "advertisedMaxContentBytes"
+  | "advertisedMaxMessageBytes"
+  | "effectiveMaxContentBytes"
+  | "reason"
+  | "source"
 >;
 
 export class RelayContentLimitError extends Error {
@@ -37,7 +44,7 @@ function validPositiveSafeInteger(value: unknown): value is number {
 
 export function parseRelayContentLimit(
   document: unknown,
-  legacyMaxContentBytes = DOC_MAX_CONTENT_BYTES,
+  legacyMaxContentBytes = DOC_DEFAULT_MAX_CONTENT_BYTES,
 ): ParsedRelayContentLimit {
   if (!validPositiveSafeInteger(legacyMaxContentBytes)) {
     fail("invalid-legacy-content-limit");
@@ -52,9 +59,19 @@ export function parseRelayContentLimit(
     };
   }
   if (!isRecord(document.limitation)) fail("relay-info-invalid-document");
+  let advertisedMaxMessageBytes: number | undefined;
+  if ("max_message_length" in document.limitation) {
+    if (!validPositiveSafeInteger(document.limitation.max_message_length)) {
+      fail("relay-info-invalid-max-message-length");
+    }
+    advertisedMaxMessageBytes = document.limitation.max_message_length;
+  }
   if (!("max_content_length" in document.limitation)) {
     return {
       advertisedMaxContentBytes: null,
+      ...(advertisedMaxMessageBytes === undefined
+        ? {}
+        : { advertisedMaxMessageBytes }),
       effectiveMaxContentBytes: legacyMaxContentBytes,
       reason: "max-content-length-not-advertised",
       source: "legacy-assumption",
@@ -66,7 +83,10 @@ export function parseRelayContentLimit(
   }
   return {
     advertisedMaxContentBytes: advertised,
-    effectiveMaxContentBytes: advertised,
+    ...(advertisedMaxMessageBytes === undefined
+      ? {}
+      : { advertisedMaxMessageBytes }),
+    effectiveMaxContentBytes: resolveMaxContentBytes(document),
     reason: "max-content-length-advertised",
     source: "advertised",
   };
@@ -91,6 +111,23 @@ function relayHttpUrl(relayUrl: string, pathname: "/" | "/info"): string {
   parsed.search = "";
   parsed.hash = "";
   return parsed.href;
+}
+
+function normalizedRelayOrigin(relayUrl: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(relayUrl);
+  } catch {
+    return fail("invalid-relay-url");
+  }
+  if (
+    (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") ||
+    parsed.username !== "" ||
+    parsed.password !== ""
+  ) {
+    return fail("invalid-relay-url");
+  }
+  return `${parsed.protocol}//${parsed.host}`;
 }
 
 async function readBoundedResponse(
@@ -188,6 +225,8 @@ export async function fetchRelayContentLimit(
     maxResponseBytes?: number;
     fetchImpl?: typeof fetch;
     legacyMaxContentBytes?: number;
+    /** Explicit target whose successful advertisement is operational evidence. */
+    operationalTargetRelay?: string;
   } = {},
 ): Promise<RelayContentLimit> {
   const timeoutMs = options.timeoutMs ?? RELAY_INFO_TIMEOUT_MS;
@@ -196,6 +235,13 @@ export async function fetchRelayContentLimit(
   if (!validPositiveSafeInteger(timeoutMs)) fail("invalid-relay-info-timeout");
   if (!validPositiveSafeInteger(maxResponseBytes)) {
     fail("invalid-relay-info-response-limit");
+  }
+  const relayOrigin = normalizedRelayOrigin(relayUrl);
+  if (
+    options.operationalTargetRelay !== undefined &&
+    normalizedRelayOrigin(options.operationalTargetRelay) !== relayOrigin
+  ) {
+    fail("relay-info-operational-target-mismatch");
   }
   const infoUrl = relayHttpUrl(relayUrl, "/info");
   const rootUrl = relayHttpUrl(relayUrl, "/");
@@ -223,7 +269,7 @@ export async function fetchRelayContentLimit(
       );
       if (root.unsupported) {
         const legacyMaxContentBytes =
-          options.legacyMaxContentBytes ?? DOC_MAX_CONTENT_BYTES;
+          options.legacyMaxContentBytes ?? DOC_DEFAULT_MAX_CONTENT_BYTES;
         return {
           advertisedMaxContentBytes: null,
           effectiveMaxContentBytes: legacyMaxContentBytes,
@@ -244,7 +290,7 @@ export async function fetchRelayContentLimit(
     }
     const parsed = parseRelayContentLimit(
       document,
-      options.legacyMaxContentBytes ?? DOC_MAX_CONTENT_BYTES,
+      options.legacyMaxContentBytes ?? DOC_DEFAULT_MAX_CONTENT_BYTES,
     );
     if (unsupportedInfoEndpoint && parsed.source === "legacy-assumption") {
       parsed.reason = "relay-info-endpoint-unsupported";
@@ -252,7 +298,9 @@ export async function fetchRelayContentLimit(
     return {
       ...parsed,
       limitVerified: parsed.source === "advertised",
-      operationalAdvertisementConfirmed: false,
+      operationalAdvertisementConfirmed:
+        options.operationalTargetRelay !== undefined &&
+        parsed.source === "advertised",
       relayInfoEndpoint,
       relayInfoHttpStatus,
       relayInfoUrl,

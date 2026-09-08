@@ -15,6 +15,7 @@ pub mod patches;
 pub mod pr;
 pub mod project_channel;
 pub mod projects;
+pub mod publication;
 pub mod reactions;
 pub mod repos;
 pub mod social;

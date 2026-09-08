@@ -21,7 +21,8 @@ cd desktop && node --import ./test-loader.mjs --experimental-strip-types \
   path: `#d` re-read before every publish, conflict on a stale
   `baseEventId`, no-op for identical content (dedicated-kind versions only —
   an identical write on a legacy version still publishes, migrating the
-  page), 256 KB refusal before signing, subscription-before-scan ordering,
+  page), relay-advertised byte-limit refusal before signing (256 KiB
+  fallback), subscription-before-scan ordering,
   reconnect refetch, incremental watermark anchored on relay-stamped
   `created_at`, and the one-shot legacy migration: after a complete scan,
   pages stranded on 30078 are republished verbatim onto 30623 (tombstones
@@ -38,6 +39,11 @@ cd desktop && node --import ./test-loader.mjs --experimental-strip-types \
   pass after one failed probe, and treats identical-content writes on
   legacy versions as noops again. Any other publish failure must NOT flip
   the relay to legacy writes.
+- `lib/docContentLimit.test.mjs` — NIP-11 `limitation.max_content_length`
+  parsing, the 256 KiB fallback, per-relay localStorage memory with the same
+  24 h expiry as doc-kind support, and the active-relay generation fence that
+  aborts a save across a community switch. The production hook test pins both
+  that zero-sign/zero-publish behavior and the 524,288 / 524,289-byte boundary.
 - `lib/autosaveScheduler.test.mjs`, `lib/docDraftBackup.test.mjs`,
   `lib/markdownFidelity.test.mjs`, `lib/docEditorMarkdown.test.mjs` —
   debounce/flush/pause semantics, localStorage draft mirror, the

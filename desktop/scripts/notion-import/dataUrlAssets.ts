@@ -5,6 +5,7 @@ import { crc32 } from "node:zlib";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import unzipper from "unzipper";
 
+import { markdownDestinationForNode } from "./markdownDestinations.ts";
 import type { NotionImport } from "./types.ts";
 
 const MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024;
@@ -192,31 +193,11 @@ function urlReplacement(
   node: MarkdownNode,
   value: string,
 ): Replacement {
-  const start = node.position?.start.offset;
-  const end = node.position?.end.offset;
-  if (start === undefined || end === undefined || node.url === undefined) {
-    throw new Error("data-url-missing-source-position");
-  }
-  const nodeSource = source.slice(start, end);
-  let destinationStart = 0;
-  if (node.type === "definition") {
-    const definitionDelimiter = nodeSource.lastIndexOf("]:");
-    if (definitionDelimiter < 0)
-      throw new Error("data-url-source-position-mismatch");
-    destinationStart = definitionDelimiter + 2;
-  } else if (nodeSource.startsWith("<") && nodeSource.endsWith(">")) {
-    destinationStart = 1;
-  } else {
-    const inlineDelimiter = nodeSource.lastIndexOf("](");
-    if (inlineDelimiter < 0)
-      throw new Error("data-url-source-position-mismatch");
-    destinationStart = inlineDelimiter + 2;
-  }
-  const relativeStart = nodeSource.indexOf(node.url, destinationStart);
-  if (relativeStart < 0) throw new Error("data-url-source-position-mismatch");
+  const destination = markdownDestinationForNode(source, node);
+  if (!destination) throw new Error("data-url-source-position-mismatch");
   return {
-    start: start + relativeStart,
-    end: start + relativeStart + node.url.length,
+    start: destination.start,
+    end: destination.end,
     value,
   };
 }

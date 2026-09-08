@@ -31,6 +31,8 @@ import type { AcpRuntime, ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import { buildCustomEmojiTags } from "@/shared/lib/customEmojiTags";
 import {
+  allMentionRecipients,
+  containsAllMention,
   dedupeQueuedAgentWakes,
   enqueueAgentWake,
   formatMessageSendError,
@@ -833,7 +835,12 @@ export function useMentionSendFlow({
           ...createdPersonaAgentPubkeys,
         ]);
         const pubkeys = mergeMentionRecipients(
-          explicitMentionPubkeys,
+          containsAllMention(trimmed)
+            ? allMentionRecipients(
+                Array.from(mentions.memberPubkeys),
+                explicitMentionPubkeys,
+              )
+            : explicitMentionPubkeys,
           addressedAgentPubkeys,
         );
         const outgoingTags = [

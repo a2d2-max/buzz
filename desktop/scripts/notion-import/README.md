@@ -18,7 +18,19 @@ node --import ./test-loader.mjs --experimental-strip-types \
   --output /private/path/notion-import-output \
   --report /private/path/NOTION_IMPORT_REPORT.md \
   --relay wss://relay.example
+
+node --import ./test-loader.mjs --experimental-strip-types \
+  ./scripts/notion-import/cli.ts prepare-publication \
+  --input /private/path/notion-import-output/notion-import.json \
+  --output /private/path/notion-publication-prep \
+  --relay wss://relay.example \
+  --operational-target wss://relay.example \
+  --simulate-bindings-origin https://simulation.invalid
 ```
+
+The fourth command, `execute-publication`, is a real uploader/signer/publisher
+and is intentionally shown later with its full safety checklist. Do not infer
+live authorization from either dry-run command above.
 
 `publish` is always a dry run. It performs a bounded NIP-11 metadata GET, then
 writes unsigned inputs for the desktop signer. It never reads a key, opens a
@@ -41,7 +53,11 @@ uses the legacy 256 KiB assumption but records both statuses, an unsupported
 reason, and an unverified limit instead of claiming an advertisement.
 The response is capped at 64 KiB and both requests share one five-second
 deadline. Reports record the endpoint, status, advertised value, effective
-value, source, and whether an advertisement was verified.
+value, source, and whether an advertisement was verified. A present
+`max_message_length` is also validated and recorded as frame provenance, but
+is never substituted for `max_content_length`. `--operational-target` must
+normalize to the exact `--relay`; only a successful advertisement from that
+explicit target is marked operationally confirmed.
 
 Pages above the effective advertised or compatibility limit are listed as
 failures and omitted from the event list.
@@ -67,9 +83,170 @@ streamed and hashed for duplicate comparison.
 Local placeholders are not publishable URLs. When any exist,
 `readyForSigning=false` and `readyToPublish=false` until a later approved step
 uploads the files, binds final URLs, and validates the final event bodies
-again. The current operational relay advertisement has not been confirmed by
-this tool; local test advertisements are recorded with
+again. The legacy `publish` command never marks an advertisement operational;
+`prepare-publication` does so only when `--operational-target` exactly matches
+the fetched relay. Local test advertisements omit that option and remain
 `operationalAdvertisementConfirmed=false`.
+
+## Full publication preparation
+
+`prepare-publication` is the local, credential-free stage for the complete
+archive. It does not read a signer, call an upload endpoint, open a WebSocket,
+or publish an event. It performs these operations:
+
+- streams every original non-Markdown/non-CSV ZIP attachment into
+  `notion-zip-attachments/`, preserving its normalized archive-relative path;
+- streams every CSV original into `notion-csv-originals/`, independently of
+  the Markdown table conversion;
+- checks ZIP size, entry count, path containment, encryption, declared size,
+  CRC-32, SHA-256, and existing-file identity before reuse;
+- merges ZIP-attachment and inline-data-URL references into one manifest,
+  while keeping physical entries, unique byte hashes, references, CSVs, and
+  unreferenced originals as separate denominators;
+- rewrites only mdast-recognized link, image, and definition destination
+  spans. Labels, titles, prose, code, relations, and Docs links are not
+  searched or globally replaced;
+- reconstructs every changed input body byte-for-byte from the private
+  manifest and retained files;
+- proves every archive CSV reference was consumed by the database-table
+  conversion and rejects any final destination that still resolves to one of
+  the retained CSV originals. CSV source files are evidence, not members of
+  the binary upload set;
+- applies the production Docs codec to every stable page ID, parent, and final
+  body, then enforces the advertised content limit as one batch. Any invalid
+  page empties the signable event list.
+
+The safe count/status manifest is `notion-publication-assets.json`. Archive
+paths, original destinations, and page mappings live only in
+`notion-publication-assets.private.json`. Prepared local-placeholder bodies,
+simulated final bodies, strict preflight, and the safe status are written as:
+
+```text
+notion-publication-prepared.json
+notion-publication-final.json
+notion-publication-bindings.simulated.json
+notion-publication-preflight.json
+notion-publication-compatibility.json
+notion-publication-status.json
+notion-publication-report.md
+```
+
+`--simulate-bindings-origin` deterministically exercises all destination
+replacement and post-binding size checks without network traffic. A simulated
+binding may report `referencesBound=true`, but always keeps
+`productionBindingsComplete=false`, `assetBindingsComplete=false`,
+`readyForSigning=false`, and `readyToPublish=false`. Re-run the exact same
+command to verify every retained file and regenerate byte-identical manifests;
+an existing mismatch fails instead of overwriting the file.
+
+## Locked execution adapters and journal
+
+The reusable `executePublication` engine requires explicit live authorization,
+an exact target relay, and an exact signer pubkey before it calls any adapter
+method. `createDesktopPublicationApi()` records the existing renderer/Tauri
+surface:
+
+```text
+uploadMedia -> Tauri upload_media -> kind:24242 Blossom auth -> PUT /upload
+signRelayEvent -> Tauri sign_event -> current AppState signing_keys
+relayClient.fetchEvents -> kinds 30623+30078, #d=doc:<pageId>
+relayClient.publishEvent -> current-community NIP-42 WebSocket -> OK
+fetchMediaBytes -> same-origin authenticated /media readback
+```
+
+That Desktop adapter is not a runnable host for this Node journal. The runnable
+path is `createBuzzCliPublicationApi()`, which delegates to the existing Rust
+Buzz client without reading or printing credentials in Node:
+
+```text
+buzz publication identity -> configured relay + public signer (no network)
+buzz upload file -> Blossom kind:24242 auth -> PUT /upload
+buzz media get -> Blossom get auth -> GET same-origin /media/<hash>.<ext>
+buzz publication query-doc -> NIP-98 POST /query, kinds 30623+30078, #d=doc:<pageId>
+buzz publication sign-doc -> BuzzClient::sign_event + optional verified NIP-OA auth tag
+buzz publication publish-doc -> NIP-98 POST /events
+```
+
+`BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, and optional `BUZZ_AUTH_TAG` must already
+be provisioned in the approved execution environment. They are inherited by
+the child `buzz` process; the importer never reads their values and never puts
+them on an argument list. Build the exact checkout first:
+
+```bash
+cargo build --release -p buzz-cli
+```
+
+Only after the coordinator separately confirms the production target, public
+signer, media compatibility, and live authorization, run from `desktop/`:
+
+```bash
+node --import ./test-loader.mjs --experimental-strip-types \
+  ./scripts/notion-import/cli.ts execute-publication \
+  --input /private/path/notion-publication-prep/notion-publication-prepared.json \
+  --assets /private/path/notion-publication-prep/notion-publication-assets.json \
+  --private-assets /private/path/notion-publication-prep/notion-publication-assets.private.json \
+  --compatibility /private/path/notion-publication-prep/notion-publication-compatibility.json \
+  --content-limit /private/path/notion-publication-prep/notion-publication-preflight.json \
+  --output /private/path/notion-publication-prep \
+  --journal /private/path/notion-publication-prep/notion-publication-journal.private.json \
+  --buzz-cli ../target/release/buzz \
+  --target-relay wss://relay.example \
+  --signer-pubkey 64-lowercase-hex-public-key \
+  --authorize-live
+```
+
+Without `--authorize-live`, the command stops before reading inputs or invoking
+Buzz. It also rejects a compatibility manifest whose hashes/byte denominators
+do not exactly match the upload manifest, and stops before invoking Buzz when
+the source set contains a relay-incompatible M4A, MOV, or SVG. Repeat the exact
+same command and journal path to resume; never substitute the simulated final
+JSON for `notion-publication-prepared.json`.
+
+The executor uploads each unique source hash once, verifies descriptor bytes
+by readback, binds all URLs, re-runs the full codec/limit preflight, scans all
+page IDs for identical existing pages or conflicts, then re-queries immediately
+before each publish. A signed event is persisted before send; relay acceptance
+and signature-verified exact event readback are separate durable states. A
+cross-origin descriptor is rejected before readback, and an accepted response
+without valid readback is incomplete, never success.
+
+Use `JsonPublicationJournalStore` with the same absolute journal path on every
+attempt. The small top-level JSON stores the target, signer, source/corpus
+hashes, preflight, and completion state. Per-asset, per-page, and full signed
+event records are stored under the adjacent `.d/` directory so a 3,319-page
+resume does not rewrite every signed body on each checkpoint. The store uses
+an exclusive process lock, rejects a target/signer/source/corpus mismatch, and
+recovers a stale lock only when its recorded process no longer exists. Resume
+by repeating the exact same `executePublication(...)` call and journal path;
+already-read-back assets/pages are skipped and a signed-but-ambiguous event is
+re-read before the identical signed event is retried.
+
+The Desktop adapter has two current operational constraints that must remain
+on the handoff checklist: `upload_media` accepts a path already staged beneath
+the OS temp directory, and `fetch_media_bytes` caps a single readback at 50
+MiB. A batch containing a larger retained file cannot become complete through
+this adapter until an existing bounded large-file readback seam is available.
+
+There is no executable Node/Tauri host bridge in this importer. The
+executor and journal use Node filesystem APIs, while the Desktop adapter uses
+renderer-only Tauri globals. The credential-free smoke test proves the adapter
+module loads in Node but `getCurrentRelay()` cannot run there; it deliberately
+does not call the signer. Run it with:
+
+```bash
+node --import ./test-loader.mjs --experimental-strip-types --test \
+  scripts/notion-import/desktopPublicationAdapter.test.mjs
+```
+
+`notion-publication-compatibility.json` records this Desktop-specific host gap,
+the Node-compatible Buzz CLI adapter, and separate Desktop/CLI upload and
+readback compatibility for every source hash. Code defaults for relay media
+limits are not evidence of deployed values, and `/info` does not advertise
+media upload limits. The current source set still contains relay-incompatible
+M4A, MOV, and SVG files, so a runnable adapter does not make this corpus a
+usable publisher: `operationalUploadReady`, `readyForSigning`, and
+`readyToPublish` remain false until those assets, the target, the signer, and
+production bindings are resolved and revalidated.
 
 The converter reads one Markdown or CSV entry at a time and never extracts
 attachments. It bounds archive entries and text bytes, rejects unsafe or

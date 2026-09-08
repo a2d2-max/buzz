@@ -6,7 +6,6 @@ import {
   COMMUNITY_DOC_QUERY_KINDS,
   COMMUNITY_DOC_TAG,
   createDocPageId,
-  DOC_MAX_CONTENT_BYTES,
   docPageContentEquals,
   docPageDTag,
   docPageIdFromDTag,
@@ -391,9 +390,4 @@ test("measureDocPageContentBytes: counts UTF-8 bytes of the serialized content",
     body: "가나다라",
   });
   assert.equal(hangul - ascii, 4 * 3 - 4, "each Hangul syllable is 3 bytes");
-  assert.equal(
-    DOC_MAX_CONTENT_BYTES,
-    256 * 1024,
-    "mirrors the relay's MAX_EVENT_CONTENT_BYTES",
-  );
 });

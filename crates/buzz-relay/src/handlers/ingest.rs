@@ -2185,6 +2185,14 @@ async fn ingest_event_inner(
     let kind_u32 = event_kind_u32(&event);
     debug!(event_id = %event_id_hex, kind = kind_u32, "ingest_event");
 
+    let content_bytes = event.content.len();
+    if content_bytes > state.config.max_event_content_bytes {
+        return Err(IngestError::Rejected(format!(
+            "invalid: content exceeds maximum size of {} bytes (got {})",
+            state.config.max_event_content_bytes, content_bytes
+        )));
+    }
+
     // Durable community write fence: persistent ingest is a DB write the
     // deletion engine cannot exclude via serving-write leases (those cover
     // external side effects only), so the shared WS/HTTP seam must refuse
@@ -2218,7 +2226,7 @@ async fn ingest_event_inner(
     }
 
     // Share the event with the verify task via Arc instead of deep-cloning it
-    // (tags + up to 256 KB of content). spawn_blocking only needs 'static, not
+    // (tags + bounded content). spawn_blocking only needs 'static, not
     // ownership; once it completes its Arc is dropped, so try_unwrap returns
     // the original event without ever having copied it.
     let event = std::sync::Arc::new(event);
@@ -2245,15 +2253,6 @@ async fn ingest_event_inner(
         return Err(IngestError::Rejected(
             "invalid: event timestamp too far from server time".into(),
         ));
-    }
-
-    const MAX_EVENT_CONTENT_BYTES: usize = 256 * 1024; // 256 KB
-    if event.content.len() > MAX_EVENT_CONTENT_BYTES {
-        return Err(IngestError::Rejected(format!(
-            "invalid: content exceeds maximum size of {} bytes (got {})",
-            MAX_EVENT_CONTENT_BYTES,
-            event.content.len()
-        )));
     }
 
     let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
@@ -3302,11 +3301,69 @@ mod postgres_tests {
     use super::*;
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
-        KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
-        KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE,
-        KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
+        KIND_CANVAS, KIND_COMMUNITY_DOC, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE,
+        KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE,
+        KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
+
+    #[tokio::test]
+    async fn ingest_event_enforces_configured_content_limit_at_byte_boundary() {
+        let mut state = crate::state::tests::test_state().await;
+        let unavailable_pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy("postgres://buzz:buzz@127.0.0.1:1/buzz")
+            .expect("lazy unavailable pool");
+        let state_mut = Arc::get_mut(&mut state).expect("unique test state");
+        let mut config = (*state_mut.config).clone();
+        config.max_event_content_bytes = 524_288;
+        config.max_frame_bytes = 1_048_576;
+        state_mut.config = Arc::new(config);
+        state_mut.db = buzz_db::Db::from_pool(unavailable_pool);
+
+        let limit = state.config.max_event_content_bytes;
+        assert_eq!(limit, 524_288);
+        let tenant = TenantContext::resolved(
+            buzz_core::CommunityId::from_uuid(Uuid::new_v4()),
+            "content-limit.test",
+        );
+        let keys = nostr::Keys::generate();
+
+        for bytes in [limit - 1, limit, limit + 1] {
+            let event =
+                EventBuilder::new(Kind::Custom(KIND_COMMUNITY_DOC as u16), "x".repeat(bytes))
+                    .sign_with_keys(&keys)
+                    .expect("sign boundary event");
+            let result = ingest_event(
+                &state,
+                &tenant,
+                event,
+                IngestAuth::Http {
+                    pubkey: keys.public_key(),
+                    scopes: vec![Scope::MessagesWrite],
+                    auth_method: HttpAuthMethod::Nip98,
+                },
+            )
+            .await;
+
+            if bytes > limit {
+                match result {
+                    Err(IngestError::Rejected(message)) => assert_eq!(
+                        message,
+                        format!(
+                            "invalid: content exceeds maximum size of {limit} bytes (got {bytes})"
+                        )
+                    ),
+                    _ => panic!("limit + 1 was not rejected by the production ingest seam"),
+                }
+            } else if let Err(IngestError::Rejected(message)) = result {
+                assert!(
+                    !message.contains("content exceeds maximum size"),
+                    "{bytes} bytes must pass the production content-size guard: {message}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn missing_huddle_backing_channel_is_a_client_rejection() {

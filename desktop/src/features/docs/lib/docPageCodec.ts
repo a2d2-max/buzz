@@ -5,6 +5,7 @@ import {
   KIND_COMMUNITY_DOC,
   KIND_COMMUNITY_DOC_LEGACY,
 } from "@/shared/constants/kinds";
+import { DOC_PAGE_ID_PATTERN } from "@/shared/lib/docsPageLink";
 
 export {
   COMMUNITY_DOC_TAG,
@@ -65,7 +66,8 @@ export type DocPage = DocPageContent & {
  * leading punctuation. UUIDs pass; anything a hostile publisher could use to
  * shape a URL does not.
  */
-const PAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** The id rule lives with the link parser so both agree on what a page id is. */
+const PAGE_ID_PATTERN = DOC_PAGE_ID_PATTERN;
 
 export function docPageDTag(id: string): string {
   return `${COMMUNITY_DOC_D_PREFIX}${id}`;
@@ -153,14 +155,6 @@ export function parseDocPageEvent(event: RelayEvent): DocPage | null {
   }
   return page;
 }
-
-/**
- * Relay ceiling on event content (`MAX_EVENT_CONTENT_BYTES` in buzz-relay's
- * ingest). Anything larger is rejected — and a page that also overflows the
- * WebSocket frame limit drops the connection instead of answering, so the
- * client must measure before it signs.
- */
-export const DOC_MAX_CONTENT_BYTES = 256 * 1024;
 
 /** True when the two would render and sort identically; timestamps are ignored. */
 export function docPageContentEquals(

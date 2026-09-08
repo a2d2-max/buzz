@@ -110,6 +110,20 @@ test("includes aliases from mention reference tags", () => {
   });
 });
 
+test("includes channel-wide mention aliases from content for rendering", () => {
+  assert.deepEqual(resolveMentionProps([], {}, "@all please read"), {
+    mentionNames: ["all"],
+    mentionPubkeysByName: {},
+  });
+  assert.deepEqual(
+    resolveMentionProps([], {}, "`@all` email@channel.example"),
+    {
+      mentionNames: undefined,
+      mentionPubkeysByName: undefined,
+    },
+  );
+});
+
 test("every rendered name resolves to a pubkey (outputs stay in sync)", () => {
   const tags = [
     ["p", PUBKEY],

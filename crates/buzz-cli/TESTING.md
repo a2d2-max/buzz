@@ -104,6 +104,24 @@ cargo clippy -p buzz-cli -- -D warnings
 # Expected: zero warnings
 ```
 
+### 5.1 Community Docs publication bridge
+
+The `publication` group is a narrow transport seam for the resumable Notion
+importer, not a general raw-event interface. Its unit tests use only the fixed
+secp256k1 fixture secret `00...01` and isolated HTTP listeners:
+
+```bash
+cargo test -p buzz-cli commands::publication::tests
+cargo test -p buzz-cli publication_upload_tests
+```
+
+Coverage binds `query-doc` to NIP-98 `POST /query`, `publish-doc` to the exact
+signed event passed through `POST /events`, and generic attachments to the
+primary Blossom `PUT /upload` route. `identity` performs no network request and
+prints only the configured relay plus public signer. Do not run these commands
+against a live relay as part of this generic CLI runbook; the importer requires
+its own explicit target/signer/live-authorization gate and durable journal.
+
 ---
 
 ## 6. Live Testing — Command by Command

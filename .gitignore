@@ -36,6 +36,14 @@ Thumbs.db
 /desktop/notion-import-output/
 **/notion-inline-assets/
 **/notion-data-url-assets.private.json
+**/notion-zip-attachments/
+**/notion-csv-originals/
+**/notion-publication-assets.private.json
+**/notion-publication-prepared.json
+**/notion-publication-final.json
+**/notion-publication-preflight.json
+**/publication-journal.private.json
+**/publication-journal.private.json.d/
 
 # Playwright artifacts
 playwright-report/

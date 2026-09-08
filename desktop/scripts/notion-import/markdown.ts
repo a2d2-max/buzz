@@ -2,6 +2,7 @@ import path from "node:path";
 import { fromMarkdown } from "mdast-util-from-markdown";
 
 import { scanUnsupportedMarkdown } from "../../src/features/docs/lib/markdownFidelity.ts";
+import { markdownDestinationForNode } from "./markdownDestinations.ts";
 import type { ImportedDatabase, UnresolvedLink } from "./types.ts";
 
 type MarkdownNode = {
@@ -106,18 +107,11 @@ function replaceLinkUrl(
   node: MarkdownNode,
   replacementUrl: string,
 ): Replacement | null {
-  const start = node.position?.start.offset;
-  const end = node.position?.end.offset;
-  const rawUrl = node.url;
-  if (start === undefined || end === undefined || rawUrl === undefined) {
-    return null;
-  }
-  const linkSource = source.slice(start, end);
-  const relativeStart = linkSource.indexOf(rawUrl);
-  if (relativeStart < 0) return null;
+  const destination = markdownDestinationForNode(source, node);
+  if (!destination) return null;
   return {
-    start: start + relativeStart,
-    end: start + relativeStart + rawUrl.length,
+    start: destination.start,
+    end: destination.end,
     value: replacementUrl,
   };
 }
@@ -176,7 +170,7 @@ function protectMarkdownCode(source: string): {
   };
 }
 
-function expandNotionHtml(source: string): string {
+export function expandNotionHtml(source: string): string {
   const protectedCode = protectMarkdownCode(source);
   const withoutAsides = protectedCode.protectedSource.replace(
     /<aside(?:\s[^>]*)?>([\s\S]*?)<\/aside>/gi,

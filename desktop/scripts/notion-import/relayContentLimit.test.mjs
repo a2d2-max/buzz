@@ -69,6 +69,9 @@ test("missing advertisement uses the named legacy assumption and ignores frame s
   ]) {
     assert.deepEqual(parseRelayContentLimit(document, LEGACY_BYTES), {
       advertisedMaxContentBytes: null,
+      ...(document.limitation?.max_message_length
+        ? { advertisedMaxMessageBytes: 1_048_576 }
+        : {}),
       effectiveMaxContentBytes: LEGACY_BYTES,
       reason: "max-content-length-not-advertised",
       source: "legacy-assumption",
@@ -153,6 +156,7 @@ test("GET /info returns advertised and canonical-root fallback provenance", asyn
   });
   assert.deepEqual(await fetchRelayContentLimit(unsupported.relayUrl), {
     advertisedMaxContentBytes: null,
+    advertisedMaxMessageBytes: 1_048_576,
     effectiveMaxContentBytes: LEGACY_BYTES,
     limitVerified: false,
     operationalAdvertisementConfirmed: false,
@@ -223,6 +227,57 @@ test("an advertised 256 KiB value is verified and distinct from the equal legacy
   assert.equal(assumed.source, "legacy-assumption");
   assert.equal(assumed.reason, "max-content-length-not-advertised");
   assert.equal(assumed.limitVerified, false);
+});
+
+test("records a strict frame-limit advertisement without using it as the content limit", async () => {
+  const fixture = await serve((_request, response) => {
+    response.writeHead(200);
+    response.end(
+      JSON.stringify({
+        limitation: {
+          max_content_length: 524_288,
+          max_message_length: 1_048_576,
+        },
+      }),
+    );
+  });
+  const result = await fetchRelayContentLimit(fixture.relayUrl, {
+    operationalTargetRelay: fixture.relayUrl,
+  });
+  assert.equal(result.effectiveMaxContentBytes, 524_288);
+  assert.equal(result.advertisedMaxMessageBytes, 1_048_576);
+  assert.equal(result.operationalAdvertisementConfirmed, true);
+
+  const invalid = await serve((_request, response) => {
+    response.writeHead(200);
+    response.end(
+      JSON.stringify({
+        limitation: {
+          max_content_length: 524_288,
+          max_message_length: "1048576",
+        },
+      }),
+    );
+  });
+  await assert.rejects(
+    fetchRelayContentLimit(invalid.relayUrl),
+    (error) => error?.code === "relay-info-invalid-max-message-length",
+  );
+});
+
+test("operational confirmation requires the exact normalized target relay", async () => {
+  const fixture = await serve((_request, response) => {
+    response.writeHead(200);
+    response.end(
+      JSON.stringify({ limitation: { max_content_length: 524_288 } }),
+    );
+  });
+  await assert.rejects(
+    fetchRelayContentLimit(fixture.relayUrl, {
+      operationalTargetRelay: "wss://other.example",
+    }),
+    (error) => error?.code === "relay-info-operational-target-mismatch",
+  );
 });
 
 test("HTTP, malformed JSON, and malformed document failures propagate", async () => {

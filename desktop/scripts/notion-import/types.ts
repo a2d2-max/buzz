@@ -132,6 +132,8 @@ export type PublishFailure = {
 
 export type ContentLimitProvenance = {
   advertisedMaxContentBytes: number | null;
+  /** NIP-11 WebSocket frame ceiling; provenance only, never a content limit. */
+  advertisedMaxMessageBytes?: number;
   effectiveMaxContentBytes: number;
   source: "advertised" | "legacy-assumption";
   reason:
@@ -139,7 +141,7 @@ export type ContentLimitProvenance = {
     | "max-content-length-not-advertised"
     | "relay-info-endpoint-unsupported";
   limitVerified: boolean;
-  operationalAdvertisementConfirmed: false;
+  operationalAdvertisementConfirmed: boolean;
   relayInfoUrl: string;
   relayInfoEndpoint: "/" | "/info";
   relayInfoHttpStatus: number;

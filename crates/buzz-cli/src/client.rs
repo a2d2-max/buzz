@@ -36,6 +36,136 @@ pub struct BlobDescriptor {
     pub duration: Option<f64>,
 }
 
+#[cfg(test)]
+mod publication_upload_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Response, StatusCode};
+    use axum::routing::put;
+    use axum::Router;
+    use nostr::Keys;
+    use tempfile::NamedTempFile;
+    use tokio::net::TcpListener;
+
+    use super::{BuzzClient, MAX_VIDEO_BYTES};
+
+    #[tokio::test]
+    async fn upload_file_uses_primary_generic_attachment_path() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let state = requests.clone();
+        let app = Router::new()
+            .route(
+                "/upload",
+                put(
+                    |State(requests): State<Arc<AtomicUsize>>, _body: Body| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "url": "http://127.0.0.1/media/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf",
+                                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                    "size": 18,
+                                    "type": "application/pdf",
+                                    "uploaded": 1
+                                })
+                                .to_string(),
+                            ))
+                            .expect("response")
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let mut file = NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut file, b"%PDF-1.7\nfixture\n").expect("write fixture");
+        let client = BuzzClient::new(
+            format!("http://{address}"),
+            Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("fixture key"),
+            None,
+            None,
+        )
+        .expect("client");
+
+        let descriptor = client
+            .upload_file(file.path().to_str().expect("utf8 path"))
+            .await
+            .expect("generic PDF should reach the relay primary upload path");
+        assert_eq!(descriptor.mime_type, "application/pdf");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn upload_file_rejects_an_oversized_sparse_file_before_reading_it() {
+        let file = NamedTempFile::new().expect("temp file");
+        file.as_file()
+            .set_len(MAX_VIDEO_BYTES + 1)
+            .expect("sparse fixture");
+        let client = BuzzClient::new(
+            "http://127.0.0.1:1".into(),
+            Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("fixture key"),
+            None,
+            None,
+        )
+        .expect("client");
+
+        let error = client
+            .upload_file(file.path().to_str().expect("utf8 path"))
+            .await
+            .expect_err("oversized file must fail locally");
+        assert!(error.to_string().contains("absolute max"));
+    }
+
+    #[tokio::test]
+    async fn media_readback_rejects_an_oversized_declared_body_before_buffering() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.expect("request");
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/octet-stream\r\n\r\n",
+                        MAX_VIDEO_BYTES + 1
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("response headers");
+        });
+        let client = BuzzClient::new(
+            format!("http://{address}"),
+            Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("fixture key"),
+            None,
+            None,
+        )
+        .expect("client");
+        let input = format!("{}.bin", "a".repeat(64));
+
+        let error = client
+            .download_media(&input)
+            .await
+            .expect_err("declared oversized readback must fail");
+        assert!(error.to_string().contains("media readback exceeds"));
+    }
+}
+
 /// Build an `imeta` tag array from a BlobDescriptor (NIP-92 media metadata).
 pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
     let mut tag = vec![
@@ -60,20 +190,14 @@ pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
     tag
 }
 
-/// MIME types accepted for upload.
-const ALLOWED_MIMES: &[&str] = &[
-    "image/jpeg",
-    "image/png",
-    "image/gif",
-    "image/webp",
-    "video/mp4",
-];
-
 /// Maximum file size for image uploads (50 MB).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Maximum file size for video uploads (500 MB).
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Maximum file size for generic attachment uploads (100 MB).
+const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
 ///
@@ -1166,6 +1290,13 @@ impl BuzzClient {
         if !metadata.is_file() {
             return Err(CliError::Usage(format!("{file_path} is not a file")));
         }
+        if metadata.len() > MAX_VIDEO_BYTES {
+            return Err(CliError::Usage(format!(
+                "file too large: {} bytes (absolute max {})",
+                metadata.len(),
+                MAX_VIDEO_BYTES
+            )));
+        }
 
         let bytes = std::fs::read(file_path)
             .map_err(|e| CliError::Other(format!("failed to read {file_path}: {e}")))?;
@@ -1175,15 +1306,16 @@ impl BuzzClient {
             .map(|t| t.mime_type().to_string())
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        if !ALLOWED_MIMES.contains(&mime.as_str()) {
-            return Err(CliError::Usage(format!("unsupported file type: {mime}")));
-        }
-
-        // 3. Size check
+        // 3. Size check. The primary relay endpoint performs the authoritative
+        // magic-byte and deny-list validation. Keep the CLI's local caps aligned
+        // with the relay defaults so generic documents and archives reach that
+        // production validator without allowing an unbounded read.
         let max = if mime.starts_with("video/") {
             MAX_VIDEO_BYTES
-        } else {
+        } else if mime.starts_with("image/") {
             MAX_IMAGE_BYTES
+        } else {
+            MAX_FILE_BYTES
         };
         if bytes.len() as u64 > max {
             return Err(CliError::Usage(format!(
@@ -1198,7 +1330,7 @@ impl BuzzClient {
 
         // 5. PUT request to the BUD-02 /upload endpoint with a generous timeout.
         // Auth is signed per attempt — matches the per-attempt signing pattern in download_media.
-        let upload_timeout = if mime.starts_with("video/") {
+        let upload_timeout = if mime.starts_with("video/") || bytes.len() as u64 > MAX_IMAGE_BYTES {
             Duration::from_secs(600)
         } else {
             Duration::from_secs(120)
@@ -1302,7 +1434,7 @@ impl BuzzClient {
             let client = client.clone();
             async move {
                 let auth_header = sign_blossom_get(&self.keys, &url)?;
-                let resp = self
+                let mut resp = self
                     .with_auth_tag(client.get(&url).header("Authorization", auth_header))
                     .send()
                     .await?;
@@ -1311,7 +1443,24 @@ impl BuzzClient {
                     let body = resp.text().await.unwrap_or_default();
                     return Err(CliError::Relay { status, body });
                 }
-                resp.bytes().await.map_err(CliError::Network)
+                if resp
+                    .content_length()
+                    .is_some_and(|length| length > MAX_VIDEO_BYTES)
+                {
+                    return Err(CliError::Other(format!(
+                        "media readback exceeds {MAX_VIDEO_BYTES} bytes"
+                    )));
+                }
+                let mut bytes = bytes::BytesMut::new();
+                while let Some(chunk) = resp.chunk().await.map_err(CliError::Network)? {
+                    if bytes.len().saturating_add(chunk.len()) > MAX_VIDEO_BYTES as usize {
+                        return Err(CliError::Other(format!(
+                            "media readback exceeds {MAX_VIDEO_BYTES} bytes"
+                        )));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(bytes.freeze())
             }
         })
         .await

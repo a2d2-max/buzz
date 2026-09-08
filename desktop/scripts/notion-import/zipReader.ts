@@ -28,7 +28,7 @@ export type NotionZipContents = {
   attachments: ZipAttachmentEntry[];
 };
 
-function normalizeArchivePath(rawPath: string): string {
+export function normalizeArchivePath(rawPath: string): string {
   if (rawPath.includes("\0") || rawPath.includes("\\")) {
     throw new Error("unsafe-zip-entry-path");
   }
