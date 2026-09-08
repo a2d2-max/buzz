@@ -20,7 +20,8 @@
 //! directory, not `~/.codex` — the cost of making the explicit choice win.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use tauri::AppHandle;
 
@@ -36,26 +37,252 @@ pub(crate) const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub(crate) const CODEX_HOME_ENV: &str = "CODEX_HOME";
 
 const CODEX_HOMES_DIR_NAME: &str = "codex-homes";
+const CODEX_CONFIG_FILE_NAME: &str = "config.toml";
+const CODEX_CREDENTIAL_STORE_KEY: &str = "cli_auth_credentials_store";
 
 /// The `CODEX_HOME` directory owned by account `id`.
 pub(crate) fn codex_home_dir<R: tauri::Runtime>(
     app: &AppHandle<R>,
     id: &str,
 ) -> Result<PathBuf, String> {
+    let id = validated_codex_account_id(id)?;
     Ok(managed_agents_base_dir(app)?
         .join(CODEX_HOMES_DIR_NAME)
         .join(id))
 }
 
-/// Create the account's `CODEX_HOME` directory (idempotent).
+fn validated_codex_account_id(id: &str) -> Result<&str, String> {
+    let parsed = uuid::Uuid::parse_str(id)
+        .map_err(|_| "invalid Codex account id; remove the account and add it again".to_string())?;
+    if parsed.to_string() != id {
+        return Err("invalid Codex account id; remove the account and add it again".to_string());
+    }
+    Ok(id)
+}
+
+/// Create the account's `CODEX_HOME` and converge its credential store to a
+/// file in that home (idempotent).
+///
+/// The ChatGPT spawn gate checks this home's `auth.json`. Letting Codex choose
+/// `keyring` or `auto` can make `codex login` succeed without creating that
+/// file, after which Buzz would reject the same account at spawn. This config
+/// is app-owned, but owners can still add normal Codex settings to it, so the
+/// edit preserves unrelated values and formatting.
 pub(crate) fn ensure_codex_home_dir<R: tauri::Runtime>(
     app: &AppHandle<R>,
     id: &str,
 ) -> Result<PathBuf, String> {
     let dir = codex_home_dir(app, id)?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("failed to create the account's Codex directory: {error}"))?;
+    ensure_codex_home(&dir)?;
     Ok(dir)
+}
+
+/// Reserve and initialize a newly generated account home. Existing paths are
+/// rejected so a failed add can safely remove only the directory it created.
+pub(crate) fn create_codex_home_dir<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+) -> Result<PathBuf, String> {
+    let dir = codex_home_dir(app, id)?;
+    create_codex_home(&dir)?;
+    Ok(dir)
+}
+
+fn create_codex_home(dir: &Path) -> Result<(), String> {
+    create_codex_home_with(dir, converge_codex_credential_store)
+}
+
+fn ensure_codex_home(dir: &Path) -> Result<(), String> {
+    create_codex_homes_parent(dir)?;
+    let created = match std::fs::create_dir(dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_existing_codex_home(dir)?;
+            false
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to create the account's Codex directory: {error}"
+            ))
+        }
+    };
+    let config_path = dir.join(CODEX_CONFIG_FILE_NAME);
+    if let Err(error) = converge_codex_credential_store(&config_path) {
+        if created {
+            return Err(with_new_codex_home_cleanup(error, dir));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn create_codex_home_with(
+    dir: &Path,
+    initialize: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    create_codex_homes_parent(dir)?;
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(
+                "the new Codex account directory already exists; try adding the account again"
+                    .to_string(),
+            )
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to create the new account's Codex directory: {error}"
+            ))
+        }
+    }
+    let config_path = dir.join(CODEX_CONFIG_FILE_NAME);
+    initialize(&config_path).map_err(|error| with_new_codex_home_cleanup(error, dir))
+}
+
+fn create_codex_homes_parent(dir: &Path) -> Result<(), String> {
+    let parent = dir
+        .parent()
+        .ok_or_else(|| "the Codex account directory has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create the Codex accounts directory: {error}"))
+}
+
+fn validate_existing_codex_home(dir: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|error| format!("failed to inspect the account's Codex directory: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(
+            "the account's Codex directory must be an app-owned directory, not a link or file"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn with_new_codex_home_cleanup(error: String, dir: &Path) -> String {
+    match cleanup_created_codex_home(dir) {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{error}; new account home cleanup failed: {cleanup_error}"),
+    }
+}
+
+fn cleanup_created_codex_home(dir: &Path) -> Result<(), String> {
+    let config_path = dir.join(CODEX_CONFIG_FILE_NAME);
+    match std::fs::symlink_metadata(&config_path) {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+            std::fs::remove_file(&config_path)
+                .map_err(|error| format!("failed to remove config.toml: {error}"))?;
+        }
+        Ok(_) => return Err("config.toml is not a removable file".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to inspect config.toml: {error}")),
+    }
+    std::fs::remove_dir(dir).map_err(|error| format!("failed to remove account directory: {error}"))
+}
+
+/// Clean up a home reserved by [`create_codex_home_dir`] when the subsequent
+/// account-store commit fails. Never recursively removes files.
+pub(crate) fn cleanup_created_codex_home_dir<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+) -> Option<String> {
+    let dir = match codex_home_dir(app, id) {
+        Ok(dir) => dir,
+        Err(error) => return Some(error),
+    };
+    cleanup_created_codex_home(&dir).err().map(|error| {
+        format!(
+            "the account was not added, but its new Codex directory could not be cleaned up ({}): {error}",
+            dir.display()
+        )
+    })
+}
+
+fn converge_codex_credential_store(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "the account's Codex config must be an app-owned file, not a symbolic link ({})",
+                path.display()
+            ))
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "the account's Codex config is not a regular file ({})",
+                path.display()
+            ))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect the account's Codex config ({}): {error}",
+                path.display()
+            ))
+        }
+    }
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "failed to read the account's Codex config ({}): {error}",
+                path.display()
+            ))
+        }
+    };
+    let mut document = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| {
+            format!(
+                "failed to parse the account's Codex config ({}); fix or remove the malformed file and try again",
+                path.display()
+            )
+        })?;
+    if document
+        .get(CODEX_CREDENTIAL_STORE_KEY)
+        .and_then(toml_edit::Item::as_str)
+        == Some("file")
+    {
+        return Ok(());
+    }
+
+    document[CODEX_CREDENTIAL_STORE_KEY] = toml_edit::value("file");
+    atomic_write_codex_config(path, document.to_string().as_bytes())
+}
+
+fn atomic_write_codex_config(path: &Path, payload: &[u8]) -> Result<(), String> {
+    use atomic_write_file::AtomicWriteFile;
+
+    let mut file = AtomicWriteFile::open(path).map_err(|error| {
+        format!(
+            "failed to open the account's Codex config for atomic write ({}): {error}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                format!(
+                    "failed to secure the account's Codex config ({}): {error}",
+                    path.display()
+                )
+            })?;
+    }
+    file.write_all(payload).map_err(|error| {
+        format!(
+            "failed to write the account's Codex config ({}): {error}",
+            path.display()
+        )
+    })?;
+    file.commit().map_err(|error| {
+        format!(
+            "failed to commit the account's Codex config ({}): {error}",
+            path.display()
+        )
+    })
 }
 
 /// Delete the account's `CODEX_HOME` directory. For `chatgpt` accounts it

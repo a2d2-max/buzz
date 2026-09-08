@@ -82,16 +82,20 @@ pub async fn add_codex_account(
             .managed_agents_store_lock
             .lock()
             .map_err(|error| format!("failed to acquire store lock: {error}"))?;
-        let account = with_claude_account_store(&app, |store| {
-            store.add_codex(kind, &label, api_key.as_deref())
-        })?;
-        // The directory is what makes the account selectable at spawn; create
-        // it now so the login command is runnable the moment the dialog shows
-        // it. A failure here still leaves a working record — spawn re-ensures.
-        if let Err(error) = codex_accounts::ensure_codex_home_dir(&app, &account.id) {
-            eprintln!("buzz-desktop: {error}");
+        // Prepare the app-owned home before account metadata or a keyring
+        // secret becomes durable. This avoids a cross-store rollback if the
+        // credential policy cannot be written.
+        let id = uuid::Uuid::new_v4().to_string();
+        codex_accounts::create_codex_home_dir(&app, &id)?;
+        match with_claude_account_store(&app, |store| {
+            store.add_codex_with_id(id.clone(), kind, &label, api_key.as_deref())
+        }) {
+            Ok(account) => Ok(account),
+            Err(error) => match codex_accounts::cleanup_created_codex_home_dir(&app, &id) {
+                None => Err(error),
+                Some(warning) => Err(format!("{error}; account cleanup warning: {warning}")),
+            },
         }
-        Ok(account)
     })
     .await
 }
@@ -242,22 +246,31 @@ pub async fn test_codex_account(
             command.env("PATH", path);
         }
 
-        let Some(output) = output_with_timeout(command, TEST_TIMEOUT) else {
-            return Ok(CodexAccountTestResult {
-                ok: false,
-                message: format!("no response within {}s", TEST_TIMEOUT.as_secs()),
-            });
-        };
-        let ok = output.status.success();
-        let raw = if ok || output.stderr.is_empty() {
-            output.stdout
-        } else {
-            output.stderr
-        };
-        let message = summarize_probe_output(&String::from_utf8_lossy(&raw), key.as_deref(), ok);
-        Ok(CodexAccountTestResult { ok, message })
+        Ok(finish_codex_account_probe(command, key.as_deref()))
     })
     .await
+}
+
+/// Execute the exact command assembled by `test_codex_account` and reduce its
+/// bounded output to the public, secret-scrubbed result.
+fn finish_codex_account_probe(
+    command: std::process::Command,
+    key: Option<&str>,
+) -> CodexAccountTestResult {
+    let Some(output) = output_with_timeout(command, TEST_TIMEOUT) else {
+        return CodexAccountTestResult {
+            ok: false,
+            message: format!("no response within {}s", TEST_TIMEOUT.as_secs()),
+        };
+    };
+    let ok = output.status.success();
+    let raw = if ok || output.stderr.is_empty() {
+        output.stdout
+    } else {
+        output.stderr
+    };
+    let message = summarize_probe_output(&String::from_utf8_lossy(&raw), key, ok);
+    CodexAccountTestResult { ok, message }
 }
 
 /// First non-empty line of the CLI output, with the key (and anything else
@@ -304,8 +317,32 @@ fn scrub_secrets(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_auth_kind, summarize_probe_output};
+    use super::{finish_codex_account_probe, parse_auth_kind, summarize_probe_output};
     use crate::managed_agents::CodexAuthKind;
+
+    #[cfg(unix)]
+    fn failing_probe_command(secret: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "printf 'rejected %s key=sk-other-secret\\n' \"$PROBE_SECRET\" >&2; exit 7",
+            ])
+            .env("PROBE_SECRET", secret);
+        command
+    }
+
+    #[cfg(windows)]
+    fn failing_probe_command(secret: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("cmd");
+        command
+            .args([
+                "/C",
+                "echo rejected %PROBE_SECRET% key=sk-other-secret 1>&2 & exit /B 7",
+            ])
+            .env("PROBE_SECRET", secret);
+        command
+    }
 
     #[test]
     fn auth_kind_parses_the_two_wire_values_and_rejects_the_rest() {
@@ -345,5 +382,16 @@ mod tests {
         let message = summarize_probe_output(&long, None, true);
         assert_eq!(message.chars().count(), 201);
         assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn production_probe_marks_nonzero_as_failed_and_scrubs_captured_stderr() {
+        let key = "sk-proj-account-verify-dummy";
+        let result = finish_codex_account_probe(failing_probe_command(key), Some(key));
+
+        assert!(!result.ok, "a nonzero CLI exit must never report success");
+        assert_eq!(result.message, "rejected … key=…");
+        assert!(!result.message.contains(key));
+        assert!(!result.message.contains("sk-"));
     }
 }
