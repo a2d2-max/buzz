@@ -317,7 +317,7 @@ const bob = new RawClient(generateSecretKey());
 await bob.open();
 const newestOf = async (id) => {
   const events = await bob.req({
-    kinds: [30078],
+    kinds: [30623, 30078],
     "#d": [docPageDTag(id)],
     limit: 200,
   });

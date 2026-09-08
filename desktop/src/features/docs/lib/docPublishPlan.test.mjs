@@ -9,6 +9,7 @@ function version(id, eventId, overrides = {}) {
     author: "a".repeat(64),
     eventId,
     eventCreatedAt: 100,
+    eventKind: 30623,
     title: "T",
     body: "body",
     parentId: null,
@@ -60,6 +61,24 @@ test("noop when nothing visible changed, even without a base", () => {
     kind: "noop",
     newest,
   });
+});
+
+test("identical content on top of a legacy-kind version is a publish, not a noop", () => {
+  // The republish is what migrates the page off the shared 30078 window; a
+  // noop here would strand untouched pages on the legacy kind forever.
+  const newest = version("p", "v2", { eventKind: 30078 });
+  assert.deepEqual(planDocPagePublish({ newest, next: NEXT }), {
+    kind: "publish",
+    content: NEXT,
+  });
+});
+
+test("a conflict still wins over migration on a legacy-kind version", () => {
+  const newest = version("p", "v2", { eventKind: 30078 });
+  assert.equal(
+    planDocPagePublish({ newest, next: NEXT, baseEventId: "v1" }).kind,
+    "conflict",
+  );
 });
 
 test("restoring a tombstone is a change, not a noop", () => {

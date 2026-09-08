@@ -45,7 +45,9 @@ export const KIND_HUDDLE_LIVENESS = 48104;
 // NIP-78 application-specific data. All use kind 30078; the relay
 // differentiates them by d-tag ("read-state:<slotId>", "channel-sections",
 // "channel-mutes", "channel-stars", "channel-sort", "project-sidebar-membership",
-// "community-task:<uuid>", "doc:<uuid>").
+// "community-task:<uuid>"). Docs pages ("doc:<uuid>") used to live here too —
+// they now have KIND_COMMUNITY_DOC below, with 30078 kept as a read-only
+// legacy source.
 export const KIND_READ_STATE = 30078;
 export const KIND_CHANNEL_SECTIONS = 30078;
 export const KIND_CHANNEL_MUTES = 30078;
@@ -60,10 +62,18 @@ export const KIND_COMMUNITY_TASK = 30078;
 export const COMMUNITY_TASK_D_TAG_PREFIX = "community-task:";
 export const COMMUNITY_TASK_T_TAG = "community-task";
 // Community-wide wiki pages (the Docs surface). One addressable event per
-// page, keyed by d="doc:<uuid>" and tagged t="community-doc" so a single `#t`
-// filter loads the whole tree. Any member may republish a page; readers
-// resolve last-write-wins across authors by created_at.
-export const KIND_COMMUNITY_DOC = 30078;
+// page, keyed by d="doc:<uuid>" and tagged t="community-doc". Any member may
+// republish a page; readers resolve last-write-wins across authors by
+// created_at. Docs have their own kind (mirror of buzz-core's
+// KIND_COMMUNITY_DOC) so a kinds-only REQ walks a window holding only doc
+// pages — on the shared 30078 window the relay applies `#t` after the SQL
+// LIMIT, so every refetch had to scan every app-data row.
+export const KIND_COMMUNITY_DOC = 30623;
+// Where docs lived before the dedicated kind: the shared NIP-78 window,
+// distinguished only by the d prefix + t tag. Still read (and migrated
+// forward on sight) so no page published by an older build is lost; never
+// written anymore.
+export const KIND_COMMUNITY_DOC_LEGACY = 30078;
 export const COMMUNITY_DOC_TAG = "community-doc";
 export const COMMUNITY_DOC_D_PREFIX = "doc:";
 // NIP-33 persona/team/managed-agent projection events (d-tag keyed). Published

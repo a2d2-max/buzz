@@ -3,14 +3,27 @@ import {
   COMMUNITY_DOC_D_PREFIX,
   COMMUNITY_DOC_TAG,
   KIND_COMMUNITY_DOC,
+  KIND_COMMUNITY_DOC_LEGACY,
 } from "@/shared/constants/kinds";
 
 export {
   COMMUNITY_DOC_TAG,
   KIND_COMMUNITY_DOC,
+  KIND_COMMUNITY_DOC_LEGACY,
 } from "@/shared/constants/kinds";
 
-/** JSON body of a page event (kind 30078, d="doc:<uuid>", t="community-doc"). */
+/**
+ * Every kind a doc page may arrive on: the dedicated kind first, then the
+ * legacy shared NIP-78 kind that pre-migration pages still sit on. Reads
+ * (history scan, `#d` re-read, live subscription) must cover both until the
+ * legacy window is retired; writes use `KIND_COMMUNITY_DOC` only.
+ */
+export const COMMUNITY_DOC_QUERY_KINDS: readonly number[] = [
+  KIND_COMMUNITY_DOC,
+  KIND_COMMUNITY_DOC_LEGACY,
+];
+
+/** JSON body of a page event (kind 30623, d="doc:<uuid>", t="community-doc"). */
 export type DocPageContent = {
   title: string;
   /** Markdown source. */
@@ -37,6 +50,12 @@ export type DocPage = DocPageContent & {
   eventId: string;
   /** Relay `created_at` (unix seconds) — the last-write-wins key. */
   eventCreatedAt: number;
+  /**
+   * Kind the version arrived on. `KIND_COMMUNITY_DOC_LEGACY` marks a
+   * pre-migration page: still authoritative when newest, but the migration
+   * pass republishes it onto the dedicated kind.
+   */
+  eventKind: number;
   deleted: boolean;
 };
 
@@ -73,7 +92,12 @@ function finiteNumberOr(value: unknown, fallback: number): number {
  * safe defaults so one sloppy publisher cannot hide a page from everyone.
  */
 export function parseDocPageEvent(event: RelayEvent): DocPage | null {
-  if (event.kind !== KIND_COMMUNITY_DOC) return null;
+  if (
+    event.kind !== KIND_COMMUNITY_DOC &&
+    event.kind !== KIND_COMMUNITY_DOC_LEGACY
+  ) {
+    return null;
+  }
   const dTags = event.tags.filter((tag) => tag[0] === "d");
   if (dTags.length !== 1) return null;
   const id = docPageIdFromDTag(dTags[0][1] ?? "");
@@ -115,6 +139,7 @@ export function parseDocPageEvent(event: RelayEvent): DocPage | null {
     author: event.pubkey,
     eventId: event.id,
     eventCreatedAt: event.created_at,
+    eventKind: event.kind,
     title: content.title,
     body: content.body,
     parentId,
