@@ -130,7 +130,7 @@ async function mountDocs({ history, liveEvents = [], versionsByDTag }) {
     if (dTags) return state.versionsByDTag[dTags[0]] ?? [];
     historyRequests.push(filter);
     calls.push("history");
-    return history;
+    return typeof history === "function" ? history(filter) : history;
   };
   relayClient.publishEvent = async (event) => {
     published.push(event);
@@ -421,6 +421,74 @@ test("a relay reconnect triggers a fresh history fetch", async () => {
       for (const listener of docs.reconnectListeners) listener();
     });
     await waitFor(() => assert.equal(docs.historyRequests.length, 2));
+  } finally {
+    docs.restore();
+  }
+});
+
+test("an incremental scan that overflows its page budget falls back to one full scan", async () => {
+  // A 31-minute window can hold more than 30 pages of read-state churn in a
+  // large community. That must not end as a "pages may be missing" banner
+  // plus a full rescan on the *next* load: the store retries as a full scan
+  // right away, which here is short and complete.
+  const newest = docEvent({
+    id: "other-page",
+    eventId: "newest",
+    author: AUTHOR_THEM,
+    createdAt: 50_000,
+    content: {},
+  });
+  // One distinct row per second going back from 60_000: every incremental
+  // page is full and the cursor keeps moving, so the scan spends its whole
+  // page budget before it can reach `since`.
+  const busyRow = (createdAt) => ({
+    id: `busy${createdAt}`.padEnd(64, "0"),
+    pubkey: AUTHOR_THEM,
+    created_at: createdAt,
+    kind: 30078,
+    tags: [
+      ["d", `read-state:${String(createdAt).padStart(32, "0")}`],
+      ["t", "read-state"],
+    ],
+    content: "x",
+    sig: "f".repeat(128),
+  });
+  const docs = await mountDocs({
+    history: (filter) => {
+      if (filter.since === undefined) return [V1, newest];
+      const top = Math.min(filter.until ?? 60_000, 60_000);
+      return Array.from({ length: filter.limit }, (_, index) =>
+        busyRow(top - index),
+      );
+    },
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1] },
+  });
+  try {
+    assert.equal(docs.result.current.truncated, false);
+    await docs.result.current.refetch();
+    const incremental = docs.historyRequests.filter(
+      (filter) => filter.since !== undefined,
+    );
+    const full = docs.historyRequests.filter(
+      (filter) => filter.since === undefined,
+    );
+    assert.equal(
+      incremental.length,
+      30,
+      "the incremental scan ran to its budget",
+    );
+    assert.equal(
+      full.length,
+      2,
+      "then one full scan, on top of the initial one",
+    );
+    assert.equal(docs.result.current.truncated, false, "no false alarm");
+    assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventId, V1.id);
+    // The full scan restored a usable watermark: the next refetch starts
+    // incremental again (and, with this busy stub, falls back once more).
+    const before = docs.historyRequests.length;
+    await docs.result.current.refetch();
+    assert.notEqual(docs.historyRequests[before].since, undefined);
   } finally {
     docs.restore();
   }

@@ -199,10 +199,19 @@ export function useCommunityDocs(): CommunityDocs {
         previous?.watermark !== undefined && !previous.truncated
           ? Math.max(0, previous.watermark - INCREMENTAL_LOOKBACK_SECONDS)
           : undefined;
-      const history = await fetchDocPagesToExhaustion({
+      let history = await fetchDocPagesToExhaustion({
         fetchEvents: (filter) => relayClient.fetchEvents(filter),
         since,
       });
+      // An incremental window can hold more rows than the page budget in a
+      // busy community. Rather than warn about missing pages and leave the
+      // next load to rescan everything, do the full scan now; only its own
+      // truncation is worth a banner.
+      if (since !== undefined && history.truncated) {
+        history = await fetchDocPagesToExhaustion({
+          fetchEvents: (filter) => relayClient.fetchEvents(filter),
+        });
+      }
       // Live events can land while the scan is in flight; keep whichever
       // version is newer per page rather than letting the snapshot win.
       const cached =

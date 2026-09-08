@@ -72,6 +72,22 @@ PGHOST=127.0.0.1 PGPORT=5433 PGUSER=postgres PGDATABASE=buzz \
 in this setup). Tear down with `pg_ctl stop`, `redis-cli -p 6380 shutdown`
 and by removing `$LAB`.
 
+If the relay binary is older than the checkout you are validating, first
+confirm the four relay properties the scan depends on are unchanged at HEAD
+— a green run against an old binary proves nothing about a relay that
+changed them:
+
+```bash
+# 1. kind 30078 sits in no post-filter gate list.
+grep -n -A6 -E 'pub const (AUTHOR_ONLY|P_GATED|RESULT_GATED|SHARED_GATED)_KINDS' crates/buzz-core/src/kind.rs
+# 2. `#t` is still not pushed down to SQL (only d/e tags are).
+grep -n -E 'pub (d_tags|e_tags|t_tags):' crates/buzz-db/src/store/event.rs
+# 3. The REQ lane still post-filters after LIMIT (filters_match / event_visible_to_reader).
+grep -n -E 'filters_match\(std::slice|event_visible_to_reader|accessible_channels.contains' crates/buzz-relay/src/handlers/req.rs
+# 4. The page clamp and ordering are unchanged.
+grep -n -E 'DEFAULT_MAX_PAGE_LIMIT: i64|created_at DESC, id ASC' crates/buzz-db/src/store/event.rs
+```
+
 ### 2. Protocol probe — `scripts/docs-relay-probe.mjs`
 
 Runs `fetchDocPagesToExhaustion` and the codec over a raw NIP-42 WebSocket
