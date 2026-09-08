@@ -29,6 +29,7 @@ export const ENTITY_LINK_TABS = [
   "commits",
   "issues",
   "prs",
+  "board",
   "contributors",
   "channels",
 ] as const;

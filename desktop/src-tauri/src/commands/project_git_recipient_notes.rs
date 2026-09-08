@@ -4,7 +4,8 @@
 //! shape so clients can parse them with one code path.
 
 use super::project_git_workflow::{
-    normalize_event_id, project_owner_identity, validate_repo_address,
+    build_root_status_event, normalize_event_id, project_owner_identity, validate_repo_address,
+    RootStatusEvent,
 };
 use crate::app_state::AppState;
 use crate::relay::submit_signed_event_with_keys;
@@ -21,6 +22,18 @@ pub struct ProjectPullRequestReviewRequestInput {
     pull_request_id: String,
     reviewers: Vec<String>,
     reviewer_label: String,
+}
+
+/// Repository-scoped metadata for an agent-signed issue lifecycle status.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectIssueStatusInput {
+    target_owner: String,
+    repo_address: String,
+    issue_id: String,
+    issue_author: String,
+    status: String,
+    created_at: u64,
 }
 
 /// Repository-scoped metadata for an agent-signed issue assignee operation.
@@ -263,6 +276,64 @@ pub async fn sign_project_issue_unassignment(
     sign_project_issue_assignee_operation(input, IssueAssigneeOperation::Unassign, app, state).await
 }
 
+/// Board columns map onto NIP-34 status kinds. `In Progress` / `In Review`
+/// are label heuristics with no status kind, so they are not accepted here.
+/// 1631 is "merged" for a pull request and "resolved" for a task. Mirrors
+/// `ISSUE_BOARD_DROP_TARGETS` in `lib/issueBoardColumns.ts`.
+const ISSUE_STATUS_KINDS: [(&str, u16); 4] = [
+    ("open", 1630),
+    ("resolved", 1631),
+    ("closed", 1632),
+    ("draft", 1633),
+];
+
+fn build_issue_status_event(
+    keys: &Keys,
+    repo_address: &str,
+    issue_id: &str,
+    issue_author: &str,
+    status: &str,
+    created_at: u64,
+) -> Result<String, String> {
+    build_root_status_event(
+        keys,
+        RootStatusEvent {
+            noun: "issue",
+            repo_address,
+            root_id: issue_id,
+            root_author: issue_author,
+            kinds: &ISSUE_STATUS_KINDS,
+            status,
+            created_at,
+        },
+    )
+}
+
+#[tauri::command]
+pub async fn sign_project_issue_status(
+    input: ProjectIssueStatusInput,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let target_owner = input.target_owner.trim().to_ascii_lowercase();
+    if normalize_event_id(&target_owner).is_none() {
+        return Err("Invalid target repository owner.".to_string());
+    }
+    let identity = project_owner_identity(&app, &state, &target_owner)?;
+    let event = Event::from_json(build_issue_status_event(
+        &identity.keys,
+        &input.repo_address,
+        &input.issue_id,
+        &input.issue_author,
+        &input.status,
+        input.created_at,
+    )?)
+    .map_err(|error| format!("parse signed issue status: {error}"))?;
+    submit_signed_event_with_keys(&event, &state, &identity.keys, identity.auth_tag.as_deref())
+        .await?;
+    Ok(())
+}
+
 async fn sign_project_issue_assignee_operation(
     input: ProjectIssueAssigneeOperationInput,
     operation: IssueAssigneeOperation,
@@ -292,7 +363,8 @@ async fn sign_project_issue_assignee_operation(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_issue_assignment_event, build_issue_unassignment_event, build_review_request_event,
+        build_issue_assignment_event, build_issue_status_event, build_issue_unassignment_event,
+        build_review_request_event,
     };
     use nostr::{Event, JsonUtil, Keys};
 
@@ -327,6 +399,71 @@ mod tests {
             .iter()
             .any(|tag| tag.as_slice() == ["t", "assignment"]));
         assert!(event.verify().is_ok());
+    }
+
+    #[test]
+    fn issue_status_is_signed_by_repository_owner() {
+        let keys = Keys::generate();
+        let owner = keys.public_key().to_hex();
+        let author = "b".repeat(64);
+        let repo_address = format!("30617:{owner}:buzz");
+        let issue_id = "d".repeat(64);
+
+        for (status, kind) in [
+            ("open", 1630u16),
+            ("resolved", 1631),
+            ("closed", 1632),
+            ("draft", 1633),
+        ] {
+            let event = Event::from_json(
+                build_issue_status_event(&keys, &repo_address, &issue_id, &author, status, 0)
+                    .unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(event.pubkey, keys.public_key());
+            assert_eq!(event.kind, nostr::Kind::Custom(kind));
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["e", issue_id.as_str(), "", "root"]));
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["a", repo_address.as_str()]));
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["p", author.as_str()]));
+            // nostr's EventBuilder strips `p` tags naming the signer, so the
+            // owner tag survives only when the owner isn't signing. Same as
+            // build_pull_request_status_event.
+            assert!(!event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["p", owner.as_str()]));
+            assert!(event.verify().is_ok());
+        }
+    }
+
+    #[test]
+    fn issue_status_rejects_columns_without_a_status_kind() {
+        let keys = Keys::generate();
+        let owner = keys.public_key().to_hex();
+        let repo_address = format!("30617:{owner}:buzz");
+        let issue_id = "d".repeat(64);
+        let author = "b".repeat(64);
+
+        for status in ["In Progress", "In Review", "Backlog", "merged", ""] {
+            assert!(
+                build_issue_status_event(&keys, &repo_address, &issue_id, &author, status, 0)
+                    .is_err(),
+                "{status:?} must not publish a status event"
+            );
+        }
+        assert!(
+            build_issue_status_event(&keys, &repo_address, "nope", &author, "resolved", 0).is_err()
+        );
     }
 
     #[test]

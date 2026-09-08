@@ -585,6 +585,7 @@ pub fn run() {
             sign_project_pull_request_review_request,
             sign_project_issue_assignment,
             sign_project_issue_unassignment,
+            sign_project_issue_status,
             publish_project_pull_request_merged_status,
             merge_project_pull_request,
             open_project_terminal,

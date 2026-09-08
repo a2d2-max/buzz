@@ -73,6 +73,7 @@ export function shareTabForWorkspaceTab(
   workspaceTab: string,
 ): EntityLinkTab | undefined {
   switch (workspaceTab) {
+    case "board":
     case "files":
     case "issues":
     case "prs":

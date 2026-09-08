@@ -395,11 +395,12 @@ fn is_linkable_dtag(value: &str) -> bool {
 ///
 /// Workspace tabs addressable by `buzz://repo|project` links — mirrors
 /// `ENTITY_LINK_TABS` in `entityLink.ts`.
-const ENTITY_LINK_TABS: [&str; 6] = [
+const ENTITY_LINK_TABS: [&str; 7] = [
     "files",
     "commits",
     "issues",
     "prs",
+    "board",
     "contributors",
     "channels",
 ];

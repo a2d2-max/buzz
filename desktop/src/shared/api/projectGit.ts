@@ -680,6 +680,17 @@ export async function signProjectIssueUnassignment(input: {
   await invokeTauri<void>("sign_project_issue_unassignment", { input });
 }
 
+export async function signProjectIssueStatus(input: {
+  targetOwner: string;
+  repoAddress: string;
+  issueId: string;
+  issueAuthor: string;
+  status: "open" | "draft" | "resolved" | "closed";
+  createdAt: number;
+}): Promise<void> {
+  await invokeTauri<void>("sign_project_issue_status", { input });
+}
+
 export async function signProjectPullRequestStatus(input: {
   targetOwner: string;
   repoAddress: string;
