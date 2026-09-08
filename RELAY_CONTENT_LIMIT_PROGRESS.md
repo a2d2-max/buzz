@@ -9,9 +9,10 @@ BUZZ_MAX_FRAME_BYTES=1048576
 
 ## Current state
 
-- Phase: implementation, validation, live proof, and independent review complete; stage 7 signed local commit preparation in progress
+- Phase: implementation, validation, live proof, independent review, and signed local commits complete
 - Branch: `a2d2-max/relay-content-limit`
 - Base HEAD at task start: `b2978786cf2cbdf7b2876b16371ddc324d88a1b4`
+- Implementation commit: `6921aa337d718ffba3265bbb60e908ce2ccb2cd8`
 - Worktree at start: clean
 - Production code edits: relay config/ingest/NIP-11 and Docs bounded resolver/cache/save guard implemented; importer handoff documented without editing importer-owned files
 - Current passing evidence: relay feature selection 52/52; post-review resolver/production-hook selection 34/34; Docs package 145/145; desktop package 6,749/6,749 across 86 suites; direct `just test` unit implementation 14/14 commands and 3,663/3,663 executed tests with 270 ignored; relay media 35/35, telemetry 1/1, and boot lifecycle 9/9; relay all-target clippy with warnings denied; final desktop check, typecheck, file-size core 10/10 and all surface scans, Rust formatting, and diff whitespace checks
@@ -28,7 +29,7 @@ BUZZ_MAX_FRAME_BYTES=1048576
 4. Expose the shared resolver contract for the separate importer worker; do not edit importer-owned files. **Complete.**
 5. Run focused Rust and Node boundary/regression tests, then repository-prescribed desktop/type/file-size and isolated integration checks. **Complete with the explicit wrapper and out-of-scope baseline limitations above.**
 6. Run fresh-binary live WebSocket proof: exact 512 KiB boundary, the measured-size synthetic Docs page, and the historical 300 KiB/default-vs-raised cases. **Complete: all 13 live assertions passed.**
-7. Record evidence, complete independent review, address findings, and create signed local commits. **Review complete at 10/10 with no open findings; commits pending.**
+7. Record evidence, complete independent review, address findings, and create signed local commits. **Complete.**
 
 ## Seams and constraints
 
@@ -115,3 +116,4 @@ Plain Node fails on that alias. The separately owned importer still imports the 
 - 2026-09-08: `cargo clippy -p buzz-relay --all-targets -- -D warnings` passed. Final `cargo fmt --all -- --check` and `git diff --check` passed.
 - 2026-09-08: The final ignored review package was refreshed after all checks. Compared with the scoped-reviewed `2112d3a0...04d4c` snapshot, production files did not change; only `DocsScreen.test.mjs` gained the relay URL/NIP-11 fixture required by the final full Docs run, and the progress ledger was finalized. Its exact final hash is recorded in ignored `implementation-review.md` to avoid a self-referential tracked ledger.
 - 2026-09-08: Skills used: `/Users/sign-x/.agents/skills/superpowers/receiving-code-review/SKILL.md` for technically verifying and addressing the independent findings. Coordinator-owned workflow skills were reported as `/Users/sign-x/.agents/skills/superpowers/subagent-driven-development/SKILL.md` and `/Users/sign-x/.agents/skills/superpowers/using-git-worktrees/SKILL.md`.
+- 2026-09-08: Implementation and tests committed as `6921aa337d718ffba3265bbb60e908ce2ccb2cd8` under `a2d2-max` with DCO sign-off. The pre-commit desktop Biome and Rust formatting lanes passed with the same unrelated 4 warnings / 5 infos; the commit message contains no AI or co-author trailer.
