@@ -2,13 +2,20 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
 import { relayClient } from "@/shared/api/relayClient";
-import { signRelayEvent } from "@/shared/api/tauri";
+import { getRelayWsUrl, signRelayEvent } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import {
   COMMUNITY_DOC_TAG,
+  KIND_COMMUNITY_DOC,
   KIND_COMMUNITY_DOC_LEGACY,
 } from "@/shared/constants/kinds";
 
+import {
+  dedicatedDocKindMarkedUnsupported,
+  isUnknownKindRejection,
+  markDedicatedDocKindAccepted,
+  markDedicatedDocKindRejected,
+} from "./docKindSupport";
 import {
   buildDocPageEventInput,
   COMMUNITY_DOC_QUERY_KINDS,
@@ -354,9 +361,11 @@ export function useCommunityDocs(): CommunityDocs {
     [applyPage, readPages],
   );
 
-  const publishPage = React.useCallback(
+  /** Signs and publishes one version on exactly `kind` — no fallback. */
+  const publishPageAs = React.useCallback(
     async (
       content: DocPageContent & { id: string },
+      kind: number,
       known: DocPage | undefined,
     ): Promise<DocPage> => {
       const bytes = measureDocPageContentBytes(content);
@@ -369,7 +378,7 @@ export function useCommunityDocs(): CommunityDocs {
         throw new DocClockSkewError(known?.eventCreatedAt ?? 0);
       }
       const event = await signRelayEvent({
-        ...buildDocPageEventInput(content),
+        ...buildDocPageEventInput(content, kind),
         createdAt,
       });
       const page = parseDocPageEvent(event);
@@ -386,6 +395,45 @@ export function useCommunityDocs(): CommunityDocs {
   );
 
   /**
+   * Regular write path. The community relay may be a stock Buzz relay that
+   * predates kind 30623 and rejects it as unknown, and NIP-11 cannot tell
+   * us in advance — so the write itself is the probe: try the dedicated
+   * kind, and on an "unknown event kind" OK-false remember this relay (per
+   * URL, in localStorage, re-checked after a day) and republish the same
+   * content on the legacy shared kind. Any other failure propagates
+   * unchanged — auth, size, or rate problems must not flip the relay to
+   * legacy writes.
+   */
+  const publishPage = React.useCallback(
+    async (
+      content: DocPageContent & { id: string },
+      known: DocPage | undefined,
+    ): Promise<DocPage> => {
+      // Unknown URL (early Tauri failure): still publish, just without a
+      // durable verdict to consult or update.
+      const relayUrl = await getRelayWsUrl().catch(() => null);
+      if (
+        relayUrl !== null &&
+        dedicatedDocKindMarkedUnsupported(relayUrl, Date.now())
+      ) {
+        return publishPageAs(content, KIND_COMMUNITY_DOC_LEGACY, known);
+      }
+      try {
+        const page = await publishPageAs(content, KIND_COMMUNITY_DOC, known);
+        if (relayUrl !== null) markDedicatedDocKindAccepted(relayUrl);
+        return page;
+      } catch (error) {
+        if (!isUnknownKindRejection(error)) throw error;
+        if (relayUrl !== null) {
+          markDedicatedDocKindRejected(relayUrl, Date.now());
+        }
+        return publishPageAs(content, KIND_COMMUNITY_DOC_LEGACY, known);
+      }
+    },
+    [publishPageAs],
+  );
+
+  /**
    * One-shot migration off the legacy shared kind: after a complete scan,
    * every page whose newest version still sits on kind 30078 is republished
    * verbatim onto the dedicated kind. The copy carries identical content
@@ -398,13 +446,27 @@ export function useCommunityDocs(): CommunityDocs {
   const migrationStartedRef = React.useRef(false);
   const migrateLegacyPages = React.useCallback(
     async (candidates: DocPage[]) => {
+      // A relay known to reject 30623 has nowhere to migrate to: skip the
+      // whole pass instead of failing once per page per mount. When the
+      // verdict is stale (or absent) the first candidate below doubles as
+      // the probe.
+      const relayUrl = await getRelayWsUrl().catch(() => null);
+      if (
+        relayUrl !== null &&
+        dedicatedDocKindMarkedUnsupported(relayUrl, Date.now())
+      ) {
+        return;
+      }
       for (const cached of candidates) {
         try {
           const newest = await fetchNewestVersion(cached.id);
           if (!newest || newest.eventKind !== KIND_COMMUNITY_DOC_LEGACY) {
             continue;
           }
-          await publishPage(
+          // The migration must land on the dedicated kind or not happen at
+          // all — publishPage's legacy fallback would only stack an
+          // identical dead version on the shared window.
+          await publishPageAs(
             {
               id: newest.id,
               title: newest.title,
@@ -416,15 +478,25 @@ export function useCommunityDocs(): CommunityDocs {
               updatedAt: newest.updatedAt,
               ...(newest.deleted ? { deleted: true } : {}),
             },
+            KIND_COMMUNITY_DOC,
             newest,
           );
-        } catch {
+          if (relayUrl !== null) markDedicatedDocKindAccepted(relayUrl);
+        } catch (error) {
+          if (isUnknownKindRejection(error)) {
+            // The relay does not know 30623: every remaining candidate
+            // would fail identically. Remember the verdict and stop.
+            if (relayUrl !== null) {
+              markDedicatedDocKindRejected(relayUrl, Date.now());
+            }
+            return;
+          }
           // Best-effort: a failed republish (offline, clock skew) leaves the
           // page on the legacy window, which is still read. Retried next mount.
         }
       }
     },
-    [fetchNewestVersion, publishPage],
+    [fetchNewestVersion, publishPageAs],
   );
   const snapshotForMigration = query.data;
   React.useEffect(() => {
@@ -475,8 +547,14 @@ export function useCommunityDocs(): CommunityDocs {
       if (options?.requireLive && newest.deleted) {
         throw new Error("This page was deleted by someone else.");
       }
+      // On a relay that rejects 30623 an identical write on a legacy
+      // version is a plain noop again — there is no migration to force.
+      const relayUrl = await getRelayWsUrl().catch(() => null);
       const plan = planDocPagePublish({
         baseEventId: options?.baseEventId,
+        dedicatedKindSupported:
+          relayUrl === null ||
+          !dedicatedDocKindMarkedUnsupported(relayUrl, Date.now()),
         newest,
         next: {
           id,
