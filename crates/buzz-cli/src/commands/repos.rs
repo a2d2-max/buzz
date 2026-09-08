@@ -398,6 +398,78 @@ async fn cmd_protect_remove(
     submit_repo_update(client, builder).await
 }
 
+/// Build the NIP-09 kind:5 tombstone for the caller's own repository
+/// announcement.
+///
+/// The deletion carries **only** an `a` tag (`30617:<pubkey>:<id>`) and no `e`
+/// tag. That is load-bearing: the relay routes to its coordinate soft-delete
+/// path (`handle_standard_deletion_event` → `handle_a_tag_deletion`) only when
+/// the kind:5 has no `e` target; an `e` tag would route to the per-event path
+/// and leave the live addressable row — and therefore the git ACL — intact.
+/// `buzz_sdk::build_delete_addressable` emits exactly that shape.
+///
+/// The coordinate is taken from the observed head, never from user input, so
+/// the deletion can only ever address the announcement we just read back for
+/// the signing identity.
+///
+/// `created_at` is `max(now, head.created_at + 1)`: NIP-09 scopes an a-tag
+/// deletion to versions at or before the tombstone's own timestamp, so a
+/// tombstone older than the head is a silent no-op at the relay. Pure and
+/// unit-testable.
+fn build_delete_announcement(head: &Event, now: Timestamp) -> Result<EventBuilder, CliError> {
+    let repo_id = repo_id_from_event(head)?;
+    let after_head = head
+        .created_at
+        .as_secs()
+        .checked_add(1)
+        .ok_or_else(|| CliError::Other("repository timestamp cannot be advanced".into()))?;
+    let next_created_at = Timestamp::from(after_head.max(now.as_secs()));
+
+    buzz_sdk::build_delete_addressable(KIND_GIT_REPO_ANNOUNCEMENT, &head.pubkey.to_hex(), repo_id)
+        .map_err(|error| CliError::Other(format!("failed to build delete event: {error}")))
+        .map(|builder| builder.custom_created_at(next_created_at))
+}
+
+/// `buzz repos delete` — retire one of your own kind:30617 announcements.
+///
+/// Head-based and verified, mirroring `projects delete`:
+///   1. Fetch the caller's own live head — `NotFound` if absent (this is also
+///      the ownership check: the query is scoped to the signing pubkey, so
+///      another owner's repo is simply not found).
+///   2. Build the tombstone at `max(now, head.created_at + 1)`.
+///   3. Submit.
+///   4. Re-query the coordinate; a surviving head means a concurrent write
+///      raced the delete → `Conflict`.
+async fn cmd_delete_repo(client: &BuzzClient, repo_id: &str) -> Result<(), CliError> {
+    let head = current_repo(client, repo_id).await?;
+    let owner_hex = head.pubkey.to_hex();
+
+    let builder = build_delete_announcement(&head, Timestamp::now())?;
+    let event = client.sign_event(builder)?;
+    let event_id = event.id.to_hex();
+    let raw = client.submit_event(event).await?;
+    parse_write_response(&raw, "delete event was dominated; a newer head exists")?;
+
+    // Post-submit verification: re-query to confirm the head is gone.
+    if let Some(survivor) = fetch_own_repo_announcement(client, repo_id).await? {
+        return Err(CliError::Conflict(format!(
+            "repository {repo_id:?} still exists (head at {}); a concurrent write raced the delete",
+            survivor.created_at.as_secs()
+        )));
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "deleted": true,
+            "id": repo_id,
+            "address": format!("{KIND_GIT_REPO_ANNOUNCEMENT}:{owner_hex}:{repo_id}"),
+            "event_id": event_id,
+        })
+    );
+    Ok(())
+}
+
 /// Bind (or rebind) a repository to a channel — the fix path for issue
 /// #3527's permanently-404 repos. Publishes a read-modify-write update of
 /// the caller's own kind:30617 with exactly one `buzz-channel` tag; all
@@ -442,6 +514,7 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
         ReposCmd::Get { id, owner } => cmd_get_repo(client, &id, owner.as_deref()).await,
         ReposCmd::List { owner, limit } => cmd_list_repos(client, owner.as_deref(), limit).await,
         ReposCmd::Bind { id, channel } => cmd_bind_repo(client, &id, &channel).await,
+        ReposCmd::Delete { id } => cmd_delete_repo(client, &id).await,
         ReposCmd::Protect(command) => match command {
             ReposProtectCmd::List { id } => cmd_protect_list(client, &id).await,
             ReposProtectCmd::Set {
@@ -475,15 +548,25 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     use super::{
-        build_create_announcement, build_protection_tag, build_updated_repo_announcement,
-        protection_rules_json, validate_write_response, RepoChange,
+        build_create_announcement, build_delete_announcement, build_protection_tag,
+        build_updated_repo_announcement, protection_rules_json, validate_write_response,
+        RepoChange,
     };
 
     fn signed_repo(tags: Vec<Tag>, content: &str, created_at: u64) -> nostr::Event {
+        signed_repo_with_keys(&Keys::generate(), tags, content, created_at)
+    }
+
+    fn signed_repo_with_keys(
+        keys: &Keys,
+        tags: Vec<Tag>,
+        content: &str,
+        created_at: u64,
+    ) -> nostr::Event {
         EventBuilder::new(Kind::Custom(30617), content)
             .tags(tags)
             .custom_created_at(Timestamp::from(created_at))
-            .sign_with_keys(&Keys::generate())
+            .sign_with_keys(keys)
             .expect("sign repository event")
     }
 
@@ -824,6 +907,124 @@ mod tests {
         let error = build_create_announcement("demo", None, None, &[], None, &[], Some("nope"))
             .expect_err("malformed channel id must not build an announcement");
         assert!(matches!(error, crate::error::CliError::Usage(_)));
+    }
+
+    // ── repos delete (NIP-09 kind:5 coordinate tombstone) ────────────────────
+
+    /// The tombstone must be a kind:5 carrying exactly one `a` tag addressing
+    /// the head's own coordinate — and no `e` tag. An `e` tag would route the
+    /// relay to its per-event delete path and leave the live 30617 row (the
+    /// git ACL) alive.
+    #[test]
+    fn delete_emits_a_tag_only_kind5_for_the_head_coordinate() {
+        let keys = Keys::generate();
+        let head = signed_repo_with_keys(
+            &keys,
+            vec![tag(&["d", "demo"]), tag(&["name", "Demo"])],
+            "repository content",
+            100,
+        );
+
+        let tombstone = build_delete_announcement(&head, Timestamp::from(1_000u64))
+            .expect("build tombstone")
+            .sign_with_keys(&keys)
+            .expect("sign tombstone");
+
+        assert_eq!(tombstone.kind, Kind::Custom(5));
+        assert_eq!(tombstone.content, "");
+        let a_tags: Vec<_> = tombstone
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("a"))
+            .collect();
+        assert_eq!(a_tags.len(), 1, "exactly one coordinate");
+        assert_eq!(
+            a_tags[0].as_slice(),
+            ["a", &format!("30617:{}:demo", keys.public_key().to_hex())]
+        );
+        assert!(
+            !tombstone
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice().first().map(String::as_str) == Some("e")),
+            "an e tag would leave the announcement alive"
+        );
+    }
+
+    /// NIP-09 scopes an a-tag deletion to versions at or before the
+    /// tombstone's own `created_at`, so a tombstone older than the observed
+    /// head is a silent no-op at the relay.
+    #[test]
+    fn delete_timestamp_uses_later_of_wall_clock_and_after_head() {
+        let cases = [
+            ("stale head", 100, 1_000, 1_000),
+            ("head equal to now", 1_000, 1_000, 1_001),
+            ("future head", 1_500, 1_000, 1_501),
+        ];
+
+        for (name, head_ts, now, expected) in cases {
+            let head = signed_repo(vec![tag(&["d", "demo"])], "", head_ts);
+            let tombstone = build_delete_announcement(&head, Timestamp::from(now))
+                .expect("build tombstone")
+                .sign_with_keys(&Keys::generate())
+                .expect("sign tombstone");
+
+            assert_eq!(tombstone.created_at.as_secs(), expected, "case: {name}");
+        }
+    }
+
+    #[test]
+    fn delete_rejects_head_without_a_d_tag() {
+        let head = signed_repo(vec![tag(&["name", "Demo"])], "", 10);
+
+        let error = build_delete_announcement(&head, Timestamp::from(1_000u64))
+            .expect_err("a coordinate needs the d tag");
+
+        assert!(error.to_string().contains("missing its d tag"));
+    }
+
+    #[test]
+    fn delete_rejects_overflowing_head_timestamp() {
+        let head = signed_repo(vec![tag(&["d", "demo"])], "", u64::MAX);
+
+        let error = build_delete_announcement(&head, Timestamp::from(1_000u64))
+            .expect_err("maximum timestamp cannot be advanced");
+
+        assert!(matches!(
+            error,
+            crate::error::CliError::Other(ref message)
+                if message == "repository timestamp cannot be advanced"
+        ));
+    }
+
+    /// `buzz repos delete --id <other-owner-repo>` is unreachable by
+    /// construction: the coordinate comes from the head the CLI read back,
+    /// which is queried `authors: [self]`. This pins the invariant that the
+    /// signer and the coordinate pubkey are the same key.
+    #[test]
+    fn delete_coordinate_always_matches_the_signing_identity() {
+        let owner = Keys::generate();
+        let head = signed_repo_with_keys(&owner, vec![tag(&["d", "demo"])], "", 10);
+
+        let tombstone = build_delete_announcement(&head, Timestamp::from(1_000u64))
+            .expect("build tombstone")
+            .sign_with_keys(&owner)
+            .expect("sign tombstone");
+
+        let coord = tombstone
+            .tags
+            .iter()
+            .find_map(|tag| {
+                let values = tag.as_slice();
+                (values.first().map(String::as_str) == Some("a"))
+                    .then(|| values.get(1).cloned())
+                    .flatten()
+            })
+            .expect("coordinate tag");
+        assert_eq!(
+            coord.split(':').nth(1),
+            Some(tombstone.pubkey.to_hex().as_str())
+        );
     }
 
     #[test]

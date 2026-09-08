@@ -102,6 +102,9 @@ buzz repos protect list --id my-repo
 buzz repos protect set --id my-repo --ref refs/heads/main --push admin --no-force-push --no-delete
 buzz repos protect remove --id my-repo --ref refs/heads/main
 
+# Retire a repository announcement (yours only)
+buzz repos delete --id my-repo
+
 # Pipe to jq
 buzz channels list | jq '.[].name'
 ```
@@ -109,6 +112,13 @@ buzz channels list | jq '.[].name'
 `protect set` replaces every existing rule for the exact ref pattern. Any
 constraint omitted from the command is removed. `protect list` reports malformed
 stored rules in `validation_error` so an owner can remove and repair them.
+
+`repos delete` publishes a NIP-09 kind:5 tombstone for the coordinate
+`30617:<your pubkey>:<id>`, so only your own repos can be deleted and a repo
+that isn't yours (or doesn't exist) exits 1. The announcement is the relay's
+git ACL, so deleting it takes clone/fetch/push offline. The repo-name
+reservation and the stored git objects are kept: you can re-announce the same
+`--id` later, and nobody else can claim it in the meantime.
 
 ## Commands
 
@@ -168,6 +178,8 @@ stored rules in `validation_error` so an owner can remove and repair them.
 | `repos` | `create` | Announce a git repository (NIP-34) |
 | | `get` | Get a repository announcement |
 | | `list` | List repository announcements |
+| | `bind` | Bind (or rebind) one of your repos to a channel |
+| | `delete` | Delete one of your own repository announcements |
 | | `protect list` | List branch and tag protection rules |
 | | `protect set` | Create or replace a protection rule |
 | | `protect remove` | Remove a protection rule |
