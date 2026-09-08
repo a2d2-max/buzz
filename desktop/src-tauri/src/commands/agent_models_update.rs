@@ -322,11 +322,25 @@ pub async fn update_managed_agent(
         // dialog cannot pin an agent to an account that was already removed.
         // Only the id is written; the token stays in the keyring until spawn.
         if input.claude_account_id.is_some() {
-            let accounts =
-                crate::managed_agents::with_claude_account_store(&app, |store| store.list())?;
+            let accounts = crate::managed_agents::with_claude_account_store(&app, |store| {
+                store.list(crate::managed_agents::AccountProvider::Claude)
+            })?;
             crate::managed_agents::apply_claude_account_update(
                 record,
                 input.claude_account_id,
+                &|id| accounts.iter().any(|account| account.id == id),
+            )?;
+        }
+
+        // Codex account picker: same stale-dialog guard against the Codex
+        // account list.
+        if input.codex_account_id.is_some() {
+            let accounts = crate::managed_agents::with_claude_account_store(&app, |store| {
+                store.list(crate::managed_agents::AccountProvider::Codex)
+            })?;
+            crate::managed_agents::apply_codex_account_update(
+                record,
+                input.codex_account_id,
                 &|id| accounts.iter().any(|account| account.id == id),
             )?;
         }

@@ -1,7 +1,8 @@
 use crate::managed_agents::{
     command_availability, find_command, is_npm_global_install, normalize_agent_args,
-    oauth_token_env_var_for_command, AcpRuntimeCatalogEntry, DiscoverManagedAgentPrereqsRequest,
-    InstallRuntimeResult, ManagedAgentPrereqsInfo, DEFAULT_ACP_COMMAND,
+    oauth_token_env_var_for_command, supports_codex_accounts_for_command, AcpRuntimeCatalogEntry,
+    DiscoverManagedAgentPrereqsRequest, InstallRuntimeResult, ManagedAgentPrereqsInfo,
+    DEFAULT_ACP_COMMAND,
 };
 
 mod forced_single_flight;
@@ -148,6 +149,7 @@ pub async fn save_custom_harness(
         provider_env_var: None,
         thinking_env_var: None,
         oauth_token_env_var: oauth_token_env_var_for_command(&definition.command),
+        supports_codex_accounts: supports_codex_accounts_for_command(&definition.command),
         effort_canonical_values: None,
         max_tokens_env_var: None,
         context_limit_env_var: None,
@@ -1300,11 +1302,11 @@ mod tests {
     //
     // `availability_drift` is a pure predicate over two `Option` values —
     // no global state, no parallelism hazard.
+    use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
 
     /// Both sides known and different → drift detected.
     #[test]
     fn test_availability_drift_detected_when_stamped_differs_from_current() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
         assert!(
             availability_drift(
                 Some(&AcpAvailabilityStatus::Available),
@@ -1317,7 +1319,6 @@ mod tests {
     /// Both sides known and equal → no drift.
     #[test]
     fn test_availability_drift_no_drift_when_stamped_equals_current() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
         assert!(
             !availability_drift(
                 Some(&AcpAvailabilityStatus::Available),
@@ -1330,7 +1331,6 @@ mod tests {
     /// Stamped is None (cold cache at spawn) → no drift regardless of current.
     #[test]
     fn test_availability_drift_none_stamp_never_drifts() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
         assert!(
             !availability_drift(None, Some(AcpAvailabilityStatus::Available)),
             "None stamp (cold cache at spawn) must never signal drift"
@@ -1340,7 +1340,6 @@ mod tests {
     /// Current is None (cache cold now) → no drift regardless of stamp.
     #[test]
     fn test_availability_drift_none_current_never_drifts() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
         assert!(
             !availability_drift(Some(&AcpAvailabilityStatus::Available), None),
             "None current (cache cold) must never signal drift"
@@ -1350,7 +1349,6 @@ mod tests {
     /// Non-codex agent (stamp is None) → no drift (None case).
     #[test]
     fn test_availability_drift_non_codex_none_never_drifts() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
         // Non-codex agents have `adapter_availability = None` — must never flip.
         assert!(
             !availability_drift(None, Some(AcpAvailabilityStatus::AdapterMissing)),

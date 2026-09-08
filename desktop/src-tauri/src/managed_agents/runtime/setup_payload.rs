@@ -41,6 +41,10 @@ pub(super) fn apply_setup_payload_env(
             record,
             runtime_meta,
             &descriptor.env,
+        ) || crate::managed_agents::codex_accounts::codex_auth_supplied(
+            record,
+            runtime_meta,
+            &descriptor.env,
         ),
     };
     // Compute the optional payload before touching the command.

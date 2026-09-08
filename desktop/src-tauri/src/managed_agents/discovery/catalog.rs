@@ -47,6 +47,7 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         login_hint: None,
         auth_probe_args: None,
         oauth_token_env_var: None,
+        supports_codex_accounts: false,
     },
     KnownAcpRuntime {
         id: "claude",
@@ -83,6 +84,7 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         login_hint: Some("Run the Claude CLI to complete authentication."),
         auth_probe_args: Some(&["claude", "auth", "status"]),
         oauth_token_env_var: Some(crate::managed_agents::claude_accounts::CLAUDE_OAUTH_TOKEN_ENV),
+        supports_codex_accounts: false,
     },
     KnownAcpRuntime {
         id: "codex",
@@ -120,6 +122,7 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         // Verified: `codex login status` exits 0 when logged in, non-zero otherwise.
         auth_probe_args: Some(&["codex", "login", "status"]),
         oauth_token_env_var: None,
+        supports_codex_accounts: true,
     },
     KnownAcpRuntime {
         id: "buzz-agent",
@@ -156,5 +159,6 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         login_hint: None,
         auth_probe_args: None,
         oauth_token_env_var: None,
+        supports_codex_accounts: false,
     },
 ];

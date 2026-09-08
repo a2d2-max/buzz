@@ -74,11 +74,12 @@ pub(crate) struct EffectiveAgentEnv {
     // replaces this resolution path wholesale.
     #[allow(dead_code)]
     pub config_file_path: Option<&'static str>,
-    /// `true` when the spawn will supply an OAuth token for this runtime — a
-    /// stored Claude account on the record, or a non-blank value under the
-    /// runtime's `oauth_token_env_var` in the layered env — so readiness must
-    /// not demand the desktop's own CLI login. Always `false` for runtimes
-    /// without such an env var.
+    /// `true` when the spawn will supply this runtime its own login — a
+    /// stored Claude/Codex account on the record, or a non-blank value under
+    /// the runtime's login env vars (`oauth_token_env_var`, or
+    /// `OPENAI_API_KEY`/`CODEX_HOME` for Codex) in the layered env — so
+    /// readiness must not demand the desktop's own CLI login. Always `false`
+    /// for runtimes with neither input.
     pub oauth_token_supplied: bool,
     /// The resolved harness binary name (e.g. `"buzz-agent"`, `"goose"`).
     pub effective_command: String,
@@ -298,7 +299,8 @@ fn resolve_effective_agent_env_with_def(
         effective_model.as_deref(),
     );
 
-    let token_supplied = super::claude_accounts::oauth_token_supplied(record, runtime, &env);
+    let token_supplied = super::claude_accounts::oauth_token_supplied(record, runtime, &env)
+        || super::codex_accounts::codex_auth_supplied(record, runtime, &env);
     EffectiveAgentEnv {
         env,
         config_file_path: runtime.and_then(|r| r.config_file_path),
@@ -465,6 +467,9 @@ fn collect_missing_requirements(
             "complete Claude Code authentication by running the Claude CLI",
             rt,
         ),
+        // Same as claude: a per-agent Codex account (or hand-typed
+        // OPENAI_API_KEY / CODEX_HOME) is what the spawn signs in with.
+        "codex" if effective.oauth_token_supplied => vec![],
         "codex" => cli_login::requirements(&["codex", "login", "status"], "run `codex login`", rt),
         _ => vec![],
     }
@@ -1084,6 +1089,7 @@ mod tests {
             login_hint: None,
             auth_probe_args: None,
             oauth_token_env_var: None,
+            supports_codex_accounts: false,
         }
     }
 
@@ -1535,6 +1541,7 @@ mod tests {
             relay_mesh: None,
             effort_level: None,
             claude_account_id: None,
+            codex_account_id: None,
         };
 
         let runtime = known_acp_runtime_exact("buzz-agent");
@@ -1688,6 +1695,8 @@ mod tests {
     // module stays under the desktop file-size ratchet.
     #[path = "claude_account.rs"]
     mod claude_account;
+    #[path = "codex_account.rs"]
+    mod codex_account;
 
     #[path = "openrouter_tests.rs"]
     mod openrouter_tests;

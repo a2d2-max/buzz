@@ -14,8 +14,11 @@ mod backend;
 pub(crate) mod bestie_assignment;
 pub(crate) mod claude_accounts;
 pub(crate) use claude_accounts::{
-    apply_claude_account_update, detach_claude_account, with_claude_account_store, ClaudeAccount,
+    apply_claude_account_update, detach_claude_account, with_claude_account_store, AccountProvider,
+    CodexAuthKind, ProviderAccount,
 };
+pub(crate) mod codex_accounts;
+pub(crate) use codex_accounts::{apply_codex_account_update, detach_codex_account};
 pub(crate) mod claude_config;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;

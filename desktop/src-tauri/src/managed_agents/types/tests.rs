@@ -762,6 +762,7 @@ fn summary_fixture(
         respond_to: RespondTo::OwnerOnly,
         respond_to_allowlist: Vec::new(),
         claude_account_id: None,
+        codex_account_id: None,
     }
 }
 

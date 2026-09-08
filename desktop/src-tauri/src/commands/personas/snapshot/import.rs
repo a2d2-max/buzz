@@ -662,6 +662,7 @@ pub async fn confirm_agent_snapshot_import(
             relay_mesh: None,
             effort_level: None,
             claude_account_id: None,
+            codex_account_id: None,
             runtime: snapshot.definition.runtime.clone(),
             name_pool: snapshot.definition.name_pool.clone(),
         };

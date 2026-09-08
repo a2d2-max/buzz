@@ -25,10 +25,12 @@ import { SubsectionLabel } from "@/shared/ui/PageHeader";
 import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
 import { useAcpRuntimesQuery } from "@/features/agents/hooks";
 import { useClaudeAccountsQuery } from "@/features/agents/useClaudeAccounts";
+import { useCodexAccountsQuery } from "@/features/agents/useCodexAccounts";
 import {
   findRuntimeForCommand,
   resolveClaudeAccountLabel,
 } from "./claudeAccountOptions";
+import { resolveCodexAccountLabel } from "./codexAccountOptions";
 import { RestartDiffBadge } from "./RestartDiffBadge";
 
 export function ManagedAgentRow({
@@ -409,18 +411,34 @@ function RuntimeBlock({
   runtimeSource: string | null;
 }) {
   // Shared, cached queries; only agents that picked an account fetch them.
-  // The label is gated on the effective runtime's OAuth-token capability so a
+  // Labels are gated on the effective runtime's account capability so a
   // stale id on an agent moved to another harness never labels its row.
-  const hasAccount = agent.claudeAccountId != null;
-  const runtimesQuery = useAcpRuntimesQuery({ enabled: hasAccount });
-  const claudeAccountsQuery = useClaudeAccountsQuery({ enabled: hasAccount });
-  const readsToken =
-    findRuntimeForCommand(runtimesQuery.data ?? [], agent.agentCommand)
-      ?.oauthTokenEnvVar != null;
-  const accountLabel = readsToken
-    ? resolveClaudeAccountLabel(
-        agent.claudeAccountId,
-        claudeAccountsQuery.data ?? null,
+  const hasClaudeAccount = agent.claudeAccountId != null;
+  const hasCodexAccount = agent.codexAccountId != null;
+  const runtimesQuery = useAcpRuntimesQuery({
+    enabled: hasClaudeAccount || hasCodexAccount,
+  });
+  const claudeAccountsQuery = useClaudeAccountsQuery({
+    enabled: hasClaudeAccount,
+  });
+  const codexAccountsQuery = useCodexAccountsQuery({
+    enabled: hasCodexAccount,
+  });
+  const runtime = findRuntimeForCommand(
+    runtimesQuery.data ?? [],
+    agent.agentCommand,
+  );
+  const accountLabel =
+    runtime?.oauthTokenEnvVar != null
+      ? resolveClaudeAccountLabel(
+          agent.claudeAccountId,
+          claudeAccountsQuery.data ?? null,
+        )
+      : null;
+  const codexAccountLabel = runtime?.supportsCodexAccounts
+    ? resolveCodexAccountLabel(
+        agent.codexAccountId,
+        codexAccountsQuery.data ?? null,
       )
     : null;
   return (
@@ -429,7 +447,7 @@ function RuntimeBlock({
       <p className="truncate font-mono text-xs text-foreground">
         {agent.agentCommand}
       </p>
-      {runtimeSource || agent.model || accountLabel ? (
+      {runtimeSource || agent.model || accountLabel || codexAccountLabel ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           {runtimeSource ? <span>{runtimeSource}</span> : null}
           {agent.model ? (
@@ -438,6 +456,11 @@ function RuntimeBlock({
           {accountLabel ? (
             <span data-testid="managed-agent-claude-account">
               Claude account: {accountLabel}
+            </span>
+          ) : null}
+          {codexAccountLabel ? (
+            <span data-testid="managed-agent-codex-account">
+              Codex account: {codexAccountLabel}
             </span>
           ) : null}
         </div>

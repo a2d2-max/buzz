@@ -156,6 +156,7 @@ export type RawManagedAgent = {
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
   claude_account_id?: string | null;
+  codex_account_id?: string | null;
 };
 
 type RawCreateManagedAgentResponse = {
@@ -183,6 +184,7 @@ export type RawAcpRuntimeCatalogEntry = {
   provider_env_var?: string | null;
   thinking_env_var?: string | null;
   oauth_token_env_var?: string | null;
+  supports_codex_accounts?: boolean;
   max_tokens_env_var?: string | null;
   context_limit_env_var?: string | null;
   max_rounds_env_var?: string | null;
@@ -671,6 +673,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
     claudeAccountId: agent.claude_account_id ?? null,
+    codexAccountId: agent.codex_account_id ?? null,
   };
 }
 
@@ -690,6 +693,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     providerEnvVar: entry.provider_env_var ?? null,
     thinkingEnvVar: entry.thinking_env_var ?? null,
     oauthTokenEnvVar: entry.oauth_token_env_var ?? null,
+    supportsCodexAccounts: entry.supports_codex_accounts ?? false,
     maxTokensEnvVar: entry.max_tokens_env_var ?? null,
     contextLimitEnvVar: entry.context_limit_env_var ?? null,
     maxRoundsEnvVar: entry.max_rounds_env_var ?? null,

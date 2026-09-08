@@ -270,6 +270,7 @@ fn record_with(
         relay_mesh: None,
         effort_level: None,
         claude_account_id: None,
+        codex_account_id: None,
     }
 }
 

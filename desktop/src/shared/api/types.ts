@@ -379,6 +379,11 @@ export type ManagedAgent = {
    * injects for this agent. `null` = the app's own Claude login.
    */
   claudeAccountId: string | null;
+  /**
+   * Stored Codex account (see `CodexAccount`) whose login the spawn injects
+   * for this agent. `null` = the app's own Codex login.
+   */
+  codexAccountId: string | null;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */
@@ -515,6 +520,12 @@ export type AcpRuntimeCatalogEntry = {
    * account picker; `null` = not applicable to this runtime.
    */
   oauthTokenEnvVar: string | null;
+  /**
+   * True when this runtime honors per-agent Codex accounts (the spawn can
+   * point it at another OpenAI login). Gates the "Codex account" picker the
+   * way `oauthTokenEnvVar` gates Claude's.
+   */
+  supportsCodexAccounts: boolean;
   /**
    * Canonical accepted effort values for this runtime, in display order.
    *
@@ -723,6 +734,8 @@ export type UpdateManagedAgentInput = {
   effortLevel?: string | null;
   /** Tri-state: absent = don't touch; `null` = back to the app's own Claude login; `string` = that stored account's id. */
   claudeAccountId?: string | null;
+  /** Tri-state like `claudeAccountId`, for the Codex account picker. */
+  codexAccountId?: string | null;
 };
 
 /**
@@ -746,6 +759,36 @@ export type RemoveClaudeAccountResult = {
   /** Agents switched back to the app login because they used the account. */
   detachedAgentPubkeys: string[];
   /** Set when the account is gone but its keyring entry could not be deleted. */
+  warning: string | null;
+};
+
+/** How a Codex account authenticates. */
+export type CodexAuthKind = "api_key" | "chatgpt";
+
+/**
+ * A named Codex (OpenAI) account. An `api_key` account's key lives in the OS
+ * keyring and never reaches the frontend; a `chatgpt` account's login lives
+ * in an app-managed `CODEX_HOME` directory instead (no key at all).
+ */
+export type CodexAccount = {
+  id: string;
+  label: string;
+  createdAt: string;
+  /** `…` + the key's last four; empty for `chatgpt` accounts. */
+  tokenHint: string;
+  authKind: CodexAuthKind;
+};
+
+export type CodexAccountTestResult = {
+  ok: boolean;
+  /** One short, secret-scrubbed line from the CLI or a status sentence. */
+  message: string;
+};
+
+export type RemoveCodexAccountResult = {
+  /** Agents switched back to the app login because they used the account. */
+  detachedAgentPubkeys: string[];
+  /** Set when the keyring entry or Codex directory could not be deleted. */
   warning: string | null;
 };
 // Persona (agent definition) types live in a sibling module to keep this
