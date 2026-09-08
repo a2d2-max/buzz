@@ -15,6 +15,7 @@ import {
 } from "@/shared/lib/platform";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 
+import { isEditorViewMounted } from "./editorViewMounted";
 import { resolveLinkAt, type LinkSelectionInfo } from "./resolveLinkAt";
 
 export type { LinkSelectionInfo } from "./resolveLinkAt";
@@ -143,6 +144,14 @@ export type RichTextEditorOptions = {
    * image node for document surfaces. Read once at editor creation.
    */
   extraExtensions?: readonly AnyExtension[];
+  /**
+   * `data-testid` for the contenteditable element itself (defaults to the
+   * chat composer's `"message-input"`). Goes through `editorProps.attributes`
+   * so the label exists from the moment the view is created — consumers must
+   * not reach for `editor.view.dom` to relabel it, which throws while the
+   * view is unmounted. Read once at editor creation.
+   */
+  testId?: string;
 };
 
 /**
@@ -172,6 +181,7 @@ export function useRichTextEditor({
   onLinkShortcut,
   documentMode = false,
   extraExtensions,
+  testId,
 }: RichTextEditorOptions) {
   const addressedAgentMentionNamesRef = React.useRef<readonly string[]>([]);
   const onUpdateRef = React.useRef(onUpdate);
@@ -422,7 +432,7 @@ export function useRichTextEditor({
           autocapitalize: "none",
           autocorrect: "off",
           class: `${MESSAGE_MARKDOWN_CLASS} min-h-0 resize-none overflow-y-hidden border-0 bg-transparent px-0 py-0 text-message font-normal tracking-normal text-foreground shadow-none focus-visible:ring-0 caret-foreground outline-hidden max-w-none`,
-          "data-testid": "message-input",
+          "data-testid": testId ?? "message-input",
           spellcheck: "true",
         },
         // ArrowUp in an empty composer → edit your last message (Slack
@@ -694,7 +704,12 @@ export function useRichTextEditor({
     [editor],
   );
 
+  // Focus helpers no-op while the view is unmounted: the focus command goes
+  // through `view.dom.focus()`, which throws on TipTap's unmounted-view stub
+  // (e.g. the Docs surface in markdown-source mode never renders
+  // <EditorContent>, so its view may never attach).
   const focusEnd = React.useCallback(() => {
+    if (!isEditorViewMounted(editor)) return;
     editor?.commands.focus("end");
   }, [editor]);
 
@@ -705,9 +720,9 @@ export function useRichTextEditor({
    * effect) where we don't want to yank the cursor to the end.
    */
   const focusPreserve = React.useCallback(() => {
-    if (!editor) return;
+    if (!isEditorViewMounted(editor)) return;
     // `focus()` with no position argument preserves the current selection.
-    editor.commands.focus();
+    editor?.commands.focus();
   }, [editor]);
 
   // Backwards-compatible alias — existing call sites that want "end"
