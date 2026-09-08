@@ -1,23 +1,22 @@
-// TV 설정: 릴레이 URL + 관전용 키.
+// TV 설정: 릴레이 URL + 세션 전용 관전 키.
 //
-// - 리모컨으로 nsec 를 치는 건 고문이라 URL 해시/쿼리(#relay=…&key=…)로도
-//   주입받는다. 주입받으면 즉시 저장하고 주소창에서 지운다(키가 화면·히스토리에
-//   남지 않게).
-// - localStorage 는 TV 에서 예고 없이 지워질 수 있으니(공장초기화·용량 축출)
-//   "언제든 사라지는 캐시"로 취급한다 — 없으면 설정 화면으로 돌아간다.
+// 개인키는 React 상태와 RelayConnection 메모리에만 둔다. URL, localStorage,
+// sessionStorage 에는 넣지 않는다. 릴레이 URL 만 다음 실행 편의를 위해 저장한다.
 
 import { nip19 } from "nostr-tools";
 import { getPublicKey } from "nostr-tools/pure";
 
 export type TvSettings = {
   relayUrl: string;
-  /** 관전용 개인키(64자리 hex). nsec 는 저장 전에 hex 로 푼다. */
+  /** 관전용 개인키(64자리 hex). 앱 프로세스가 살아 있는 동안만 보관한다. */
   secretKeyHex: string;
   /** secretKeyHex 에서 유도한 공개키(hex). */
   pubkeyHex: string;
 };
 
-const STORAGE_KEY = "a2d2-tv-settings-v1";
+const RELAY_STORAGE_KEY = "a2d2-tv-relay-url-v2";
+const LEGACY_SECRET_STORAGE_KEY = "a2d2-tv-settings-v1";
+const SESSION_BOOTSTRAP_KEY = "__BUZZ_TV_SESSION__";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -95,64 +94,40 @@ export function buildSettings(
   return { ok: true, settings: { relayUrl, secretKeyHex, pubkeyHex } };
 }
 
-// localStorage 접근은 전부 try/catch — TV/시뮬레이터에 따라 접근 자체가
-// 막혀 있을 수 있고, 그 경우에도 앱은 설정 화면으로 살아 있어야 한다.
+// localStorage 접근은 전부 try/catch 한다. 저장소가 막혀도 현재 세션은
+// 설정 화면에서 입력한 값으로 계속 동작한다.
 
-export function loadSettings(storage?: Storage): TvSettings | null {
+export function loadRelayUrl(storage?: Storage): string | null {
   const store = storage ?? safeLocalStorage();
   if (!store) return null;
-  let raw: string | null;
   try {
-    raw = store.getItem(STORAGE_KEY);
-  } catch {
-    return null;
-  }
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw) as Partial<TvSettings>;
-    if (
-      typeof parsed.relayUrl !== "string" ||
-      typeof parsed.secretKeyHex !== "string" ||
-      !HEX64.test(parsed.secretKeyHex)
-    ) {
-      return null;
-    }
-    // 공개키는 저장값을 믿지 않고 매번 다시 유도한다(저장소가 반쯤 깨졌을 때 대비).
-    const pubkeyHex = getPublicKey(hexToBytes(parsed.secretKeyHex));
-    return {
-      relayUrl: parsed.relayUrl,
-      secretKeyHex: parsed.secretKeyHex,
-      pubkeyHex,
-    };
+    const raw = store.getItem(RELAY_STORAGE_KEY);
+    return raw ? normalizeRelayUrl(raw) : null;
   } catch {
     return null;
   }
 }
 
-export function saveSettings(settings: TvSettings, storage?: Storage): boolean {
+export function saveRelayUrl(relayUrl: string, storage?: Storage): boolean {
   const store = storage ?? safeLocalStorage();
   if (!store) return false;
   try {
-    store.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        relayUrl: settings.relayUrl,
-        secretKeyHex: settings.secretKeyHex,
-      }),
-    );
+    store.setItem(RELAY_STORAGE_KEY, relayUrl);
     return true;
   } catch {
     return false;
   }
 }
 
-export function clearSettings(storage?: Storage): void {
+/** 이전 버전이 localStorage 에 남긴 개인키 레코드를 무조건 지운다. */
+export function purgeLegacySecretSettings(storage?: Storage): boolean {
   const store = storage ?? safeLocalStorage();
-  if (!store) return;
+  if (!store) return false;
   try {
-    store.removeItem(STORAGE_KEY);
+    store.removeItem(LEGACY_SECRET_STORAGE_KEY);
+    return true;
   } catch {
-    // 지우기 실패는 무시 — 다음 load 검증에서 걸러진다.
+    return false;
   }
 }
 
@@ -164,36 +139,29 @@ function safeLocalStorage(): Storage | null {
   }
 }
 
-/**
- * URL 로 주입된 설정(#relay=…&key=… 또는 ?relay=…&key=…)을 읽는다.
- * 해시가 쿼리보다 우선한다(해시는 서버 로그에 안 남아 키 전달에 더 낫다).
- */
-export function readLaunchParams(location: { search: string; hash: string }): {
-  relay?: string;
-  key?: string;
-} {
-  const merged: { relay?: string; key?: string } = {};
-  for (const raw of [location.search, location.hash]) {
-    const query =
-      raw.startsWith("#") || raw.startsWith("?") ? raw.slice(1) : raw;
-    if (!query) continue;
-    const params = new URLSearchParams(query);
-    const relay = params.get("relay");
-    const key = params.get("key");
-    if (relay) merged.relay = relay;
-    if (key) merged.key = key;
-  }
-  return merged;
-}
+type SessionBootstrapScope = Record<string, unknown>;
 
-/** 주소창에서 주입 파라미터를 지운다(키가 화면·북마크에 남지 않게). */
-export function stripLaunchParams(): void {
+/**
+ * 검증 러너 같은 신뢰된 호스트가 문서 평가 전에 메모리에 넣은 설정을 한 번만
+ * 읽고 즉시 전역에서 지운다. 이 통로는 URL이나 웹 저장소를 사용하지 않는다.
+ */
+export function consumeSessionBootstrap(
+  scope: SessionBootstrapScope = globalThis as SessionBootstrapScope,
+): TvSettings | null {
+  const raw = scope[SESSION_BOOTSTRAP_KEY];
   try {
-    const url = new URL(window.location.href);
-    url.hash = "";
-    url.search = "";
-    window.history.replaceState(null, "", url.toString());
+    delete scope[SESSION_BOOTSTRAP_KEY];
   } catch {
-    // 못 지워도 동작엔 지장 없다.
+    scope[SESSION_BOOTSTRAP_KEY] = undefined;
   }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const candidate = raw as Record<string, unknown>;
+  if (
+    typeof candidate.relayUrl !== "string" ||
+    typeof candidate.secretKeyHex !== "string"
+  ) {
+    return null;
+  }
+  const result = buildSettings(candidate.relayUrl, candidate.secretKeyHex);
+  return result.ok ? result.settings : null;
 }

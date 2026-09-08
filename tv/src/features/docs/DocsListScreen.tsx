@@ -61,6 +61,8 @@ export function DocsListScreen({
             key={doc.id}
             onSelect={() => onOpenDoc(doc)}
             autoFocus={index === 0}
+            docId={doc.id}
+            docEventId={doc.eventId}
           >
             <span style={{ paddingLeft: `${doc.depth * 40}px` }}>
               {doc.icon ? `${doc.icon} ` : "📄 "}

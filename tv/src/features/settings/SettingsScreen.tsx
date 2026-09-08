@@ -1,14 +1,9 @@
-// 설정 화면: 릴레이 URL + 관전용 키.
-// 리모컨 입력이 고통이므로 첫 줄에 URL 주입법(#relay=…&key=…)을 안내한다.
+// 설정 화면: 릴레이 URL + 세션 전용 관전 키.
 // 입력칸에 OK 를 누르면 spatial nav 를 멈추고 DOM 포커스를 넘겨
 // webOS 가상 키보드가 뜨게 한다. 입력을 마치면(Enter/뒤로) 다시 켠다.
 
 import { useEffect, useRef, useState } from "react";
-import {
-  buildSettings,
-  saveSettings,
-  type TvSettings,
-} from "../../shared/lib/settings.ts";
+import { buildSettings, type TvSettings } from "../../shared/lib/settings.ts";
 import { FocusItem } from "../../shared/ui/FocusItem.tsx";
 import {
   pauseSpatialNavigation,
@@ -88,11 +83,7 @@ export function SettingsScreen({
       setError(result.error);
       return;
     }
-    if (!saveSettings(result.settings)) {
-      // 저장 실패(저장소 접근 불가)여도 이번 세션은 진행한다 —
-      // TV 저장소는 어차피 캐시 취급이다.
-      setError(null);
-    }
+    setError(null);
     onComplete(result.settings);
   };
 
@@ -100,8 +91,8 @@ export function SettingsScreen({
     <div className="screen" data-testid="settings-screen">
       <h1 className="screen-title">a2d2 TV 설정</h1>
       <p className="screen-subtitle">
-        릴레이 주소와 관전용 키(nsec)를 넣어 주세요. 리모컨 입력 대신 앱 주소
-        뒤에 #relay=…&key=… 를 붙여 열면 자동으로 채워집니다.
+        릴레이 주소와 관전용 키(nsec)를 넣어 주세요. 개인키는 이 실행의
+        메모리에만 두고, 앱을 닫으면 다시 입력합니다.
       </p>
       {notice ? <p className="status-line error">{notice}</p> : null}
       <div className="scroll-list">
@@ -109,7 +100,7 @@ export function SettingsScreen({
           label="릴레이 주소"
           value={relayInput}
           onChange={setRelayInput}
-          placeholder="wss://a2d2.communities.buzz.xyz"
+          placeholder="wss://buzz.a2d2lab.com"
           testId="settings-relay"
         />
         <FocusInput
@@ -121,7 +112,7 @@ export function SettingsScreen({
           testId="settings-key"
         />
         <FocusItem onSelect={submit} autoFocus>
-          <span className="item-title">저장하고 시작</span>
+          <span className="item-title">이 세션에서 시작</span>
         </FocusItem>
         {error ? <p className="status-line error">{error}</p> : null}
       </div>

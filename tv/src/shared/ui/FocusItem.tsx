@@ -14,6 +14,11 @@ type FocusItemProps = {
   autoFocus?: boolean;
   /** setFocus 로 바깥에서 포커스를 줄 때 쓰는 이름표. */
   focusKey?: string;
+  testId?: string;
+  channelId?: string;
+  eventId?: string;
+  docId?: string;
+  docEventId?: string;
 };
 
 export function FocusItem({
@@ -22,6 +27,11 @@ export function FocusItem({
   className,
   autoFocus,
   focusKey,
+  testId,
+  channelId,
+  eventId,
+  docId,
+  docEventId,
 }: FocusItemProps) {
   const { ref, focused, focusSelf } = useFocusable({
     focusKey,
@@ -47,6 +57,11 @@ export function FocusItem({
     <button
       type="button"
       ref={ref}
+      data-testid={testId}
+      data-channel-id={channelId}
+      data-event-id={eventId}
+      data-doc-id={docId}
+      data-doc-event-id={docEventId}
       className={`focusable ${focused ? "focused" : ""} ${className ?? ""}`}
       onClick={onSelect}
     >

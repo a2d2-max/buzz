@@ -45,10 +45,10 @@ export function ChannelListScreen({
     <div className="screen" data-testid="channel-list-screen">
       <h1 className="screen-title">채널</h1>
       <div className="dialog-buttons">
-        <FocusItem onSelect={onOpenDocs}>
+        <FocusItem onSelect={onOpenDocs} testId="open-docs">
           <span className="item-title">📚 Docs</span>
         </FocusItem>
-        <FocusItem onSelect={onOpenSettings}>
+        <FocusItem onSelect={onOpenSettings} testId="open-settings">
           <span className="item-title">⚙️ 설정</span>
         </FocusItem>
       </div>
@@ -69,6 +69,7 @@ export function ChannelListScreen({
             key={channel.id}
             onSelect={() => onOpenChannel(channel)}
             autoFocus={index === 0}
+            channelId={channel.id}
           >
             <span className="item-title"># {channel.name}</span>
             {channel.about ? (

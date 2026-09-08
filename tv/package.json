@@ -15,7 +15,8 @@
     "format": "biome format --write .",
     "preview": "vite preview",
     "test": "node --experimental-strip-types --no-warnings --test \"src/**/*.test.mjs\"",
-    "mock-relay": "node scripts/mock-relay.mjs"
+    "mock-relay": "node scripts/mock-relay.mjs",
+    "verify:hosted": "node scripts/verify-hosted-chrome68.mjs"
   },
   "dependencies": {
     "@noriginmedia/norigin-spatial-navigation": "^3.3.0",

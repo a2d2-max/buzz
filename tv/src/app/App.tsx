@@ -1,19 +1,17 @@
-// 앱 셸: 설정 확보 → 릴레이 연결 → 화면 스택.
+// 앱 셸: 세션 설정 확보 → 릴레이 연결 → 화면 스택.
 // - 뒤로가기(461, 개발용 Escape): 스택을 하나 걷고, 루트면 종료 확인을 띄운다.
 //   appinfo.json 의 disableBackHistoryAPI=true 와 짝이다.
-// - localStorage 는 캐시 취급: 설정이 없거나 인증이 깨지면 설정 화면으로 돌아간다.
+// - 개인키는 메모리에만 둔다. localStorage 에는 릴레이 URL 만 남는다.
 
 import { useCallback, useEffect, useState } from "react";
 import { isBackKey } from "../remote/keys.ts";
 import { usePointerState } from "../remote/usePointerState.ts";
 import { RelayConnection, type RelayStatus } from "../shared/lib/relay.ts";
 import {
-  buildSettings,
-  clearSettings,
-  loadSettings,
-  readLaunchParams,
-  saveSettings,
-  stripLaunchParams,
+  consumeSessionBootstrap,
+  loadRelayUrl,
+  purgeLegacySecretSettings,
+  saveRelayUrl,
   type TvSettings,
 } from "../shared/lib/settings.ts";
 import { FocusItem } from "../shared/ui/FocusItem.tsx";
@@ -31,21 +29,22 @@ type Screen =
   | { kind: "docs" }
   | { kind: "docViewer"; doc: DocListEntry };
 
-/** URL 주입 → 저장된 설정 순서로 초기 설정을 정한다. */
-function resolveInitialSettings(): TvSettings | null {
-  const params = readLaunchParams(window.location);
-  if (params.relay && params.key) {
-    const result = buildSettings(params.relay, params.key);
-    stripLaunchParams();
-    if (result.ok) {
-      saveSettings(result.settings);
-      return result.settings;
-    }
-    return null;
-  }
-  if (params.relay || params.key) stripLaunchParams();
-  return loadSettings();
+type InitialConfig = {
+  settings: TvSettings | null;
+  relayUrl: string;
+};
+
+/** 모듈 평가 때 한 번만 실행해 StrictMode 이중 렌더에서도 부트스트랩을 잃지 않는다. */
+function resolveInitialConfig(): InitialConfig {
+  purgeLegacySecretSettings();
+  const settings = consumeSessionBootstrap();
+  return {
+    settings,
+    relayUrl: settings?.relayUrl ?? loadRelayUrl() ?? "",
+  };
 }
+
+const INITIAL_CONFIG = resolveInitialConfig();
 
 function ExitConfirmDialog({
   onConfirm,
@@ -72,8 +71,11 @@ function ExitConfirmDialog({
 }
 
 export function App() {
-  const [settings, setSettings] = useState<TvSettings | null>(() =>
-    resolveInitialSettings(),
+  const [settings, setSettings] = useState<TvSettings | null>(
+    INITIAL_CONFIG.settings,
+  );
+  const [initialRelayUrl, setInitialRelayUrl] = useState(
+    INITIAL_CONFIG.relayUrl,
   );
   const [settingsNotice, setSettingsNotice] = useState<string | undefined>();
   const [stack, setStack] = useState<Screen[]>([{ kind: "channels" }]);
@@ -103,10 +105,9 @@ export function App() {
     };
   }, [settings]);
 
-  // 인증 실패 = 키가 릴레이에서 거부됨. 캐시(저장 키)를 비우고 설정으로.
+  // 인증 실패 = 키가 릴레이에서 거부됨. 메모리 키를 버리고 설정으로.
   useEffect(() => {
     if (relayStatus === "auth-failed") {
-      clearSettings();
       setSettings(null);
       setSettingsNotice(
         "릴레이가 이 키를 거부했습니다. 키를 다시 등록해 주세요.",
@@ -151,10 +152,12 @@ export function App() {
       <>
         <SettingsScreen
           notice={settingsNotice}
-          initialRelayUrl={settings?.relayUrl}
+          initialRelayUrl={initialRelayUrl}
           onComplete={(next) => {
             setSettingsNotice(undefined);
             setStack([{ kind: "channels" }]);
+            setInitialRelayUrl(next.relayUrl);
+            saveRelayUrl(next.relayUrl);
             setSettings(next);
           }}
         />
@@ -178,7 +181,8 @@ export function App() {
           onOpenChannel={(channel) => push({ kind: "timeline", channel })}
           onOpenDocs={() => push({ kind: "docs" })}
           onOpenSettings={() => {
-            // 설정 화면으로 가는 명시적 길: 저장 키를 지우진 않는다.
+            // 설정 화면으로 가면 현재 메모리 키를 버린다.
+            setInitialRelayUrl(settings.relayUrl);
             setSettings(null);
             setSettingsNotice(undefined);
           }}
