@@ -4,6 +4,8 @@ packages:
   - "admin-web"
   - "tv"
 allowBuilds:
+  # core-js 의 postinstall 은 후원 배너 출력뿐이라 돌릴 필요 없다
+  core-js: false
   esbuild: true
 overrides:
   # Force a single copy of the dismissable-layer. Radix packages otherwise

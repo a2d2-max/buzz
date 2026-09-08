@@ -1,8 +1,11 @@
-/* 10-foot UI 토큰. 1920x1080 고정 화면 기준.
+/* 10-foot UI 토큰. 1920x1080 고정, 대상 엔진은 Chromium 68(webOS TV 5.x).
  * - 본문 28px 이상, 선택 대상 54px 이상, 가장자리 20px 이상 여백
- *   (근거: 리서치 문서 4절 — LG UI 가이드/overscan 문서)
- * - TV 는 단일 다크 테마로 고정한다(거실 화면에서 흰 배경은 눈부심).
- * - 포커스 링은 항상 보인다 — 5-way 모드에서 "포커스 없는 상태"는 금지. */
+ * - 단일 다크 테마(거실 화면에서 흰 배경은 눈부심)
+ * - 포커스 링은 항상 보인다 — 5-way 모드에서 "포커스 없는 상태"는 금지
+ *
+ * ★크롬 68 제약: flex 컨테이너의 gap(84+)·inset(87+)·:focus-visible(86+)·
+ * :has()·컨테이너 쿼리 전부 금지. 간격은 전부 마진(> * + *)으로 만든다.
+ * CSS 변수(49+)·flex·grid 는 68 에서 된다. */
 
 :root {
   --bg: #101014;
@@ -43,7 +46,11 @@ body {
   padding: var(--edge);
   display: flex;
   flex-direction: column;
-  gap: 24px;
+}
+
+/* flex gap 대체: 세로 스택 간격 */
+.screen > * + * {
+  margin-top: 24px;
 }
 
 .screen-title {
@@ -65,9 +72,12 @@ body {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 12px;
   /* 포커스 링이 스크롤 컨테이너에 잘리지 않게 안쪽 여백을 준다 */
   padding: var(--focus-ring);
+}
+
+.scroll-list > * + * {
+  margin-top: 12px;
 }
 
 /* 선택 가능한 행/버튼. 최소 높이 54px 을 훨씬 넘긴다. */
@@ -82,8 +92,12 @@ body {
   text-align: left;
   display: flex;
   align-items: center;
-  gap: 20px;
   cursor: pointer;
+}
+
+/* flex gap 대체: 행 안의 가로 간격 */
+.focusable > * + * {
+  margin-left: 20px;
 }
 
 .focusable.focused {
@@ -103,13 +117,20 @@ body {
 .message-row {
   flex-direction: column;
   align-items: stretch;
-  gap: 6px;
+}
+
+.message-row > * + * {
+  margin-left: 0;
+  margin-top: 6px;
 }
 
 .message-meta {
   display: flex;
-  gap: 16px;
   align-items: baseline;
+}
+
+.message-meta > * + * {
+  margin-left: 16px;
 }
 
 .message-author {
@@ -193,7 +214,10 @@ body {
 .field {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+}
+
+.field > * + * {
+  margin-top: 10px;
 }
 
 .field > span {
@@ -217,10 +241,13 @@ body {
   background: var(--bg-focus);
 }
 
-/* 종료 확인 오버레이 */
+/* 종료 확인 오버레이 (inset 은 87+ 라 안 쓴다) */
 .overlay {
   position: fixed;
-  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   background: rgba(0, 0, 0, 0.72);
   display: flex;
   align-items: center;
@@ -234,13 +261,19 @@ body {
   padding: 48px 64px;
   display: flex;
   flex-direction: column;
-  gap: 32px;
   align-items: center;
+}
+
+.dialog > * + * {
+  margin-top: 32px;
 }
 
 .dialog-buttons {
   display: flex;
-  gap: 24px;
+}
+
+.dialog-buttons > * + * {
+  margin-left: 24px;
 }
 
 .dialog-buttons .focusable {
