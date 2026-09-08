@@ -1,0 +1,8 @@
+Name,Relation,Notes
+One,"Child Page (Root%20Page/Child%20Page%2099999999999999999999999999999999.csv)","first line
+second | cell"
+Two,"Duplicate (Duplicate%2099999999999999999999999999999999.csv)","comma, quote ""ok"""
+Three,"A|B (Folder(Inner)%20A%7CB%2099999999999999999999999999999999.md)",Child Page
+Four,"Missing Relation (Missing%20Relation%2077777777777777777777777777777777.md)",plain
+Five,"Comma, Title (Folder (Group)/Comma,%20Title%2099999999999999999999999999999999.md), Child Page (Folder (Group)/Child%20Page%2099999999999999999999999999999999.md)",multi
+Six,"Child Page (Folder (One)/Child%20Page%2099999999999999999999999999999999.csv), Duplicate (Folder (Two)/Duplicate%2099999999999999999999999999999999.md), A|B (Folder (Three)/A%7CB%2099999999999999999999999999999999.csv), Comma, Title (Folder (Four)/Comma,%20Title%2099999999999999999999999999999999.md), Child Page (Folder (Five)/Child%20Page%2099999999999999999999999999999999.csv)",five

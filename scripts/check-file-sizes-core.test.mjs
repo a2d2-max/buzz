@@ -212,6 +212,7 @@ test("surface entrypoints expose the exact ordered production policies", () => {
         ["src/shared/lib", [".ts", ".tsx"], 1200],
         ["src/shared/ui", [".ts", ".tsx"], 1200],
         ["src/shared/styles", [".css"], 1200],
+        ["scripts/notion-import", [".ts", ".mjs"], 1200],
       ],
     ],
     [mobilePolicy, [["lib", [".dart"], 1200]]],

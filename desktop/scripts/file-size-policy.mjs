@@ -50,4 +50,9 @@ export const rules = [
     extensions: new Set([".css"]),
     maxLines: DESKTOP_FRONTEND_MAX_LINES,
   },
+  {
+    root: "scripts/notion-import",
+    extensions: new Set([".ts", ".mjs"]),
+    maxLines: DESKTOP_FRONTEND_MAX_LINES,
+  },
 ];

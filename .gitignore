@@ -31,6 +31,10 @@ Thumbs.db
 # Scratch / working files (AI reviews, notes, drafts)
 .scratch/
 
+# Notion import output contains private source documents and unsigned events.
+/notion-import-output/
+/desktop/notion-import-output/
+
 # Playwright artifacts
 playwright-report/
 test-results/
