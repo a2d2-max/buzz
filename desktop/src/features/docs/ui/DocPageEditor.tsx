@@ -1,6 +1,7 @@
 import { EditorContent } from "@tiptap/react";
 import * as React from "react";
 
+import { isEditorViewMounted } from "@/features/messages/lib/editorViewMounted";
 import { useRichTextEditor } from "@/features/messages/lib/useRichTextEditor";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -202,6 +203,10 @@ export function DocPageEditor({
     },
     placeholder:
       "Write something… Markdown works: # headings, - lists, ```code",
+    // Applied via editorProps at view creation — the shared hook would
+    // otherwise label the element as the chat input, and relabeling through
+    // `editor.view.dom` throws while the view is unmounted.
+    testId: "doc-body-input",
   });
   getMarkdownRef.current = richText.getMarkdown;
   const { editor, focusEnd, getMarkdown, setContent } = richText;
@@ -245,27 +250,45 @@ export function DocPageEditor({
   );
 
   const loadedRef = React.useRef(false);
+  // One-time fidelity check + autofocus. The Editor object exists before
+  // <EditorContent> attaches its ProseMirror view, and `editor.view` access
+  // throws until then — so the rich-mode setup waits for the editor's
+  // "mount" event instead of running as soon as `editor` is non-null.
+  // Source mode never renders <EditorContent> (the view may never attach),
+  // but its setup touches only the title/textarea refs, so it runs at once.
   React.useEffect(() => {
     if (!editor || loadedRef.current) return;
-    loadedRef.current = true;
-    // The shared hook labels its element as the chat input.
-    editor.view.dom.setAttribute("data-testid", "doc-body-input");
-    if (modeRef.current === "rich") {
-      const reasons = assessRichFidelity(page.body);
-      if (reasons.length > 0) {
-        setLossyReasons(reasons);
-        setMode("source");
+    const runInitialLoad = () => {
+      if (loadedRef.current) return;
+      loadedRef.current = true;
+      if (modeRef.current === "rich") {
+        const reasons = assessRichFidelity(page.body);
+        if (reasons.length > 0) {
+          setLossyReasons(reasons);
+          setMode("source");
+        }
       }
+      if (!autoFocus) return;
+      if (page.title.trim() === "") titleInputRef.current?.focus();
+      else if (modeRef.current === "rich") focusEnd();
+      else sourceInputRef.current?.focus();
+    };
+    if (modeRef.current === "source" || isEditorViewMounted(editor)) {
+      runInitialLoad();
+      return;
     }
-    if (!autoFocus) return;
-    if (page.title.trim() === "") titleInputRef.current?.focus();
-    else if (modeRef.current === "rich") focusEnd();
-    else sourceInputRef.current?.focus();
+    editor.on("mount", runInitialLoad);
+    return () => {
+      editor.off("mount", runInitialLoad);
+    };
   }, [assessRichFidelity, autoFocus, editor, focusEnd, page.body, page.title]);
 
   const switchMode = React.useCallback(
     (next: DocEditorMode) => {
       if (next === modeRef.current) return;
+      // A manual mode switch supersedes the pending one-time initial load —
+      // a "mount" firing later must not reload `page.body` over newer state.
+      loadedRef.current = true;
       if (next === "source") {
         const markdown = getMarkdownRef.current();
         sourceBodyRef.current = markdown;
@@ -282,6 +305,8 @@ export function DocPageEditor({
 
   const applyDraft = React.useCallback(
     (draft: DocDraft) => {
+      // The restored draft supersedes the pending one-time initial load.
+      loadedRef.current = true;
       setTitle(draft.title);
       titleRef.current = draft.title;
       sourceBodyRef.current = draft.body;
