@@ -10,6 +10,7 @@ import {
   KIND_COMMUNITY_DOC_LEGACY,
 } from "@/shared/constants/kinds";
 
+import { resolveCurrentRelayContentLimit } from "./docContentLimit";
 import {
   dedicatedDocKindMarkedUnsupported,
   isUnknownKindRejection,
@@ -20,7 +21,6 @@ import {
   buildDocPageEventInput,
   COMMUNITY_DOC_QUERY_KINDS,
   createDocPageId,
-  DOC_MAX_CONTENT_BYTES,
   type DocPage,
   type DocPageContent,
   docPageDTag,
@@ -107,13 +107,15 @@ export class DocConflictError extends Error {
 /** The page would exceed the relay's content ceiling; nothing was signed. */
 export class DocTooLargeError extends Error {
   readonly bytes: number;
+  readonly maxContentBytes: number;
 
-  constructor(bytes: number) {
+  constructor(bytes: number, maxContentBytes: number) {
     super(
-      `This page is too large to save (${Math.ceil(bytes / 1024)} KB; the limit is ${DOC_MAX_CONTENT_BYTES / 1024} KB).`,
+      `This page is too large to save (${Math.ceil(bytes / 1024)} KB; the relay limit is ${maxContentBytes} bytes).`,
     );
     this.name = "DocTooLargeError";
     this.bytes = bytes;
+    this.maxContentBytes = maxContentBytes;
   }
 }
 
@@ -369,7 +371,11 @@ export function useCommunityDocs(): CommunityDocs {
       known: DocPage | undefined,
     ): Promise<DocPage> => {
       const bytes = measureDocPageContentBytes(content);
-      if (bytes > DOC_MAX_CONTENT_BYTES) throw new DocTooLargeError(bytes);
+      const { relayUrl, maxContentBytes } =
+        await resolveCurrentRelayContentLimit();
+      if (bytes > maxContentBytes) {
+        throw new DocTooLargeError(bytes, maxContentBytes);
+      }
       const createdAt = nextDocEventCreatedAt(
         Math.floor(Date.now() / 1_000),
         known?.eventCreatedAt,
@@ -383,6 +389,19 @@ export function useCommunityDocs(): CommunityDocs {
       });
       const page = parseDocPageEvent(event);
       if (!page) throw new Error("Signed page event did not round-trip.");
+      let currentRelayUrl: string;
+      try {
+        currentRelayUrl = await getRelayWsUrl();
+      } catch {
+        throw new Error(
+          "Could not confirm the active community before saving.",
+        );
+      }
+      if (currentRelayUrl !== relayUrl) {
+        throw new Error(
+          "The active community changed before the page was saved.",
+        );
+      }
       await relayClient.publishEvent(
         event,
         "Timed out publishing the page.",

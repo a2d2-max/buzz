@@ -17,6 +17,7 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", {
 const AUTHOR_ME = "a".repeat(64);
 const AUTHOR_THEM = "b".repeat(64);
 const PAGE_ID = "3f0c2b1a-7d4e-4c9a-9b1e-2a6f8d5c4e10";
+const TEST_RELAY_URL = "ws://test-relay.example";
 
 let nextEventSerial = 0;
 
@@ -76,6 +77,10 @@ before(() => {
     ClipboardEvent: dom.window.Event,
     DOMParser: dom.window.DOMParser,
     document: dom.window.document,
+    fetch: async () =>
+      new Response("{}", {
+        headers: { "Content-Type": "application/nostr+json" },
+      }),
     getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
     IntersectionObserver: NoopObserver,
     IS_REACT_ACT_ENVIRONMENT: true,
@@ -135,6 +140,9 @@ before(() => {
             sig: "f".repeat(128),
           }),
         );
+      }
+      if (command === "get_relay_ws_url") {
+        return Promise.resolve(TEST_RELAY_URL);
       }
       return Promise.reject(new Error(`unmocked: ${command}`));
     },
