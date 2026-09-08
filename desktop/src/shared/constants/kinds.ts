@@ -44,7 +44,8 @@ export const KIND_HUDDLE_ENDED = 48103;
 export const KIND_HUDDLE_LIVENESS = 48104;
 // NIP-78 application-specific data. All use kind 30078; the relay
 // differentiates them by d-tag ("read-state:<slotId>", "channel-sections",
-// "channel-mutes", "channel-stars", "channel-sort", "project-sidebar-membership").
+// "channel-mutes", "channel-stars", "channel-sort", "project-sidebar-membership",
+// "community-task:<uuid>").
 export const KIND_READ_STATE = 30078;
 export const KIND_CHANNEL_SECTIONS = 30078;
 export const KIND_CHANNEL_MUTES = 30078;
@@ -52,6 +53,12 @@ export const KIND_CHANNEL_STARS = 30078;
 export const KIND_CHANNEL_SORT = 30078;
 export const KIND_PROJECT_SIDEBAR_MEMBERSHIP = 30078;
 export const KIND_COMMUNITY_THEME = 30078;
+// Board › Tasks: one plaintext, community-readable card per event. The d-tag
+// is `community-task:<uuid>`; the `t` tag lets a single `#t` filter load the
+// whole board without knowing any card id up front.
+export const KIND_COMMUNITY_TASK = 30078;
+export const COMMUNITY_TASK_D_TAG_PREFIX = "community-task:";
+export const COMMUNITY_TASK_T_TAG = "community-task";
 // NIP-33 persona/team/managed-agent projection events (d-tag keyed). Published
 // backend-side as secrets-stripped snapshots; the inbound sync hook subscribes
 // to all three to patch local records. Mirror of buzz-core's KIND_PERSONA etc.
