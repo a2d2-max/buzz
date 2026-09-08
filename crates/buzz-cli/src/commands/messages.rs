@@ -9,7 +9,8 @@ use crate::validate::{
     validate_content_size, validate_hex64, validate_uuid, MAX_DIFF_BYTES,
 };
 use buzz_sdk::mentions::{
-    extract_at_mentions_with_known, extract_nostr_uris, strip_code_regions, MENTION_CAP,
+    contains_all_mention, extract_at_mentions_with_known, extract_nostr_uris, is_all_mention_name,
+    strip_code_regions, MENTION_CAP,
 };
 
 /// Extract the thread root event ID from a Nostr tag array.
@@ -152,6 +153,14 @@ fn resolve_names_to_pubkeys(
     Ok(resolved)
 }
 
+fn unique_mention_count(explicit: &[String], uri_pubkeys: &[String]) -> usize {
+    explicit
+        .iter()
+        .chain(uri_pubkeys.iter())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
 /// Resolve mention text against the channel membership snapshot.
 ///
 /// Returns both the current member set and uniquely name-resolved pubkeys.
@@ -162,9 +171,11 @@ async fn resolve_content_mentions(
     channel_id: &str,
     content: &str,
     has_explicit_mentions: bool,
+    expand_all_mentions: bool,
+    all_mention_budget: usize,
 ) -> Result<(Vec<String>, Vec<String>), CliError> {
     let stripped = strip_code_regions(content);
-    if !stripped.contains('@') && !has_explicit_mentions {
+    if !stripped.contains('@') && !has_explicit_mentions && !expand_all_mentions {
         return Ok((vec![], vec![]));
     }
 
@@ -179,8 +190,19 @@ async fn resolve_content_mentions(
             CliError::Other("could not load channel membership for mention preflight".into())
         })?;
 
+    let mut resolved = Vec::new();
+    if expand_all_mentions {
+        if member_pubkeys.len() > all_mention_budget {
+            eprintln!(
+                "warning: @all mentions {} channel members, but only {all_mention_budget} fit in the {MENTION_CAP}-mention cap",
+                member_pubkeys.len()
+            );
+        }
+        resolved.extend(member_pubkeys.iter().take(all_mention_budget).cloned());
+    }
+
     if !stripped.contains('@') {
-        return Ok((member_pubkeys, vec![]));
+        return Ok((member_pubkeys, resolved));
     }
 
     let profiles_filter = serde_json::json!({
@@ -223,8 +245,15 @@ async fn resolve_content_mentions(
     }
 
     let known_refs: Vec<&str> = display_names.iter().map(String::as_str).collect();
-    let names = extract_at_mentions_with_known(&stripped, &known_refs);
-    let resolved = resolve_names_to_pubkeys(&names, &name_to_pubkeys, has_explicit_mentions)?;
+    let names: Vec<String> = extract_at_mentions_with_known(&stripped, &known_refs)
+        .into_iter()
+        .filter(|name| !is_all_mention_name(name))
+        .collect();
+    resolved.extend(resolve_names_to_pubkeys(
+        &names,
+        &name_to_pubkeys,
+        has_explicit_mentions,
+    )?);
     Ok((member_pubkeys, resolved))
 }
 
@@ -606,6 +635,7 @@ pub struct SendMessageParams {
     pub broadcast: bool,
     pub files: Vec<String>,
     pub mentions: Vec<String>,
+    pub all: bool,
 }
 
 pub async fn cmd_send_message(
@@ -626,13 +656,23 @@ pub async fn cmd_send_message(
     let explicit_mentions = normalize_explicit_mentions(&p.mentions)?;
     let stripped = strip_code_regions(&p.content);
     let uri_pubkeys = extract_nostr_uris(&stripped);
+    let expand_all_mentions = p.all || contains_all_mention(&p.content);
     // Supplying any identity explicitly authorizes unresolved or ambiguous @Name text
     // as presentation-only, matching Desktop's separate visible-label and p-tag model.
     // Uniquely resolvable member names still add their own p-tags; callers must supply
     // every intended identity whose visible label cannot be resolved uniquely.
     let has_explicit_mentions = !explicit_mentions.is_empty() || !uri_pubkeys.is_empty();
-    let (member_pubkeys, auto_resolved) =
-        resolve_content_mentions(client, &p.channel_id, &p.content, has_explicit_mentions).await?;
+    let all_mention_budget =
+        MENTION_CAP.saturating_sub(unique_mention_count(&explicit_mentions, &uri_pubkeys));
+    let (member_pubkeys, auto_resolved) = resolve_content_mentions(
+        client,
+        &p.channel_id,
+        &p.content,
+        has_explicit_mentions,
+        expand_all_mentions,
+        all_mention_budget,
+    )
+    .await?;
     let mention_pubkeys = merge_message_mentions(&explicit_mentions, &uri_pubkeys, &auto_resolved)?;
 
     let missing = missing_members(&mention_pubkeys, &member_pubkeys);
@@ -945,6 +985,7 @@ pub async fn dispatch(
             broadcast,
             files,
             mentions,
+            all,
         } => {
             cmd_send_message(
                 client,
@@ -956,6 +997,7 @@ pub async fn dispatch(
                     broadcast,
                     files,
                     mentions,
+                    all,
                 },
             )
             .await
@@ -1091,7 +1133,8 @@ mod tests {
         thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
     };
     use buzz_sdk::mentions::{
-        extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
+        contains_all_mention, extract_at_mentions_with_known, extract_at_names,
+        match_names_to_profiles, MentionProfile,
     };
     use nostr::Keys;
     use serde_json::json;
@@ -1517,6 +1560,28 @@ mod tests {
     }
 
     #[test]
+    fn all_mentions_append_member_pubkeys_after_explicit_mentions() {
+        let explicit = vec![PK_VALID_B.to_string()];
+        let all_member_pubkeys = vec![
+            PK_VALID_A.to_string(),
+            PK_VALID_B.to_string(),
+            PK_VALID_C.to_string(),
+        ];
+
+        assert_eq!(
+            merge_message_mentions(&explicit, &[], &all_member_pubkeys).unwrap(),
+            vec![PK_VALID_B, PK_VALID_A, PK_VALID_C]
+        );
+    }
+
+    #[test]
+    fn all_mentions_are_detected_before_name_resolution() {
+        assert!(contains_all_mention("@all ship it"));
+        assert!(contains_all_mention("heads up @channel."));
+        assert!(!contains_all_mention("`@all`"));
+    }
+
+    #[test]
     fn membership_preflight_lists_only_missing_mentions() {
         assert_eq!(
             missing_members(
@@ -1717,6 +1782,7 @@ mod tests {
             broadcast: false,
             files: vec![],
             mentions: vec![],
+            all: false,
         }
     }
 

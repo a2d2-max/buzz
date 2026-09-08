@@ -23,13 +23,14 @@ export type MentionSuggestion = {
   personaId?: string;
   teamId?: string;
   teamMembers?: TeamMentionMember[];
-  kind?: "identity" | "persona" | "team";
+  kind?: "identity" | "persona" | "team" | "all";
   displayName: string;
   avatarUrl?: string | null;
   isAgent?: boolean;
   agentProvenance?: "managed-here" | "managed-elsewhere";
   notInChannel?: boolean;
   ownerLabel?: string | null;
+  secondaryLabel?: string | null;
   role?: string | null;
 };
 
@@ -248,9 +249,11 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
               suggestion.pubkey ??
               (suggestion.personaId
                 ? `persona-${suggestion.personaId}`
-                : null) ??
-              (suggestion.teamId ? `team-${suggestion.teamId}` : null) ??
-              suggestion.displayName;
+                : suggestion.teamId
+                  ? `team-${suggestion.teamId}`
+                  : suggestion.kind === "all"
+                    ? "all"
+                    : suggestion.displayName);
             const hasNameCollision =
               (nameCounts.get(suggestion.displayName.toLowerCase()) ?? 0) > 1;
             const showAgentProvenanceMarker =
@@ -264,7 +267,8 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 ? safeNpub(suggestion.pubkey)
                 : null;
             const hasMetadataBeforeNpub = Boolean(
-              suggestion.kind === "team" ||
+              suggestion.kind === "all" ||
+                suggestion.kind === "team" ||
                 suggestion.isAgent ||
                 suggestion.role ||
                 ownerLabel ||
@@ -305,7 +309,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                   tabIndex={-1}
                   type="button"
                 >
-                  {suggestion.kind === "team" ? (
+                  {suggestion.kind === "team" || suggestion.kind === "all" ? (
                     <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
                       <Users aria-hidden="true" className="h-4 w-4" />
                     </span>
@@ -338,7 +342,12 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                             : "text-muted-foreground",
                         )}
                       >
-                        {suggestion.kind === "team" ? (
+                        {suggestion.kind === "all" ? (
+                          <span className="inline-flex shrink-0 items-center gap-1">
+                            <Users aria-hidden="true" className="h-3.5 w-3.5" />
+                            {suggestion.secondaryLabel ?? "channel members"}
+                          </span>
+                        ) : suggestion.kind === "team" ? (
                           <span className="inline-flex shrink-0 items-center gap-1">
                             <Users aria-hidden="true" className="h-3.5 w-3.5" />
                             team · {suggestion.teamMembers?.length ?? 0} agents

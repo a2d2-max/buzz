@@ -2,11 +2,39 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  allMentionRecipients,
+  containsAllMention,
   formatMessageSendError,
   getErrorMessage,
   mergeMentionRecipients,
   mentionRevalidationOptions,
 } from "./useMentionSendFlow.helpers.ts";
+
+test("detects channel-wide mentions only in prose", () => {
+  assert.equal(containsAllMention("@all please read"), true);
+  assert.equal(containsAllMention("heads up @channel."), true);
+  assert.equal(containsAllMention("email@all.example"), false);
+  assert.equal(containsAllMention("@ally is not everyone"), false);
+  assert.equal(containsAllMention("`@all`"), false);
+  assert.equal(containsAllMention("```\n@channel\n```"), false);
+});
+
+test("channel-wide mentions use current members up to the notification cap", () => {
+  const currentUser = "a".repeat(64);
+  const members = new Set([currentUser, "b".repeat(64), "c".repeat(64)]);
+  assert.deepEqual(allMentionRecipients(members, [currentUser]), [
+    currentUser,
+    "b".repeat(64),
+    "c".repeat(64),
+  ]);
+
+  const manyMembers = new Set(
+    Array.from({ length: 60 }, (_, index) =>
+      index.toString(16).padStart(64, "0"),
+    ),
+  );
+  assert.equal(allMentionRecipients(manyMembers, []).length, 50);
+});
 
 test("formatMessageSendError preserves the publication failure", () => {
   assert.equal(

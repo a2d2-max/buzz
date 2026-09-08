@@ -142,6 +142,29 @@ test("automatic mention setting is visible by default without an options ingress
   assert.deepEqual(changes, [false]);
 });
 
+test("channel-wide mention rows render member count and select normally", async () => {
+  const React = await import("react");
+  const { fireEvent, render } = await import("@testing-library/react");
+  const { MentionAutocomplete } = await import("./MentionAutocomplete.tsx");
+  const suggestion = {
+    kind: "all",
+    displayName: "all",
+    secondaryLabel: "channel members (5)",
+  };
+  const selected = [];
+  const view = render(
+    React.createElement(MentionAutocomplete, {
+      suggestions: [suggestion],
+      selectedIndex: 0,
+      onSelect: (value) => selected.push(value),
+    }),
+  );
+
+  assert.ok(view.getByText("channel members (5)"));
+  fireEvent.mouseDown(view.getByRole("button", { name: "Mention all" }));
+  assert.deepEqual(selected, [suggestion]);
+});
+
 test("automatic selection updates the visible setting in place", async () => {
   const React = await import("react");
   const { render } = await import("@testing-library/react");

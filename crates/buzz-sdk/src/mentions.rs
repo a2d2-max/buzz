@@ -37,6 +37,9 @@ use nostr::{FromBech32, PublicKey};
 /// inline implementation.
 pub const MENTION_CAP: usize = 50;
 
+/// Channel-wide mention aliases understood by Buzz clients.
+pub const ALL_MENTION_NAMES: &[&str] = &["all", "channel"];
+
 /// A channel-member profile, as needed for name matching.
 ///
 /// `pubkey` is the lowercase hex public key. `content_json` is the raw
@@ -155,6 +158,43 @@ fn is_word_boundary(s: &str) -> bool {
     s.chars().next().is_none_or(|c| {
         c.is_ascii_whitespace() || matches!(c, ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}')
     })
+}
+
+/// Returns true when `name` is a channel-wide mention alias.
+pub fn is_all_mention_name(name: &str) -> bool {
+    ALL_MENTION_NAMES
+        .iter()
+        .any(|alias| name.eq_ignore_ascii_case(alias))
+}
+
+/// Detect `@all` / `@channel` in prose, ignoring code regions.
+pub fn contains_all_mention(content: &str) -> bool {
+    let stripped = strip_code_regions(content);
+    for (i, _) in stripped.match_indices('@') {
+        let preceded = if i == 0 {
+            true
+        } else {
+            stripped[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_whitespace() || matches!(c, '*' | '_' | '|' | '~'))
+        };
+        if !preceded {
+            continue;
+        }
+        let rest = &stripped[i + 1..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '-' | '_'))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            continue;
+        }
+        let token = rest[..end].trim_end_matches(['.', '_', '-']);
+        if is_all_mention_name(token) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Match extracted `@names` against channel-member profiles.
@@ -540,6 +580,17 @@ mod tests {
         // Reverse case: multi-byte known name against ASCII content.
         let result = extract_at_mentions_with_known("@alice hello", &["日本語"]);
         assert_eq!(result, vec!["alice"]);
+    }
+
+    #[test]
+    fn detects_all_and_channel_mentions_outside_code() {
+        assert!(contains_all_mention("@all please read"));
+        assert!(contains_all_mention("heads up @channel."));
+        assert!(contains_all_mention("**@ALL**"));
+        assert!(!contains_all_mention("email@all.example"));
+        assert!(!contains_all_mention("@ally is not everyone"));
+        assert!(!contains_all_mention("`@all` then prose"));
+        assert!(!contains_all_mention("```\n@channel\n```"));
     }
 
     fn profile<'a>(pk: &'a str, json: &'a str) -> MentionProfile<'a> {

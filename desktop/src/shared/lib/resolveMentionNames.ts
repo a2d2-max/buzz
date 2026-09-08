@@ -70,6 +70,29 @@ export type ResolvedMentionProps = {
   mentionPubkeysByName: Record<string, string> | undefined;
 };
 
+function collectChannelWideMentionNames(content: string): string[] {
+  const names = new Set<string>();
+  const stripped = content
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]*`/g, " ");
+  for (const match of stripped.matchAll(/@([A-Za-z][A-Za-z0-9._-]*)/g)) {
+    const start = match.index ?? 0;
+    const tokenText = match[1] ?? "";
+    const token = tokenText.replace(/[._-]+$/g, "");
+    const end = start + 1 + tokenText.length;
+    const before = start <= 0 ? "" : (stripped[start - 1] ?? "");
+    const after = end >= stripped.length ? "" : (stripped[end] ?? "");
+    if (
+      (token.toLowerCase() === "all" || token.toLowerCase() === "channel") &&
+      (start === 0 || /[\s*_~`>|([{]/.test(before)) &&
+      (end >= stripped.length || /[^A-Za-z0-9._-]/.test(after))
+    ) {
+      names.add(token);
+    }
+  }
+  return [...names];
+}
+
 /**
  * Resolves mention render names and the name→pubkey map for mentioned users
  * from message `p` tags and non-notifying `mention` reference tags, in one
@@ -158,6 +181,9 @@ export function resolveMentionProps(
     }
     names.add(entry.displayName);
     if (keys.length === 1) pubkeysByName[label] = keys[0];
+  }
+  for (const name of collectChannelWideMentionNames(content)) {
+    names.add(name);
   }
 
   return {
