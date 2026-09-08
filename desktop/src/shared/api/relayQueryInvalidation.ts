@@ -6,6 +6,7 @@ const RELAY_QUERY_ROOTS = new Set<string>([
   "contact-list",
   "custom-emoji",
   "custom-emoji-own",
+  "docs",
   "forum-posts",
   "forum-thread",
   "global-notes",

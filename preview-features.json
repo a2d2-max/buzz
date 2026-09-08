@@ -20,6 +20,13 @@
       "platforms": ["desktop"]
     },
     {
+      "id": "docs",
+      "name": "Docs",
+      "description": "Community wiki: a shared page tree with markdown editing",
+      "defaultEnabled": true,
+      "platforms": ["desktop"]
+    },
+    {
       "id": "pulse",
       "name": "Pulse",
       "description": "Activity feed with notes, social posts, and agent activity",

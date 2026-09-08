@@ -1,4 +1,12 @@
-import { Activity, Bot, Folders, Inbox, KanbanSquare, Zap } from "lucide-react";
+import {
+  Activity,
+  BookOpen,
+  Bot,
+  Folders,
+  Inbox,
+  KanbanSquare,
+  Zap,
+} from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
@@ -22,7 +30,8 @@ type SidebarSelectedView =
   | "workflows"
   | "pulse"
   | "projects"
-  | "board";
+  | "board"
+  | "docs";
 
 type AppSidebarPinnedHeaderProps = {
   channelLabels: Record<string, string>;
@@ -44,6 +53,7 @@ type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
   onSelectBoard: () => void;
+  onSelectDocs: () => void;
   onSelectHome: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
@@ -95,6 +105,7 @@ export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
   onSelectBoard,
+  onSelectDocs,
   onSelectHome,
   onSelectProjects,
   onSelectPulse,
@@ -199,6 +210,20 @@ export function AppSidebarPrimaryMenu({
               >
                 <KanbanSquare className="h-4 w-4" />
                 <SidebarMenuLabel>Board</SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
+          <FeatureGate feature="docs">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                data-testid="open-docs-view"
+                isActive={selectedView === "docs"}
+                onClick={onSelectDocs}
+                tooltip="Docs"
+                type="button"
+              >
+                <BookOpen className="h-4 w-4" />
+                <SidebarMenuLabel>Docs</SidebarMenuLabel>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>

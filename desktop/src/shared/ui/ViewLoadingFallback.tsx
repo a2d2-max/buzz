@@ -9,6 +9,7 @@ type ViewLoadingFallbackKind =
   | "agents"
   | "board"
   | "channel"
+  | "docs"
   | "forum"
   | "projects"
   | "pulse"
@@ -410,6 +411,7 @@ export function ViewLoadingFallback({
       {kind === "board" ? (
         <BuzzLoadingState fill label="Loading board" />
       ) : null}
+      {kind === "docs" ? <BuzzLoadingState fill label="Loading docs" /> : null}
       {kind === "channel" ? (
         <ChannelLoadingBody hasHeader={shouldShowChannelHeader} />
       ) : null}

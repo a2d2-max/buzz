@@ -46,7 +46,8 @@ export type AppSidebarProps = {
     | "workflows"
     | "pulse"
     | "projects"
-    | "board";
+    | "board"
+    | "docs";
   unreadChannelCounts: ReadonlyMap<string, number>;
   unreadChannelIds: ReadonlySet<string>;
   highPriorityUnreadChannelIds: ReadonlySet<string>;
@@ -87,6 +88,7 @@ export type AppSidebarProps = {
   onCreateAgent: () => void;
   onSelectAgents: () => void;
   onSelectBoard: () => void;
+  onSelectDocs: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
   onSelectWorkflows: () => void;

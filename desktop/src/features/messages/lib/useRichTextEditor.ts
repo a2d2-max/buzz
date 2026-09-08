@@ -5,7 +5,7 @@ import { useEditor, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import Link from "@tiptap/extension-link";
-import { Extension } from "@tiptap/core";
+import { type AnyExtension, Extension } from "@tiptap/core";
 import { TextSelection } from "@tiptap/pm/state";
 
 import { readTextFromSystemClipboard } from "@/shared/api/tauriMedia";
@@ -131,6 +131,18 @@ export type RichTextEditorOptions = {
    * app-wide ⌘K muscle memory.
    */
   onLinkShortcut?: () => boolean;
+  /**
+   * Long-form document mode (the Docs surface). Re-enables heading nodes and
+   * the trailing paragraph that the chat composer deliberately turns off, so
+   * markdown headings survive an edit round-trip and the caret can always
+   * land after a closing block. Read once at editor creation.
+   */
+  documentMode?: boolean;
+  /**
+   * Extra TipTap extensions registered after the composer's own set — e.g. an
+   * image node for document surfaces. Read once at editor creation.
+   */
+  extraExtensions?: readonly AnyExtension[];
 };
 
 /**
@@ -158,6 +170,8 @@ export function useRichTextEditor({
   onEditLink,
   onLinkSelectionChange,
   onLinkShortcut,
+  documentMode = false,
+  extraExtensions,
 }: RichTextEditorOptions) {
   const addressedAgentMentionNamesRef = React.useRef<readonly string[]>([]);
   const onUpdateRef = React.useRef(onUpdate);
@@ -196,7 +210,9 @@ export function useRichTextEditor({
           // Disable heading input rules — in a chat composer, typing "# "
           // should keep the literal "#", not convert to a heading node.
           // Users type #channel-name and the "#" would get eaten otherwise.
-          heading: false,
+          // Document mode keeps them: a page body is rendered markdown and
+          // dropping the node would flatten `# Title` on the next save.
+          heading: documentMode ? { levels: [1, 2, 3, 4, 5, 6] } : false,
           // Suppress spellcheck inside inline code spans — code identifiers
           // are not natural language and should not show red squiggles.
           code: {
@@ -209,8 +225,9 @@ export function useRichTextEditor({
           },
           // Disable the trailing-node plugin — it forces an empty paragraph
           // after block nodes (lists, blockquotes, code blocks) which creates
-          // a phantom empty line in the compact message composer.
-          trailingNode: false,
+          // a phantom empty line in the compact message composer. Documents
+          // want it back so the caret can land after a closing code block.
+          trailingNode: documentMode ? {} : false,
           // Disable StarterKit's built-in Link — we configure it separately
           // below with custom options (autolink, openOnClick, etc.).
           link: false,
@@ -371,6 +388,7 @@ export function useRichTextEditor({
           transformCopiedText: true,
           breaks: true,
         }),
+        ...(extraExtensions ?? []),
       ],
       editorProps: {
         handleDOMEvents: {
@@ -632,8 +650,8 @@ export function useRichTextEditor({
 
   const getMarkdown = React.useCallback((): string => {
     if (!editor) return "";
-    return getMarkdownFromEditor(editor);
-  }, [editor]);
+    return getMarkdownFromEditor(editor, documentMode);
+  }, [editor, documentMode]);
 
   const isEmpty = React.useCallback((): boolean => {
     if (!editor) return true;
@@ -892,12 +910,29 @@ export function useRichTextEditor({
 
 export type UseRichTextEditorResult = ReturnType<typeof useRichTextEditor>;
 
-function getMarkdownFromEditor(editor: Editor): string {
+/**
+ * Documents are rendered markdown, so every escape the serializer emitted is
+ * load-bearing: `\*` keeps a literal asterisk from becoming emphasis, and a
+ * `\` inside code is code. Only the hard-break marker is normalised to a bare
+ * newline (which the renderer already treats as a break), and only outside
+ * fenced code, where a trailing backslash is a shell line continuation.
+ */
+function normalizeDocumentMarkdown(markdown: string): string {
+  return markdown
+    .split(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/)
+    .map((segment, index) =>
+      index % 2 === 1 ? segment : segment.replace(/\\\n/g, "\n"),
+    )
+    .join("");
+}
+
+function getMarkdownFromEditor(editor: Editor, documentMode: boolean): string {
   // biome-ignore lint/suspicious/noExplicitAny: tiptap-markdown storage is untyped
   const storage = (editor.storage as any).markdown as
     | { getMarkdown?: () => string }
     | undefined;
   if (storage?.getMarkdown) {
+    if (documentMode) return normalizeDocumentMarkdown(storage.getMarkdown());
     let md = storage.getMarkdown();
     // tiptap-markdown serializes hard breaks as "\" + newline (CommonMark hard
     // line break syntax). Chat messages are plain text, not rendered markdown,

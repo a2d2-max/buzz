@@ -258,3 +258,18 @@ test("deriveShellRoute does not mistake a board-prefixed path for the board", ()
   assert.equal(deriveShellRoute("/projects").selectedView, "projects");
   assert.equal(deriveShellRoute("/pulse").selectedView, "pulse");
 });
+
+test("deriveShellRoute_docsRoutesSelectTheDocsView", () => {
+  assert.deepEqual(deriveShellRoute("/docs"), {
+    selectedChannelId: null,
+    selectedView: "docs",
+  });
+  assert.deepEqual(deriveShellRoute("/docs/3f0c2b1a"), {
+    selectedChannelId: null,
+    selectedView: "docs",
+  });
+});
+
+test("deriveShellRoute_docsPrefixMustBeAPathSegment", () => {
+  assert.equal(deriveShellRoute("/docsx").selectedView, "home");
+});

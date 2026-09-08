@@ -104,6 +104,15 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goDocs = React.useCallback(
+    (pageId?: string | null, behavior?: NavigationBehavior) =>
+      commitNavigation(
+        pageId ? { to: "/docs/$pageId", params: { pageId } } : { to: "/docs" },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProfile = React.useCallback(
     (pubkey: string, behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -472,6 +481,7 @@ export function useAppNavigation() {
     goAgents,
     goBoard,
     goChannel,
+    goDocs,
     goDuplicateWorkflow,
     goEditWorkflow,
     goForumPost,
