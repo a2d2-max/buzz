@@ -25,8 +25,19 @@ cd desktop && node --import ./test-loader.mjs --experimental-strip-types \
   reconnect refetch, incremental watermark anchored on relay-stamped
   `created_at`, and the one-shot legacy migration: after a complete scan,
   pages stranded on 30078 are republished verbatim onto 30623 (tombstones
-  included), skipped when a dedicated-kind successor exists, and never run
-  from a truncated scan.
+  included), skipped when a dedicated-kind successor exists, never run from
+  a truncated scan, and skipped entirely against a relay marked as
+  rejecting 30623 (see `docKindSupport.ts`).
+- `lib/docKindSupport.test.mjs`, plus the relay-fallback scenarios in
+  `lib/useCommunityDocs.test.mjs` — the per-relay dedicated-kind verdict.
+  A hosted relay built before kind 30623 rejects it at ingest with OK false
+  `restricted: unknown event kind`, and NIP-11 does not advertise kinds, so
+  the first write doubles as the probe: on that rejection the client
+  republishes the same content on legacy 30078, remembers the verdict per
+  relay URL in localStorage (re-probed after 24 h), stops the migration
+  pass after one failed probe, and treats identical-content writes on
+  legacy versions as noops again. Any other publish failure must NOT flip
+  the relay to legacy writes.
 - `lib/autosaveScheduler.test.mjs`, `lib/docDraftBackup.test.mjs`,
   `lib/markdownFidelity.test.mjs`, `lib/docEditorMarkdown.test.mjs` —
   debounce/flush/pause semantics, localStorage draft mirror, the

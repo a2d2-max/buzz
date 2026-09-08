@@ -184,8 +184,16 @@ export function measureDocPageContentBytes(
   return new TextEncoder().encode(buildDocPageEventInput(page).content).length;
 }
 
-/** Unsigned event input for `signRelayEvent`; `createdAt` is chosen by the caller. */
-export function buildDocPageEventInput(page: DocPageContent & { id: string }): {
+/**
+ * Unsigned event input for `signRelayEvent`; `createdAt` is chosen by the
+ * caller. `kind` defaults to the dedicated kind; the write path passes
+ * `KIND_COMMUNITY_DOC_LEGACY` for a relay that rejects 30623 as unknown
+ * (see `docKindSupport.ts`).
+ */
+export function buildDocPageEventInput(
+  page: DocPageContent & { id: string },
+  kind: number = KIND_COMMUNITY_DOC,
+): {
   kind: number;
   content: string;
   tags: string[][];
@@ -201,7 +209,7 @@ export function buildDocPageEventInput(page: DocPageContent & { id: string }): {
     ...(page.deleted ? { deleted: true } : {}),
   };
   return {
-    kind: KIND_COMMUNITY_DOC,
+    kind,
     content: JSON.stringify(content),
     tags: [
       ["d", docPageDTag(page.id)],

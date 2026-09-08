@@ -17,6 +17,7 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", {
 const AUTHOR_ME = "a".repeat(64);
 const AUTHOR_THEM = "b".repeat(64);
 const PAGE_ID = "3f0c2b1a-7d4e-4c9a-9b1e-2a6f8d5c4e10";
+const TEST_RELAY_URL = "ws://test-relay.example";
 
 let nextEventSerial = 0;
 function signedEvent(input) {
@@ -86,6 +87,9 @@ before(() => {
       if (command === "sign_event") {
         return Promise.resolve(JSON.stringify(signedEvent(args)));
       }
+      if (command === "get_relay_ws_url") {
+        return Promise.resolve(TEST_RELAY_URL);
+      }
       return Promise.reject(new Error(`unmocked: ${command}`));
     },
     transformCallback: () => 1,
@@ -96,6 +100,9 @@ before(() => {
 afterEach(async () => {
   const { cleanup } = await import("@testing-library/react");
   cleanup();
+  // The kind-support verdict is keyed by relay URL in localStorage; one
+  // test's "this relay rejects 30623" must not leak into the next.
+  dom.window.localStorage.clear();
 });
 
 after(() => dom.window.close());
@@ -105,7 +112,15 @@ after(() => dom.window.close());
  * re-read, `liveEvents` are delivered by the live subscription before it
  * reports ready, and `calls` records the order of relay interactions.
  */
-async function mountDocs({ history, liveEvents = [], versionsByDTag }) {
+async function mountDocs({
+  history,
+  liveEvents = [],
+  versionsByDTag,
+  // Kinds the stub relay rejects the way buzz-relay rejects an unregistered
+  // kind: OK false with its verbatim wire message. `attempts` records every
+  // publish try (accepted or not); `published` only the accepted ones.
+  rejectKinds = [],
+}) {
   const React = await import("react");
   const { QueryClient, QueryClientProvider } = await import(
     "@tanstack/react-query"
@@ -115,6 +130,7 @@ async function mountDocs({ history, liveEvents = [], versionsByDTag }) {
   const { useCommunityDocs } = await import("./useCommunityDocs.ts");
 
   const published = [];
+  const attempts = [];
   const historyRequests = [];
   const calls = [];
   const reconnectListeners = [];
@@ -133,6 +149,10 @@ async function mountDocs({ history, liveEvents = [], versionsByDTag }) {
     return typeof history === "function" ? history(filter) : history;
   };
   relayClient.publishEvent = async (event) => {
+    attempts.push(event);
+    if (rejectKinds.includes(event.kind)) {
+      throw new Error("restricted: unknown event kind");
+    }
     published.push(event);
   };
   relayClient.subscribeLive = async (_filter, onEvent, onReady) => {
@@ -158,6 +178,7 @@ async function mountDocs({ history, liveEvents = [], versionsByDTag }) {
     assert.equal(rendered.result.current.isLoading, false, "history loaded"),
   );
   return {
+    attempts,
     calls,
     historyRequests,
     published,
@@ -540,6 +561,136 @@ test("an identical save on top of a legacy version still publishes, migrating th
     assert.ok(docs.published.length >= 1);
     assert.equal(docs.published[0].kind, 30623);
     assert.equal(saved.eventKind, 30623);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a relay that rejects 30623 gets the write republished on 30078, and later writes skip the probe", async () => {
+  // The production community relay may be a stock Buzz relay that predates
+  // the dedicated kind; it answers OK false "unknown event kind". The write
+  // must land anyway (on 30078) and the verdict must stick per relay URL.
+  const legacyV = docEvent({
+    id: PAGE_ID,
+    eventId: "legacy1",
+    author: AUTHOR_THEM,
+    createdAt: 1_000,
+    content: {},
+    kind: 30078,
+  });
+  const docs = await mountDocs({
+    history: [],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [legacyV] },
+    rejectKinds: [30623],
+  });
+  try {
+    const saved = await docs.result.current.updatePage(
+      PAGE_ID,
+      { title: "mine" },
+      { baseEventId: legacyV.id },
+    );
+    assert.deepEqual(
+      docs.attempts.map((event) => event.kind),
+      [30623, 30078],
+      "first write probes the dedicated kind, then falls back",
+    );
+    assert.equal(docs.published.length, 1);
+    assert.equal(docs.published[0].kind, 30078);
+    assert.equal(saved.eventKind, 30078);
+
+    // Second write: the verdict is remembered — straight to 30078.
+    await docs.result.current.updatePage(PAGE_ID, { title: "mine 2" });
+    assert.deepEqual(
+      docs.attempts.map((event) => event.kind),
+      [30623, 30078, 30078],
+      "no repeated probe within the recheck interval",
+    );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("on a legacy-marked relay the migration pass does not run, and an identical save is a noop again", async () => {
+  // Marked before mount, as a previous session would have left it.
+  dom.window.localStorage.setItem(
+    `docs:dedicated-kind-rejected:${TEST_RELAY_URL}`,
+    String(Date.now()),
+  );
+  const legacyV = docEvent({
+    id: PAGE_ID,
+    eventId: "legacy1",
+    author: AUTHOR_THEM,
+    createdAt: 1_000,
+    content: { body: "legacy body", title: "Legacy" },
+    kind: 30078,
+  });
+  const docs = await mountDocs({
+    history: [legacyV],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [legacyV] },
+    rejectKinds: [30623],
+  });
+  try {
+    // The complete scan found a legacy candidate, but there is nowhere to
+    // migrate to — no publish may be attempted.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(docs.attempts.length, 0, "migration pass skipped entirely");
+
+    // Identical content on the legacy version: noop, not a forced migration.
+    const result = await docs.result.current.updatePage(
+      PAGE_ID,
+      { title: "Legacy", body: "legacy body" },
+      { baseEventId: legacyV.id },
+    );
+    assert.equal(docs.attempts.length, 0, "nothing was signed or sent");
+    assert.equal(result.eventId, legacyV.id);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a rejecting relay stops the migration pass after one probe instead of failing per page", async () => {
+  const legacyA = docEvent({
+    id: PAGE_ID,
+    eventId: "legacyA",
+    author: AUTHOR_THEM,
+    createdAt: 1_000,
+    content: {},
+    kind: 30078,
+  });
+  const otherId = "b2222222-1111-4c9a-9b1e-2a6f8d5c4e10";
+  const legacyB = docEvent({
+    id: otherId,
+    eventId: "legacyB",
+    author: AUTHOR_THEM,
+    createdAt: 1_001,
+    content: {},
+    kind: 30078,
+  });
+  const docs = await mountDocs({
+    history: [legacyA, legacyB],
+    versionsByDTag: {
+      [`doc:${PAGE_ID}`]: [legacyA],
+      [`doc:${otherId}`]: [legacyB],
+    },
+    rejectKinds: [30623],
+  });
+  try {
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() => assert.ok(docs.attempts.length >= 1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(
+      docs.attempts.length,
+      1,
+      "one probe for the first candidate, then the pass stops",
+    );
+    assert.equal(docs.attempts[0].kind, 30623);
+    assert.equal(docs.published.length, 0);
+    assert.ok(
+      dom.window.localStorage.getItem(
+        `docs:dedicated-kind-rejected:${TEST_RELAY_URL}`,
+      ),
+      "the verdict is remembered for the write path and later mounts",
+    );
   } finally {
     docs.restore();
   }

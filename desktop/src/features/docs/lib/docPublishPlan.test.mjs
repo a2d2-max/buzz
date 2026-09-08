@@ -73,6 +73,25 @@ test("identical content on top of a legacy-kind version is a publish, not a noop
   });
 });
 
+test("on a relay that rejects 30623, identical content on a legacy version is a noop again", () => {
+  // There is nowhere to migrate to: forcing a publish would stack identical
+  // dead versions on the shared 30078 window on every touch.
+  const newest = version("p", "v2", { eventKind: 30078 });
+  assert.deepEqual(
+    planDocPagePublish({ dedicatedKindSupported: false, newest, next: NEXT }),
+    { kind: "noop", newest },
+  );
+  // A real change still publishes.
+  assert.equal(
+    planDocPagePublish({
+      dedicatedKindSupported: false,
+      newest,
+      next: { ...NEXT, title: "changed" },
+    }).kind,
+    "publish",
+  );
+});
+
 test("a conflict still wins over migration on a legacy-kind version", () => {
   const newest = version("p", "v2", { eventKind: 30078 });
   assert.equal(
