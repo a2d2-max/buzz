@@ -15,7 +15,7 @@ use crate::app_state::AppState;
 use crate::managed_agents::{
     claude_accounts::CLAUDE_OAUTH_TOKEN_ENV, detach_claude_account, load_managed_agents,
     output_with_timeout, resolve_command, save_managed_agents, with_claude_account_store,
-    ClaudeAccount,
+    AccountProvider, ProviderAccount,
 };
 
 /// Cheapest model for the round-trip probe; the point is the auth, not the answer.
@@ -49,10 +49,13 @@ async fn run_blocking<T: Send + 'static>(
         .map_err(|error| format!("spawn_blocking failed: {error}"))?
 }
 
-/// All stored accounts (no tokens).
+/// All stored Claude accounts (no tokens).
 #[tauri::command]
-pub async fn list_claude_accounts(app: AppHandle) -> Result<Vec<ClaudeAccount>, String> {
-    run_blocking(move || with_claude_account_store(&app, |store| store.list())).await
+pub async fn list_claude_accounts(app: AppHandle) -> Result<Vec<ProviderAccount>, String> {
+    run_blocking(move || {
+        with_claude_account_store(&app, |store| store.list(AccountProvider::Claude))
+    })
+    .await
 }
 
 /// Store a `claude setup-token` result under `label`.
@@ -61,7 +64,7 @@ pub async fn add_claude_account(
     label: String,
     token: String,
     app: AppHandle,
-) -> Result<ClaudeAccount, String> {
+) -> Result<ProviderAccount, String> {
     run_blocking(move || {
         let state = app.state::<AppState>();
         let _guard = state
@@ -79,7 +82,7 @@ pub async fn rename_claude_account(
     id: String,
     label: String,
     app: AppHandle,
-) -> Result<ClaudeAccount, String> {
+) -> Result<ProviderAccount, String> {
     run_blocking(move || {
         let state = app.state::<AppState>();
         let _guard = state
@@ -123,7 +126,9 @@ pub async fn remove_claude_account(
         // The detach above is already durable: if the removal itself fails,
         // say so, so the owner knows those agents are on the app login now
         // and that retrying the removal is safe.
-        let warning = with_claude_account_store(&app, |store| store.remove(&id)).map_err(
+        let warning = with_claude_account_store(&app, |store| store.remove(&id))
+            .map(|(_removed, warning)| warning)
+            .map_err(
             |error| {
                 if detached_agent_pubkeys.is_empty() {
                     error

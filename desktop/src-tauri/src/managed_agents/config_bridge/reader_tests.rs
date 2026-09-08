@@ -63,6 +63,7 @@ fn test_runtime() -> &'static KnownAcpRuntime {
         login_hint: None,
         auth_probe_args: None,
         oauth_token_env_var: None,
+        supports_codex_accounts: false,
     };
     &RUNTIME
 }
@@ -124,6 +125,7 @@ fn test_record() -> ManagedAgentRecord {
         relay_mesh: None,
         effort_level: None,
         claude_account_id: None,
+        codex_account_id: None,
         agent_command_override: None,
         persona_source_version: None,
         provider: None,
@@ -661,6 +663,7 @@ fn buzz_agent_runtime() -> &'static KnownAcpRuntime {
         login_hint: None,
         auth_probe_args: None,
         oauth_token_env_var: None,
+        supports_codex_accounts: false,
     }
 }
 

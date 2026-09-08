@@ -626,6 +626,7 @@ pub async fn confirm_team_snapshot_import(
             relay_mesh: None,
             effort_level: None,
             claude_account_id: None,
+            codex_account_id: None,
             runtime: member.definition.runtime.clone(),
             name_pool: member.definition.name_pool.clone(),
         };

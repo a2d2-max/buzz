@@ -20,7 +20,12 @@ rule: `requires_external_cli` is derived from `KnownAcpRuntime` and projected
 to the UI rather than inferred from a runtime ID in a component. The per-agent
 Claude account picker follows it too: it renders only when the prospective
 runtime's `oauthTokenEnvVar` (from `KnownAcpRuntime::oauth_token_env_var`) is
-set, and spawn injects the picked account's token under that same key.
+set, and spawn injects the picked account's token under that same key. The
+Codex account picker mirrors this with `supportsCodexAccounts`
+(`KnownAcpRuntime::supports_codex_accounts`); spawn injects the picked
+account's `CODEX_HOME` directory plus, for API-key accounts, `OPENAI_API_KEY`
+— the directory move is required because a ChatGPT login in the ambient
+`~/.codex` beats an env key.
 
 **Second metadata source: command-keyed execution policy.**
 `harness_max_parallelism` (`managed_agents/parallelism.rs`) maps the harness's

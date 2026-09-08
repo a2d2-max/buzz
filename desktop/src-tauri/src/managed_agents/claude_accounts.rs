@@ -1,17 +1,22 @@
-//! Named Claude subscription accounts for per-agent OAuth token selection.
+//! Named provider accounts (Claude and Codex) for per-agent login selection.
 //!
-//! The owner may hold several Claude subscriptions. Each becomes a named
-//! account whose `claude setup-token` output is kept in the OS keyring under
-//! `claude-account:<id>` — the same blob the agent nsecs live in — while the
-//! non-secret metadata (id, label, created_at, a `…last4` hint) lives in
+//! The owner may hold several Claude or ChatGPT/OpenAI subscriptions. Each
+//! becomes a named account whose secret — the `claude setup-token` output for
+//! Claude, the OpenAI API key for a Codex `api_key` account — is kept in the
+//! OS keyring under `claude-account:<id>` / `codex-account:<id>` (the same
+//! blob the agent nsecs live in), while the non-secret metadata (id, label,
+//! provider, created_at, a `…last4` hint) lives in
 //! `<app-data>/agents/claude-accounts.json`, written `0o600` like the agent
-//! store.
+//! store. The file name predates the Codex provider and stays for
+//! back-compat; records without a `provider` field deserialize as `claude`.
+//! Codex `chatgpt` accounts keep no keyring secret at all — their login lives
+//! in a per-account `CODEX_HOME` directory (see `codex_accounts`).
 //!
 //! A managed agent references an account by id
-//! (`ManagedAgentRecord.claude_account_id`). The token is resolved from the
-//! keyring at spawn time and written straight onto the child `Command` as
-//! `CLAUDE_CODE_OAUTH_TOKEN`; it is never copied into `env_vars`, the spawn
-//! snapshot, logs, or any IPC response.
+//! (`ManagedAgentRecord.claude_account_id` / `codex_account_id`). The secret
+//! is resolved from the keyring at spawn time and written straight onto the
+//! child `Command` (`CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY`); it is never
+//! copied into `env_vars`, the spawn snapshot, logs, or any IPC response.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -35,25 +40,56 @@ const MAX_LABEL_CHARS: usize = 64;
 /// mistake, and the `…last4` hint would otherwise disclose a large share of it.
 const MIN_TOKEN_CHARS: usize = 16;
 
-/// One stored Claude account. Never carries the token.
+/// Which CLI login a stored account belongs to.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountProvider {
+    /// `claude` — records written before the field existed deserialize here.
+    #[default]
+    Claude,
+    Codex,
+}
+
+/// How a Codex account authenticates. `None` on Claude accounts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAuthKind {
+    /// OpenAI API key in the keyring, injected as `OPENAI_API_KEY`.
+    ApiKey,
+    /// ChatGPT-subscription login living in the account's own `CODEX_HOME`
+    /// directory (`codex login` run there by the owner).
+    Chatgpt,
+}
+
+/// One stored provider account. Never carries the secret.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ClaudeAccount {
-    /// Random UUID minted on add; what `ManagedAgentRecord.claude_account_id` points at.
+pub struct ProviderAccount {
+    /// Random UUID minted on add; what `ManagedAgentRecord.claude_account_id`
+    /// (or `codex_account_id`) points at.
     pub id: String,
-    /// Owner-chosen display name, unique (case-insensitively) among accounts.
+    /// Owner-chosen display name, unique (case-insensitively) among the same
+    /// provider's accounts.
     pub label: String,
     /// RFC 3339 timestamp of the add.
     pub created_at: String,
-    /// `…` plus the last four characters of the token — enough to tell two
-    /// accounts apart, never enough to reconstruct one.
+    /// `…` plus the last four characters of the secret — enough to tell two
+    /// accounts apart, never enough to reconstruct one. Empty for Codex
+    /// `chatgpt` accounts, which keep no secret here.
     #[serde(default)]
     pub token_hint: String,
+    /// Which CLI this account signs in. Absent in records written before the
+    /// Codex provider existed — those are Claude accounts.
+    #[serde(default)]
+    pub provider: AccountProvider,
+    /// Codex-only: how the account authenticates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_kind: Option<CodexAuthKind>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ClaudeAccountsFile {
     #[serde(default)]
-    accounts: Vec<ClaudeAccount>,
+    accounts: Vec<ProviderAccount>,
 }
 
 /// The keyring operations the account store needs, abstracted so the store
@@ -79,57 +115,106 @@ impl AccountTokenStore for SecretStore {
     }
 }
 
-/// Keyring key name for an account's token, namespaced like `agent:<pubkey>`.
-pub(crate) fn token_keyring_name(id: &str) -> String {
-    format!("claude-account:{id}")
+/// Keyring key name for an account's secret, namespaced like `agent:<pubkey>`.
+/// Claude entries predate the provider split and keep their historical prefix.
+pub(crate) fn token_keyring_name(provider: AccountProvider, id: &str) -> String {
+    match provider {
+        AccountProvider::Claude => format!("claude-account:{id}"),
+        AccountProvider::Codex => format!("codex-account:{id}"),
+    }
 }
 
 /// Metadata file plus token store. Pure over its inputs — no `AppHandle`.
-pub(crate) struct ClaudeAccountStore<'a> {
+pub(crate) struct ProviderAccountStore<'a> {
     path: PathBuf,
     tokens: &'a dyn AccountTokenStore,
 }
 
-impl<'a> ClaudeAccountStore<'a> {
+impl<'a> ProviderAccountStore<'a> {
     pub(crate) fn new(path: PathBuf, tokens: &'a dyn AccountTokenStore) -> Self {
         Self { path, tokens }
     }
 
-    /// All accounts in insertion order. Fails loudly on a corrupt file rather
-    /// than presenting an empty list that a later save would make permanent.
-    pub(crate) fn list(&self) -> Result<Vec<ClaudeAccount>, String> {
-        Ok(self.read()?.accounts)
+    /// `provider`'s accounts in insertion order. Fails loudly on a corrupt
+    /// file rather than presenting an empty list that a later save would make
+    /// permanent.
+    pub(crate) fn list(&self, provider: AccountProvider) -> Result<Vec<ProviderAccount>, String> {
+        let mut accounts = self.read()?.accounts;
+        accounts.retain(|account| account.provider == provider);
+        Ok(accounts)
     }
 
-    /// Store `token` under a fresh id and record the account. The token is
+    /// Store a Claude `claude setup-token` result under `label`. The token is
     /// written first: an account whose token never reached the keyring must
     /// not exist, and a failed metadata write rolls the token back.
-    pub(crate) fn add(&self, label: &str, token: &str) -> Result<ClaudeAccount, String> {
-        let label = normalize_label(label)?;
-        let token = normalize_token(token)?;
-        let mut file = self.read()?;
-        ensure_unique_label(&file.accounts, &label, None)?;
+    pub(crate) fn add(&self, label: &str, token: &str) -> Result<ProviderAccount, String> {
+        self.add_with_secret(AccountProvider::Claude, None, label, Some(token))
+    }
 
-        let account = ClaudeAccount {
+    /// Store a Codex account. `api_key` is required for `ApiKey` accounts and
+    /// must be absent for `Chatgpt` ones (their login lives in the account's
+    /// `CODEX_HOME` directory, not the keyring).
+    pub(crate) fn add_codex(
+        &self,
+        auth_kind: CodexAuthKind,
+        label: &str,
+        api_key: Option<&str>,
+    ) -> Result<ProviderAccount, String> {
+        match (auth_kind, api_key) {
+            (CodexAuthKind::ApiKey, None) => {
+                Err("an API key is required for this account type".to_string())
+            }
+            (CodexAuthKind::Chatgpt, Some(_)) => {
+                Err("a ChatGPT-login account does not take an API key".to_string())
+            }
+            _ => self.add_with_secret(AccountProvider::Codex, Some(auth_kind), label, api_key),
+        }
+    }
+
+    fn add_with_secret(
+        &self,
+        provider: AccountProvider,
+        auth_kind: Option<CodexAuthKind>,
+        label: &str,
+        secret: Option<&str>,
+    ) -> Result<ProviderAccount, String> {
+        let label = normalize_label(label)?;
+        let secret = secret.map(normalize_token).transpose()?;
+        let mut file = self.read()?;
+        ensure_unique_label(&file.accounts, provider, &label, None)?;
+
+        let account = ProviderAccount {
             id: uuid::Uuid::new_v4().to_string(),
             label,
             created_at: crate::util::now_iso(),
-            token_hint: token_hint(&token),
+            token_hint: secret.as_deref().map(token_hint).unwrap_or_default(),
+            provider,
+            auth_kind,
         };
-        let name = token_keyring_name(&account.id);
-        self.tokens.store(&name, &token)?;
+        let name = token_keyring_name(provider, &account.id);
+        if let Some(ref secret) = secret {
+            self.tokens.store(&name, secret)?;
+        }
         file.accounts.push(account.clone());
         if let Err(error) = self.write(&file) {
-            let _ = self.tokens.delete(&name);
+            if secret.is_some() {
+                let _ = self.tokens.delete(&name);
+            }
             return Err(error);
         }
         Ok(account)
     }
 
-    pub(crate) fn rename(&self, id: &str, label: &str) -> Result<ClaudeAccount, String> {
+    pub(crate) fn rename(&self, id: &str, label: &str) -> Result<ProviderAccount, String> {
         let label = normalize_label(label)?;
         let mut file = self.read()?;
-        ensure_unique_label(&file.accounts, &label, Some(id))?;
+        let provider = file
+            .accounts
+            .iter()
+            .find(|account| account.id == id)
+            .ok_or_else(|| not_found(id))?
+            .provider;
+        ensure_unique_label(&file.accounts, provider, &label, Some(id))?;
         let account = file
             .accounts
             .iter_mut()
@@ -141,44 +226,73 @@ impl<'a> ClaudeAccountStore<'a> {
         Ok(renamed)
     }
 
-    /// Drop the account and its token. Metadata goes first so a keyring
-    /// failure can never leave a listed account without a token. Returns
-    /// `Ok(Some(warning))` when the account is gone but its keyring entry
-    /// could not be deleted — an orphaned entry is harmless, and reporting
-    /// that as a failure would hide a removal that did happen.
-    pub(crate) fn remove(&self, id: &str) -> Result<Option<String>, String> {
+    /// Drop the account and its keyring secret. Metadata goes first so a
+    /// keyring failure can never leave a listed account without a secret.
+    /// Returns the removed record plus `Some(warning)` when the account is
+    /// gone but its keyring entry could not be deleted — an orphaned entry is
+    /// harmless, and reporting that as a failure would hide a removal that did
+    /// happen. Codex `chatgpt` accounts have no keyring entry; the caller owns
+    /// deleting their `CODEX_HOME` directory.
+    pub(crate) fn remove(&self, id: &str) -> Result<(ProviderAccount, Option<String>), String> {
         let mut file = self.read()?;
         let index = file
             .accounts
             .iter()
             .position(|account| account.id == id)
             .ok_or_else(|| not_found(id))?;
-        file.accounts.remove(index);
+        let removed = file.accounts.remove(index);
         self.write(&file)?;
-        Ok(self
+        if removed.auth_kind == Some(CodexAuthKind::Chatgpt) {
+            return Ok((removed, None));
+        }
+        let warning = self
             .tokens
-            .delete(&token_keyring_name(id))
+            .delete(&token_keyring_name(removed.provider, id))
             .err()
             .map(|error| {
                 format!("account removed, but its keyring entry could not be deleted: {error}")
-            }))
+            });
+        Ok((removed, warning))
     }
 
-    /// The token for `id`. `Ok(None)` when no such account is recorded; an
-    /// account that is recorded but has no keyring entry is an error, not
-    /// "no token" — the caller must not silently fall back to another login.
-    pub(crate) fn token(&self, id: &str) -> Result<Option<String>, String> {
+    /// The keyring secret for `provider`'s account `id`. `Ok(None)` when no
+    /// such account is recorded under that provider; an account that is
+    /// recorded but has no keyring entry is an error, not "no secret" — the
+    /// caller must not silently fall back to another login.
+    pub(crate) fn secret(
+        &self,
+        provider: AccountProvider,
+        id: &str,
+    ) -> Result<Option<String>, String> {
         let file = self.read()?;
-        let Some(account) = file.accounts.iter().find(|account| account.id == id) else {
+        let Some(account) = file
+            .accounts
+            .iter()
+            .find(|account| account.id == id && account.provider == provider)
+        else {
             return Ok(None);
         };
-        match self.tokens.load(&token_keyring_name(id))? {
+        match self.tokens.load(&token_keyring_name(provider, id))? {
             Some(token) => Ok(Some(token)),
             None => Err(format!(
-                "Claude account \"{}\" has no token in the OS keyring; remove it and add it again",
+                "account \"{}\" has no secret in the OS keyring; remove it and add it again",
                 account.label
             )),
         }
+    }
+
+    /// The token for a Claude account — see `secret`.
+    pub(crate) fn token(&self, id: &str) -> Result<Option<String>, String> {
+        self.secret(AccountProvider::Claude, id)
+    }
+
+    /// The full record for `id`, any provider. `Ok(None)` when unknown.
+    pub(crate) fn find(&self, id: &str) -> Result<Option<ProviderAccount>, String> {
+        Ok(self
+            .read()?
+            .accounts
+            .into_iter()
+            .find(|account| account.id == id))
     }
 
     fn read(&self) -> Result<ClaudeAccountsFile, String> {
@@ -199,7 +313,7 @@ impl<'a> ClaudeAccountStore<'a> {
 }
 
 fn not_found(id: &str) -> String {
-    format!("Claude account {id} not found")
+    format!("account {id} not found")
 }
 
 fn normalize_label(label: &str) -> Result<String, String> {
@@ -215,39 +329,42 @@ fn normalize_label(label: &str) -> Result<String, String> {
     Ok(label.to_string())
 }
 
-/// Validate a pasted token. Errors are generic on purpose — the value is a
-/// credential and must never be echoed back.
+/// Validate a pasted secret (Claude OAuth token or OpenAI API key). Errors
+/// are generic on purpose — the value is a credential and must never be
+/// echoed back.
 fn normalize_token(token: &str) -> Result<String, String> {
     let token = token.trim();
     if token.is_empty() {
-        return Err(
-            "token is required — run `claude setup-token` and paste the result".to_string(),
-        );
+        return Err("a token or key is required".to_string());
     }
     if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("token must be a single line with no spaces".to_string());
+        return Err("the token or key must be a single line with no spaces".to_string());
     }
     if token.chars().count() < MIN_TOKEN_CHARS {
-        return Err("token is too short to be a Claude OAuth token".to_string());
+        return Err("the token or key is too short to be real".to_string());
     }
     if token.len() > MAX_ENV_VALUE_BYTES {
-        return Err("token is too long".to_string());
+        return Err("the token or key is too long".to_string());
     }
     Ok(token.to_string())
 }
 
+/// Labels are unique per provider (case-insensitively) — a "Work" Claude
+/// account and a "Work" Codex account may coexist.
 fn ensure_unique_label(
-    accounts: &[ClaudeAccount],
+    accounts: &[ProviderAccount],
+    provider: AccountProvider,
     label: &str,
     except_id: Option<&str>,
 ) -> Result<(), String> {
     let wanted = label.to_lowercase();
     let taken = accounts
         .iter()
+        .filter(|account| account.provider == provider)
         .filter(|account| Some(account.id.as_str()) != except_id)
         .any(|account| account.label.to_lowercase() == wanted);
     if taken {
-        return Err(format!("a Claude account named \"{label}\" already exists"));
+        return Err(format!("an account named \"{label}\" already exists"));
     }
     Ok(())
 }
@@ -369,16 +486,16 @@ fn claude_accounts_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf
 }
 
 /// Run `f` against the app's account store: metadata under the agents data
-/// dir, tokens in the shared desktop keyring. Listing never touches the
+/// dir, secrets in the shared desktop keyring. Listing never touches the
 /// keyring; in a build without a keyring backend every secret operation fails
 /// with `SecretStore`'s own error.
 pub(crate) fn with_claude_account_store<R: tauri::Runtime, T>(
     app: &AppHandle<R>,
-    f: impl FnOnce(&ClaudeAccountStore<'_>) -> Result<T, String>,
+    f: impl FnOnce(&ProviderAccountStore<'_>) -> Result<T, String>,
 ) -> Result<T, String> {
     let path = claude_accounts_path(app)?;
     let tokens: &'static SecretStore = SecretStore::shared(keyring_service());
-    f(&ClaudeAccountStore::new(path, tokens))
+    f(&ProviderAccountStore::new(path, tokens))
 }
 
 /// Keyring lookup for the spawn path: `Ok(None)` when the account is gone.

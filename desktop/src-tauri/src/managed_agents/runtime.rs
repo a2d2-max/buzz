@@ -319,6 +319,7 @@ pub fn build_managed_agent_summary(
         restart_diff,
         env_vars: record.env_vars.clone(),
         claude_account_id: record.claude_account_id.clone(),
+        codex_account_id: record.codex_account_id.clone(),
         backend: record.backend.clone(),
         backend_agent_id: record.backend_agent_id.clone(),
         status,
@@ -513,6 +514,18 @@ pub fn spawn_agent_child(
         record.claude_account_id.as_deref(),
         oauth_token_env_var.is_some(),
         |id| super::claude_accounts::lookup_claude_account_token(app, id),
+    )
+    .map_err(|error| format!("cannot spawn agent {}: {error}", record.pubkey))?;
+
+    // Per-agent Codex account: same contract as the Claude account above —
+    // resolved before any side effect, fails closed on a dangling account,
+    // never enters `env_vars` or the spawn snapshot.
+    let runtime_supports_codex_accounts =
+        known_acp_runtime(effective_command).is_some_and(|r| r.supports_codex_accounts);
+    let codex_account_auth = super::codex_accounts::codex_account_spawn_auth(
+        record.codex_account_id.as_deref(),
+        runtime_supports_codex_accounts,
+        |id| super::codex_accounts::lookup_codex_spawn_auth(app, id),
     )
     .map_err(|error| format!("cannot spawn agent {}: {error}", record.pubkey))?;
 
@@ -776,6 +789,9 @@ pub fn spawn_agent_child(
         oauth_token_env_var,
         claude_account_token.as_deref(),
     );
+    // Same rule for the picked Codex account: its CODEX_HOME (and key) beat
+    // hand-typed values in the user env.
+    super::codex_accounts::apply_codex_account_env(&mut command, codex_account_auth.as_ref());
     // Resolve once and stamp the same value onto the snapshot below.
     let acp_session_policy = super::apply_app_acp_session_policy_env(app, &mut command);
 

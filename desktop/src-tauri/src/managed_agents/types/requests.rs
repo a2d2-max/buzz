@@ -274,6 +274,9 @@ pub struct UpdateManagedAgentRequest {
     /// app's own login, id = that stored account.
     #[serde(default, deserialize_with = "crate::util::double_option")]
     pub claude_account_id: Option<Option<String>>,
+    /// Codex account selection, same tri-state contract as `claude_account_id`.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub codex_account_id: Option<Option<String>>,
 }
 
 #[cfg(test)]

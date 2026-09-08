@@ -76,14 +76,11 @@ import {
   usePersonaModelDiscovery,
 } from "./usePersonaModelDiscovery";
 import { EditAgentProviderModelFields } from "./EditAgentProviderModelFields";
-import { EditAgentClaudeAccountField } from "./EditAgentClaudeAccountField";
-import { EditAgentRuntimeField } from "./EditAgentRuntimeField";
 import {
-  claudeAccountSelectionValue,
-  hasManualClaudeToken,
-  resolveClaudeAccountSubmission,
-} from "./claudeAccountOptions";
-import { useClaudeAccountsQuery } from "@/features/agents/useClaudeAccounts";
+  EditAgentAccountFields,
+  useEditAgentAccountSelections,
+} from "./EditAgentAccountFields";
+import { EditAgentRuntimeField } from "./EditAgentRuntimeField";
 import {
   getBakedModelInheritLabel,
   getBakedProviderInheritLabel,
@@ -193,11 +190,6 @@ export function AgentInstanceEditDialog({
 
   // Tracks whether the user has made an in-dialog runtime selection.
   const runtimeTouched = React.useRef(false);
-  // Claude account picker: `null` = untouched (derived from record + env).
-  const [claudeAccountSelection, setClaudeAccountSelection] = React.useState<
-    string | null
-  >(null);
-
   // Reset form state only when the dialog opens or when switching to a different agent.
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional — including agent fields would re-fire on every 5s poll and wipe edits
   React.useEffect(() => {
@@ -228,7 +220,6 @@ export function AgentInstanceEditDialog({
       setIsAvatarUploadPending(false);
       setIsAddHarnessOpen(false);
       runtimeTouched.current = false;
-      setClaudeAccountSelection(null);
       const matched =
         runtimes.find((r) => r.command?.trim() === agent.agentCommand.trim()) ??
         runtimes.find((r) => r.id === agent.agentCommand.trim());
@@ -333,11 +324,6 @@ export function AgentInstanceEditDialog({
   const prospectiveRuntime = runtimes.find(
     (r) => r.id === prospectiveRuntimeId,
   );
-  // Claude account picker — gated on a catalog capability, not a harness id.
-  const claudeTokenEnvVar = prospectiveRuntime?.oauthTokenEnvVar ?? null;
-  const claudeAccountsQuery = useClaudeAccountsQuery({
-    enabled: open && claudeTokenEnvVar != null,
-  });
   const runtimeCatalogStatus = runtimesQuery.isLoading
     ? ("loading" as const)
     : runtimesQuery.isError
@@ -440,17 +426,15 @@ export function AgentInstanceEditDialog({
     () => ({ ...globalConfig.env_vars, ...inheritedSubmission.envVars }),
     [globalConfig.env_vars, inheritedSubmission.envVars],
   );
-  // Same layered env the spawn reads, so a persona/global token is detected.
-  const claudeManualToken = hasManualClaudeToken(
-    envVarsForDiscovery,
-    claudeTokenEnvVar,
-  );
-  const claudeAccountValue =
-    claudeAccountSelection ??
-    claudeAccountSelectionValue({
-      currentAccountId: agent.claudeAccountId,
-      hasManualToken: claudeManualToken,
-    });
+  // Claude/Codex account pickers — selections, queries, manual-env
+  // detection, and tri-state submissions all live in the extracted hook.
+  const accountSelections = useEditAgentAccountSelections({
+    agent,
+    envVars: envVarsForDiscovery,
+    open,
+    prospectiveRuntime,
+    resetKey: agent.pubkey,
+  });
   const effectiveProvider =
     (inheritedSubmission.provider ?? "").trim() ||
     inheritedProviderDefault.value;
@@ -772,13 +756,8 @@ export function AgentInstanceEditDialog({
           respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
             ? respondToAllowlist
             : undefined,
-        // Tri-state like effortLevel (see resolveClaudeAccountSubmission).
-        claudeAccountId: resolveClaudeAccountSubmission({
-          tokenEnvVar: claudeTokenEnvVar,
-          runtimeKnown: prospectiveRuntime != null,
-          selectionValue: claudeAccountValue,
-          initialAccountId: agent.claudeAccountId,
-        }),
+        // Tri-state like effortLevel (see the account-fields hook).
+        ...accountSelections.submissions(),
       };
 
       // Resolve effort before the update so access-change restarts can
@@ -1092,18 +1071,10 @@ export function AgentInstanceEditDialog({
               onModelChange={setModel}
               modelStatusMessage={modelStatusMessage}
             />
-            {claudeTokenEnvVar ? (
-              <EditAgentClaudeAccountField
-                accounts={claudeAccountsQuery.data ?? null}
-                accountsError={claudeAccountsQuery.isError}
-                currentAccountId={agent.claudeAccountId}
-                disabled={isSaving}
-                hasManualToken={claudeManualToken}
-                onValueChange={setClaudeAccountSelection}
-                tokenEnvVar={claudeTokenEnvVar}
-                value={claudeAccountValue}
-              />
-            ) : null}
+            <EditAgentAccountFields
+              disabled={isSaving}
+              selections={accountSelections}
+            />
 
             <EffortPickerField
               agent={agent}

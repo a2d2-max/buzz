@@ -83,6 +83,7 @@ pub(super) fn record() -> ManagedAgentRecord {
         relay_mesh: None,
         effort_level: None,
         claude_account_id: None,
+        codex_account_id: None,
         agent_command_override: None,
         persona_source_version: None,
         provider: None,

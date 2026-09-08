@@ -169,6 +169,7 @@ impl AgentDefinition {
             relay_mesh: None,
             effort_level: None,
             claude_account_id: None,
+            codex_account_id: None,
         }
     }
 }
@@ -482,6 +483,11 @@ pub struct ManagedAgentRecord {
     /// Claude login. Only the id is persisted; the token stays in the keyring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_account_id: Option<String>,
+    /// Stored Codex account (see `codex_accounts`) whose login the spawn
+    /// injects via `CODEX_HOME` (+ `OPENAI_API_KEY` for key accounts).
+    /// `None` = the app's own Codex login. Only the id is persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_account_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -595,6 +601,9 @@ pub struct ManagedAgentSummary {
     /// Selected Claude account id, `None` for the app's own login.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_account_id: Option<String>,
+    /// Selected Codex account id, `None` for the app's own login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -675,6 +684,10 @@ pub struct AcpRuntimeCatalogEntry {
     /// per-agent Claude account picker. `None` = not applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth_token_env_var: Option<String>,
+    /// Whether this runtime honors per-agent Codex accounts; drives the
+    /// "Codex account" picker the way `oauth_token_env_var` drives Claude's.
+    #[serde(default)]
+    pub supports_codex_accounts: bool,
     /// Canonical accepted effort values for this runtime, in display order.
     /// Serialized from `KnownAcpRuntime::effort_normalization.canonical` for
     /// runtimes with a static finite vocabulary (e.g. Goose). `None` for

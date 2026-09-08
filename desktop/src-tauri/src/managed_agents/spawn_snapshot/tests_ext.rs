@@ -502,3 +502,35 @@ fn changing_the_claude_account_requires_restart_and_never_snapshots_the_token() 
     );
     assert!(policy_transition_diff(&selected, &snapshot_for(&with_account)).is_empty());
 }
+
+#[test]
+fn changing_the_codex_account_requires_restart_and_never_snapshots_the_auth() {
+    // Same contract as the Claude test above: the id is the badge's only
+    // representation — the API key / CODEX_HOME are written straight onto the
+    // spawn `Command` and must never be readable from the snapshot env.
+    let mut with_account = record();
+    with_account.codex_account_id = Some("acct-2".into());
+    let app_login = snapshot_for(&record());
+    let selected = snapshot_for(&with_account);
+
+    let forward = policy_transition_diff(&app_login, &selected);
+    assert_eq!(
+        forward.iter().map(|e| e.field.as_str()).collect::<Vec<_>>(),
+        vec!["codex_account_id"],
+    );
+    let reverse = policy_transition_diff(&selected, &app_login);
+    assert_eq!(
+        reverse.iter().map(|e| e.field.as_str()).collect::<Vec<_>>(),
+        vec!["codex_account_id"],
+    );
+
+    for key in [
+        crate::managed_agents::codex_accounts::OPENAI_API_KEY_ENV,
+        crate::managed_agents::codex_accounts::CODEX_HOME_ENV,
+    ] {
+        assert!(
+            !selected.env.keys().any(|k| k.eq_ignore_ascii_case(key)),
+            "{key} must never be part of the snapshot env"
+        );
+    }
+}

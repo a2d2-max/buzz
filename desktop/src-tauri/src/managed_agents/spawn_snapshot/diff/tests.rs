@@ -31,6 +31,7 @@ fn base() -> SpawnConfigSnapshot {
         effort_level: Some("high".into()),
         session_policy: "channel".into(),
         claude_account_id: None,
+        codex_account_id: None,
     }
 }
 
@@ -77,6 +78,9 @@ fn mutations() -> Vec<Mutation> {
         ("session_policy", |s| s.session_policy = "thread".into()),
         ("claude_account_id", |s| {
             s.claude_account_id = Some("acct-1".into())
+        }),
+        ("codex_account_id", |s| {
+            s.codex_account_id = Some("acct-2".into())
         }),
     ]
 }

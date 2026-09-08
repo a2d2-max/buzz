@@ -157,6 +157,9 @@ pub(crate) struct SpawnConfigSnapshot {
     /// never part of `env`, so the id is the only thing the badge can compare:
     /// picking a different account while the agent runs must badge.
     pub claude_account_id: Option<String>,
+    /// Selected Codex account id — an account switch must surface the restart
+    /// badge exactly like a Claude account switch.
+    pub codex_account_id: Option<String>,
 }
 
 /// The startup effort a spawn actually applied, read from the single effort key
@@ -264,6 +267,7 @@ impl SpawnConfigSnapshot {
             effort_level: effective_effort(descriptor),
             session_policy: session_policy.as_str().to_string(),
             claude_account_id: record.claude_account_id.clone(),
+            codex_account_id: record.codex_account_id.clone(),
         }
     }
 

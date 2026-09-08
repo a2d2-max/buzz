@@ -688,6 +688,7 @@ pub async fn create_managed_agent(
             },
             effort_level: None,
             claude_account_id: None,
+            codex_account_id: None,
         };
 
         records.push(record);

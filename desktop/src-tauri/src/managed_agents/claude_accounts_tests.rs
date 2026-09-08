@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 use tempfile::TempDir;
 
 use super::{
-    claude_account_spawn_token, detach_claude_account, token_keyring_name, AccountTokenStore,
-    ClaudeAccountStore, CLAUDE_OAUTH_TOKEN_ENV,
+    claude_account_spawn_token, detach_claude_account, token_keyring_name, AccountProvider,
+    AccountTokenStore, ProviderAccountStore, CLAUDE_OAUTH_TOKEN_ENV,
 };
 use crate::managed_agents::ManagedAgentRecord;
 
@@ -73,8 +73,13 @@ impl AccountTokenStore for FakeTokenStore {
     }
 }
 
-fn store_in<'a>(dir: &TempDir, tokens: &'a FakeTokenStore) -> ClaudeAccountStore<'a> {
-    ClaudeAccountStore::new(dir.path().join("claude-accounts.json"), tokens)
+fn store_in<'a>(dir: &TempDir, tokens: &'a FakeTokenStore) -> ProviderAccountStore<'a> {
+    ProviderAccountStore::new(dir.path().join("claude-accounts.json"), tokens)
+}
+
+/// The Claude keyring name — every store test here works on Claude accounts.
+fn kr(id: &str) -> String {
+    token_keyring_name(AccountProvider::Claude, id)
 }
 
 fn file_text(dir: &TempDir) -> String {
@@ -109,10 +114,7 @@ fn add_persists_metadata_on_disk_and_token_only_in_the_token_store() {
         "token must never land in the metadata file: {text}"
     );
     assert_eq!(
-        tokens
-            .stored()
-            .get(&token_keyring_name(&account.id))
-            .map(String::as_str),
+        tokens.stored().get(&kr(&account.id)).map(String::as_str),
         Some(TOKEN),
         "token lives in the token store under the account's keyring name"
     );
@@ -129,10 +131,7 @@ fn add_trims_the_pasted_token() {
         .expect("surrounding whitespace is a paste artifact, not part of the token");
 
     assert_eq!(
-        tokens
-            .stored()
-            .get(&token_keyring_name(&account.id))
-            .map(String::as_str),
+        tokens.stored().get(&kr(&account.id)).map(String::as_str),
         Some(TOKEN)
     );
 }
@@ -192,7 +191,7 @@ fn add_rejects_duplicate_labels_case_insensitively() {
         error.contains("already"),
         "error explains the duplicate: {error}"
     );
-    assert_eq!(store.list().expect("list").len(), 1);
+    assert_eq!(store.list(AccountProvider::Claude).expect("list").len(), 1);
 }
 
 #[test]
@@ -220,12 +219,15 @@ fn list_is_empty_before_any_add_and_preserves_insertion_order() {
     let tokens = FakeTokenStore::working();
     let store = store_in(&dir, &tokens);
 
-    assert!(store.list().expect("empty list").is_empty());
+    assert!(store
+        .list(AccountProvider::Claude)
+        .expect("empty list")
+        .is_empty());
 
     store.add("Second", TOKEN).expect("add");
     store.add("First", TOKEN).expect("add");
     let labels: Vec<String> = store
-        .list()
+        .list(AccountProvider::Claude)
         .expect("list")
         .into_iter()
         .map(|a| a.label)
@@ -240,7 +242,9 @@ fn list_fails_loudly_on_a_corrupt_metadata_file() {
     let tokens = FakeTokenStore::working();
     let store = store_in(&dir, &tokens);
 
-    let error = store.list().expect_err("corrupt file");
+    let error = store
+        .list(AccountProvider::Claude)
+        .expect_err("corrupt file");
     assert!(
         error.contains("claude-accounts.json"),
         "error names the file: {error}"
@@ -305,16 +309,14 @@ fn remove_deletes_metadata_and_token() {
     store.remove(&work.id).expect("remove");
 
     let ids: Vec<String> = store
-        .list()
+        .list(AccountProvider::Claude)
         .expect("list")
         .into_iter()
         .map(|a| a.id)
         .collect();
     assert_eq!(ids, vec![personal.id.clone()]);
-    assert!(!tokens.stored().contains_key(&token_keyring_name(&work.id)));
-    assert!(tokens
-        .stored()
-        .contains_key(&token_keyring_name(&personal.id)));
+    assert!(!tokens.stored().contains_key(&kr(&work.id)));
+    assert!(tokens.stored().contains_key(&kr(&personal.id)));
     assert!(store
         .remove(&work.id)
         .expect_err("second remove")
@@ -343,7 +345,7 @@ fn token_missing_from_the_token_store_for_a_known_account_is_an_error() {
 
     let work = store.add("Work", TOKEN).expect("add");
     tokens
-        .delete(&token_keyring_name(&work.id))
+        .delete(&kr(&work.id))
         .expect("simulate lost keyring entry");
 
     let error = store.token(&work.id).expect_err("metadata without token");
@@ -524,7 +526,7 @@ fn remove_reports_a_lingering_keyring_entry_as_a_warning_not_a_failure() {
     let store = store_in(&dir, &tokens);
 
     let work = store.add("Work", TOKEN).expect("add");
-    let warning = store
+    let (_removed, warning) = store
         .remove(&work.id)
         .expect("the account is gone even if the keyring entry lingers");
     assert!(
@@ -532,7 +534,10 @@ fn remove_reports_a_lingering_keyring_entry_as_a_warning_not_a_failure() {
         "caller must learn about the orphaned keyring entry"
     );
     assert!(
-        store.list().expect("list").is_empty(),
+        store
+            .list(AccountProvider::Claude)
+            .expect("list")
+            .is_empty(),
         "metadata removal is what makes the account gone"
     );
 }

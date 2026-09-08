@@ -1,5 +1,6 @@
 import { AgentDefaultsSettingsCard } from "./AgentDefaultsSettingsCard";
 import { ClaudeAccountsSettingsCard } from "./ClaudeAccountsSettingsCard";
+import { CodexAccountsSettingsCard } from "./CodexAccountsSettingsCard";
 import {
   setKeepMentionedAgentsPinned,
   useKeepMentionedAgentsPinned,
@@ -53,6 +54,7 @@ export function AgentsSettingsPanel() {
         <HarnessesSettingsPanel />
         <AgentDefaultsSettingsCard />
         <ClaudeAccountsSettingsCard />
+        <CodexAccountsSettingsCard />
       </SettingsOptionGroupList>
     </section>
   );

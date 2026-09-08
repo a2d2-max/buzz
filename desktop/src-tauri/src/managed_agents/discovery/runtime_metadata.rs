@@ -165,6 +165,11 @@ pub(crate) struct KnownAcpRuntime {
     /// `AcpRuntimeCatalogEntry` so the UI gates the account picker on this
     /// fact instead of comparing harness ids.
     pub oauth_token_env_var: Option<&'static str>,
+    /// Whether per-agent Codex accounts apply: the spawn can point this
+    /// runtime at another OpenAI login via `CODEX_HOME` (+ `OPENAI_API_KEY`
+    /// for key accounts). Exposed on `AcpRuntimeCatalogEntry` the same way as
+    /// `oauth_token_env_var`, so UI and spawn can never disagree.
+    pub supports_codex_accounts: bool,
 }
 
 impl KnownAcpRuntime {

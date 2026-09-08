@@ -166,6 +166,14 @@ pub(crate) fn oauth_token_env_var_for_command(command: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether a harness with this STATIC definition command honors per-agent
+/// Codex accounts — same projection rule as `oauth_token_env_var_for_command`:
+/// resolved the way spawn resolves it, so a custom or preset harness wrapping
+/// `codex-acp` counts.
+pub(crate) fn supports_codex_accounts_for_command(command: &str) -> bool {
+    known_acp_runtime(command).is_some_and(|runtime| runtime.supports_codex_accounts)
+}
+
 pub(crate) fn known_acp_runtime_exact(id: &str) -> Option<&'static KnownAcpRuntime> {
     KNOWN_ACP_RUNTIMES.iter().find(|p| p.id == id)
 }
@@ -1053,6 +1061,7 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             provider_env_var: runtime.provider_env_var.map(str::to_string),
             thinking_env_var: runtime.thinking_env_var.map(str::to_string),
             oauth_token_env_var: runtime.oauth_token_env_var.map(str::to_string),
+            supports_codex_accounts: runtime.supports_codex_accounts,
             effort_canonical_values: runtime
                 .effort_normalization
                 .map(|norm| norm.canonical.iter().map(|s| s.to_string()).collect()),
@@ -1196,6 +1205,7 @@ pub fn discover_acp_runtimes_from(
                 provider_env_var: None,
                 thinking_env_var: None,
                 oauth_token_env_var: oauth_token_env_var_for_command(&def.command),
+                supports_codex_accounts: supports_codex_accounts_for_command(&def.command),
                 effort_canonical_values: None,
                 max_tokens_env_var: None,
                 context_limit_env_var: None,
