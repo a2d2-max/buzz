@@ -65,18 +65,21 @@ async function seedEvent({ assignees = [], status = "todo" } = {}) {
 }
 
 /**
- * Stubs the relay + Tauri seams the panel writes through. `signing` decides
- * what `sign_event` does; every other Tauri command answers with something
- * harmless so React Query never retries into the test's timers.
+ * Stubs the relay + Tauri seams the panel writes through. `signing` is
+ * called once per `sign_event` with the call index and decides how that
+ * signing settles; every other Tauri command answers with something
+ * harmless so React Query never retries into the test's timers. The live
+ * subscription reports ready at once so history is allowed to start.
  */
 async function installSeams({ signing }) {
   const { relayClient } = await import("@/shared/api/relayClient");
   const published = [];
   let signCounter = 0;
   mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
-  mock.method(relayClient, "subscribeLive", () =>
-    Promise.resolve(() => Promise.resolve()),
-  );
+  mock.method(relayClient, "subscribeLive", (_filter, _onEvent, onReady) => {
+    onReady?.("eose");
+    return Promise.resolve(() => Promise.resolve());
+  });
   mock.method(relayClient, "subscribeToReconnects", () => () => {});
   mock.method(relayClient, "publishEvent", (event) => {
     published.push(event);
@@ -85,9 +88,10 @@ async function installSeams({ signing }) {
   globalThis.window.__TAURI_INTERNALS__ = {
     invoke: (command, args) => {
       if (command === "sign_event") {
-        return signing(args).then((input) =>
+        const index = signCounter++;
+        return signing(args, index).then((input) =>
           JSON.stringify({
-            id: `${String(++signCounter).padStart(4, "0")}${"f".repeat(60)}`,
+            id: `${String(index + 1).padStart(4, "0")}${"f".repeat(60)}`,
             pubkey: input.pubkey,
             created_at: args.createdAt,
             kind: args.kind,
@@ -108,6 +112,18 @@ async function installSeams({ signing }) {
     transformCallback: () => 1,
   };
   return { published };
+}
+
+/** Settle React and the write queue until `predicate` holds (or give up). */
+async function settleUntil(predicate, { attempts = 50 } = {}) {
+  const { act } = await import("@testing-library/react");
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    if (predicate()) return;
+  }
+  throw new Error("settleUntil: predicate never held");
 }
 
 async function renderPanel({ events, viewer }) {
@@ -240,6 +256,58 @@ test("a successful move publishes a newer revision and the card stays put", asyn
   const cached = queryClient.getQueryData(QUERY_KEY);
   assert.equal(cached.length, 1);
   assert.equal(cached[0].id, event.id);
+  assert.deepEqual(toasts.errors, []);
+});
+
+test("a second move of the same card waits for the first and builds on it", async (t) => {
+  const toasts = await captureToasts(t);
+  // Hold only the first signing; everything after it signs at once.
+  let releaseFirst;
+  const firstSigning = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const { published } = await installSeams({
+    signing: (_args, index) =>
+      index === 0 ? firstSigning : Promise.resolve({ pubkey: AUTHOR }),
+  });
+  const { container, queryClient } = await renderPanel({
+    events: [await seedEvent()],
+    viewer: AUTHOR,
+  });
+  t.after(() => queryClient.clear());
+
+  // To Do -> Doing (held), then Doing -> Done while the first is in flight.
+  await keyboardDrag(
+    container.querySelector("[data-testid='community-task-drag-handle']"),
+    1,
+  );
+  assert.equal(columnOf(container, CARD_ID), "doing");
+  await keyboardDrag(
+    container.querySelector("[data-testid='community-task-drag-handle']"),
+    1,
+  );
+  assert.equal(columnOf(container, CARD_ID), "done", "optimistic overlay");
+  assert.deepEqual(published, [], "the second write waits for the first");
+
+  releaseFirst({ pubkey: AUTHOR });
+  await settleUntil(() => published.length === 2);
+
+  const [first, second] = published.map((event) => ({
+    content: JSON.parse(event.content),
+    createdAt: event.created_at,
+    id: event.id,
+  }));
+  assert.equal(first.content.status, "doing");
+  assert.equal(second.content.status, "done");
+  assert.ok(
+    second.content.updatedAt > first.content.updatedAt,
+    "the second write strictly follows the first",
+  );
+  assert.ok(second.createdAt > first.createdAt);
+  assert.equal(columnOf(container, CARD_ID), "done");
+  const cached = queryClient.getQueryData(QUERY_KEY);
+  assert.equal(cached.length, 1);
+  assert.equal(cached[0].id, second.id, "the cache keeps the newest write");
   assert.deepEqual(toasts.errors, []);
 });
 

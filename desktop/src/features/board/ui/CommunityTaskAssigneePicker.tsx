@@ -13,6 +13,8 @@ import {
   communityTaskProfileLabel,
 } from "./CommunityTaskAssignees";
 
+const SEARCH_PANEL_ID = "community-task-assign-search-panel";
+
 /**
  * The assignee list of one card, editable in place: remove with the ✕ on a
  * chip, add yourself with one click, or search the community. The picker
@@ -21,12 +23,15 @@ import {
 export function CommunityTaskAssigneePicker({
   assignees,
   disabled = false,
+  labelledBy,
   onChange,
   profiles,
   viewerPubkey,
 }: {
   assignees: string[];
   disabled?: boolean;
+  /** id of the visible "Assignees" heading; names the whole group. */
+  labelledBy: string;
   onChange: (assignees: string[]) => void;
   profiles?: UserProfileLookup;
   viewerPubkey: string | null;
@@ -60,7 +65,11 @@ export function CommunityTaskAssigneePicker({
   };
 
   return (
-    <div className="space-y-2" data-testid="community-task-assignee-picker">
+    <fieldset
+      aria-labelledby={labelledBy}
+      className="m-0 min-w-0 space-y-2 border-0 p-0"
+      data-testid="community-task-assignee-picker"
+    >
       <div className="flex flex-wrap items-center gap-1.5">
         {assignees.map((pubkey) => {
           const label = communityTaskProfileLabel(pubkey, profiles);
@@ -105,6 +114,7 @@ export function CommunityTaskAssigneePicker({
             </Button>
           ) : null}
           <Button
+            aria-controls={searchOpen ? SEARCH_PANEL_ID : undefined}
             aria-expanded={searchOpen}
             data-testid="community-task-assign-search-toggle"
             onClick={() => setSearchOpen((open) => !open)}
@@ -118,7 +128,10 @@ export function CommunityTaskAssigneePicker({
         </div>
       )}
       {searchOpen && !disabled ? (
-        <div className="space-y-1.5 rounded-lg border border-border/60 p-2">
+        <div
+          className="space-y-1.5 rounded-lg border border-border/60 p-2"
+          id={SEARCH_PANEL_ID}
+        >
           <Input
             aria-label="Search people to assign"
             className="h-8 text-xs"
@@ -171,6 +184,6 @@ export function CommunityTaskAssigneePicker({
           </ul>
         </div>
       ) : null}
-    </div>
+    </fieldset>
   );
 }

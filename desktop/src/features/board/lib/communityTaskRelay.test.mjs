@@ -6,6 +6,7 @@ import { serializeCommunityTaskContent } from "./communityTaskCodec.ts";
 import {
   COMMUNITY_TASK_HISTORY_MAX_PAGES,
   COMMUNITY_TASK_HISTORY_PAGE_LIMIT,
+  fetchCommunityTaskCardEvents,
   fetchCommunityTaskEvents,
   isCommunityTaskEvent,
   publishCommunityTaskRevision,
@@ -142,6 +143,20 @@ test("history fails loudly when the relay hands the same cursor back", async (t)
   });
   await assert.rejects(fetchCommunityTaskEvents(), /cursor did not advance/);
   assert.equal(calls, 2, "one page, one retry with the cursor, then stop");
+});
+
+test("one card's events are fetched by exact d-tag, which the relay pushes into SQL", async (t) => {
+  t.after(() => mock.reset());
+  const filters = [];
+  const rows = [appDataEvent({ n: 1, createdAt: 10, card: true })];
+  mock.method(relayClient, "fetchEvents", (filter) => {
+    filters.push(filter);
+    return Promise.resolve(rows);
+  });
+  assert.equal(await fetchCommunityTaskCardEvents("card-1"), rows);
+  assert.deepEqual(filters, [
+    { kinds: [30078], "#d": ["community-task:card-1"], limit: 100 },
+  ]);
 });
 
 test("publishing signs a kind:30078 card with its d and t tags and returns the event", async (t) => {

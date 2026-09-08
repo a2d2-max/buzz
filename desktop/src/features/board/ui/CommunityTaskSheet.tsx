@@ -62,22 +62,38 @@ function draftOf(task: CommunityTask): Draft {
   };
 }
 
+const FIELD_LABEL_CLASS = "block text-xs font-medium text-muted-foreground";
+
 function FieldLabel({
   children,
   htmlFor,
 }: {
   children: React.ReactNode;
-  htmlFor?: string;
+  htmlFor: string;
 }) {
   return (
-    <label
-      className="block text-xs font-medium text-muted-foreground"
-      htmlFor={htmlFor}
-    >
+    <label className={FIELD_LABEL_CLASS} htmlFor={htmlFor}>
       {children}
     </label>
   );
 }
+
+/** Heading for a control group (the assignee picker) that no single input owns. */
+function GroupHeading({
+  children,
+  id,
+}: {
+  children: React.ReactNode;
+  id: string;
+}) {
+  return (
+    <span className={FIELD_LABEL_CLASS} id={id}>
+      {children}
+    </span>
+  );
+}
+
+const ASSIGNEES_HEADING_ID = "community-task-sheet-assignees-heading";
 
 /**
  * Side sheet for one card. Editors (author or assignee) get the form and
@@ -308,10 +324,13 @@ export function CommunityTaskSheet({
                   </div>
                 </div>
                 <div className="space-y-1.5">
-                  <FieldLabel>Assignees</FieldLabel>
+                  <GroupHeading id={ASSIGNEES_HEADING_ID}>
+                    Assignees
+                  </GroupHeading>
                   <CommunityTaskAssigneePicker
                     assignees={draft.assignees}
                     disabled={busy}
+                    labelledBy={ASSIGNEES_HEADING_ID}
                     onChange={(assignees) => patch({ assignees })}
                     profiles={profiles}
                     viewerPubkey={viewerPubkey}
@@ -401,10 +420,13 @@ export function CommunityTaskSheet({
                   </p>
                 )}
                 <div className="space-y-1.5">
-                  <FieldLabel>Assignees</FieldLabel>
+                  <GroupHeading id={ASSIGNEES_HEADING_ID}>
+                    Assignees
+                  </GroupHeading>
                   <CommunityTaskAssigneePicker
                     assignees={task.assignees}
                     disabled
+                    labelledBy={ASSIGNEES_HEADING_ID}
                     onChange={() => {}}
                     profiles={profiles}
                     viewerPubkey={viewerPubkey}

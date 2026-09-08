@@ -45,11 +45,18 @@ export function compareCommunityTasksInColumn(
 }
 
 /**
- * An `order` that sorts after everything already on the board — a new card
- * joins the bottom of its column, and so does a card dropped into one.
+ * An `order` that sorts after every card already in the column — a new card
+ * joins the bottom, and so does a card dropped in. Derived from the column,
+ * not the wall clock, so a device with a slow clock cannot jump the queue.
  */
-export function nextCommunityTaskOrder(nowMs = Date.now()): number {
-  return nowMs;
+export function nextCommunityTaskOrder(
+  columnTasks: readonly Pick<CommunityTask, "order">[],
+): number {
+  let highest = 0;
+  for (const task of columnTasks) {
+    if (task.order > highest) highest = task.order;
+  }
+  return Math.floor(highest) + 1;
 }
 
 export function communityTasksByStatus(

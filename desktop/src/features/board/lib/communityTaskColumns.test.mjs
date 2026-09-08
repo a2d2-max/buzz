@@ -6,6 +6,7 @@ import {
   COMMUNITY_TASK_STATUS_LABELS,
   communityTasksByStatus,
   compareCommunityTasksInColumn,
+  nextCommunityTaskOrder,
   resolveCommunityTaskDrop,
 } from "./communityTaskColumns.ts";
 
@@ -66,4 +67,10 @@ test("communityTasksByStatus buckets and sorts every column", () => {
     columns.done.map((task) => task.id),
     ["x"],
   );
+});
+
+test("the next order lands below every card in the column, clock be damned", () => {
+  assert.equal(nextCommunityTaskOrder([]), 1);
+  assert.equal(nextCommunityTaskOrder([{ order: 3 }, { order: 7.5 }]), 8);
+  assert.equal(nextCommunityTaskOrder([{ order: -4 }]), 1);
 });

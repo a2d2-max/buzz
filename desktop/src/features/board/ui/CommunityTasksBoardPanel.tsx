@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -18,9 +19,9 @@ import {
   latestOwnCommunityTaskEventCreatedAt,
   mergeCommunityTaskEvents,
 } from "@/features/board/lib/communityTaskMerge";
+import { CommunityTaskWriteQueue } from "@/features/board/lib/communityTaskWriteQueue";
 import {
-  useCommunityTaskEventsQuery,
-  useCommunityTasksLiveUpdates,
+  useCommunityTasks,
   useSaveCommunityTaskMutation,
 } from "@/features/board/lib/useCommunityTasks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
@@ -44,6 +45,17 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1_000);
 }
 
+/** The `order` that puts `key` at the bottom of `status` on `board`. */
+function orderAtBottom(
+  board: readonly CommunityTask[],
+  status: CommunityTaskStatus,
+  key: string,
+): number {
+  return nextCommunityTaskOrder(
+    board.filter((task) => task.status === status && task.key !== key),
+  );
+}
+
 export type CommunityTasksBoardPanelProps = {
   className?: string;
 };
@@ -58,14 +70,15 @@ export type CommunityTasksBoardPanelProps = {
 export function CommunityTasksBoardPanel({
   className,
 }: CommunityTasksBoardPanelProps = {}) {
-  const eventsQuery = useCommunityTaskEventsQuery();
-  useCommunityTasksLiveUpdates();
+  const queryClient = useQueryClient();
+  const { query: eventsQuery, queryKey } = useCommunityTasks();
   const identityQuery = useIdentityQuery();
   const viewer = identityQuery.data?.pubkey
     ? normalizePubkey(identityQuery.data.pubkey)
     : null;
   const { isPending: isSaving, mutateAsync: save } =
     useSaveCommunityTaskMutation();
+  const writeQueue = React.useRef(new CommunityTaskWriteQueue()).current;
 
   const events = eventsQuery.data ?? EMPTY_EVENTS;
   const tasks = React.useMemo(() => mergeCommunityTaskEvents(events), [events]);
@@ -122,24 +135,62 @@ export function CommunityTasksBoardPanel({
     [viewer],
   );
 
+  /**
+   * The board as the cache knows it right now — not this render's snapshot
+   * — so a queued write builds on whatever the write before it left behind.
+   */
+  const readFreshBoard = React.useCallback(
+    () =>
+      mergeCommunityTaskEvents(
+        queryClient.getQueryData<RelayEvent[]>(queryKey) ?? EMPTY_EVENTS,
+      ),
+    [queryClient, queryKey],
+  );
+
+  /**
+   * One write to one card, queued behind any write already in flight for
+   * it. `build` gets the card's freshest state (and the fresh board, for
+   * column order) and returns the content to publish; the stamps are set
+   * here, from that fresh state, so every write strictly follows the one
+   * before it instead of tying with it on a same-second clock.
+   */
+  const writeCard = React.useCallback(
+    (
+      key: string,
+      build: (
+        fresh: CommunityTask,
+        board: readonly CommunityTask[],
+      ) => CommunityTaskContent,
+    ) =>
+      writeQueue.enqueue(key, async () => {
+        const board = readFreshBoard();
+        const fresh = board.find((task) => task.key === key);
+        if (!fresh) throw new Error("This task is no longer on the board.");
+        const content = build(fresh, board);
+        const cached =
+          queryClient.getQueryData<RelayEvent[]>(queryKey) ?? EMPTY_EVENTS;
+        await save({
+          content: {
+            ...content,
+            updatedAt: nextMonotonicSeconds(nowSeconds(), fresh.updatedAt),
+          },
+          id: fresh.id,
+          previousEventCreatedAt: viewer
+            ? latestOwnCommunityTaskEventCreatedAt(cached, fresh.id, viewer)
+            : undefined,
+        });
+      }),
+    [queryClient, queryKey, readFreshBoard, save, viewer, writeQueue],
+  );
+
   const handleMoveTask = React.useCallback(
     (task: CommunityTask, status: CommunityTaskStatus) => {
       setPendingStatus((current) => ({ ...current, [task.key]: status }));
-      const content: CommunityTaskContent = {
-        ...communityTaskContentOf(task),
-        order: nextCommunityTaskOrder(),
+      void writeCard(task.key, (fresh, board) => ({
+        ...communityTaskContentOf(fresh),
+        order: orderAtBottom(board, status, fresh.key),
         status,
-        updatedAt: nextMonotonicSeconds(nowSeconds(), task.updatedAt),
-      };
-      void save({
-        content,
-        id: task.id,
-        previousEventCreatedAt: latestOwnCommunityTaskEventCreatedAt(
-          events,
-          task.id,
-          viewer ?? "",
-        ),
-      })
+      }))
         .then(() => clearPendingStatus(task.key, status))
         .catch((error: unknown) => {
           // Roll the card back to the column it came from.
@@ -149,7 +200,7 @@ export function CommunityTasksBoardPanel({
           );
         });
     },
-    [clearPendingStatus, events, save, viewer],
+    [clearPendingStatus, writeCard],
   );
 
   const handleCreate = React.useCallback(
@@ -162,7 +213,9 @@ export function CommunityTasksBoardPanel({
         body: draft.body,
         status: "todo",
         assignees: [],
-        order: nextCommunityTaskOrder(),
+        order: nextCommunityTaskOrder(
+          readFreshBoard().filter((task) => task.status === "todo"),
+        ),
         createdAt: now,
         updatedAt: now,
       };
@@ -170,47 +223,46 @@ export function CommunityTasksBoardPanel({
       await save({ content, id: newCommunityTaskId() });
       toast.success("Task created.");
     },
-    [save, viewer],
+    [readFreshBoard, save, viewer],
   );
 
   const handleSave = React.useCallback(
     async (content: CommunityTaskContent) => {
       if (!selectedTask) return;
-      await save({
-        content: {
-          ...content,
-          updatedAt: nextMonotonicSeconds(nowSeconds(), selectedTask.updatedAt),
-        },
-        id: selectedTask.id,
-        previousEventCreatedAt: latestOwnCommunityTaskEventCreatedAt(
-          events,
-          selectedTask.id,
-          viewer ?? "",
-        ),
+      await writeCard(selectedTask.key, (fresh, board) => {
+        // The sheet's draft owns the fields a person edits; identity and
+        // position come from the card as it is now.
+        const next: CommunityTaskContent = {
+          ...communityTaskContentOf(fresh),
+          assignees: content.assignees,
+          body: content.body,
+          status: content.status,
+          title: content.title,
+        };
+        if (content.due === undefined) delete next.due;
+        else next.due = content.due;
+        if (content.status !== fresh.status) {
+          next.order = orderAtBottom(board, content.status, fresh.key);
+        }
+        return next;
       });
       toast.success("Task saved.");
       setSelectedTaskKey(null);
     },
-    [events, save, selectedTask, viewer],
+    [selectedTask, writeCard],
   );
 
   const handleDelete = React.useCallback(async () => {
     if (!selectedTask) return;
-    await save({
-      content: tombstoneCommunityTaskContent(
-        communityTaskContentOf(selectedTask),
+    await writeCard(selectedTask.key, (fresh) =>
+      tombstoneCommunityTaskContent(
+        communityTaskContentOf(fresh),
         nowSeconds(),
       ),
-      id: selectedTask.id,
-      previousEventCreatedAt: latestOwnCommunityTaskEventCreatedAt(
-        events,
-        selectedTask.id,
-        viewer ?? "",
-      ),
-    });
+    );
     toast.success("Task deleted.");
     setSelectedTaskKey(null);
-  }, [events, save, selectedTask, viewer]);
+  }, [selectedTask, writeCard]);
 
   const handleOpenTask = React.useCallback(
     (task: CommunityTask) => setSelectedTaskKey(task.key),
@@ -232,7 +284,9 @@ export function CommunityTasksBoardPanel({
   );
 
   let body: React.ReactNode;
-  if (eventsQuery.isLoading) {
+  if (eventsQuery.isPending) {
+    // Also covers the moment before the live subscription is armed and
+    // history is allowed to start.
     body = <BuzzLoadingState label="Loading tasks" />;
   } else if (visibleTasks.length === 0) {
     body = (

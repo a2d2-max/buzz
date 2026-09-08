@@ -8,6 +8,7 @@ import {
 } from "@/shared/constants/kinds";
 import {
   type CommunityTaskContent,
+  communityTaskDTag,
   communityTaskIdFromDTag,
   communityTaskTags,
   serializeCommunityTaskContent,
@@ -90,6 +91,24 @@ export async function fetchCommunityTaskEvents(): Promise<RelayEvent[]> {
     cursor = { until: tail.created_at, before_id: tail.id };
   }
   return cards;
+}
+
+/** Every signer's current event for one card — at most one row per signer. */
+const CARD_EVENTS_LIMIT = 100;
+
+/**
+ * What the relay currently holds for one card, from every signer. Unlike
+ * `#t`, a `#d` filter on a NIP-33 kind is pushed into SQL, so this is one
+ * cheap, exact query — the right tool for reconciling a card after a write.
+ */
+export function fetchCommunityTaskCardEvents(
+  id: string,
+): Promise<RelayEvent[]> {
+  return relayClient.fetchEvents({
+    kinds: [KIND_COMMUNITY_TASK],
+    "#d": [communityTaskDTag(id)],
+    limit: CARD_EVENTS_LIMIT,
+  });
 }
 
 /**
