@@ -185,3 +185,72 @@ test("fetchProjectsWorkItems returns a single row for a PR present in both proje
   // Sanity: the stub was actually called (proves we ran the production path).
   assert.ok(callCount >= 1, "fetchEvents must have been called");
 });
+
+// ── Status events ───────────────────────────────────────────────────────────
+//
+// The relay post-filters `#a` AFTER its SQL LIMIT, so a status fetch bounded
+// by repo address silently truncates in a busy community — and a root whose
+// status was cut off falls back to its labels (usually Backlog). Statuses are
+// therefore walked by root id (`#e`), the one tag constraint pushed into SQL.
+
+const STATUS_KINDS = [1630, 1631, 1632, 1633];
+
+function makeStatus(id, rootId, kind, createdAt) {
+  return {
+    id,
+    kind,
+    pubkey: REPO_OWNER,
+    created_at: createdAt,
+    content: "",
+    tags: [
+      ["e", rootId, "", "root"],
+      ["a", REPO_ADDRESS],
+    ],
+  };
+}
+
+test("statuses are fetched by root id for issues and pull requests alike", async () => {
+  const statusFilters = [];
+  const fetchEvents = async (filter) => {
+    if (filter.kinds?.includes(1621)) {
+      return [makeIssue(ISSUE_ID), makePR(PR_ID)];
+    }
+    if (STATUS_KINDS.some((kind) => filter.kinds?.includes(kind))) {
+      statusFilters.push(filter);
+      return [
+        makeStatus("s".repeat(64), ISSUE_ID, 1631, 200),
+        makeStatus("t".repeat(64), PR_ID, 1631, 200),
+      ];
+    }
+    return [];
+  };
+
+  const result = await fetchProjectsWorkItems([projectA], fetchEvents);
+
+  assert.equal(statusFilters.length, 1, "one exhaustive walk, no repo window");
+  assert.deepEqual(
+    [...statusFilters[0]["#e"]].sort(),
+    [ISSUE_ID, PR_ID].sort(),
+  );
+  assert.equal(statusFilters[0]["#a"], undefined, "#a is post-filtered");
+  assert.deepEqual(statusFilters[0].kinds, STATUS_KINDS);
+  assert.equal(result.issues.items[0].issue.status, "Done");
+  assert.equal(result.pullRequests.items[0].pullRequest.status, "Merged");
+  assert.deepEqual(result.issues.failedSections, []);
+});
+
+test("a failed status walk surfaces as a failed statuses section", async () => {
+  const fetchEvents = async (filter) => {
+    if (filter.kinds?.includes(1621)) return [makeIssue(ISSUE_ID)];
+    if (STATUS_KINDS.some((kind) => filter.kinds?.includes(kind))) {
+      throw new Error("relay went away");
+    }
+    return [];
+  };
+
+  const result = await fetchProjectsWorkItems([projectA], fetchEvents);
+
+  assert.equal(result.issues.items.length, 1, "roots still render");
+  assert.ok(result.issues.failedSections.includes("statuses"));
+  assert.ok(result.pullRequests.failedSections.includes("statuses"));
+});

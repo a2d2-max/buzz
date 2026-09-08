@@ -347,3 +347,21 @@ test("a card that turns unmovable mid-drag is not moved", async () => {
 
   assert.deepEqual(moves, []);
 });
+
+test("a locked board says why in every column and offers no drag handles", async () => {
+  const { screen } = await import("@testing-library/react");
+  // `canMoveIssue` still says yes: the lock must win on its own.
+  await renderBoard({ moveLockedReason: "Statuses did not load." });
+
+  assert.equal(
+    screen.queryAllByTestId("project-issue-board-drag-handle").length,
+    0,
+  );
+  const hints = screen.getAllByTestId("project-issue-board-column-locked");
+  assert.equal(hints.length, BOARD_ORDER.length);
+  assert.ok(
+    hints.every((hint) => hint.textContent === "Statuses did not load."),
+  );
+  // The cards themselves stay readable and openable.
+  assert.equal(screen.getAllByTestId("project-issue-board-card").length, 6);
+});

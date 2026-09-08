@@ -2,6 +2,7 @@ import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
 import { type BoardTab, parseBoardTab } from "@/features/board/boardTabs";
+import { usePreviewFeatureWarning } from "@/shared/features";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 
 const BoardScreen = React.lazy(async () => {
@@ -32,6 +33,9 @@ export const Route = createFileRoute("/board")({
 });
 
 function BoardRouteComponent() {
+  // The board publishes NIP-34 status events for project tasks, so it sits
+  // behind the same preview gate as the Projects surface it writes to.
+  usePreviewFeatureWarning("projects");
   return (
     <React.Suspense
       fallback={<ViewLoadingFallback includeHeader kind="board" />}

@@ -186,19 +186,22 @@ export function AppSidebarPrimaryMenu({
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              className="data-[active=true]:font-normal"
-              data-testid="open-board-view"
-              isActive={selectedView === "board"}
-              onClick={onSelectBoard}
-              tooltip="Board"
-              type="button"
-            >
-              <KanbanSquare className="h-4 w-4" />
-              <SidebarMenuLabel>Board</SidebarMenuLabel>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
+          {/* Writes project task statuses, so it follows the Projects gate. */}
+          <FeatureGate feature="projects">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                className="data-[active=true]:font-normal"
+                data-testid="open-board-view"
+                isActive={selectedView === "board"}
+                onClick={onSelectBoard}
+                tooltip="Board"
+                type="button"
+              >
+                <KanbanSquare className="h-4 w-4" />
+                <SidebarMenuLabel>Board</SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
         </SidebarMenu>
       </SidebarHeader>
       <SidebarProjectsSection />

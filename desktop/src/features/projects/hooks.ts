@@ -56,7 +56,10 @@ import {
   PR_INLINE_COMMENT_LABEL,
   projectPullRequestEventsToPullRequests,
 } from "./projectPullRequests.mjs";
-import { fetchProjectsWorkItems } from "./projectWorkItems";
+import {
+  fetchProjectsWorkItems,
+  projectsWorkItemsQueryKey,
+} from "./projectWorkItems";
 import {
   projectDeletionMutationOptions,
   projectsQueryKey,
@@ -833,19 +836,7 @@ export function useProjectPullRequestsQuery(
 export function useProjectsWorkItemsQuery(projects: Project[]) {
   return useQuery({
     enabled: projects.length > 0,
-    queryKey: [
-      "projects",
-      "work-items",
-      projects.map((project) => project.id),
-      // Repo attach/detach changes the fan-out inputs without changing
-      // project ids; keying on addresses too prevents a pre-attach result
-      // from serving as fresh for the whole staleTime window.
-      projects
-        .flatMap((project) =>
-          project.repositories.map((repository) => repository.repoAddress),
-        )
-        .sort(),
-    ],
+    queryKey: projectsWorkItemsQueryKey(projects),
     queryFn: ({ signal }) =>
       fetchProjectsWorkItems(projects, undefined, signal),
     staleTime: PROJECT_WORK_ITEMS_STALE_TIME_MS,

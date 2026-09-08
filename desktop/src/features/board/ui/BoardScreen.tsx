@@ -1,5 +1,3 @@
-import { useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft } from "lucide-react";
 import * as React from "react";
 
 import {
@@ -11,7 +9,6 @@ import { PROJECT_TAB_TRIGGER_CLASS } from "@/features/projects/ui/ProjectWorkspa
 import { ProjectPanelState } from "@/features/projects/ui/ProjectPanelState";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { useHistorySearchState } from "@/shared/hooks/useHistorySearchState";
-import { Button } from "@/shared/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { CommunityIssueBoardPanel } from "./CommunityIssueBoardPanel";
 
@@ -23,18 +20,9 @@ const BOARD_SEARCH_KEYS = ["issue", "tab"] as const;
  * URL so back/forward and reloads restore them.
  */
 export function BoardScreen() {
-  const queryClient = useQueryClient();
   const { applyPatch, values } = useHistorySearchState(BOARD_SEARCH_KEYS);
   const tab = parseBoardTab(values.tab) ?? DEFAULT_BOARD_TAB;
   const selectedIssueId = values.issue;
-
-  React.useEffect(() => {
-    return () => {
-      // Leaving the surface: stop the work-items fan, whose assignment
-      // pagination is abort-aware. Cached data stays for the next visit.
-      void queryClient.cancelQueries({ queryKey: ["projects", "work-items"] });
-    };
-  }, [queryClient]);
 
   const handleTabChange = React.useCallback(
     (value: string) => {
@@ -60,19 +48,6 @@ export function BoardScreen() {
     >
       <TopChromeInsetHeader flush>
         <div className="flex min-h-9 items-center gap-2 px-4 py-2">
-          {selectedIssueId ? (
-            <Button
-              aria-label="Back to board"
-              className="h-7 w-7 p-0"
-              data-testid="community-board-back"
-              onClick={() => handleSelectedIssueIdChange(null)}
-              size="icon"
-              type="button"
-              variant="ghost"
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-          ) : null}
           <span className="text-sm font-semibold">Board</span>
           <TabsList className="ml-2 h-7 gap-1.5 bg-transparent p-0">
             <TabsTrigger

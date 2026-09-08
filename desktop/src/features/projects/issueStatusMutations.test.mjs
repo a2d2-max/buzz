@@ -97,6 +97,66 @@ test("createdAt outranks the previous status event", () => {
   );
 });
 
+test("a createdAt the caller already showed is published exactly as given", () => {
+  // The board hands over the timestamp of its optimistic overlay so the event
+  // and the overlay agree; the clock is not consulted in that case.
+  assert.equal(
+    projectIssueStatusEvent(
+      project,
+      issue({ statusCreatedAt: 1_700 }),
+      "Done",
+      1_900,
+      1_701,
+    ).createdAt,
+    1_701,
+  );
+});
+
+test("both write paths forward a caller-supplied createdAt", async (t) => {
+  const prior = globalThis.window;
+  t.after(() => {
+    globalThis.window = prior;
+  });
+  const calls = [];
+  installTauriInvoke((command, args) => {
+    calls.push([command, args]);
+    return command === "sign_event"
+      ? Promise.reject(new Error("no signer in tests"))
+      : Promise.resolve(null);
+  });
+
+  await updateProjectIssueStatus({
+    createdAt: 4_000_000_009,
+    issue: issue({ statusCreatedAt: 4_000_000_000 }),
+    project,
+    signAsManagedOwner: true,
+    status: "Closed",
+  });
+  await assert.rejects(
+    updateProjectIssueStatus({
+      createdAt: 4_000_000_009,
+      issue: issue({ statusCreatedAt: 4_000_000_000 }),
+      project,
+      signAsManagedOwner: false,
+      status: "Triage",
+    }),
+    /no signer in tests/,
+  );
+
+  assert.deepEqual(
+    calls.map(([command, args]) => [
+      command,
+      command === "sign_project_issue_status"
+        ? args.input.createdAt
+        : args.createdAt,
+    ]),
+    [
+      ["sign_project_issue_status", 4_000_000_009],
+      ["sign_event", 4_000_000_009],
+    ],
+  );
+});
+
 test("the managed-owner path hands the whole write to the Tauri command", async (t) => {
   const prior = globalThis.window;
   t.after(() => {

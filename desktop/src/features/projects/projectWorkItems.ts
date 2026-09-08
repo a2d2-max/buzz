@@ -23,6 +23,7 @@ import {
   type ProjectPullRequest,
   projectPullRequestEventsToPullRequests,
 } from "./projectPullRequests.mjs";
+import { fetchRootTaggedEvents } from "./rootTaggedEventFetch";
 
 type RepositoryReference = {
   repoAddress: string;
@@ -31,6 +32,30 @@ type RepositoryReference = {
 type ProjectReference = {
   repositories: RepositoryReference[];
 };
+
+/**
+ * Query key of the aggregate work-items fan for these projects. Exported so a
+ * surface can cancel exactly the fetch it observes on unmount without
+ * touching other consumers' scopes (`ProjectHomeWorkspaceSheet`,
+ * `ProjectInboxDetail`) that share the `["projects", "work-items"]` prefix.
+ */
+export function projectsWorkItemsQueryKey<
+  TProject extends ProjectReference & { id: string },
+>(projects: readonly TProject[]) {
+  return [
+    "projects",
+    "work-items",
+    projects.map((project) => project.id),
+    // Repo attach/detach changes the fan-out inputs without changing
+    // project ids; keying on addresses too prevents a pre-attach result
+    // from serving as fresh for the whole staleTime window.
+    projects
+      .flatMap((project) =>
+        project.repositories.map((repository) => repository.repoAddress),
+      )
+      .sort(),
+  ] as const;
+}
 
 type ProjectRepository<TProject extends ProjectReference> =
   TProject["repositories"][number];
@@ -116,21 +141,31 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
         "#a": repoAddresses,
         limit: 2_000,
       }),
-      fetchEvents({
-        kinds: [
-          KIND_GIT_STATUS_OPEN,
-          KIND_GIT_STATUS_MERGED,
-          KIND_GIT_STATUS_CLOSED,
-          KIND_GIT_STATUS_DRAFT,
-        ],
-        "#a": repoAddresses,
-        limit: 2_000,
-      }),
+      // Statuses are authoritative: a root whose status event fell outside a
+      // bounded `#a` window (the relay post-filters `#a` AFTER its SQL LIMIT)
+      // silently falls back to its labels, and the board would then let a
+      // closed task be "reopened" from a column it was never in. Walk them
+      // to exhaustion by root id (`#e`), the one tag constraint the relay
+      // pushes into SQL; see fetchRootTaggedEvents.
+      rootPromise.then((rootEvents) =>
+        fetchRootTaggedEvents({
+          fetchEvents,
+          kinds: [
+            KIND_GIT_STATUS_OPEN,
+            KIND_GIT_STATUS_MERGED,
+            KIND_GIT_STATUS_CLOSED,
+            KIND_GIT_STATUS_DRAFT,
+          ],
+          rootIds: rootEvents.map((event) => event.id),
+          signal,
+          subject: { history: "task statuses", rows: "status events" },
+        }),
+      ),
       // Assignment state must reduce over the complete operation history —
       // the 2,000-comment window above is shared across every loaded repo
       // and can evict older assignment operations. Keyed by issue id (`#e`)
-      // because that is the only tag constraint the relay applies before its
-      // SQL LIMIT; see fetchAssignmentOperationEvents.
+      // for the same reason as the statuses; see
+      // fetchAssignmentOperationEvents.
       rootPromise.then((rootEvents) =>
         fetchAssignmentOperationEvents(
           rootEvents
@@ -142,10 +177,10 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
       ),
     ]);
 
-  // The five eager queries above are single bounded REQs the relay client
-  // cannot abort mid-flight; only the assignment pagination is abort-aware.
-  // What cancellation CAN save here is the reduce work below and caching a
-  // result for a surface the user already left.
+  // The three eager queries above are single bounded REQs the relay client
+  // cannot abort mid-flight; only the status and assignment pagination is
+  // abort-aware. What cancellation CAN save here is the reduce work below
+  // and caching a result for a surface the user already left.
   signal?.throwIfAborted();
 
   if (rootResult.status === "rejected") {

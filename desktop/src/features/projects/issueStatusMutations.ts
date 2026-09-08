@@ -16,6 +16,14 @@ import {
 } from "./projectIssues.mjs";
 
 export type ProjectIssueStatusMutationInput = {
+  /**
+   * `created_at` for the status event. A board that already shows the move
+   * optimistically passes the timestamp it displayed, so the published event
+   * and the overlay agree exactly and a second drop on the same card (whose
+   * overlaid `statusCreatedAt` is this value) always outranks the first.
+   * Defaults to the next second after the issue's current status.
+   */
+  createdAt?: number;
   issue: ProjectIssue;
   /**
    * Repository the status event is published against. Optional for the
@@ -44,6 +52,7 @@ export function projectIssueStatusEvent(
   issue: ProjectIssue,
   status: IssueBoardDropStatus,
   now: number,
+  createdAt?: number,
 ): {
   createdAt: number;
   kind: number;
@@ -58,7 +67,7 @@ export function projectIssueStatusEvent(
     ...new Set([project.owner.toLowerCase(), issue.author.toLowerCase()]),
   ];
   return {
-    createdAt: nextProjectIssueStatusCreatedAt(issue, now),
+    createdAt: createdAt ?? nextProjectIssueStatusCreatedAt(issue, now),
     kind: target.kind,
     word: target.word,
     tags: [
@@ -70,6 +79,7 @@ export function projectIssueStatusEvent(
 }
 
 export async function updateProjectIssueStatus({
+  createdAt: requestedCreatedAt,
   issue,
   project,
   signAsManagedOwner,
@@ -80,6 +90,7 @@ export async function updateProjectIssueStatus({
     issue,
     status,
     Math.floor(Date.now() / 1_000),
+    requestedCreatedAt,
   );
   if (signAsManagedOwner) {
     await signProjectIssueStatus({

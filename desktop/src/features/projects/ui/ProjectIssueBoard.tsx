@@ -187,11 +187,13 @@ function BoardColumn({
   children,
   count,
   dragging,
+  lockedReason,
   status,
 }: {
   children: React.ReactNode;
   count: number;
   dragging: boolean;
+  lockedReason?: string;
   status: ProjectIssueStatus;
 }) {
   const visual = issueStatusVisual(status);
@@ -234,6 +236,14 @@ function BoardColumn({
             Set by labels — drop not available.
           </p>
         ) : null}
+        {lockedReason ? (
+          <p
+            className="px-1 text-2xs text-muted-foreground/60"
+            data-testid="project-issue-board-column-locked"
+          >
+            {lockedReason}
+          </p>
+        ) : null}
         {children}
       </div>
     </section>
@@ -248,12 +258,20 @@ function BoardColumn({
 export function ProjectIssueBoard({
   canMoveIssue,
   items,
+  moveLockedReason,
   onMoveIssue,
   onOpenIssue,
   profiles,
 }: {
   canMoveIssue: (item: ProjectIssueBoardItem) => boolean;
   items: ProjectIssueBoardItem[];
+  /**
+   * When set, no card can be moved regardless of `canMoveIssue`, and every
+   * column says why. For boards whose statuses are known to be incomplete:
+   * a drop would publish an authoritative status over one the viewer never
+   * saw.
+   */
+  moveLockedReason?: string;
   onMoveIssue: (
     item: ProjectIssueBoardItem,
     status: IssueBoardDropStatus,
@@ -261,6 +279,7 @@ export function ProjectIssueBoard({
   onOpenIssue: (item: ProjectIssueBoardItem) => void;
   profiles?: UserProfileLookup;
 }) {
+  const locked = moveLockedReason !== undefined;
   const [activeIssueId, setActiveIssueId] = React.useState<string | null>(null);
   // Without these, dnd-kit announces the draggable id — a 64-char hex event id
   // read out one character at a time.
@@ -319,12 +338,12 @@ export function ProjectIssueBoard({
         currentStatus: item.issue.status,
         overStatus:
           overData?.type === "issue-column" ? overData.status : undefined,
-        permitted: canMoveIssue(item),
+        permitted: !locked && canMoveIssue(item),
       });
       if (status === null) return;
       onMoveIssue(item, status);
     },
-    [canMoveIssue, items, onMoveIssue],
+    [canMoveIssue, items, locked, onMoveIssue],
   );
 
   const activeItem = activeIssueId
@@ -353,11 +372,12 @@ export function ProjectIssueBoard({
               count={columnItems.length}
               dragging={activeIssueId !== null}
               key={status}
+              lockedReason={moveLockedReason}
               status={status}
             >
               {columnItems.map((item) => (
                 <IssueCard
-                  draggable={canMoveIssue(item)}
+                  draggable={!locked && canMoveIssue(item)}
                   isDragging={item.issue.id === activeIssueId}
                   issue={item.issue}
                   key={item.issue.id}

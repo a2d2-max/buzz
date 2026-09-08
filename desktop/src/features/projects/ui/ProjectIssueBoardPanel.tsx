@@ -1,4 +1,3 @@
-import { useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 import { toast } from "sonner";
 
@@ -10,6 +9,7 @@ import {
 } from "@/features/projects/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useUpdateProjectIssueStatusMutation } from "@/features/projects/issueStatusMutations";
+import { useIssueStatusOverlays } from "@/features/projects/issueStatusOverlay";
 import type { IssueBoardDropStatus } from "@/features/projects/lib/issueBoardColumns";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -20,6 +20,8 @@ import {
 } from "./ProjectIssueBoard";
 import { ProjectIssueDetail } from "./ProjectIssuesPanel";
 import { ProjectPanelState } from "./ProjectPanelState";
+
+const EMPTY_ISSUES: ProjectIssue[] = [];
 
 /**
  * Data + permissions wrapper for the kanban board. `ProjectIssueBoard` stays
@@ -43,42 +45,16 @@ export function ProjectIssueBoardPanel({
   const isOwner = viewer === normalizePubkey(project.owner);
   const isManagedAgentOwner = useIsManagedAgent(project.owner) === true;
   const { mutateAsync } = useUpdateProjectIssueStatusMutation(project);
-  const queryClient = useQueryClient();
-  // Show the move immediately, then drop the overlay once the refetch settles
-  // (success) or the publish fails (rollback). It never outlives one write, so
-  // a lagging relay cannot strand a card in a column it isn't in.
-  const [pendingStatus, setPendingStatus] = React.useState<
-    Record<string, ProjectIssue["status"]>
-  >({});
-
-  const issues = React.useMemo(
-    () => issuesQuery.data ?? [],
-    [issuesQuery.data],
-  );
-
-  const clearPendingStatus = React.useCallback(
-    (issueId: string, status: ProjectIssue["status"]) => {
-      setPendingStatus((current) => {
-        // A newer drag on the same card owns the overlay now.
-        if (current[issueId] !== status) return current;
-        const rest = { ...current };
-        delete rest[issueId];
-        return rest;
-      });
-    },
-    [],
-  );
+  const issues = issuesQuery.data ?? EMPTY_ISSUES;
+  // Show the move immediately. The overlay clears once the refetch the
+  // mutation triggers brings back a status at least as new as the one
+  // published, or at once when the publish fails (rollback) — so a lagging
+  // relay cannot strand a card in a column it isn't in.
+  const { apply, begin, rollBack } = useIssueStatusOverlays(issues);
 
   const items = React.useMemo<ProjectIssueBoardItem[]>(
-    () =>
-      issues.map((issue) => {
-        const pending = pendingStatus[issue.id];
-        return {
-          issue: pending ? { ...issue, status: pending } : issue,
-          project,
-        };
-      }),
-    [issues, pendingStatus, project],
+    () => issues.map((issue) => ({ issue: apply(issue), project })),
+    [apply, issues, project],
   );
 
   const canMoveIssue = React.useCallback(
@@ -92,38 +68,23 @@ export function ProjectIssueBoardPanel({
 
   const handleMoveIssue = React.useCallback(
     (item: ProjectIssueBoardItem, status: IssueBoardDropStatus) => {
-      setPendingStatus((current) => ({ ...current, [item.issue.id]: status }));
+      const createdAt = begin(item.issue, status);
       void mutateAsync({
+        createdAt,
         issue: item.issue,
         signAsManagedOwner: isManagedAgentOwner && !isOwner,
         status,
-      })
-        .then(async () => {
-          // The mutation already asked for a refetch; awaiting the same key
-          // joins that in-flight fetch and resolves when it settles.
-          await queryClient.invalidateQueries({
-            queryKey: ["project", project.id, "issues"],
-          });
-          clearPendingStatus(item.issue.id, status);
-        })
-        .catch((error: unknown) => {
-          // Roll the card back to the column it came from.
-          clearPendingStatus(item.issue.id, status);
-          toast.error(
-            error instanceof Error
-              ? error.message
-              : `Failed to move this task to ${status}.`,
-          );
-        });
+      }).catch((error: unknown) => {
+        // Roll the card back to the column it came from.
+        rollBack(item.issue.id, createdAt);
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : `Failed to move this task to ${status}.`,
+        );
+      });
     },
-    [
-      clearPendingStatus,
-      isManagedAgentOwner,
-      isOwner,
-      mutateAsync,
-      project.id,
-      queryClient,
-    ],
+    [begin, isManagedAgentOwner, isOwner, mutateAsync, rollBack],
   );
 
   const handleOpenIssue = React.useCallback(

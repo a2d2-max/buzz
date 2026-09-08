@@ -5,6 +5,7 @@ import {
   markAllReadSources,
   activateDesktopNotificationTarget,
   createDesktopNotificationActivationQueue,
+  deriveShellRoute,
   shouldBounceForChannelNotification,
 } from "./AppShell.helpers.ts";
 
@@ -242,4 +243,18 @@ test("markAllReadSources skips the active marker without projected activity", ()
   });
 
   assert.deepEqual(calls, ["channels"]);
+});
+
+test("deriveShellRoute selects the board view for /board and its children", () => {
+  const board = { selectedChannelId: null, selectedView: "board" };
+  assert.deepEqual(deriveShellRoute("/board"), board);
+  assert.deepEqual(deriveShellRoute("/board/tasks"), board);
+});
+
+test("deriveShellRoute does not mistake a board-prefixed path for the board", () => {
+  assert.equal(deriveShellRoute("/boards").selectedView, "home");
+  assert.equal(deriveShellRoute("/boardroom").selectedView, "home");
+  // Neighbouring views keep their own routing.
+  assert.equal(deriveShellRoute("/projects").selectedView, "projects");
+  assert.equal(deriveShellRoute("/pulse").selectedView, "pulse");
 });
