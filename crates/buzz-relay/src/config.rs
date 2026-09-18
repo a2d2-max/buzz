@@ -901,7 +901,7 @@ impl Config {
             max_file_bytes: std::env::var("BUZZ_MAX_FILE_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(100 * 1024 * 1024),
+                .unwrap_or(500 * 1024 * 1024),
             public_base_url: std::env::var("BUZZ_MEDIA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:3000/media".to_string()),
             // Per-upload-event records (`_uploads/` moderation side channel).
