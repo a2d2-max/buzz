@@ -38,7 +38,7 @@ fn default_max_video_bytes() -> u64 {
 }
 
 fn default_max_file_bytes() -> u64 {
-    104_857_600 // 100 MB
+    524_288_000 // 500 MB
 }
 
 fn default_s3_region() -> String {
@@ -74,7 +74,7 @@ pub struct MediaConfig {
     /// Maximum upload size for video files (bytes). Default: 500 MB.
     #[serde(default = "default_max_video_bytes")]
     pub max_video_bytes: u64,
-    /// Maximum upload size for generic (non-image, non-video) files (bytes). Default: 100 MB.
+    /// Maximum upload size for generic (non-image, non-video) files (bytes). Default: 500 MB.
     #[serde(default = "default_max_file_bytes")]
     pub max_file_bytes: u64,
     /// Public base URL for media URLs in BlobDescriptor (must include `/media` path).
