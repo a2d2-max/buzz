@@ -19,7 +19,7 @@ use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -36,6 +36,17 @@ pub(crate) const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CAPTURE_LIMIT: usize = 64 * 1024;
 const MESSAGE_MAX_CHARS: usize = 200;
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct OutputDrain {
+    receiver: mpsc::Receiver<Result<(), String>>,
+    done: bool,
+}
+
+enum DrainWaitError {
+    Pending(String),
+    Failed(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,7 +102,10 @@ pub(crate) struct CodexLoginSession {
     timeout: Duration,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_drain: OutputDrain,
+    stderr_drain: OutputDrain,
     outcome: Option<(CodexLoginState, String)>,
+    terminal_message: Option<String>,
     cleanup_pending: Option<(CodexLoginState, String)>,
 }
 
@@ -142,8 +156,8 @@ fn spawn_browser_login(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {label}: {error}"))?;
-    let stdout = drain_bounded(child.stdout.take());
-    let stderr = drain_bounded(child.stderr.take());
+    let (stdout, stdout_drain) = drain_bounded(child.stdout.take(), "stdout");
+    let (stderr, stderr_drain) = drain_bounded(child.stderr.take(), "stderr");
     Ok(CodexLoginSession {
         child,
         generation: uuid::Uuid::new_v4().to_string(),
@@ -152,7 +166,10 @@ fn spawn_browser_login(
         timeout,
         stdout,
         stderr,
+        stdout_drain,
+        stderr_drain,
         outcome: None,
+        terminal_message: None,
         cleanup_pending: None,
     })
 }
@@ -160,25 +177,39 @@ fn spawn_browser_login(
 /// Read a pipe to EOF on a background thread, keeping at most
 /// `CAPTURE_LIMIT` bytes but always draining so the child never blocks on a
 /// full pipe.
-fn drain_bounded(pipe: Option<impl Read + Send + 'static>) -> Arc<Mutex<Vec<u8>>> {
+fn drain_bounded(
+    pipe: Option<impl Read + Send + 'static>,
+    label: &'static str,
+) -> (Arc<Mutex<Vec<u8>>>, OutputDrain) {
     let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
     if let Some(mut pipe) = pipe {
         let sink = Arc::clone(&buffer);
         std::thread::spawn(move || {
             let mut chunk = [0u8; 4096];
-            loop {
+            let result = loop {
                 match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break Ok(()),
+                    Err(error) => break Err(format!("failed to drain login {label}: {error}")),
                     Ok(read) => {
                         let mut buffer = sink.lock().unwrap_or_else(|e| e.into_inner());
                         let room = CAPTURE_LIMIT.saturating_sub(buffer.len());
                         buffer.extend_from_slice(&chunk[..read.min(room)]);
                     }
                 }
-            }
+            };
+            let _ = done_tx.send(result);
         });
+    } else {
+        let _ = done_tx.send(Ok(()));
     }
-    buffer
+    (
+        buffer,
+        OutputDrain {
+            receiver: done_rx,
+            done: false,
+        },
+    )
 }
 
 impl CodexLoginSession {
@@ -250,9 +281,10 @@ impl CodexLoginSession {
         };
         let message = match (&self.cleanup_pending, state) {
             (Some((_, error)), _) => Some(error.clone()),
-            (None, CodexLoginState::Failed) => {
-                Some(failure_message(&self.stderr_text(), &self.stdout_text()))
-            }
+            (None, CodexLoginState::Failed) => self
+                .terminal_message
+                .clone()
+                .or_else(|| Some(failure_message(&self.stderr_text(), &self.stdout_text()))),
             (None, CodexLoginState::TimedOut) => Some(format!(
                 "no sign-in within {}s — start again when you are ready",
                 self.timeout.as_secs()
@@ -291,7 +323,7 @@ impl CodexLoginSession {
                 format!("failed to reap login process {}: {error}", self.child.id())
             }),
         ) {
-            Ok(()) => self.finish(state),
+            Ok(()) => self.finish_after_output_drain(state),
             Err(error) => self.record_cleanup_pending(state, error),
         }
     }
@@ -302,9 +334,33 @@ impl CodexLoginSession {
         cleanup: &mut impl FnMut(u32) -> Result<(), String>,
     ) {
         match cleanup(self.child.id()) {
-            Ok(()) => self.finish(state),
+            Ok(()) => self.finish_after_output_drain(state),
             Err(error) => self.record_cleanup_pending(state, error),
         }
+    }
+
+    fn finish_after_output_drain(&mut self, state: CodexLoginState) {
+        match self.wait_for_output_drain() {
+            Ok(()) => self.finish(state),
+            Err(DrainWaitError::Pending(error)) => self.record_cleanup_pending(state, error),
+            Err(DrainWaitError::Failed(error)) => self.finish_failed(error),
+        }
+    }
+
+    fn finish_failed(&mut self, error: String) {
+        let mut message = error;
+        if message.chars().count() > MESSAGE_MAX_CHARS {
+            message = message.chars().take(MESSAGE_MAX_CHARS).collect();
+            message.push('…');
+        }
+        self.terminal_message = Some(message);
+        self.finish(CodexLoginState::Failed);
+    }
+
+    fn wait_for_output_drain(&mut self) -> Result<(), DrainWaitError> {
+        let deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
+        wait_for_drain(&mut self.stdout_drain, "stdout", deadline)?;
+        wait_for_drain(&mut self.stderr_drain, "stderr", deadline)
     }
 
     fn record_cleanup_pending(&mut self, state: CodexLoginState, error: String) {
@@ -321,6 +377,31 @@ impl CodexLoginSession {
     fn finish(&mut self, state: CodexLoginState) {
         self.cleanup_pending = None;
         self.outcome = Some((state, crate::util::now_iso()));
+    }
+}
+
+fn wait_for_drain(
+    drain: &mut OutputDrain,
+    label: &str,
+    deadline: Instant,
+) -> Result<(), DrainWaitError> {
+    if drain.done {
+        return Ok(());
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match drain.receiver.recv_timeout(remaining) {
+        Ok(Ok(())) => {
+            drain.done = true;
+            Ok(())
+        }
+        Ok(Err(error)) => Err(DrainWaitError::Failed(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(DrainWaitError::Pending(format!(
+            "timed out after {}ms draining login {label}",
+            OUTPUT_DRAIN_TIMEOUT.as_millis()
+        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(DrainWaitError::Failed(format!(
+            "login {label} collector stopped before completion"
+        ))),
     }
 }
 

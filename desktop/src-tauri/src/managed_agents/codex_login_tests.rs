@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use super::{
     auth_url_from_output, callback_port_in_use, login_start_conflict,
     retain_running_login_sessions, spawn_claude_login, spawn_codex_login, ClaudeLoginLaunch,
-    CodexLoginLaunch, CodexLoginSession, CodexLoginSnapshot, CodexLoginState,
+    CodexLoginLaunch, CodexLoginSession, CodexLoginSnapshot, CodexLoginState, OutputDrain,
 };
 
 #[cfg(unix)]
@@ -141,15 +141,98 @@ fn login_child_gets_the_account_home_and_no_ambient_api_key() {
     );
     let home = temp.path().join("acct home");
     std::fs::create_dir_all(&home).expect("home");
+    for attempt in 0..32 {
+        let mut session =
+            spawn_codex_login(&launch(&fake, &home, temp.path(), Duration::from_secs(10)))
+                .expect("spawn");
+        let snapshot = wait_terminal(&mut session, Duration::from_secs(10));
+        assert_eq!(
+            snapshot.state,
+            CodexLoginState::Succeeded,
+            "attempt {attempt}: {snapshot:?}"
+        );
+        assert_eq!(
+            session.stdout_text().trim(),
+            format!("HOME={} KEY=unset", home.display()),
+            "attempt {attempt}: a terminal snapshot must include fully drained output, CODEX_HOME must be the account home, and an ambient key must not leak in"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_state_waits_for_output_drain_and_preserves_retry_target() {
+    let temp = TempDir::new().expect("tempdir");
+    let fake = fake_codex(&temp, "printf 'ready\\n'; exit 0");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
     let mut session =
         spawn_codex_login(&launch(&fake, &home, temp.path(), Duration::from_secs(10)))
             .expect("spawn");
-    let snapshot = wait_terminal(&mut session, Duration::from_secs(10));
-    assert_eq!(snapshot.state, CodexLoginState::Succeeded, "{snapshot:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.child.try_wait().expect("wait").is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.child.try_wait().expect("wait").is_some());
+
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel();
+    session.stdout_drain = OutputDrain {
+        receiver: drain_rx,
+        done: false,
+    };
+    let pending = session.poll_with_cleanup(|_| Ok(()));
+    assert_eq!(pending.state, CodexLoginState::Failed, "{pending:?}");
+    assert_eq!(pending.finished_at, None, "drain timeout remains retryable");
     assert_eq!(
-        session.stdout_text().trim(),
-        format!("HOME={} KEY=unset", home.display()),
-        "CODEX_HOME must be the account home and an ambient key must not leak in"
+        session.cleanup_pending.as_ref().map(|(state, _)| *state),
+        Some(CodexLoginState::Succeeded),
+        "the original terminal result is the retry target"
+    );
+
+    drain_tx.send(Ok(())).expect("complete delayed drain");
+    let recovered = session.poll_with_cleanup(|_| Ok(()));
+    assert_eq!(recovered.state, CodexLoginState::Succeeded, "{recovered:?}");
+    assert!(recovered.finished_at.is_some());
+    assert_eq!(session.stdout_text().trim(), "ready");
+}
+
+#[cfg(unix)]
+#[test]
+fn disconnected_output_collector_is_a_terminal_failure() {
+    let temp = TempDir::new().expect("tempdir");
+    let fake = fake_codex(&temp, "exit 0");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let mut session =
+        spawn_codex_login(&launch(&fake, &home, temp.path(), Duration::from_secs(10)))
+            .expect("spawn");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.child.try_wait().expect("wait").is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.child.try_wait().expect("wait").is_some());
+
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel();
+    drop(drain_tx);
+    session.stdout_drain = OutputDrain {
+        receiver: drain_rx,
+        done: false,
+    };
+    let failed = session.poll_with_cleanup(|_| Ok(()));
+    assert_eq!(failed.state, CodexLoginState::Failed, "{failed:?}");
+    assert!(
+        failed.finished_at.is_some(),
+        "the session permits a new login"
+    );
+    assert!(session.is_finished());
+    assert!(
+        failed
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("collector stopped before completion")),
+        "{failed:?}"
     );
 }
 
