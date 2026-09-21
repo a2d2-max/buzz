@@ -69,6 +69,12 @@ pub struct ConnectionState {
     pub remote_addr: SocketAddr,
     /// Current NIP-42 authentication state.
     pub auth_state: RwLock<AuthState>,
+    /// Verified company assertion prepared on the WebSocket upgrade. The raw
+    /// compact JWS remains sealed inside this value and is used only for final
+    /// admission revalidation after NIP-42 proves the actor key.
+    pub federated_assertion: Option<buzz_auth::VerifiedAssertion>,
+    /// Start of the connection lease, captured before authentication work.
+    pub connected_at: chrono::DateTime<chrono::Utc>,
     /// Active subscriptions keyed by subscription ID.
     pub subscriptions: ConnectionSubscriptions,
     /// Sender for outbound data messages (EVENT, NOTICE, OK, etc.).
@@ -128,6 +134,7 @@ pub async fn handle_connection(
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
+    federated_assertion: Option<buzz_auth::VerifiedAssertion>,
 ) {
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
@@ -142,7 +149,17 @@ pub async fn handle_connection(
         community_id,
         control,
         move || async move { check_state.db.is_community_active(community_id).await },
-        move |control| handle_active_connection(socket, run_state, addr, tenant, conn_id, control),
+        move |control| {
+            handle_active_connection(
+                socket,
+                run_state,
+                addr,
+                tenant,
+                conn_id,
+                control,
+                federated_assertion,
+            )
+        },
     )
     .await;
 }
@@ -154,6 +171,7 @@ async fn handle_active_connection(
     tenant: TenantContext,
     conn_id: Uuid,
     control: CommunityConnectionControl,
+    federated_assertion: Option<buzz_auth::VerifiedAssertion>,
 ) {
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
@@ -187,6 +205,8 @@ async fn handle_active_connection(
         auth_state: RwLock::new(AuthState::Pending {
             challenge: challenge.clone(),
         }),
+        federated_assertion,
+        connected_at: chrono::Utc::now(),
         subscriptions: Arc::clone(&subscriptions),
         send_tx: tx.clone(),
         ctrl_tx: ctrl_tx.clone(),
@@ -676,6 +696,8 @@ pub(crate) mod tests {
             ),
             remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
             auth_state: RwLock::new(auth),
+            federated_assertion: None,
+            connected_at: chrono::Utc::now(),
             subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             send_tx,
             ctrl_tx,

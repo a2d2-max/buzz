@@ -3,6 +3,136 @@ use crate::managed_agents::known_acp_runtime;
 #[path = "cli_tests.rs"]
 mod cli_tests;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn production_harness_builder_protects_external_codex_sources_and_allows_other_writes() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let protected_parent = dir.path().join("protected-parent");
+    let orca_root = protected_parent.join("orca");
+    let home = orca_root.join("codex-accounts/account-a/home");
+    let other_original = orca_root.join("codex-accounts/account-b/home/original");
+    let claude_original = orca_root.join("claude-accounts/account-c/home/original");
+    let writable = dir.path().join("writable");
+    for path in [
+        &home,
+        other_original.parent().unwrap(),
+        claude_original.parent().unwrap(),
+        &writable,
+    ] {
+        std::fs::create_dir_all(path).expect("fixture dir");
+    }
+    std::fs::write(&other_original, "codex-original").expect("other original");
+    std::fs::write(&claude_original, "claude-original").expect("Claude original");
+    symlink(&other_original, home.join("codex-alias")).expect("Codex alias");
+    symlink(&claude_original, home.join("claude-alias")).expect("Claude alias");
+
+    let auth = crate::managed_agents::codex_accounts::CodexSpawnAuth {
+        home_dir: std::fs::canonicalize(&home).expect("canonical home"),
+        api_key: None,
+        external_read_only: true,
+    };
+    let blocked = home.join("blocked");
+    let allowed = writable.join("allowed");
+    let moved_orca = protected_parent.join("moved-orca");
+    let moved_parent = dir.path().join("moved-parent");
+    let script = format!(
+        "touch '{}' 2>/dev/null || true; printf changed > '{}' 2>/dev/null || true; printf changed > '{}' 2>/dev/null || true; mv '{}' '{}' 2>/dev/null || true; rm -rf '{}' 2>/dev/null || true; mv '{}' '{}' 2>/dev/null || true; touch '{}'",
+        blocked.display(),
+        home.join("codex-alias").display(),
+        home.join("claude-alias").display(),
+        orca_root.display(),
+        moved_orca.display(),
+        orca_root.display(),
+        protected_parent.display(),
+        moved_parent.display(),
+        allowed.display(),
+    );
+    let mut command =
+        super::build_agent_harness_command(std::path::Path::new("/bin/sh"), Some(&auth))
+            .expect("protected harness");
+    command.args(["-c", &script]);
+    assert!(command.status().expect("run fixture process").success());
+    assert!(!blocked.exists());
+    assert_eq!(
+        std::fs::read_to_string(other_original).unwrap(),
+        "codex-original"
+    );
+    assert_eq!(
+        std::fs::read_to_string(claude_original).unwrap(),
+        "claude-original"
+    );
+    assert!(orca_root.is_dir(), "Orca root cannot be renamed or removed");
+    assert!(!moved_orca.exists());
+    assert!(
+        protected_parent.is_dir(),
+        "a writable ancestor cannot be renamed around the protected root"
+    );
+    assert!(!moved_parent.exists());
+    assert!(allowed.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn production_harness_command_writes_state_inside_each_agent_owned_home() {
+    for (env_key, home_name) in [
+        ("CODEX_HOME", "codex-agent-home"),
+        ("HERMES_HOME", "hermes-agent-home"),
+    ] {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir.path().join(home_name);
+        std::fs::create_dir_all(&home).expect("agent home");
+        let plan = crate::managed_agents::agent_home::DataHomePlan {
+            env_key,
+            dir: home.clone(),
+        };
+        let mut command = super::build_agent_harness_command(std::path::Path::new("/bin/sh"), None)
+            .expect("production harness command");
+        let _data_home =
+            crate::managed_agents::agent_home::apply_agent_data_home(&mut command, Some(&plan));
+        command.args([
+            "-c",
+            &format!(
+                "printf state > \"${{{env_key}}}/state.json\"; printf refreshed > \"${{{env_key}}}/auth-refresh\""
+            ),
+        ]);
+
+        assert!(command.status().expect("run fixture harness").success());
+        assert_eq!(
+            std::fs::read_to_string(home.join("state.json")).unwrap(),
+            "state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth-refresh")).unwrap(),
+            "refreshed"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn production_harness_builder_rejects_hardlinked_external_auth() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let home = dir.path().join("orca/codex-accounts/account-a/home");
+    let original = dir
+        .path()
+        .join("orca/codex-accounts/account-b/home/original-auth");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(original.parent().unwrap()).expect("other home");
+    std::fs::write(&original, "original").expect("original auth");
+    std::fs::hard_link(&original, home.join("auth.json")).expect("hardlink fixture");
+    let auth = crate::managed_agents::codex_accounts::CodexSpawnAuth {
+        home_dir: std::fs::canonicalize(home).expect("canonical home"),
+        api_key: None,
+        external_read_only: true,
+    };
+    let error = super::build_agent_harness_command(std::path::Path::new("/bin/sh"), Some(&auth))
+        .expect_err("hardlinked auth must fail closed");
+    assert!(error.contains("not a single regular file"));
+    assert_eq!(std::fs::read_to_string(original).unwrap(), "original");
+}
+
 // ── desktop binary name tests ───────────────────────────────────────────
 
 #[test]

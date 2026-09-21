@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::AppHandle;
 
+pub(crate) use super::claude_accounts::ExternalCodexAccount;
 use super::claude_accounts::{AccountProvider, CodexAuthKind};
 use super::discovery::KnownAcpRuntime;
 use super::storage::managed_agents_base_dir;
@@ -39,6 +40,119 @@ pub(crate) const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const CODEX_HOMES_DIR_NAME: &str = "codex-homes";
 const CODEX_CONFIG_FILE_NAME: &str = "config.toml";
 const CODEX_CREDENTIAL_STORE_KEY: &str = "cli_auth_credentials_store";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedCodexHome {
+    pub path: PathBuf,
+    pub external_read_only: bool,
+}
+
+pub(crate) fn resolve_codex_home(
+    app_owned_home: PathBuf,
+    external_home: Option<PathBuf>,
+) -> ResolvedCodexHome {
+    match external_home {
+        Some(path) => ResolvedCodexHome {
+            path,
+            external_read_only: true,
+        },
+        None => ResolvedCodexHome {
+            path: app_owned_home,
+            external_read_only: false,
+        },
+    }
+}
+
+pub(crate) fn external_home_auth_kind(auth_kind: Option<CodexAuthKind>) -> Result<(), String> {
+    if auth_kind == Some(CodexAuthKind::Chatgpt) {
+        Ok(())
+    } else {
+        Err("an external Codex home is valid only for a ChatGPT account".to_string())
+    }
+}
+
+fn external_codex_account_roots(home: &Path) -> Result<[PathBuf; 3], String> {
+    let canonical = std::fs::canonicalize(home)
+        .map_err(|error| format!("external Codex home is unavailable: {error}"))?;
+    if canonical != home {
+        return Err("external Codex home changed after import; re-import it from Orca".to_string());
+    }
+    if home.file_name().and_then(|name| name.to_str()) != Some("home") {
+        return Err(
+            "external Codex home no longer has Orca's account-home shape; re-import it".to_string(),
+        );
+    }
+    let codex_accounts_root = home
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "external Codex home has no Orca source root".to_string())?;
+    if codex_accounts_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("codex-accounts")
+    {
+        return Err(
+            "external Codex home is outside Orca's account source tree; re-import it".to_string(),
+        );
+    }
+    let orca_root = codex_accounts_root
+        .parent()
+        .filter(|root| root.file_name().and_then(|name| name.to_str()) == Some("orca"))
+        .ok_or_else(|| {
+            "external Codex home is outside Orca's app-data tree; re-import it".to_string()
+        })?;
+    let canonical_orca_root = std::fs::canonicalize(orca_root)
+        .map_err(|error| format!("Orca Codex account source tree is unavailable: {error}"))?;
+    if canonical_orca_root != orca_root {
+        return Err(
+            "Orca Codex account source tree changed after import; re-import it".to_string(),
+        );
+    }
+    let claude_accounts_root = canonical_orca_root.join("claude-accounts");
+    match std::fs::symlink_metadata(&claude_accounts_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("Orca Claude account source root is not a regular directory".to_string());
+        }
+        Ok(_) => {
+            let canonical = std::fs::canonicalize(&claude_accounts_root).map_err(|error| {
+                format!("failed to resolve Orca Claude account source root: {error}")
+            })?;
+            if canonical != claude_accounts_root {
+                return Err("Orca Claude account source root changed unexpectedly".to_string());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect Orca Claude account source root: {error}"
+            ));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        for name in ["auth.json", "config.toml"] {
+            let path = home.join(name);
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!("failed to inspect external Codex {name}: {error}"));
+                }
+            };
+            if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() > 1 {
+                return Err(format!(
+                    "external Codex {name} is not a single regular file; repair it in Orca before using this account"
+                ));
+            }
+        }
+    }
+    Ok([
+        canonical_orca_root,
+        codex_accounts_root.to_path_buf(),
+        claude_accounts_root,
+    ])
+}
 
 /// The `CODEX_HOME` directory owned by account `id`.
 pub(crate) fn codex_home_dir<R: tauri::Runtime>(
@@ -286,30 +400,145 @@ fn atomic_write_codex_config(path: &Path, payload: &[u8]) -> Result<(), String> 
 }
 
 /// Delete the account's `CODEX_HOME` directory. For `chatgpt` accounts it
-/// holds real OAuth tokens (`auth.json`), so a removal must take it along;
-/// a failure is returned as a warning — the account itself is already gone.
+/// holds real OAuth tokens (`auth.json`), so this must succeed before account
+/// metadata is removed. Imported external homes remain read-only references.
 pub(crate) fn remove_codex_home_dir<R: tauri::Runtime>(
     app: &AppHandle<R>,
-    id: &str,
-) -> Option<String> {
-    let dir = match codex_home_dir(app, id) {
-        Ok(dir) => dir,
-        Err(error) => return Some(error),
-    };
-    if !dir.exists() {
-        return None;
+    account: &super::claude_accounts::ProviderAccount,
+) -> Result<(), String> {
+    let app_home = codex_home_dir(app, &account.id)?;
+    let home = resolve_codex_home(app_home, account.external_home.clone());
+    remove_resolved_codex_home_dir(&home)
+}
+
+/// Remove an app-owned Codex home. Imported external homes are references and
+/// are deliberately left untouched.
+pub(crate) fn remove_resolved_codex_home_dir(home: &ResolvedCodexHome) -> Result<(), String> {
+    if home.external_read_only || !home.path.exists() {
+        return Ok(());
     }
-    std::fs::remove_dir_all(&dir).err().map(|error| {
+    std::fs::remove_dir_all(&home.path).map_err(|error| {
         format!(
-            "account removed, but its Codex directory could not be deleted ({}): {error}",
-            dir.display()
+            "could not delete the account's Codex directory ({}): {error}; the account was kept so removal can be retried",
+            home.path.display()
         )
     })
 }
 
-/// The copyable one-time login command for a `chatgpt` account.
-pub(crate) fn codex_login_command(dir: &std::path::Path) -> String {
-    format!("CODEX_HOME=\"{}\" codex login", dir.display())
+fn sandbox_string(value: &Path) -> Result<String, String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| "external Codex home path is not valid UTF-8".to_string())?;
+    if value.contains(['\n', '\r', '\0']) {
+        return Err("external Codex home path contains unsupported characters".to_string());
+    }
+    Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Wrap the ACP harness so it and every descendant can read, but cannot write,
+/// an imported Orca home. Workspace and other process writes remain allowed.
+#[cfg(target_os = "macos")]
+pub(crate) fn command_for_external_codex_home(
+    program: &Path,
+    home: &Path,
+) -> Result<std::process::Command, String> {
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+    if !Path::new(SANDBOX_EXEC).is_file() {
+        return Err(
+            "macOS sandbox-exec is unavailable; refusing to start with an external Codex home"
+                .to_string(),
+        );
+    }
+    let [orca_root, codex_accounts_root, claude_accounts_root] =
+        external_codex_account_roots(home)?;
+    let protected_ancestors = orca_root
+        .ancestors()
+        .map(sandbox_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|ancestor| format!("(deny file-write* (literal \"{ancestor}\"))"))
+        .collect::<String>();
+    let codex_accounts_root = sandbox_string(&codex_accounts_root)?;
+    let claude_accounts_root = sandbox_string(&claude_accounts_root)?;
+    let profile = format!(
+        "(version 1)(allow default){protected_ancestors}(deny file-write* (literal \"{codex_accounts_root}\"))(deny file-write* (subpath \"{codex_accounts_root}\"))(deny file-write* (literal \"{claude_accounts_root}\"))(deny file-write* (subpath \"{claude_accounts_root}\"))"
+    );
+    let mut command = std::process::Command::new(SANDBOX_EXEC);
+    command.args(["-p", &profile]);
+    command.arg(program);
+    Ok(command)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn command_for_external_codex_home(
+    _program: &Path,
+    _home: &Path,
+) -> Result<std::process::Command, String> {
+    Err("external Orca Codex homes are supported only on macOS".to_string())
+}
+
+/// Status probes need no writes anywhere. Global denial also protects any
+/// path reached through a symlink inside the imported home.
+#[cfg(target_os = "macos")]
+pub(crate) fn command_for_read_only_probe(program: &Path) -> Result<std::process::Command, String> {
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+    if !Path::new(SANDBOX_EXEC).is_file() {
+        return Err(
+            "macOS sandbox-exec is unavailable; refusing to test an external Codex home"
+                .to_string(),
+        );
+    }
+    let mut command = std::process::Command::new(SANDBOX_EXEC);
+    command.args([
+        "-p",
+        "(version 1)(allow default)(deny file-write*)(allow file-write-data (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\") (literal \"/dev/tty\"))",
+    ]);
+    command.arg(program);
+    Ok(command)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn command_for_read_only_probe(
+    _program: &Path,
+) -> Result<std::process::Command, String> {
+    Err("external Orca Codex homes are supported only on macOS".to_string())
+}
+
+/// The copyable one-time login command for a `chatgpt` account, built for
+/// the owner's interactive shell.
+///
+/// A `codex` shell function or alias there (e.g. one that appends
+/// `--profile …`, which `codex login` rejects) would intercept a bare
+/// `codex`, so the CLI is named by the absolute path the resolver found —
+/// `resolve_command` never returns a function — or, while the CLI is not on
+/// PATH yet, through the POSIX `command` builtin, which also bypasses both.
+/// Words are single-quoted (ASCII `'`) only when they need it; the double
+/// quotes macOS text substitution turns into typographic quotes (leaving the
+/// shell stuck on `dquote>`) are never used.
+pub(crate) fn codex_login_command(dir: &Path, codex_binary: Option<&Path>) -> String {
+    let home = posix_shell_word(&dir.display().to_string());
+    match codex_binary {
+        Some(binary) => format!(
+            "{CODEX_HOME_ENV}={home} {} login",
+            posix_shell_word(&binary.display().to_string())
+        ),
+        None => format!("{CODEX_HOME_ENV}={home} command codex login"),
+    }
+}
+
+/// Quote `word` for a POSIX shell: left bare when it is plain
+/// (`[A-Za-z0-9/_.:=-]`), otherwise wrapped in ASCII single quotes with any
+/// embedded quote spelled `'\''`.
+fn posix_shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.' | ':' | '='));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 /// What the spawn writes onto the child for a named Codex account.
@@ -320,13 +549,17 @@ pub(crate) struct CodexSpawnAuth {
     /// The keyring API key for `api_key` accounts; `None` for `chatgpt`
     /// accounts, whose login lives in `home_dir` itself.
     pub api_key: Option<String>,
+    /// Imported Orca homes must be protected from writes by the full child
+    /// process tree.
+    pub external_read_only: bool,
 }
 
 /// The auth to inject for a spawn, or `None` when the agent runs on the app's
-/// own Codex login. Only the Codex runtime honors the selection, so a stale
-/// account id on a Claude/Goose agent is ignored rather than fatal; on a
-/// Codex agent a missing account fails closed — silently launching on a
-/// different login than the one the owner picked is worse than not launching.
+/// own Codex login. Fails closed in both bad cases: a runtime that does not
+/// honor the selection (a stale account id on a Claude/Goose/Hermes agent)
+/// would silently start on the app's own login — the global fallback the
+/// owner did not pick — and a missing account is just as wrong. Not
+/// launching beats launching on a different login.
 pub(crate) fn codex_account_spawn_auth(
     account_id: Option<&str>,
     runtime_is_codex: bool,
@@ -336,7 +569,10 @@ pub(crate) fn codex_account_spawn_auth(
         return Ok(None);
     };
     if !runtime_is_codex {
-        return Ok(None);
+        return Err(
+            "this runtime cannot sign in with a Codex account, so the one picked for the agent would be ignored — pick Default (or a supported runtime) in the agent's settings before starting it"
+                .to_string(),
+        );
     }
     match lookup(id)? {
         Some(auth) => Ok(Some(auth)),
@@ -363,7 +599,16 @@ pub(crate) fn lookup_codex_spawn_auth<R: tauri::Runtime>(
     if account.provider != AccountProvider::Codex {
         return Ok(None);
     }
-    let home_dir = ensure_codex_home_dir(app, id)?;
+    let app_home = codex_home_dir(app, id)?;
+    let home = resolve_codex_home(app_home, account.external_home.clone());
+    if home.external_read_only {
+        external_home_auth_kind(account.auth_kind)?;
+    }
+    if !home.external_read_only {
+        std::fs::create_dir_all(&home.path)
+            .map_err(|error| format!("failed to create the account's Codex directory: {error}"))?;
+    }
+    let home_dir = home.path.clone();
     match account.auth_kind {
         Some(CodexAuthKind::ApiKey) => {
             let api_key = super::claude_accounts::with_claude_account_store(app, |store| {
@@ -373,25 +618,39 @@ pub(crate) fn lookup_codex_spawn_auth<R: tauri::Runtime>(
             Ok(Some(CodexSpawnAuth {
                 home_dir,
                 api_key: Some(api_key),
+                external_read_only: false,
             }))
         }
         Some(CodexAuthKind::Chatgpt) => {
             if !home_dir.join("auth.json").exists() {
-                return Err(format!(
-                    "Codex account \"{}\" is not logged in yet — run `{}` once, then start the agent",
-                    account.label,
-                    codex_login_command(&home_dir)
-                ));
+                return Err(missing_chatgpt_login_message(&account.label, &home));
             }
             Ok(Some(CodexSpawnAuth {
                 home_dir,
                 api_key: None,
+                external_read_only: home.external_read_only,
             }))
         }
         None => Err(format!(
             "Codex account \"{}\" has no auth kind recorded; remove it and add it again",
             account.label
         )),
+    }
+}
+
+pub(crate) fn missing_chatgpt_login_message(label: &str, home: &ResolvedCodexHome) -> String {
+    if home.external_read_only {
+        format!(
+            "Codex account \"{label}\" is not logged in in Orca — sign in through Orca, then test or re-import the account"
+        )
+    } else {
+        format!(
+            "Codex account \"{label}\" is not logged in yet — sign it in from Settings → Agents → Codex accounts (or run `{}` once), then start the agent",
+            codex_login_command(
+                &home.path,
+                super::discovery::resolve_command("codex").as_deref()
+            )
+        )
     }
 }
 
@@ -409,6 +668,11 @@ pub(crate) fn apply_codex_account_env(
     let Some(auth) = auth else {
         return;
     };
+    // Orca's wrapper variables can redirect Codex away from CODEX_HOME. A
+    // named Buzz account is the explicit choice, so remove only those known
+    // account selectors before setting the exact home.
+    command.env_remove("ORCA_CODEX_HOME");
+    command.env_remove("ORCA_CODEX_LAUNCH_PREFLIGHT");
     command.env(CODEX_HOME_ENV, &auth.home_dir);
     match auth.api_key.as_deref() {
         Some(key) => {

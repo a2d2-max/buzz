@@ -27,9 +27,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
 use buzz_core::tenant::{relay_url_authority, TenantContext};
+use buzz_core::CommunityId;
+use buzz_db::engine_projection::{PlaneProjectionBindingConfig, PlaneStateMap};
 use buzz_db::{Db, DbConfig};
 use buzz_pubsub::{EventTopic, PubSubManager};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use tracing::warn;
 
@@ -88,6 +90,11 @@ enum Command {
         #[command(subcommand)]
         command: deletions::DeletionsCommand,
     },
+    /// Configure and recover server-side projections into replaceable engines.
+    EngineProjection {
+        #[command(subcommand)]
+        command: EngineProjectionCommand,
+    },
     /// Emit missing kind:39000/39001/39002 channel discovery events, or
     /// republish only a targeted channel's kind:39002 roster.
     ///
@@ -104,6 +111,73 @@ enum Command {
         /// an ephemeral key (events will be unverifiable after restart).
         #[arg(long)]
         relay_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EngineProjectionCommand {
+    /// Configure Plane and atomically backfill current canonical tasks.
+    ConfigurePlane {
+        /// Expected community UUID. Must match this relay's configured host.
+        #[arg(long)]
+        community: uuid::Uuid,
+        /// Private Plane root origin (HTTPS, or loopback HTTP for local QA).
+        #[arg(long)]
+        origin: String,
+        /// Plane workspace slug.
+        #[arg(long)]
+        workspace_slug: String,
+        /// Plane project UUID receiving derived work items.
+        #[arg(long)]
+        project_id: uuid::Uuid,
+        /// Environment variable name holding the server-only Plane API key.
+        #[arg(long)]
+        api_key_env: String,
+        /// Plane state UUID corresponding to A2D2 `todo`.
+        #[arg(long)]
+        todo_state: uuid::Uuid,
+        /// Plane state UUID corresponding to A2D2 `doing`.
+        #[arg(long)]
+        doing_state: uuid::Uuid,
+        /// Plane state UUID corresponding to A2D2 `done`.
+        #[arg(long)]
+        done_state: uuid::Uuid,
+        /// Store desired heads but keep the worker from claiming them.
+        #[arg(long, action = ArgAction::SetTrue)]
+        disabled: bool,
+    },
+    /// Map one A2D2 Nostr principal to a provider-internal Plane user UUID.
+    MapPlanePrincipal {
+        /// Expected community UUID. Must match this relay's configured host.
+        #[arg(long)]
+        community: uuid::Uuid,
+        /// Plane projection binding UUID.
+        #[arg(long)]
+        binding_id: uuid::Uuid,
+        /// A2D2 member public key (npub or hex).
+        #[arg(long)]
+        pubkey: String,
+        /// Provider-internal Plane user UUID.
+        #[arg(long)]
+        plane_user_id: uuid::Uuid,
+        /// Retain the mapping but make it unavailable to projection.
+        #[arg(long, action = ArgAction::SetTrue)]
+        inactive: bool,
+    },
+    /// Allow one ambiguous Plane create to POST again after an exact lookup.
+    RecoverPlaneCreate {
+        /// Expected community UUID. Must match this relay's configured host.
+        #[arg(long)]
+        community: uuid::Uuid,
+        /// Plane projection binding UUID.
+        #[arg(long)]
+        binding_id: uuid::Uuid,
+        /// Exact canonical external id checked in Plane by the operator.
+        #[arg(long)]
+        external_id: String,
+        /// Assert that an exact Plane lookup returned no matching item.
+        #[arg(long, action = ArgAction::SetTrue)]
+        confirm_provider_lookup_missing: bool,
     },
 }
 
@@ -161,8 +235,97 @@ async fn run(cli: Cli) -> Result<i32> {
             command: ProductFeedbackCommand::List { limit },
         } => cmd_list_product_feedback(limit).await,
         Command::Deletions { command } => deletions::run(command).await,
+        Command::EngineProjection { command } => run_engine_projection(command).await,
         Command::ReconcileChannels { channel, relay_key } => {
             reconcile_channels(channel, relay_key).await?;
+            Ok(0)
+        }
+    }
+}
+
+async fn projection_community(db: &Db, expected: uuid::Uuid) -> Result<CommunityId> {
+    let tenant = resolve_admin_tenant(db).await?;
+    if tenant.community().as_uuid() != &expected {
+        return Err(anyhow::anyhow!(
+            "--community does not match the community resolved from RELAY_URL"
+        ));
+    }
+    Ok(tenant.community())
+}
+
+async fn run_engine_projection(command: EngineProjectionCommand) -> Result<i32> {
+    let db = connect_db().await?;
+    match command {
+        EngineProjectionCommand::ConfigurePlane {
+            community,
+            origin,
+            workspace_slug,
+            project_id,
+            api_key_env,
+            todo_state,
+            doing_state,
+            done_state,
+            disabled,
+        } => {
+            let community = projection_community(&db, community).await?;
+            let (binding, queued) = db
+                .configure_plane_projection(
+                    community,
+                    &PlaneProjectionBindingConfig {
+                        origin,
+                        workspace_slug,
+                        project_id,
+                        api_key_env,
+                        state_map: PlaneStateMap {
+                            todo: todo_state,
+                            doing: doing_state,
+                            done: done_state,
+                        },
+                        enabled: !disabled,
+                    },
+                )
+                .await?;
+            println!(
+                "Plane projection binding {binding} configured; queued {queued} canonical task(s)."
+            );
+            Ok(0)
+        }
+        EngineProjectionCommand::MapPlanePrincipal {
+            community,
+            binding_id,
+            pubkey,
+            plane_user_id,
+            inactive,
+        } => {
+            let community = projection_community(&db, community).await?;
+            let pubkey = parse_pubkey_hex(&pubkey).map_err(anyhow::Error::msg)?;
+            let pubkey = hex::decode(pubkey).map_err(|_| anyhow::anyhow!("invalid pubkey"))?;
+            db.upsert_engine_principal(community, binding_id, &pubkey, plane_user_id, !inactive)
+                .await?;
+            println!("Plane principal mapping updated for binding {binding_id}.");
+            Ok(0)
+        }
+        EngineProjectionCommand::RecoverPlaneCreate {
+            community,
+            binding_id,
+            external_id,
+            confirm_provider_lookup_missing,
+        } => {
+            if !confirm_provider_lookup_missing {
+                return Err(anyhow::anyhow!(
+                    "recovery requires --confirm-provider-lookup-missing after an exact Plane external-id lookup"
+                ));
+            }
+            let community = projection_community(&db, community).await?;
+            if !db
+                .confirm_engine_projection_create_absent(community, binding_id, &external_id)
+                .await?
+            {
+                return Err(anyhow::anyhow!(
+                    "no expired ambiguous create matched the exact community, binding, and external id"
+                ));
+            }
+            println!("Plane create recovery queued for the exact external id.");
             Ok(0)
         }
     }

@@ -3,6 +3,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::managed_agents::agent_home::{DataHomeKind, GENERIC_ACCOUNT_REASON};
 use crate::managed_agents::{
     buzz_managed_command_path, buzz_managed_node_bin_dir, buzz_managed_npm_bin_dir,
     AcpAvailabilityStatus, AcpRuntimeCatalogEntry, AuthStatus, CommandAvailabilityInfo,
@@ -172,6 +173,87 @@ pub(crate) fn oauth_token_env_var_for_command(command: &str) -> Option<String> {
 /// `codex-acp` counts.
 pub(crate) fn supports_codex_accounts_for_command(command: &str) -> bool {
     known_acp_runtime(command).is_some_and(|runtime| runtime.supports_codex_accounts)
+}
+
+pub(crate) fn data_home_for_command(command: &str) -> DataHomeKind {
+    if let Some(runtime) = known_acp_runtime(command) {
+        return runtime.data_home;
+    }
+    presets::preset_for_command(command)
+        .map(|preset| presets::preset_home_facts(preset).0)
+        .unwrap_or(DataHomeKind::None)
+}
+
+pub(crate) fn account_unsupported_reason_for_command(command: &str) -> Option<String> {
+    let specific = known_acp_runtime(command)
+        .and_then(|runtime| runtime.account_unsupported_reason)
+        .or_else(|| {
+            presets::preset_for_command(command)
+                .and_then(|preset| presets::preset_home_facts(preset).1)
+        });
+    account_unsupported_reason(
+        oauth_token_env_var_for_command(command).is_some(),
+        supports_codex_accounts_for_command(command),
+        specific,
+    )
+}
+
+fn account_unsupported_reason(
+    claude_applies: bool,
+    codex_applies: bool,
+    specific: Option<&'static str>,
+) -> Option<String> {
+    (!claude_applies && !codex_applies)
+        .then(|| specific.unwrap_or(GENERIC_ACCOUNT_REASON).to_string())
+}
+
+/// One constructor for a user-defined harness catalog row, shared by save and
+/// discovery tests so capability, account, and data-home projections cannot
+/// drift.
+pub(crate) fn custom_catalog_entry(
+    def: &crate::managed_agents::custom_harnesses::HarnessDefinition,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> AcpRuntimeCatalogEntry {
+    let (availability, command, binary_path) = match resolve(&def.command) {
+        Some(path) => (
+            AcpAvailabilityStatus::Available,
+            Some(def.command.clone()),
+            Some(path.display().to_string()),
+        ),
+        None => (AcpAvailabilityStatus::NotInstalled, None, None),
+    };
+    AcpRuntimeCatalogEntry {
+        id: def.id.clone(),
+        label: def.label.clone(),
+        avatar_url: String::new(),
+        availability,
+        command,
+        binary_path,
+        default_args: normalize_agent_args(&def.command, def.args.clone()),
+        mcp_command: None,
+        model_env_var: None,
+        provider_env_var: None,
+        thinking_env_var: None,
+        oauth_token_env_var: oauth_token_env_var_for_command(&def.command),
+        supports_codex_accounts: supports_codex_accounts_for_command(&def.command),
+        data_home: data_home_for_command(&def.command),
+        account_unsupported_reason: account_unsupported_reason_for_command(&def.command),
+        effort_canonical_values: None,
+        max_tokens_env_var: None,
+        context_limit_env_var: None,
+        max_rounds_env_var: None,
+        install_hint: def.install_hint.clone(),
+        install_instructions_url: def.install_instructions_url.clone(),
+        can_auto_install: false,
+        requires_external_cli: false,
+        underlying_cli_path: None,
+        node_required: false,
+        auth_status: AuthStatus::NotApplicable,
+        login_hint: None,
+        source: HarnessSource::Custom,
+        definition_env: def.env.clone(),
+        max_parallelism: super::parallelism::harness_max_parallelism(&def.command),
+    }
 }
 
 pub(crate) fn known_acp_runtime_exact(id: &str) -> Option<&'static KnownAcpRuntime> {
@@ -1062,6 +1144,12 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             thinking_env_var: runtime.thinking_env_var.map(str::to_string),
             oauth_token_env_var: runtime.oauth_token_env_var.map(str::to_string),
             supports_codex_accounts: runtime.supports_codex_accounts,
+            data_home: runtime.data_home,
+            account_unsupported_reason: account_unsupported_reason(
+                runtime.oauth_token_env_var.is_some(),
+                runtime.supports_codex_accounts,
+                runtime.account_unsupported_reason,
+            ),
             effort_canonical_values: runtime
                 .effort_normalization
                 .map(|norm| norm.canonical.iter().map(|s| s.to_string()).collect()),
@@ -1206,6 +1294,8 @@ pub fn discover_acp_runtimes_from(
                 thinking_env_var: None,
                 oauth_token_env_var: oauth_token_env_var_for_command(&def.command),
                 supports_codex_accounts: supports_codex_accounts_for_command(&def.command),
+                data_home: data_home_for_command(&def.command),
+                account_unsupported_reason: account_unsupported_reason_for_command(&def.command),
                 effort_canonical_values: None,
                 max_tokens_env_var: None,
                 context_limit_env_var: None,
@@ -1279,3 +1369,7 @@ pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "discovery/data_home_tests.rs"]
+mod data_home_tests;

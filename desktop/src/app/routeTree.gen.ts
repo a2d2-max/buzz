@@ -11,6 +11,7 @@ import { Route as remindersRouteImport } from "./routes/reminders";
 import { Route as pulseRouteImport } from "./routes/pulse";
 import { Route as projectsRouteImport } from "./routes/projects";
 import { Route as docsRouteImport } from "./routes/docs";
+import { Route as databasesRouteImport } from "./routes/databases";
 import { Route as boardRouteImport } from "./routes/board";
 import { Route as agentsRouteImport } from "./routes/agents";
 import { Route as indexRouteImport } from "./routes/index";
@@ -18,7 +19,9 @@ import { Route as workflowsDotworkflowIdRouteImport } from "./routes/workflows.$
 import { Route as projectsDotprojectIdRouteImport } from "./routes/projects.$projectId";
 import { Route as messagesDotnewRouteImport } from "./routes/messages.new";
 import { Route as docsDotpageIdRouteImport } from "./routes/docs.$pageId";
+import { Route as databasesDotdatabaseIdRouteImport } from "./routes/databases.$databaseId";
 import { Route as channelsDotchannelIdRouteImport } from "./routes/channels.$channelId";
+import { Route as appsDotproductRouteImport } from "./routes/apps.$product";
 import { Route as channelsDotchannelIdDotpostsDotpostIdRouteImport } from "./routes/channels.$channelId.posts.$postId";
 
 const workflowsRoute = workflowsRouteImport.update({
@@ -49,6 +52,11 @@ const projectsRoute = projectsRouteImport.update({
 const docsRoute = docsRouteImport.update({
   id: "/docs",
   path: "/docs",
+  getParentRoute: () => rootRouteImport,
+} as any);
+const databasesRoute = databasesRouteImport.update({
+  id: "/databases",
+  path: "/databases",
   getParentRoute: () => rootRouteImport,
 } as any);
 const boardRoute = boardRouteImport.update({
@@ -86,9 +94,19 @@ const docsDotpageIdRoute = docsDotpageIdRouteImport.update({
   path: "/docs/$pageId",
   getParentRoute: () => rootRouteImport,
 } as any);
+const databasesDotdatabaseIdRoute = databasesDotdatabaseIdRouteImport.update({
+  id: "/databases/$databaseId",
+  path: "/databases/$databaseId",
+  getParentRoute: () => rootRouteImport,
+} as any);
 const channelsDotchannelIdRoute = channelsDotchannelIdRouteImport.update({
   id: "/channels/$channelId",
   path: "/channels/$channelId",
+  getParentRoute: () => rootRouteImport,
+} as any);
+const appsDotproductRoute = appsDotproductRouteImport.update({
+  id: "/apps/$product",
+  path: "/apps/$product",
   getParentRoute: () => rootRouteImport,
 } as any);
 const channelsDotchannelIdDotpostsDotpostIdRoute =
@@ -102,13 +120,16 @@ export interface FileRoutesByFullPath {
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
   "/board": typeof boardRoute;
+  "/databases": typeof databasesRoute;
   "/docs": typeof docsRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
   "/settings": typeof settingsRoute;
   "/workflows": typeof workflowsRoute;
+  "/apps/$product": typeof appsDotproductRoute;
   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+  "/databases/$databaseId": typeof databasesDotdatabaseIdRoute;
   "/docs/$pageId": typeof docsDotpageIdRoute;
   "/messages/new": typeof messagesDotnewRoute;
   "/projects/$projectId": typeof projectsDotprojectIdRoute;
@@ -119,13 +140,16 @@ export interface FileRoutesByTo {
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
   "/board": typeof boardRoute;
+  "/databases": typeof databasesRoute;
   "/docs": typeof docsRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
   "/settings": typeof settingsRoute;
   "/workflows": typeof workflowsRoute;
+  "/apps/$product": typeof appsDotproductRoute;
   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+  "/databases/$databaseId": typeof databasesDotdatabaseIdRoute;
   "/docs/$pageId": typeof docsDotpageIdRoute;
   "/messages/new": typeof messagesDotnewRoute;
   "/projects/$projectId": typeof projectsDotprojectIdRoute;
@@ -137,13 +161,16 @@ export interface FileRoutesById {
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
   "/board": typeof boardRoute;
+  "/databases": typeof databasesRoute;
   "/docs": typeof docsRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
   "/settings": typeof settingsRoute;
   "/workflows": typeof workflowsRoute;
+  "/apps/$product": typeof appsDotproductRoute;
   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+  "/databases/$databaseId": typeof databasesDotdatabaseIdRoute;
   "/docs/$pageId": typeof docsDotpageIdRoute;
   "/messages/new": typeof messagesDotnewRoute;
   "/projects/$projectId": typeof projectsDotprojectIdRoute;
@@ -156,13 +183,16 @@ export interface FileRouteTypes {
     | "/"
     | "/agents"
     | "/board"
+    | "/databases"
     | "/docs"
     | "/projects"
     | "/pulse"
     | "/reminders"
     | "/settings"
     | "/workflows"
+    | "/apps/$product"
     | "/channels/$channelId"
+    | "/databases/$databaseId"
     | "/docs/$pageId"
     | "/messages/new"
     | "/projects/$projectId"
@@ -173,13 +203,16 @@ export interface FileRouteTypes {
     | "/"
     | "/agents"
     | "/board"
+    | "/databases"
     | "/docs"
     | "/projects"
     | "/pulse"
     | "/reminders"
     | "/settings"
     | "/workflows"
+    | "/apps/$product"
     | "/channels/$channelId"
+    | "/databases/$databaseId"
     | "/docs/$pageId"
     | "/messages/new"
     | "/projects/$projectId"
@@ -190,13 +223,16 @@ export interface FileRouteTypes {
     | "/"
     | "/agents"
     | "/board"
+    | "/databases"
     | "/docs"
     | "/projects"
     | "/pulse"
     | "/reminders"
     | "/settings"
     | "/workflows"
+    | "/apps/$product"
     | "/channels/$channelId"
+    | "/databases/$databaseId"
     | "/docs/$pageId"
     | "/messages/new"
     | "/projects/$projectId"
@@ -208,13 +244,16 @@ export interface RootRouteChildren {
   indexRoute: typeof indexRoute;
   agentsRoute: typeof agentsRoute;
   boardRoute: typeof boardRoute;
+  databasesRoute: typeof databasesRoute;
   docsRoute: typeof docsRoute;
   projectsRoute: typeof projectsRoute;
   pulseRoute: typeof pulseRoute;
   remindersRoute: typeof remindersRoute;
   settingsRoute: typeof settingsRoute;
   workflowsRoute: typeof workflowsRoute;
+  appsDotproductRoute: typeof appsDotproductRoute;
   channelsDotchannelIdRoute: typeof channelsDotchannelIdRoute;
+  databasesDotdatabaseIdRoute: typeof databasesDotdatabaseIdRoute;
   docsDotpageIdRoute: typeof docsDotpageIdRoute;
   messagesDotnewRoute: typeof messagesDotnewRoute;
   projectsDotprojectIdRoute: typeof projectsDotprojectIdRoute;
@@ -266,6 +305,13 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof docsRouteImport;
       parentRoute: typeof rootRouteImport;
     };
+    "/databases": {
+      id: "/databases";
+      path: "/databases";
+      fullPath: "/databases";
+      preLoaderRoute: typeof databasesRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
     "/board": {
       id: "/board";
       path: "/board";
@@ -315,11 +361,25 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof docsDotpageIdRouteImport;
       parentRoute: typeof rootRouteImport;
     };
+    "/databases/$databaseId": {
+      id: "/databases/$databaseId";
+      path: "/databases/$databaseId";
+      fullPath: "/databases/$databaseId";
+      preLoaderRoute: typeof databasesDotdatabaseIdRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
     "/channels/$channelId": {
       id: "/channels/$channelId";
       path: "/channels/$channelId";
       fullPath: "/channels/$channelId";
       preLoaderRoute: typeof channelsDotchannelIdRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/apps/$product": {
+      id: "/apps/$product";
+      path: "/apps/$product";
+      fullPath: "/apps/$product";
+      preLoaderRoute: typeof appsDotproductRouteImport;
       parentRoute: typeof rootRouteImport;
     };
     "/channels/$channelId/posts/$postId": {
@@ -336,13 +396,16 @@ const rootRouteChildren: RootRouteChildren = {
   indexRoute: indexRoute,
   agentsRoute: agentsRoute,
   boardRoute: boardRoute,
+  databasesRoute: databasesRoute,
   docsRoute: docsRoute,
   projectsRoute: projectsRoute,
   pulseRoute: pulseRoute,
   remindersRoute: remindersRoute,
   settingsRoute: settingsRoute,
   workflowsRoute: workflowsRoute,
+  appsDotproductRoute: appsDotproductRoute,
   channelsDotchannelIdRoute: channelsDotchannelIdRoute,
+  databasesDotdatabaseIdRoute: databasesDotdatabaseIdRoute,
   docsDotpageIdRoute: docsDotpageIdRoute,
   messagesDotnewRoute: messagesDotnewRoute,
   projectsDotprojectIdRoute: projectsDotprojectIdRoute,

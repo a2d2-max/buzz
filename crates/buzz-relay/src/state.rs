@@ -640,6 +640,12 @@ pub struct AppState {
     pub pubsub: Arc<PubSubManager>,
     /// Authentication service.
     pub auth: Arc<AuthService>,
+    /// Company identity assertion verifier and finite session policy.
+    pub company_identity: Arc<crate::company_identity::CompanyIdentityRuntime>,
+    /// Product origins and server-only callback verifiers for managed sessions.
+    pub engine_session_config: Arc<crate::engine_sessions::EngineSessionConfig>,
+    /// Bounded one-time launches and active managed product sessions.
+    pub engine_session_broker: Arc<crate::engine_sessions::EngineSessionBroker>,
     /// Full-text search service.
     pub search: Arc<SearchService>,
     /// Registry of active client subscriptions.
@@ -799,6 +805,9 @@ impl AppState {
         relay_keypair: nostr::Keys,
         media_storage: MediaStorage,
     ) -> (Self, AuditShutdownHandle) {
+        let company_identity = Arc::new(crate::company_identity::CompanyIdentityRuntime::new(
+            &config.company_identity,
+        ));
         let max_connections = config.max_connections;
         let max_concurrent_handlers = config.max_concurrent_handlers;
         let search_arc = Arc::new(search);
@@ -873,6 +882,9 @@ impl AppState {
             audit: audit_arc,
             pubsub,
             auth: Arc::new(auth),
+            company_identity,
+            engine_session_config: Arc::new(crate::engine_sessions::EngineSessionConfig::from_env()),
+            engine_session_broker: Arc::new(crate::engine_sessions::EngineSessionBroker::default()),
             search: search_arc,
             sub_registry: Arc::new(SubscriptionRegistry::new()),
             conn_manager: Arc::new(ConnectionManager::new()),
@@ -1689,6 +1701,8 @@ pub(crate) mod tests {
             ),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
             auth_state: RwLock::new(AuthState::Failed),
+            federated_assertion: None,
+            connected_at: chrono::Utc::now(),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             send_tx: tx.clone(),
             ctrl_tx,

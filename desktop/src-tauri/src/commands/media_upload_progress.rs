@@ -82,9 +82,7 @@ pub(super) async fn send_upload_attempt(
         progress,
         cancellation,
     } = attempt;
-    let req = state
-        .http_client
-        .put(url)
+    let req = crate::company_identity::relay_request(state, reqwest::Method::PUT, &url)?
         .header("Authorization", auth_header)
         .header("Content-Type", mime)
         .header("X-SHA-256", sha256);

@@ -125,9 +125,8 @@ test("history stops at the page cap even when the relay never runs dry", async (
     }
     return Promise.resolve(page);
   });
-  const cards = await fetchCommunityTaskEvents();
+  await assert.rejects(fetchCommunityTaskEvents(), /history limit/);
   assert.equal(calls, COMMUNITY_TASK_HISTORY_MAX_PAGES);
-  assert.deepEqual(cards, []);
 });
 
 test("history fails loudly when the relay hands the same cursor back", async (t) => {

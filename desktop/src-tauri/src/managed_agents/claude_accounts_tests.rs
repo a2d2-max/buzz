@@ -10,8 +10,11 @@ use std::collections::{BTreeMap, HashMap};
 use tempfile::TempDir;
 
 use super::{
-    claude_account_spawn_token, detach_claude_account, token_keyring_name, AccountProvider,
-    AccountTokenStore, ProviderAccountStore, CLAUDE_OAUTH_TOKEN_ENV,
+    apply_claude_account_env, claude_account_spawn_auth, config_dir_spawn_auth,
+    configure_claude_login_command, detach_claude_account, is_app_owned_claude_config_dir,
+    token_keyring_name, validate_existing_claude_config_dir, AccountProvider, AccountTokenStore,
+    ClaudeAuthKind, ClaudeSpawnAuth, ProviderAccountStore, ANTHROPIC_API_KEY_ENV,
+    ANTHROPIC_AUTH_TOKEN_ENV, CLAUDE_CONFIG_DIR_ENV, CLAUDE_OAUTH_TOKEN_ENV,
 };
 use crate::managed_agents::ManagedAgentRecord;
 
@@ -118,6 +121,91 @@ fn add_persists_metadata_on_disk_and_token_only_in_the_token_store() {
         Some(TOKEN),
         "token lives in the token store under the account's keyring name"
     );
+}
+
+#[test]
+fn config_dir_account_persists_only_an_app_owned_path_and_no_keyring_secret() {
+    let dir = TempDir::new().expect("tempdir");
+    let tokens = FakeTokenStore::working();
+    let store = store_in(&dir, &tokens);
+    let config_dir = dir.path().join("claude-configs/account-id");
+
+    let account = store
+        .add_claude_config_dir("Browser login", config_dir.clone())
+        .expect("add config-dir account");
+
+    assert_eq!(account.claude_auth_kind, Some(ClaudeAuthKind::ConfigDir));
+    assert_eq!(account.config_dir.as_deref(), Some(config_dir.as_path()));
+    assert!(account.token_hint.is_empty());
+    assert!(
+        tokens.stored().is_empty(),
+        "config-dir auth has no app keyring secret"
+    );
+    let text = file_text(&dir);
+    assert!(text.contains("\"config_dir\""));
+    assert!(text.contains("claude-configs/account-id"));
+}
+
+#[test]
+fn config_dir_ownership_accepts_only_one_direct_child_of_the_app_root() {
+    let root = std::path::Path::new("/app/agents/claude-configs");
+    assert!(is_app_owned_claude_config_dir(
+        root,
+        std::path::Path::new("/app/agents/claude-configs/account")
+    ));
+    assert!(!is_app_owned_claude_config_dir(
+        root,
+        std::path::Path::new("/app/agents/claude-configs/account/nested")
+    ));
+    assert!(!is_app_owned_claude_config_dir(
+        root,
+        std::path::Path::new("/external/claude")
+    ));
+    for rejected in [
+        "/app/agents/claude-configs",
+        "/app/agents/claude-configs/..",
+        "/app/agents/claude-configs/.",
+        "/app/agents/claude-configs/account/../account",
+        "/app/agents/claude-configs/account/.",
+        "/app/agents/claude-configs/account/nested",
+        "/app/agents/claude-configs-sibling/account",
+    ] {
+        assert!(
+            !is_app_owned_claude_config_dir(root, std::path::Path::new(rejected)),
+            "lexical path must be rejected: {rejected}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn config_dir_metadata_distinguishes_absent_directory_and_inspection_failures() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().expect("tempdir");
+    let missing = root.path().join("missing");
+    assert_eq!(
+        validate_existing_claude_config_dir(&missing),
+        Ok(false),
+        "NotFound alone is a safe absent-directory result"
+    );
+
+    let directory = root.path().join("directory");
+    std::fs::create_dir(&directory).expect("directory fixture");
+    assert_eq!(validate_existing_claude_config_dir(&directory), Ok(true));
+
+    let file = root.path().join("file");
+    std::fs::write(&file, "not a directory").expect("file fixture");
+    assert!(validate_existing_claude_config_dir(&file).is_err());
+
+    let alias = root.path().join("alias");
+    symlink(&directory, &alias).expect("symlink fixture");
+    assert!(validate_existing_claude_config_dir(&alias).is_err());
+
+    let not_a_directory = file.join("child");
+    let error = validate_existing_claude_config_dir(&not_a_directory)
+        .expect_err("NotADirectory must not be collapsed into absence");
+    assert!(error.contains("failed to inspect"));
 }
 
 #[test]
@@ -354,45 +442,60 @@ fn token_missing_from_the_token_store_for_a_known_account_is_an_error() {
 
 // ── spawn-time resolution ─────────────────────────────────────────────────────
 
-fn lookup_with<'a>(
-    map: &'a BTreeMap<&'a str, &'a str>,
-) -> impl Fn(&str) -> Result<Option<String>, String> + 'a {
-    move |id| Ok(map.get(id).map(|t| t.to_string()))
+fn auth_lookup_with<'a>(
+    map: &'a BTreeMap<&'a str, ClaudeSpawnAuth>,
+) -> impl Fn(&str) -> Result<Option<ClaudeSpawnAuth>, String> + 'a {
+    move |id| Ok(map.get(id).cloned())
 }
 
 #[test]
-fn spawn_token_is_absent_without_an_account() {
+fn spawn_auth_is_absent_without_an_account() {
     let calls = RefCell::new(0);
     let lookup = |_: &str| {
         *calls.borrow_mut() += 1;
-        Ok(Some(TOKEN.to_string()))
+        Ok(Some(ClaudeSpawnAuth::SetupToken(TOKEN.to_string())))
     };
-    assert_eq!(claude_account_spawn_token(None, true, lookup), Ok(None));
+    assert_eq!(claude_account_spawn_auth(None, true, lookup), Ok(None));
     assert_eq!(*calls.borrow(), 0, "no account, no keyring read");
 }
 
 #[test]
-fn spawn_token_is_ignored_for_non_claude_runtimes() {
-    let map = BTreeMap::from([("acct", TOKEN)]);
+fn spawn_auth_fails_closed_when_the_runtime_cannot_honor_the_account() {
+    // A runtime that never reads the account would silently start on whatever
+    // login it finds — the global fallback the owner did not pick. Refuse.
+    let calls = RefCell::new(0);
+    let lookup = |_: &str| {
+        *calls.borrow_mut() += 1;
+        Ok(Some(ClaudeSpawnAuth::SetupToken(TOKEN.to_string())))
+    };
+    let error = claude_account_spawn_auth(Some("acct"), false, lookup)
+        .expect_err("an account on a runtime that cannot use it must refuse to spawn");
+    assert!(
+        error.contains("Claude account"),
+        "names the account kind: {error}"
+    );
+    assert!(
+        error.contains("Default"),
+        "tells the owner the way out (pick Default): {error}"
+    );
+    assert!(!error.contains(TOKEN), "never echoes the token: {error}");
+    assert_eq!(*calls.borrow(), 0, "refused before any keyring read");
+}
+
+#[test]
+fn spawn_auth_resolves_the_selected_account_for_claude() {
+    let auth = ClaudeSpawnAuth::SetupToken(TOKEN.to_string());
+    let map = BTreeMap::from([("acct", auth.clone())]);
     assert_eq!(
-        claude_account_spawn_token(Some("acct"), false, lookup_with(&map)),
-        Ok(None)
+        claude_account_spawn_auth(Some("acct"), true, auth_lookup_with(&map)),
+        Ok(Some(auth))
     );
 }
 
 #[test]
-fn spawn_token_resolves_the_selected_account_for_claude() {
-    let map = BTreeMap::from([("acct", TOKEN)]);
-    assert_eq!(
-        claude_account_spawn_token(Some("acct"), true, lookup_with(&map)),
-        Ok(Some(TOKEN.to_string()))
-    );
-}
-
-#[test]
-fn spawn_token_fails_closed_when_the_account_is_gone() {
+fn spawn_auth_fails_closed_when_the_account_is_gone() {
     let map = BTreeMap::new();
-    let error = claude_account_spawn_token(Some("acct"), true, lookup_with(&map))
+    let error = claude_account_spawn_auth(Some("acct"), true, auth_lookup_with(&map))
         .expect_err("dangling account must refuse to spawn");
     assert!(
         error.contains("acct"),
@@ -402,10 +505,67 @@ fn spawn_token_fails_closed_when_the_account_is_gone() {
 }
 
 #[test]
-fn spawn_token_propagates_token_store_errors_without_the_value() {
+fn spawn_auth_distinguishes_legacy_tokens_from_config_directories() {
+    let config = ClaudeSpawnAuth::ConfigDir(std::path::PathBuf::from("/app/claude/account"));
+    let token = ClaudeSpawnAuth::SetupToken(TOKEN.to_string());
+    let lookup = |id: &str| match id {
+        "config" => Ok(Some(config.clone())),
+        "token" => Ok(Some(token.clone())),
+        _ => Ok(None),
+    };
+
+    assert_eq!(
+        claude_account_spawn_auth(Some("config"), true, lookup),
+        Ok(Some(config.clone()))
+    );
+    assert_eq!(
+        claude_account_spawn_auth(Some("token"), true, lookup),
+        Ok(Some(token.clone()))
+    );
+    assert!(claude_account_spawn_auth(Some("gone"), true, lookup).is_err());
+    // A runtime that cannot honor the account fails closed for both kinds; it
+    // used to return Ok(None), which silently fell back to the global login.
+    assert!(claude_account_spawn_auth(Some("config"), false, lookup).is_err());
+}
+
+#[test]
+fn spawn_auth_propagates_lookup_errors_without_a_secret_value() {
     let lookup = |_: &str| Err("keyring backend unreachable".to_string());
-    let error = claude_account_spawn_token(Some("acct"), true, lookup).expect_err("outage");
+    let error = claude_account_spawn_auth(Some("acct"), true, lookup).expect_err("outage");
     assert!(error.contains("unreachable"));
+    assert!(!error.contains(TOKEN));
+}
+
+#[test]
+fn config_dir_spawn_auth_requires_a_login_marker_and_guides_recovery() {
+    let dir = TempDir::new().expect("tempdir");
+    let missing = dir.path().join("missing");
+    let missing_error = config_dir_spawn_auth("Work", missing.clone(), |path| {
+        validate_existing_claude_config_dir(path)
+    })
+    .expect_err("a missing directory is not authenticated");
+    assert!(missing_error.contains("CLAUDE_CONFIG_DIR="));
+    assert!(missing_error.contains("claude login"));
+
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).expect("empty config dir");
+    assert!(config_dir_spawn_auth("Work", empty.clone(), |path| {
+        validate_existing_claude_config_dir(path)
+    })
+    .expect_err("an empty config directory is not authenticated")
+    .contains("claude login"));
+
+    for marker in [".claude.json", "oauth-account.json"] {
+        let marked = dir.path().join(marker.replace('.', "_"));
+        std::fs::create_dir(&marked).expect("marked config dir");
+        std::fs::write(marked.join(marker), "fixture").expect("login marker");
+        assert_eq!(
+            config_dir_spawn_auth("Work", marked.clone(), |path| {
+                validate_existing_claude_config_dir(path)
+            }),
+            Ok(ClaudeSpawnAuth::ConfigDir(marked))
+        );
+    }
 }
 
 // ── detach on remove ──────────────────────────────────────────────────────────
@@ -544,8 +704,6 @@ fn remove_reports_a_lingering_keyring_entry_as_a_warning_not_a_failure() {
 
 // ── spawn env application ─────────────────────────────────────────────────────
 
-use super::apply_claude_account_env;
-
 fn env_map(cmd: &std::process::Command) -> BTreeMap<String, Option<String>> {
     cmd.get_envs()
         .map(|(k, v)| {
@@ -567,7 +725,11 @@ fn spawn_env_account_token_wins_over_manual_env_and_strips_ambient_api_key() {
     cmd.env("ANTHROPIC_API_KEY", "ambient-key");
     cmd.env(CLAUDE_OAUTH_TOKEN_ENV, "manual-token");
 
-    apply_claude_account_env(&mut cmd, Some(CLAUDE_OAUTH_TOKEN_ENV), Some(TOKEN));
+    apply_claude_account_env(
+        &mut cmd,
+        Some(CLAUDE_OAUTH_TOKEN_ENV),
+        Some(&ClaudeSpawnAuth::SetupToken(TOKEN.to_string())),
+    );
 
     let envs = env_map(&cmd);
     assert_eq!(
@@ -583,13 +745,47 @@ fn spawn_env_account_token_wins_over_manual_env_and_strips_ambient_api_key() {
 }
 
 #[test]
+fn spawn_env_config_dir_wins_and_clears_every_competing_claude_credential() {
+    let mut cmd = std::process::Command::new("true");
+    cmd.env(ANTHROPIC_API_KEY_ENV, "ambient-key");
+    cmd.env(ANTHROPIC_AUTH_TOKEN_ENV, "ambient-auth");
+    cmd.env(CLAUDE_OAUTH_TOKEN_ENV, "ambient-oauth");
+    cmd.env(CLAUDE_CONFIG_DIR_ENV, "/somewhere/else");
+
+    apply_claude_account_env(
+        &mut cmd,
+        Some(CLAUDE_OAUTH_TOKEN_ENV),
+        Some(&ClaudeSpawnAuth::ConfigDir(std::path::PathBuf::from(
+            "/app/claude/account",
+        ))),
+    );
+
+    let envs = env_map(&cmd);
+    assert_eq!(
+        envs.get(CLAUDE_CONFIG_DIR_ENV),
+        Some(&Some("/app/claude/account".to_string()))
+    );
+    for key in [
+        ANTHROPIC_API_KEY_ENV,
+        ANTHROPIC_AUTH_TOKEN_ENV,
+        CLAUDE_OAUTH_TOKEN_ENV,
+    ] {
+        assert_eq!(envs.get(key), Some(&None), "{key} must be removed");
+    }
+}
+
+#[test]
 fn spawn_env_is_untouched_without_an_account_token() {
     let mut cmd = std::process::Command::new("true");
     cmd.env("ANTHROPIC_API_KEY", "ambient-key");
     cmd.env(CLAUDE_OAUTH_TOKEN_ENV, "manual-token");
 
     apply_claude_account_env(&mut cmd, Some(CLAUDE_OAUTH_TOKEN_ENV), None);
-    apply_claude_account_env(&mut cmd, None, Some(TOKEN));
+    apply_claude_account_env(
+        &mut cmd,
+        None,
+        Some(&ClaudeSpawnAuth::SetupToken(TOKEN.to_string())),
+    );
 
     let envs = env_map(&cmd);
     assert_eq!(
@@ -600,4 +796,47 @@ fn spawn_env_is_untouched_without_an_account_token() {
         envs.get(CLAUDE_OAUTH_TOKEN_ENV),
         Some(&Some("manual-token".to_string()))
     );
+}
+
+/// The login the app runs must carry the same credential contract as spawn:
+/// this account's directory wins, and every ambient competitor is dropped.
+/// Without the removals an owner with `ANTHROPIC_API_KEY` exported would sign
+/// in against a different login than the account they clicked.
+#[test]
+fn login_command_points_at_the_account_directory_and_drops_competing_credentials() {
+    let mut command = std::process::Command::new("claude");
+    configure_claude_login_command(&mut command, std::path::Path::new("/data/configs/acct"));
+
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    // The bare `claude login` TUI cannot run without a terminal; only this
+    // subcommand goes straight to the browser.
+    assert_eq!(args, ["auth", "login", "--claudeai"]);
+
+    let envs: std::collections::HashMap<_, _> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        envs.get(CLAUDE_CONFIG_DIR_ENV),
+        Some(&Some("/data/configs/acct".to_string()))
+    );
+    for key in [
+        ANTHROPIC_API_KEY_ENV,
+        ANTHROPIC_AUTH_TOKEN_ENV,
+        CLAUDE_OAUTH_TOKEN_ENV,
+    ] {
+        assert_eq!(
+            envs.get(key),
+            Some(&None),
+            "{key} must be cleared for the login"
+        );
+    }
 }

@@ -55,7 +55,16 @@ fn status_for_with(
     let StatusInputs { personas, global } = inputs;
     let command = record_agent_command(record, personas);
     let metadata = super::known_acp_runtime(&command);
-    let effective = resolve_effective_agent_env(record, personas, metadata, global);
+    let effective = resolve_effective_agent_env(
+        record,
+        personas,
+        metadata,
+        global,
+        super::claude_accounts::claude_account_readiness_supplied(
+            app,
+            record.claude_account_id.as_deref(),
+        ),
+    );
     let local_setup = matches!(agent_readiness(&effective), AgentReadiness::Ready);
     ManagedAgentRuntimeStatus {
         pubkey: key.pubkey.clone(),
@@ -436,10 +445,17 @@ fn unkeyable_failed_status(
     error: String,
     personas: &[super::AgentDefinition],
     global: &super::GlobalAgentConfig,
+    named_claude_account_ready: bool,
 ) -> ManagedAgentRuntimeStatus {
     let command = record_agent_command(record, personas);
     let metadata = super::known_acp_runtime(&command);
-    let effective = resolve_effective_agent_env(record, personas, metadata, global);
+    let effective = resolve_effective_agent_env(
+        record,
+        personas,
+        metadata,
+        global,
+        named_claude_account_ready,
+    );
     ManagedAgentRuntimeStatus {
         pubkey: record.pubkey.clone(),
         relay_url: requested.clone(),
@@ -561,7 +577,15 @@ pub async fn reconcile_managed_agent_runtimes(
                                 status
                             }
                             Err(_) => unkeyable_failed_status(
-                                &record, requested, error, &personas, &global,
+                                &record,
+                                requested,
+                                error,
+                                &personas,
+                                &global,
+                                super::claude_accounts::claude_account_readiness_supplied(
+                                    &app,
+                                    record.claude_account_id.as_deref(),
+                                ),
                             ),
                         };
                     rows.push(status);
@@ -652,6 +676,7 @@ mod tests {
             "relay access probe timed out".to_string(),
             &[],
             &super::super::GlobalAgentConfig::default(),
+            false,
         );
         assert!(matches!(
             status.lifecycle,

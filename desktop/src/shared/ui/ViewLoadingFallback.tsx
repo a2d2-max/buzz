@@ -9,6 +9,7 @@ type ViewLoadingFallbackKind =
   | "agents"
   | "board"
   | "channel"
+  | "databases"
   | "docs"
   | "forum"
   | "projects"

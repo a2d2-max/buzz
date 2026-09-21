@@ -224,3 +224,96 @@ test("nextMonotonicSeconds never goes backwards", () => {
   assert.equal(nextMonotonicSeconds(100, 100), 101);
   assert.equal(nextMonotonicSeconds(100, 200), 201);
 });
+
+test("document references survive serialization and moves, while tombstones remove them", async () => {
+  const { communityTaskContentOf } = await import("./communityTaskMerge.ts");
+  const documents = [
+    {
+      pageId: "3ad62a7535ba8028935cde50d43e47a4",
+      relayUrl: "wss://buzz.a2d2lab.com",
+      title: "Specification",
+    },
+  ];
+  const original = content({ documents });
+  const parsed = parseCommunityTaskContent(
+    JSON.parse(serializeCommunityTaskContent(original)),
+  );
+  assert.deepEqual(parsed.documents, documents);
+  assert.deepEqual(
+    communityTaskContentOf({ ...parsed, id: "one" }).documents,
+    documents,
+  );
+  assert.equal(
+    tombstoneCommunityTaskContent(original, 1800000000).documents,
+    undefined,
+  );
+});
+
+test("invalid document IDs and unsafe relay URLs are dropped without losing the task", () => {
+  const parsed = parseCommunityTaskContent(
+    content({
+      documents: [
+        { pageId: "../outside", relayUrl: "wss://example.com", title: "Bad" },
+        { pageId: "valid", relayUrl: "javascript:alert(1)", title: "Bad" },
+        {
+          pageId: "valid",
+          relayUrl: "wss://user:password@example.com",
+          title: "Bad",
+        },
+        { pageId: "valid", relayUrl: "wss://example.com", title: "Good" },
+        { pageId: "valid", relayUrl: "wss://example.com/", title: "Duplicate" },
+      ],
+    }),
+  );
+  assert.equal(parsed.title, "Write the release notes");
+  assert.deepEqual(parsed.documents, [
+    { pageId: "valid", relayUrl: "wss://example.com", title: "Good" },
+  ]);
+});
+
+test("custom fields and explicit extension clears roundtrip without inventing absent extensions", () => {
+  for (const customFields of [
+    [],
+    [
+      { id: "text", name: "Team", type: "text", value: "Core" },
+      { id: "number", name: "Estimate", type: "number", value: 0 },
+      { id: "checkbox", name: "Reviewed", type: "checkbox", value: false },
+      { id: "unset", name: "Unset", type: "number", value: null },
+    ],
+  ]) {
+    const original = content({ customFields, documents: [] });
+    assert.deepEqual(
+      parseCommunityTaskContent(
+        JSON.parse(serializeCommunityTaskContent(original)),
+      ),
+      original,
+    );
+  }
+});
+
+test("malformed custom fields are ignored on read and rejected on write", () => {
+  const valid = { id: "x", name: "Estimate", type: "number", value: 1 };
+  for (const customFields of [
+    null,
+    {},
+    [null],
+    [{ ...valid, value: "1" }],
+    [{ ...valid, value: Infinity }],
+    [{ ...valid, type: "unknown" }],
+    [{ ...valid, name: " " }],
+    [{ ...valid, name: "x".repeat(65) }],
+    [{ ...valid, id: "bad id" }],
+    [valid, valid],
+    Array.from({ length: 21 }, (_, i) => ({ ...valid, id: String(i) })),
+    [{ ...valid, type: "text", value: "x".repeat(1025) }],
+  ]) {
+    assert.equal(
+      parseCommunityTaskContent(content({ customFields })).customFields,
+      undefined,
+    );
+    assert.throws(
+      () => serializeCommunityTaskContent(content({ customFields })),
+      /Invalid task custom fields/,
+    );
+  }
+});

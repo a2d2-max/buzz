@@ -17,6 +17,7 @@ fn empty_env() -> EffectiveAgentEnv {
         config_file_path: Some("~/.config/goose/config.yaml"),
         effective_command: "goose".to_string(),
         oauth_token_supplied: false,
+        selected_claude_account_unready: false,
     }
 }
 
@@ -29,6 +30,7 @@ fn env_with(pairs: &[(&str, &str)]) -> EffectiveAgentEnv {
         config_file_path: Some("~/.config/goose/config.yaml"),
         effective_command: "goose".to_string(),
         oauth_token_supplied: false,
+        selected_claude_account_unready: false,
     }
 }
 

@@ -392,7 +392,16 @@ async fn execute_relay_admin_command(
             };
 
             match remove_result {
-                RemoveResult::Removed => {}
+                RemoveResult::Removed => {
+                    let target_bytes = hex::decode(&target_hex)
+                        .map_err(|_| "invalid member public key".to_string())?;
+                    state.disconnect_pubkey_clusterwide(
+                        tenant,
+                        &target_bytes,
+                        &event.id.to_hex(),
+                        "restricted: not a relay member",
+                    );
+                }
                 RemoveResult::IsOwner => {
                     return Err("cannot remove the relay owner".to_string());
                 }

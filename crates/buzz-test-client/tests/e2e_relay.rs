@@ -302,6 +302,91 @@ async fn test_invite_mint_and_claim_admits_new_pubkey() {
     );
 }
 
+/// A signed canonical task accepted through the real NIP-42 WebSocket path
+/// must enqueue the disabled engine binding in the same database write. The
+/// binding stays disabled so this admission test never contacts Plane.
+#[tokio::test]
+#[ignore]
+async fn test_signed_community_task_ws_ingest_enqueues_projection_head() {
+    let owner = test_owner_keys();
+    seed_relay_owner(&owner).await;
+
+    let pool = e2e_db_pool().await;
+    let community_id = ensure_test_community(&relay_authority()).await;
+    let binding_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO engine_projection_bindings (\
+             id, community_id, provider, origin, workspace_slug, project_id, \
+             api_key_env, state_map, enabled\
+         ) VALUES ($1,$2,'plane','http://127.0.0.1:3020/','a2d2',$3,\
+                   'A2D2_TEST_PLANE_API_KEY',$4,false)",
+    )
+    .bind(binding_id)
+    .bind(community_id)
+    .bind(Uuid::new_v4())
+    .bind(serde_json::json!({
+        "todo": Uuid::new_v4(),
+        "doing": Uuid::new_v4(),
+        "done": Uuid::new_v4(),
+    }))
+    .execute(&pool)
+    .await
+    .expect("configure disabled projection binding");
+
+    let now = nostr::Timestamp::now().as_secs();
+    let d_tag = format!("community-task:{}", Uuid::new_v4());
+    let content = serde_json::json!({
+        "author": owner.public_key().to_hex(),
+        "title": "Authenticated projection seam",
+        "body": "Canonical A2D2 task",
+        "status": "todo",
+        "assignees": [],
+        "order": 1,
+        "createdAt": now,
+        "updatedAt": now,
+    });
+    let event = EventBuilder::new(Kind::Custom(30_078), content.to_string())
+        .tags([Tag::custom(nostr::TagKind::d(), [d_tag.clone()])])
+        .sign_with_keys(&owner)
+        .expect("sign canonical task");
+
+    let mut client = BuzzTestClient::connect(&relay_url(), &owner)
+        .await
+        .expect("connect and authenticate owner");
+    let response = client
+        .send_event(event.clone())
+        .await
+        .expect("submit canonical task through WebSocket");
+    assert!(response.accepted, "task rejected: {}", response.message);
+    client.disconnect().await.expect("disconnect owner");
+
+    let persisted_event: Vec<u8> = sqlx::query_scalar(
+        "SELECT id FROM events \
+         WHERE community_id=$1 AND kind=30078 AND d_tag=$2 AND deleted_at IS NULL",
+    )
+    .bind(community_id)
+    .bind(&d_tag)
+    .fetch_one(&pool)
+    .await
+    .expect("read accepted canonical event");
+    let head: (Vec<u8>, i64, i64, String) = sqlx::query_as(
+        "SELECT desired_event_id, desired_generation, applied_generation, task_d_tag \
+         FROM engine_projection_heads \
+         WHERE community_id=$1 AND binding_id=$2 AND entity_kind='community_task'",
+    )
+    .bind(community_id)
+    .bind(binding_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read projection head written by ingest transaction");
+
+    assert_eq!(persisted_event, event.id.as_bytes());
+    assert_eq!(head.0, event.id.as_bytes());
+    assert_eq!(head.1, 1);
+    assert_eq!(head.2, 0);
+    assert_eq!(head.3, d_tag);
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_invite_claim_rejects_invalid_code() {

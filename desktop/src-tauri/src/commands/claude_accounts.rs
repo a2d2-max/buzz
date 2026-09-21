@@ -13,15 +13,39 @@ use tauri::{AppHandle, Manager};
 
 use crate::app_state::AppState;
 use crate::managed_agents::{
-    claude_accounts::CLAUDE_OAUTH_TOKEN_ENV, detach_claude_account, load_managed_agents,
-    output_with_timeout, resolve_command, save_managed_agents, with_claude_account_store,
-    AccountProvider, ProviderAccount,
+    claude_accounts::{
+        self, ClaudeAuthKind, ClaudeSpawnAuth, ANTHROPIC_API_KEY_ENV, ANTHROPIC_AUTH_TOKEN_ENV,
+        CLAUDE_CONFIG_DIR_ENV, CLAUDE_OAUTH_TOKEN_ENV,
+    },
+    codex_login::{
+        retain_running_login_sessions, spawn_claude_login, ClaudeLoginLaunch, CodexLoginSnapshot,
+        DEFAULT_LOGIN_TIMEOUT,
+    },
+    detach_claude_account, load_managed_agents, output_with_timeout, resolve_command,
+    save_managed_agents, with_claude_account_store, AccountProvider, ProviderAccount,
 };
 
 /// Cheapest model for the round-trip probe; the point is the auth, not the answer.
 const TEST_MODEL: &str = "claude-haiku-4-5-20251001";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_CONCURRENT_CLAUDE_LOGINS: usize = 2;
 const TEST_MESSAGE_MAX_CHARS: usize = 200;
+
+fn configure_config_dir_probe(
+    command: &mut std::process::Command,
+    label: &str,
+    dir: std::path::PathBuf,
+    validate: impl FnOnce(&std::path::Path) -> Result<bool, String>,
+) -> Result<(), String> {
+    let auth = claude_accounts::config_dir_spawn_auth(label, dir, validate)?;
+    let ClaudeSpawnAuth::ConfigDir(dir) = auth else {
+        return Err("Claude config-directory account resolved as a token".to_string());
+    };
+    command.args(["auth", "status", "--json"]);
+    command.env(CLAUDE_CONFIG_DIR_ENV, dir);
+    command.env_remove(CLAUDE_OAUTH_TOKEN_ENV);
+    Ok(())
+}
 
 /// Result of `remove_claude_account`: agents that pointed at the removed
 /// account now run on the app's own login and will show the restart badge.
@@ -49,29 +73,223 @@ async fn run_blocking<T: Send + 'static>(
         .map_err(|error| format!("spawn_blocking failed: {error}"))?
 }
 
+async fn run_trusted_blocking<T: Send + 'static>(
+    _trusted: super::upstream_apps::TrustedLocalCaller,
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    run_blocking(f).await
+}
+
+fn parse_auth_kind(auth_kind: &str) -> Result<ClaudeAuthKind, String> {
+    match auth_kind {
+        "setup_token" => Ok(ClaudeAuthKind::SetupToken),
+        "config_dir" => Ok(ClaudeAuthKind::ConfigDir),
+        other => Err(format!("unknown Claude auth kind {other:?}")),
+    }
+}
+
+fn claude_login_start_conflict(running: &[String], id: &str) -> Option<String> {
+    if running.iter().any(|account_id| account_id == id) {
+        return Some(
+            "a login for this Claude account is already running — finish it in the browser or cancel it"
+                .to_string(),
+        );
+    }
+    (running.len() >= MAX_CONCURRENT_CLAUDE_LOGINS).then(|| {
+        format!(
+            "{MAX_CONCURRENT_CLAUDE_LOGINS} Claude account logins are already running — finish or cancel one first"
+        )
+    })
+}
+
+fn parse_claude_auth_status(raw: &[u8]) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_slice(raw)
+        .map_err(|error| format!("Claude returned an invalid auth status: {error}"))?;
+    value
+        .get("loggedIn")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "Claude auth status did not include loggedIn".to_string())
+}
+
+fn cleanup_before_account_removal<T>(
+    cleanup_required: bool,
+    cleanup: impl FnOnce() -> Option<String>,
+    remove_metadata: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if cleanup_required {
+        if let Some(error) = cleanup() {
+            return Err(error);
+        }
+    }
+    remove_metadata()
+}
+
 /// All stored Claude accounts (no tokens).
 #[tauri::command]
-pub async fn list_claude_accounts(app: AppHandle) -> Result<Vec<ProviderAccount>, String> {
-    run_blocking(move || {
+pub async fn list_claude_accounts(
+    app: AppHandle,
+    caller: tauri::Webview,
+) -> Result<Vec<ProviderAccount>, String> {
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
         with_claude_account_store(&app, |store| store.list(AccountProvider::Claude))
     })
     .await
 }
 
-/// Store a `claude setup-token` result under `label`.
+/// Store either a setup token or an app-owned config-directory login.
 #[tauri::command]
 pub async fn add_claude_account(
     label: String,
-    token: String,
+    auth_kind: String,
+    token: Option<String>,
     app: AppHandle,
+    caller: tauri::Webview,
 ) -> Result<ProviderAccount, String> {
-    run_blocking(move || {
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
+        let kind = parse_auth_kind(&auth_kind)?;
         let state = app.state::<AppState>();
         let _guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| format!("failed to acquire store lock: {error}"))?;
-        with_claude_account_store(&app, |store| store.add(&label, &token))
+        match kind {
+            ClaudeAuthKind::SetupToken => {
+                let token = token.as_deref().ok_or_else(|| {
+                    "a setup token is required for this account type".to_string()
+                })?;
+                with_claude_account_store(&app, |store| store.add(&label, token))
+            }
+            ClaudeAuthKind::ConfigDir => {
+                if token.is_some() {
+                    return Err("a config-directory account does not take a token".to_string());
+                }
+                let dir_id = uuid::Uuid::new_v4().to_string();
+                let dir = claude_accounts::claude_config_dir(&app, &dir_id)?;
+                let account = with_claude_account_store(&app, |store| {
+                    store.add_claude_config_dir(&label, dir.clone())
+                })?;
+                if let Err(error) = std::fs::create_dir_all(&dir) {
+                    return Err(format!(
+                        "Claude account metadata was saved for retry, but its directory could not be created ({}): {error}",
+                        dir.display()
+                    ));
+                }
+                Ok(account)
+            }
+        }
+    })
+    .await
+}
+
+/// Resolve the app-owned login directory of a config-dir account, creating it
+/// if the add left it missing. Shared by the copyable command and the launched
+/// login so both go through the same ownership validation.
+fn claude_login_dir(id: &str, app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let account = with_claude_account_store(app, |store| store.find(id))?
+        .filter(|account| account.provider == AccountProvider::Claude)
+        .ok_or_else(|| format!("Claude account {id} not found"))?;
+    if account.claude_auth_kind != Some(ClaudeAuthKind::ConfigDir) {
+        return Err("setup-token accounts do not need a browser login command".to_string());
+    }
+    let dir = account
+        .config_dir
+        .ok_or_else(|| "Claude account has no config directory".to_string())?;
+    claude_accounts::validate_recorded_claude_config_dir(app, &dir)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create the account's Claude directory: {error}"))?;
+    Ok(dir)
+}
+
+/// One-time browser login command for an app-owned config-dir account.
+#[tauri::command]
+pub async fn get_claude_login_command(
+    id: String,
+    app: AppHandle,
+    caller: tauri::Webview,
+) -> Result<String, String> {
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
+        let dir = claude_login_dir(&id, &app)?;
+        Ok(claude_accounts::claude_login_command(&dir))
+    })
+    .await
+}
+
+/// Start the bounded browser login. Poll/cancel own the same backend session;
+/// closing a dialog never orphans an unobservable CLI process.
+#[tauri::command]
+pub async fn start_claude_account_login(
+    id: String,
+    app: AppHandle,
+    caller: tauri::Webview,
+) -> Result<CodexLoginSnapshot, String> {
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
+        let dir = claude_login_dir(&id, &app)?;
+        let Some(binary) = resolve_command("claude") else {
+            return Err(
+                "Claude Code CLI (`claude`) was not found on PATH — install it, or copy \
+                        the command and run it in a terminal that has it"
+                    .to_string(),
+            );
+        };
+        let state = app.state::<AppState>();
+        let mut sessions = state
+            .claude_login_sessions
+            .lock()
+            .map_err(|error| format!("failed to acquire Claude login sessions lock: {error}"))?;
+        let running = retain_running_login_sessions(&mut sessions);
+        if let Some(conflict) = claude_login_start_conflict(&running, &id) {
+            return Err(conflict);
+        }
+        let session = spawn_claude_login(&ClaudeLoginLaunch {
+            binary,
+            config_dir: dir.clone(),
+            cwd: dir,
+            path_env: crate::managed_agents::readiness::cli_probe::augmented_path(),
+            timeout: DEFAULT_LOGIN_TIMEOUT,
+        })?;
+        let snapshot = session.snapshot();
+        sessions.insert(id, session);
+        Ok(snapshot)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn poll_claude_account_login(
+    id: String,
+    app: AppHandle,
+    caller: tauri::Webview,
+) -> Result<Option<CodexLoginSnapshot>, String> {
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
+        let state = app.state::<AppState>();
+        let mut sessions = state
+            .claude_login_sessions
+            .lock()
+            .map_err(|error| format!("failed to acquire Claude login sessions lock: {error}"))?;
+        Ok(sessions.get_mut(&id).map(|session| session.poll()))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn cancel_claude_account_login(
+    id: String,
+    app: AppHandle,
+    caller: tauri::Webview,
+) -> Result<Option<CodexLoginSnapshot>, String> {
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
+        let state = app.state::<AppState>();
+        let mut sessions = state
+            .claude_login_sessions
+            .lock()
+            .map_err(|error| format!("failed to acquire Claude login sessions lock: {error}"))?;
+        Ok(sessions.get_mut(&id).map(|session| session.cancel()))
     })
     .await
 }
@@ -82,13 +300,16 @@ pub async fn rename_claude_account(
     id: String,
     label: String,
     app: AppHandle,
+    caller: tauri::Webview,
 ) -> Result<ProviderAccount, String> {
-    run_blocking(move || {
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
         let state = app.state::<AppState>();
         let _guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| format!("failed to acquire store lock: {error}"))?;
+
         with_claude_account_store(&app, |store| store.rename(&id, &label))
     })
     .await
@@ -102,13 +323,19 @@ pub async fn rename_claude_account(
 pub async fn remove_claude_account(
     id: String,
     app: AppHandle,
+    caller: tauri::Webview,
 ) -> Result<RemoveClaudeAccountResult, String> {
-    run_blocking(move || {
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
         let state = app.state::<AppState>();
         let _guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| format!("failed to acquire store lock: {error}"))?;
+
+        let account = with_claude_account_store(&app, |store| store.find(&id))?
+            .filter(|account| account.provider == AccountProvider::Claude)
+            .ok_or_else(|| format!("Claude account {id} not found"))?;
 
         let mut records = load_managed_agents(&app)?;
         let detached_agent_pubkeys = detach_claude_account(&mut records, &id);
@@ -126,9 +353,13 @@ pub async fn remove_claude_account(
         // The detach above is already durable: if the removal itself fails,
         // say so, so the owner knows those agents are on the app login now
         // and that retrying the removal is safe.
-        let warning = with_claude_account_store(&app, |store| store.remove(&id))
-            .map(|(_removed, warning)| warning)
-            .map_err(
+        let cleanup_required = account.claude_auth_kind == Some(ClaudeAuthKind::ConfigDir);
+        let (_removed, keyring_warning) = cleanup_before_account_removal(
+            cleanup_required,
+            || claude_accounts::remove_claude_config_dir(&app, &account),
+            || with_claude_account_store(&app, |store| store.remove(&id)),
+        )
+        .map_err(
             |error| {
                 if detached_agent_pubkeys.is_empty() {
                     error
@@ -142,22 +373,24 @@ pub async fn remove_claude_account(
         )?;
         Ok(RemoveClaudeAccountResult {
             detached_agent_pubkeys,
-            warning,
+            warning: keyring_warning,
         })
     })
     .await
 }
 
-/// Round-trip the stored token through the Claude Code CLI:
-/// `claude -p ping --model <haiku>` with `CLAUDE_CODE_OAUTH_TOKEN` set.
-/// Bounded by `output_with_timeout` (deadline, output cap, tree teardown).
+/// Test setup tokens with a bounded ping and config-dir accounts with
+/// `claude auth status --json` against their app-owned directory.
 #[tauri::command]
 pub async fn test_claude_account(
     id: String,
     app: AppHandle,
+    caller: tauri::Webview,
 ) -> Result<ClaudeAccountTestResult, String> {
-    run_blocking(move || {
-        let token = with_claude_account_store(&app, |store| store.token(&id))?
+    let trusted = super::upstream_apps::trusted_local_caller(&caller)?;
+    run_trusted_blocking(trusted, move || {
+        let account = with_claude_account_store(&app, |store| store.find(&id))?
+            .filter(|account| account.provider == AccountProvider::Claude)
             .ok_or_else(|| format!("Claude account {id} not found"))?;
         let Some(binary) = resolve_command("claude") else {
             return Ok(ClaudeAccountTestResult {
@@ -167,7 +400,31 @@ pub async fn test_claude_account(
         };
 
         let mut command = std::process::Command::new(binary);
-        command.args(["-p", "ping", "--model", TEST_MODEL]);
+        let mut token = None;
+        match account
+            .claude_auth_kind
+            .unwrap_or(ClaudeAuthKind::SetupToken)
+        {
+            ClaudeAuthKind::SetupToken => {
+                let stored = with_claude_account_store(&app, |store| store.token(&id))?
+                    .ok_or_else(|| format!("Claude account {id} not found"))?;
+                command.args(["-p", "ping", "--model", TEST_MODEL]);
+                command.env_remove(CLAUDE_CONFIG_DIR_ENV);
+                command.env(CLAUDE_OAUTH_TOKEN_ENV, &stored);
+                token = Some(stored);
+            }
+            ClaudeAuthKind::ConfigDir => {
+                let dir = account
+                    .config_dir
+                    .ok_or_else(|| "Claude account has no config directory".to_string())?;
+                configure_config_dir_probe(
+                    &mut command,
+                    &account.label,
+                    dir,
+                    |path| claude_accounts::validate_recorded_claude_config_dir(&app, path),
+                )?;
+            }
+        }
         // Probe from an empty scratch directory so the CLI reads no project
         // CLAUDE.md, settings, or hooks from the agents' working directory;
         // the point is the auth round-trip, nothing else.
@@ -180,10 +437,42 @@ pub async fn test_claude_account(
         }
         // The probe must prove THIS token works: an ambient API key from the
         // desktop's own environment would make a bad token look good.
-        command.env_remove("ANTHROPIC_API_KEY");
-        command.env(CLAUDE_OAUTH_TOKEN_ENV, &token);
+        command.env_remove(ANTHROPIC_API_KEY_ENV);
+        command.env_remove(ANTHROPIC_AUTH_TOKEN_ENV);
 
-        Ok(finish_claude_account_probe(command, &token))
+        // Config-dir accounts prove themselves with `claude auth status --json`:
+        // there is no token to scrub, and the JSON has to be read because a
+        // logged-out directory can still exit zero.
+        if account.claude_auth_kind == Some(ClaudeAuthKind::ConfigDir) {
+            let Some(output) = output_with_timeout(command, TEST_TIMEOUT) else {
+                return Ok(ClaudeAccountTestResult {
+                    ok: false,
+                    message: format!("no response within {}s", TEST_TIMEOUT.as_secs()),
+                });
+            };
+            let logged_in = match parse_claude_auth_status(&output.stdout) {
+                Ok(logged_in) => logged_in,
+                Err(_) => {
+                    return Ok(ClaudeAccountTestResult {
+                        ok: false,
+                        message: "Claude returned an unsupported auth-status response; update Claude Code and try again".to_string(),
+                    });
+                }
+            };
+            let ok = output.status.success() && logged_in;
+            return Ok(ClaudeAccountTestResult {
+                ok,
+                message: if ok {
+                    "Logged in with Claude".to_string()
+                } else {
+                    "Claude login is not active for this account".to_string()
+                },
+            });
+        }
+        let token = token
+            .as_deref()
+            .ok_or_else(|| "setup-token account did not resolve a token".to_string())?;
+        Ok(finish_claude_account_probe(command, token))
     })
     .await
 }
@@ -250,7 +539,24 @@ fn scrub_secrets(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{finish_claude_account_probe, summarize_probe_output};
+    use super::{
+        claude_login_start_conflict, cleanup_before_account_removal, configure_config_dir_probe,
+        finish_claude_account_probe, parse_claude_auth_status, summarize_probe_output,
+    };
+    use crate::managed_agents::claude_accounts::validate_existing_claude_config_dir;
+    use std::cell::Cell;
+
+    #[test]
+    fn claude_login_sessions_refuse_same_account_and_n_plus_one() {
+        assert_eq!(claude_login_start_conflict(&[], "a"), None);
+        assert!(claude_login_start_conflict(&["a".into()], "a")
+            .expect("same account conflict")
+            .contains("already running"));
+        let full = vec!["a".into(), "b".into()];
+        assert!(claude_login_start_conflict(&full, "c")
+            .expect("bounded session conflict")
+            .contains('2'));
+    }
 
     #[cfg(unix)]
     fn failing_probe_command(secret: &str) -> std::process::Command {
@@ -324,5 +630,108 @@ mod tests {
         assert_eq!(result.message, "rejected … key=…");
         assert!(!result.message.contains(token));
         assert!(!result.message.contains("sk-ant-"));
+    }
+
+    #[test]
+    fn config_dir_auth_status_requires_the_logged_in_boolean() {
+        assert_eq!(parse_claude_auth_status(br#"{"loggedIn":true}"#), Ok(true));
+        assert_eq!(
+            parse_claude_auth_status(br#"{"loggedIn":false}"#),
+            Ok(false)
+        );
+        assert!(parse_claude_auth_status(br#"{"authMethod":"none"}"#).is_err());
+    }
+
+    #[test]
+    fn config_dir_test_probe_refuses_missing_or_empty_directories_before_launch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let account_dir = dir.path().join("account");
+        let mut command = std::process::Command::new("/bin/true");
+
+        let missing_error = configure_config_dir_probe(
+            &mut command,
+            "Work",
+            account_dir.clone(),
+            validate_existing_claude_config_dir,
+        )
+        .expect_err("missing config directory must not reach Claude");
+        assert!(missing_error.contains("claude login"));
+        assert!(command.get_args().next().is_none());
+
+        std::fs::create_dir(&account_dir).expect("account dir");
+        let error = configure_config_dir_probe(
+            &mut command,
+            "Work",
+            account_dir.clone(),
+            validate_existing_claude_config_dir,
+        )
+        .expect_err("empty config directory must not reach Claude");
+        assert!(error.contains("claude login"));
+        assert!(command.get_args().next().is_none());
+
+        std::fs::write(account_dir.join(".claude.json"), "fixture").expect("login marker");
+        configure_config_dir_probe(
+            &mut command,
+            "Work",
+            account_dir,
+            validate_existing_claude_config_dir,
+        )
+        .expect("marker permits the auth-status probe");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["auth", "status", "--json"]
+        );
+    }
+
+    #[test]
+    fn config_dir_cleanup_failure_keeps_the_metadata_removal_retryable() {
+        let remove_called = Cell::new(false);
+        let result: Result<(), String> = cleanup_before_account_removal(
+            true,
+            || Some("directory busy".to_string()),
+            || {
+                remove_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!remove_called.get(), "metadata must remain for retry");
+
+        cleanup_before_account_removal(
+            false,
+            || panic!("not needed"),
+            || {
+                remove_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("setup-token removal skips directory cleanup");
+        assert!(remove_called.get());
+    }
+
+    #[test]
+    fn config_dir_inspection_failure_keeps_the_metadata_removal_retryable() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "fixture").expect("file fixture");
+        let invalid_path = file.join("account");
+        let remove_called = Cell::new(false);
+
+        let result: Result<(), String> = cleanup_before_account_removal(
+            true,
+            || validate_existing_claude_config_dir(&invalid_path).err(),
+            || {
+                remove_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result
+            .expect_err("inspection failure must stop metadata removal")
+            .contains("failed to inspect"));
+        assert!(!remove_called.get(), "metadata must remain for retry");
     }
 }

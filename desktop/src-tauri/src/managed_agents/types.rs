@@ -688,6 +688,11 @@ pub struct AcpRuntimeCatalogEntry {
     /// "Codex account" picker the way `oauth_token_env_var` drives Claude's.
     #[serde(default)]
     pub supports_codex_accounts: bool,
+    /// Which per-agent data home the spawn gives this runtime.
+    pub data_home: crate::managed_agents::agent_home::DataHomeKind,
+    /// Why neither stored account kind applies to this runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_unsupported_reason: Option<String>,
     /// Canonical accepted effort values for this runtime, in display order.
     /// Serialized from `KnownAcpRuntime::effort_normalization.canonical` for
     /// runtimes with a static finite vocabulary (e.g. Goose). `None` for

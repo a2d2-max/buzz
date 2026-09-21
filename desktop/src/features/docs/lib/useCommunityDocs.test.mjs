@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { after, afterEach, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
+import * as Y from "yjs";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -65,6 +66,54 @@ function docEvent({ id, eventId, author, createdAt, content, kind = 30623 }) {
   };
 }
 
+const encodeBytes = (bytes) => Buffer.from(bytes).toString("base64");
+const decodeBytes = (value) => new Uint8Array(Buffer.from(value, "base64"));
+
+function structuredSnapshot(entries, blobs = []) {
+  const root = new Y.Doc();
+  root.getMap("spaces").set("entry", new Y.Doc({ guid: "entry" }));
+  const nested = new Y.Doc({ guid: "entry" });
+  for (const [key, value] of entries) nested.getMap("blocks").set(key, value);
+  return {
+    version: 2,
+    data: encodeBytes(
+      new TextEncoder().encode(
+        JSON.stringify({
+          entry: "entry",
+          root: encodeBytes(Y.encodeStateAsUpdate(root)),
+          docs: [
+            { id: "entry", state: encodeBytes(Y.encodeStateAsUpdate(nested)) },
+          ],
+          blobs,
+        }),
+      ),
+    ),
+  };
+}
+
+function structuredBlocks(affine) {
+  const snapshot = JSON.parse(
+    new TextDecoder().decode(decodeBytes(affine.data)),
+  );
+  const nested = new Y.Doc({ guid: "entry" });
+  Y.applyUpdate(nested, decodeBytes(snapshot.docs[0].state));
+  return Object.fromEntries(nested.getMap("blocks"));
+}
+
+function updateStructuredSnapshot(affine, key, value) {
+  const snapshot = JSON.parse(
+    new TextDecoder().decode(decodeBytes(affine.data)),
+  );
+  const nested = new Y.Doc({ guid: snapshot.entry });
+  Y.applyUpdate(nested, decodeBytes(snapshot.docs[0].state));
+  nested.getMap("blocks").set(key, value);
+  snapshot.docs[0].state = encodeBytes(Y.encodeStateAsUpdate(nested));
+  return {
+    version: 2,
+    data: encodeBytes(new TextEncoder().encode(JSON.stringify(snapshot))),
+  };
+}
+
 const V1 = docEvent({
   id: PAGE_ID,
   eventId: "v1",
@@ -78,6 +127,155 @@ const V2 = docEvent({
   author: AUTHOR_THEM,
   createdAt: 1_100,
   content: { body: "v2 body (theirs)", title: "Theirs" },
+});
+
+test("history and save merge independent page, Edgeless, and asset branches through the production hook", async () => {
+  const a = docEvent({
+    id: PAGE_ID,
+    eventId: "structured-a",
+    author: AUTHOR_ME,
+    createdAt: 1_200,
+    content: {
+      affine: structuredSnapshot(
+        [["page:block:a", "page text"]],
+        [
+          {
+            id: "image-a",
+            type: "image/png",
+            data: encodeBytes(Uint8Array.of(1, 2, 3)),
+          },
+        ],
+      ),
+    },
+  });
+  const b = docEvent({
+    id: PAGE_ID,
+    eventId: "structured-b",
+    author: AUTHOR_THEM,
+    createdAt: 1_201,
+    content: {
+      title: "Merged metadata",
+      affine: structuredSnapshot(
+        [["edgeless:shape:b", "rectangle"]],
+        [
+          {
+            id: "image-b",
+            type: "image/png",
+            data: encodeBytes(Uint8Array.of(4, 5, 6)),
+          },
+        ],
+      ),
+    },
+  });
+  const docs = await mountDocs({
+    history: [a, b],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [a, b] },
+  });
+  try {
+    const merged = docs.result.current.pages.get(PAGE_ID);
+    assert.equal(merged.title, "Merged metadata", "metadata remains relay LWW");
+    assert.deepEqual(structuredBlocks(merged.affine), {
+      "edgeless:shape:b": "rectangle",
+      "page:block:a": "page text",
+    });
+    const snapshot = JSON.parse(
+      new TextDecoder().decode(decodeBytes(merged.affine.data)),
+    );
+    assert.deepEqual(
+      snapshot.blobs.map((blob) => [blob.id, [...decodeBytes(blob.data)]]),
+      [
+        ["image-a", [1, 2, 3]],
+        ["image-b", [4, 5, 6]],
+      ],
+    );
+
+    const edited = updateStructuredSnapshot(
+      merged.affine,
+      "save:marker",
+      "round trip",
+    );
+    await docs.result.current.updatePage(
+      PAGE_ID,
+      { title: "Saved merged state", body: "merged preview", affine: edited },
+      { baseEventId: b.id },
+    );
+    assert.equal(docs.published.length, 1);
+    const saved = JSON.parse(docs.published[0].content);
+    assert.deepEqual(structuredBlocks(saved.affine), {
+      "edgeless:shape:b": "rectangle",
+      "page:block:a": "page text",
+      "save:marker": "round trip",
+    });
+    const savedSnapshot = JSON.parse(
+      new TextDecoder().decode(decodeBytes(saved.affine.data)),
+    );
+    assert.deepEqual(
+      savedSnapshot.blobs.map((blob) => blob.id),
+      ["image-a", "image-b"],
+    );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a restored epoch excludes pre-delete author heads even after the tombstone was replaced", async () => {
+  const epoch = "11111111-1111-4111-8111-111111111111";
+  const oldA = docEvent({
+    id: PAGE_ID,
+    eventId: "old-a",
+    author: AUTHOR_ME,
+    createdAt: 1_200,
+    content: { affine: structuredSnapshot([["old:a", "deleted"]]) },
+  });
+  const oldB = docEvent({
+    id: PAGE_ID,
+    eventId: "old-b",
+    author: AUTHOR_THEM,
+    createdAt: 1_201,
+    content: { affine: structuredSnapshot([["old:b", "deleted"]]) },
+  });
+  const restored = docEvent({
+    id: PAGE_ID,
+    eventId: "restored",
+    author: "c".repeat(64),
+    createdAt: 1_203,
+    content: {
+      affineEpoch: epoch,
+      affine: structuredSnapshot([["restored", "current"]]),
+    },
+  });
+  const docs = await mountDocs({
+    history: [oldA, oldB, restored],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [oldA, oldB, restored] },
+  });
+  try {
+    const page = docs.result.current.pages.get(PAGE_ID);
+    assert.deepEqual(structuredBlocks(page.affine), { restored: "current" });
+    assert.equal(page.affineEpoch, epoch);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a community change fences the in-flight structured history result", async () => {
+  relayUrlReads = ["ws://first.example", "ws://second.example"];
+  const structured = docEvent({
+    id: PAGE_ID,
+    eventId: "scope",
+    author: AUTHOR_ME,
+    createdAt: 1_200,
+    content: { affine: structuredSnapshot([["scope", "first"]]) },
+  });
+  const docs = await mountDocs({
+    history: [structured],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [structured] },
+  });
+  try {
+    assert.equal(docs.result.current.isError, true);
+    assert.equal(docs.result.current.pages.size, 0);
+  } finally {
+    docs.restore();
+  }
 });
 
 before(() => {
@@ -976,6 +1174,121 @@ test("an incremental scan that overflows its page budget falls back to one full 
     const before = docs.historyRequests.length;
     await docs.result.current.refetch();
     assert.notEqual(docs.historyRequests[before].since, undefined);
+  } finally {
+    docs.restore();
+  }
+});
+
+const AFFINE = structuredSnapshot([["existing", "structured state"]]);
+
+test("tree writes preserve structured editor state", async () => {
+  const rich = docEvent({
+    id: PAGE_ID,
+    eventId: "rich",
+    author: AUTHOR_ME,
+    createdAt: 1200,
+    content: { affine: AFFINE },
+  });
+  const docs = await mountDocs({
+    history: [rich],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [rich] },
+  });
+  try {
+    await docs.result.current.deletePage(PAGE_ID);
+    const deleted = JSON.parse(docs.published[0].content);
+    assert.deepEqual(deleted.affine, AFFINE);
+    assert.equal(deleted.deleted, true);
+    assert.match(
+      deleted.affineEpoch,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("Markdown-only edits cannot replace structured content", async () => {
+  const rich = docEvent({
+    id: PAGE_ID,
+    eventId: "rich",
+    author: AUTHOR_ME,
+    createdAt: 1200,
+    content: { affine: AFFINE },
+  });
+  const docs = await mountDocs({
+    history: [rich],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [rich] },
+  });
+  try {
+    const signedBefore = nextEventSerial;
+    await assert.rejects(
+      docs.result.current.updatePage(PAGE_ID, { body: "flattened" }),
+      /structured editor/i,
+    );
+    assert.equal(nextEventSerial, signedBefore);
+    assert.equal(docs.published.length, 0);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("legacy migration retains the structured document", async () => {
+  const rich = docEvent({
+    id: PAGE_ID,
+    eventId: "richLegacy",
+    author: AUTHOR_ME,
+    createdAt: 1200,
+    content: { affine: AFFINE },
+    kind: 30078,
+  });
+  const docs = await mountDocs({
+    history: [rich],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [rich] },
+  });
+  try {
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() => assert.equal(docs.published.length, 1));
+    assert.deepEqual(JSON.parse(docs.published[0].content).affine, AFFINE);
+  } finally {
+    docs.restore();
+  }
+});
+
+test("an unsupported newest editor version blocks stale Markdown writes", async () => {
+  const newer = docEvent({
+    id: PAGE_ID,
+    eventId: "future",
+    author: AUTHOR_THEM,
+    createdAt: 1500,
+    content: { affine: { version: 3, data: "AQID" } },
+  });
+  const docs = await mountDocs({
+    history: [V1],
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, newer] },
+  });
+  try {
+    const before = nextEventSerial;
+    await assert.rejects(
+      docs.result.current.updatePage(
+        PAGE_ID,
+        { body: "old editor" },
+        { baseEventId: V1.id },
+      ),
+    );
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() =>
+      assert.equal(docs.result.current.pages.get(PAGE_ID)?.eventId, newer.id),
+    );
+    assert.equal(
+      docs.result.current.pages.get(PAGE_ID)?.unsupportedEditor,
+      true,
+    );
+    await assert.rejects(
+      docs.result.current.deletePage(PAGE_ID),
+      /newer editor/i,
+    );
+    assert.equal(nextEventSerial, before);
+    assert.equal(docs.published.length, 0);
   } finally {
     docs.restore();
   }

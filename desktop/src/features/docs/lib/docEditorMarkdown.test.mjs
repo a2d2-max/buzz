@@ -43,6 +43,8 @@ before(() => {
       observe() {}
       unobserve() {}
     },
+    requestAnimationFrame: (callback) => setTimeout(callback, 0),
+    cancelAnimationFrame: (handle) => clearTimeout(handle),
     window: dom.window,
   });
 });
@@ -89,7 +91,11 @@ async function mountEditor(options) {
 
 async function mountDocsEditor() {
   const { DocImageNode } = await import("./docImageNode.ts");
-  return mountEditor({ documentMode: true, extraExtensions: [DocImageNode] });
+  const { DocDatabaseNode } = await import("./docDatabaseNode.ts");
+  return mountEditor({
+    documentMode: true,
+    extraExtensions: [DocImageNode, DocDatabaseNode],
+  });
 }
 
 test("document mode keeps headings, lists, code, links, images and quotes", async () => {
@@ -179,4 +185,60 @@ test("document mode still writes soft line breaks as plain newlines outside code
   const editor = await mountDocsEditor();
   const source = "first line\nsecond line";
   assert.equal(await editor.roundTrip(source), source);
+});
+
+test("document mode preserves valid database atoms and leaves escaped fenced and nested lookalikes literal", async () => {
+  const editor = await mountDocsEditor();
+  const databaseId = "11111111-2222-4333-8444-555555555555";
+  const source = [
+    "# Plan",
+    "",
+    `:::db ${databaseId}`,
+    "",
+    "Adjacent prose.",
+    "",
+    `:::db ${databaseId} missing_view`,
+    "",
+    "![Diagram](https://example.com/diagram.png)",
+    "",
+    `- :::db ${databaseId}`,
+    "",
+    "```text",
+    `:::db ${databaseId} board`,
+    "```",
+    "",
+    "~~~text",
+    `:::db ${databaseId}`,
+    "~~~",
+  ].join("\n");
+  const once = await editor.roundTrip(source);
+  const normalized = source.replaceAll("~~~", "```");
+  assert.equal(once, normalized);
+  assert.equal(await editor.roundTrip(once), once);
+});
+
+test("document mode separates a leading database atom from adjacent blocks", async () => {
+  const editor = await mountDocsEditor();
+  const databaseId = "11111111-2222-4333-8444-555555555555";
+  const cases = [
+    [
+      `:::db ${databaseId}\nAdjacent *prose*`,
+      `:::db ${databaseId}\n\nAdjacent *prose*`,
+    ],
+    [
+      `:::db ${databaseId}\n![Diagram](https://example.com/diagram.png)`,
+      `:::db ${databaseId}\n\n![Diagram](https://example.com/diagram.png)`,
+    ],
+    [
+      `:::db ${databaseId}\n:::db ${databaseId} board`,
+      `:::db ${databaseId}\n\n:::db ${databaseId} board`,
+    ],
+  ];
+  for (const [source, expected] of cases) {
+    assert.equal(await editor.roundTrip(source), expected);
+  }
+  assert.equal(
+    await editor.roundTrip(`Before\n:::db ${databaseId}`),
+    `Before\n:::db ${databaseId}`,
+  );
 });

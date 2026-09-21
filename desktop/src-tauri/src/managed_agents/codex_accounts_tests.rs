@@ -10,11 +10,15 @@ use tempfile::TempDir;
 
 use super::{
     apply_codex_account_env, codex_account_spawn_auth, codex_auth_supplied, codex_login_command,
-    create_codex_home, create_codex_home_with, detach_codex_account, ensure_codex_home,
-    validated_codex_account_id, CodexSpawnAuth, CODEX_HOME_ENV, OPENAI_API_KEY_ENV,
+    command_for_external_codex_home, command_for_read_only_probe, create_codex_home,
+    create_codex_home_with, detach_codex_account, ensure_codex_home, external_home_auth_kind,
+    missing_chatgpt_login_message, remove_resolved_codex_home_dir, resolve_codex_home,
+    validated_codex_account_id, CodexSpawnAuth, ExternalCodexAccount, CODEX_HOME_ENV,
+    OPENAI_API_KEY_ENV,
 };
 use crate::managed_agents::claude_accounts::{
-    token_keyring_name, AccountProvider, AccountTokenStore, CodexAuthKind, ProviderAccountStore,
+    token_keyring_name, AccountProvider, AccountTokenStore, CodexAuthKind, ProviderAccount,
+    ProviderAccountStore,
 };
 use crate::managed_agents::ManagedAgentRecord;
 
@@ -130,6 +134,159 @@ fn codex_store_keeps_the_prepared_account_id() {
             None,
         )
         .is_err());
+}
+
+#[test]
+fn importing_external_chatgpt_homes_is_atomic_and_deduplicates_by_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let home_a = dir.path().join("orca/codex-accounts/a/home");
+    let home_b = dir.path().join("orca/codex-accounts/b/home");
+    std::fs::create_dir_all(&home_a).expect("home a");
+    std::fs::create_dir_all(&home_b).expect("home b");
+    let tokens = FakeTokenStore::working();
+    let store = store_in(&dir, &tokens);
+
+    let first = store
+        .import_external_codex_accounts(&[
+            ExternalCodexAccount::new("a@example.com", home_a.clone()),
+            ExternalCodexAccount::new("b@example.com", home_b.clone()),
+        ])
+        .expect("first import");
+    assert_eq!(first.imported.len(), 2);
+    assert!(first.skipped_existing_paths.is_empty());
+    assert!(first
+        .imported
+        .iter()
+        .all(|account| account.auth_kind == Some(CodexAuthKind::Chatgpt)));
+    assert!(first
+        .imported
+        .iter()
+        .all(|account| account.external_home.is_some()));
+    assert!(tokens.stored().is_empty());
+
+    let second = store
+        .import_external_codex_accounts(&[
+            ExternalCodexAccount::new("renamed@example.com", home_a.clone()),
+            ExternalCodexAccount::new("duplicate-in-batch@example.com", home_a.clone()),
+        ])
+        .expect("duplicate import");
+    assert!(second.imported.is_empty());
+    assert_eq!(
+        second.skipped_existing_paths,
+        vec![std::fs::canonicalize(home_a).expect("canonical home a")]
+    );
+    assert_eq!(
+        store.list(AccountProvider::Codex).expect("list").len(),
+        2,
+        "duplicate imports never append records"
+    );
+}
+
+#[test]
+fn import_skips_a_label_collision_and_atomically_saves_the_other_candidates() {
+    let dir = TempDir::new().expect("tempdir");
+    let collision_home = dir.path().join("orca/codex-accounts/collision/home");
+    let unique_home = dir.path().join("orca/codex-accounts/unique/home");
+    std::fs::create_dir_all(&collision_home).expect("collision home");
+    std::fs::create_dir_all(&unique_home).expect("unique home");
+    let tokens = FakeTokenStore::working();
+    let store = store_in(&dir, &tokens);
+    store
+        .add_codex(CodexAuthKind::Chatgpt, "collision@example.com", None)
+        .expect("existing label");
+
+    let result = store
+        .import_external_codex_accounts(&[
+            ExternalCodexAccount::new("collision@example.com", collision_home),
+            ExternalCodexAccount::new("unique@example.com", unique_home),
+        ])
+        .expect("one label collision must not abort the valid import");
+
+    assert_eq!(result.imported.len(), 1);
+    assert_eq!(result.imported[0].label, "unique@example.com");
+    let labels: Vec<String> = store
+        .list(AccountProvider::Codex)
+        .expect("list")
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["collision@example.com", "unique@example.com"],
+        "the valid candidate lands in the same single batch persist"
+    );
+}
+
+#[test]
+fn external_home_resolution_never_creates_or_deletes_the_original() {
+    let dir = TempDir::new().expect("tempdir");
+    let app_home = dir.path().join("app/codex-homes/account");
+    let external_home = dir.path().join("orca/codex-accounts/account/home");
+    std::fs::create_dir_all(&external_home).expect("external home");
+    let marker = external_home.join("auth.json");
+    std::fs::write(&marker, b"fixture").expect("marker");
+
+    let resolved = resolve_codex_home(app_home.clone(), Some(external_home.clone()));
+    assert_eq!(resolved.path, external_home);
+    assert!(resolved.external_read_only);
+    assert!(
+        !app_home.exists(),
+        "resolution must not prepare the app fallback"
+    );
+
+    assert_eq!(remove_resolved_codex_home_dir(&resolved), Ok(()));
+    assert_eq!(
+        std::fs::read(marker).expect("external marker survives"),
+        b"fixture"
+    );
+}
+
+#[test]
+fn app_owned_home_resolution_is_still_removable() {
+    let dir = TempDir::new().expect("tempdir");
+    let app_home = dir.path().join("app/codex-homes/account");
+    std::fs::create_dir_all(&app_home).expect("app home");
+    let resolved = resolve_codex_home(app_home.clone(), None);
+    assert_eq!(resolved.path, app_home);
+    assert!(!resolved.external_read_only);
+    assert_eq!(remove_resolved_codex_home_dir(&resolved), Ok(()));
+    assert!(!resolved.path.exists());
+}
+
+#[test]
+fn external_home_is_valid_only_for_chatgpt_auth() {
+    assert_eq!(
+        external_home_auth_kind(Some(CodexAuthKind::Chatgpt)),
+        Ok(())
+    );
+    assert!(external_home_auth_kind(Some(CodexAuthKind::ApiKey)).is_err());
+    assert!(external_home_auth_kind(None).is_err());
+}
+
+#[test]
+fn malformed_imported_api_key_record_is_rejected_by_the_production_guard() {
+    let account: ProviderAccount = serde_json::from_value(serde_json::json!({
+        "id": "legacy-bad",
+        "label": "Legacy bad record",
+        "created_at": "2026-01-01T00:00:00Z",
+        "provider": "codex",
+        "auth_kind": "api_key",
+        "external_home": "/external/orca/home"
+    }))
+    .expect("deserialize a migrated record shape");
+    assert!(account.external_home.is_some());
+    assert!(external_home_auth_kind(account.auth_kind).is_err());
+}
+
+#[test]
+fn missing_external_login_recovery_never_prints_a_direct_codex_login_command() {
+    let external = resolve_codex_home("/app/home".into(), Some("/orca/home".into()));
+    let message = missing_chatgpt_login_message("Work", &external);
+    assert!(message.contains("Orca"));
+    assert!(!message.contains("CODEX_HOME="));
+
+    let app_owned = resolve_codex_home("/app/home".into(), None);
+    assert!(missing_chatgpt_login_message("Work", &app_owned).contains("CODEX_HOME="));
 }
 
 #[test]
@@ -249,7 +406,26 @@ fn auth(dir: &str, key: Option<&str>) -> CodexSpawnAuth {
     CodexSpawnAuth {
         home_dir: PathBuf::from(dir),
         api_key: key.map(str::to_string),
+        external_read_only: false,
     }
+}
+
+fn external_auth(dir: &str) -> CodexSpawnAuth {
+    CodexSpawnAuth {
+        home_dir: PathBuf::from(dir),
+        api_key: None,
+        external_read_only: true,
+    }
+}
+
+fn external_home_fixture(dir: &TempDir, account_id: &str) -> PathBuf {
+    let home = dir
+        .path()
+        .join("orca/codex-accounts")
+        .join(account_id)
+        .join("home");
+    std::fs::create_dir_all(&home).expect("external home fixture");
+    std::fs::canonicalize(home).expect("canonical external home")
 }
 
 fn lookup_with<'a>(
@@ -259,7 +435,7 @@ fn lookup_with<'a>(
 }
 
 #[test]
-fn spawn_auth_is_absent_without_an_account_and_for_non_codex_runtimes() {
+fn spawn_auth_is_absent_without_an_account_and_fails_closed_for_other_runtimes() {
     let calls = RefCell::new(0);
     let lookup = |_: &str| {
         *calls.borrow_mut() += 1;
@@ -269,12 +445,20 @@ fn spawn_auth_is_absent_without_an_account_and_for_non_codex_runtimes() {
     assert_eq!(codex_account_spawn_auth(Some("  "), true, lookup), Ok(None));
     assert_eq!(*calls.borrow(), 0, "no account, no store read");
 
-    let map = BTreeMap::from([("acct", auth("/x", Some(KEY)))]);
-    assert_eq!(
-        codex_account_spawn_auth(Some("acct"), false, lookup_with(&map)),
-        Ok(None),
-        "a stale Codex account on a non-Codex runtime is ignored, not fatal"
+    // A stale Codex account on a runtime that cannot use it is fatal, not
+    // ignored: ignoring it would start the agent on the app's own login.
+    let error = codex_account_spawn_auth(Some("acct"), false, lookup)
+        .expect_err("an account on a runtime that cannot use it must refuse to spawn");
+    assert!(
+        error.contains("Codex account"),
+        "names the account kind: {error}"
     );
+    assert!(
+        error.contains("Default"),
+        "tells the owner the way out: {error}"
+    );
+    assert!(!error.contains(KEY), "never echoes the key: {error}");
+    assert_eq!(*calls.borrow(), 0, "refused before any store read");
 }
 
 #[test]
@@ -327,6 +511,8 @@ fn spawn_env_api_key_account_sets_its_home_and_key_over_manual_values() {
 fn spawn_env_chatgpt_account_sets_its_home_and_strips_the_ambient_key() {
     let mut cmd = std::process::Command::new("true");
     cmd.env(OPENAI_API_KEY_ENV, "manual-key");
+    cmd.env("ORCA_CODEX_HOME", "/orca/ambient");
+    cmd.env("ORCA_CODEX_LAUNCH_PREFLIGHT", "ambient");
 
     apply_codex_account_env(&mut cmd, Some(&auth("/homes/acct", None)));
 
@@ -340,6 +526,110 @@ fn spawn_env_chatgpt_account_sets_its_home_and_strips_the_ambient_key() {
         envs.get(CODEX_HOME_ENV),
         Some(&Some("/homes/acct".to_string()))
     );
+    assert_eq!(envs.get("ORCA_CODEX_HOME"), Some(&None));
+    assert_eq!(envs.get("ORCA_CODEX_LAUNCH_PREFLIGHT"), Some(&None));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn external_home_command_wraps_the_process_tree_with_a_write_deny_rule() {
+    let dir = TempDir::new().expect("tempdir");
+    let home = external_home_fixture(&dir, "account-a");
+    let command = command_for_external_codex_home(std::path::Path::new("/bin/echo"), &home)
+        .expect("sandbox command");
+    assert_eq!(command.get_program(), "/usr/bin/sandbox-exec");
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(args.last().map(String::as_str), Some("/bin/echo"));
+    let profile = args.get(1).expect("profile after -p");
+    assert!(profile.contains("deny file-write*"));
+    let source_root = home
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .expect("Orca root");
+    let codex_root = source_root.join("codex-accounts");
+    let claude_root = source_root.join("claude-accounts");
+    assert!(profile.contains(codex_root.to_string_lossy().as_ref()));
+    assert!(
+        profile.contains(claude_root.to_string_lossy().as_ref()),
+        "an absent sibling provider root must still be protected if Orca creates it later"
+    );
+    assert!(
+        !profile.contains(&format!("(subpath \"{}\")", source_root.display())),
+        "non-account Orca app-data must remain writable"
+    );
+    assert!(
+        profile.contains("subpath"),
+        "descendant writes are denied too"
+    );
+
+    let auth = external_auth(home.to_string_lossy().as_ref());
+    assert!(auth.external_read_only);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn external_home_sandbox_denies_protected_writes_and_allows_other_paths() {
+    let dir = TempDir::new().expect("tempdir");
+    let protected = external_home_fixture(&dir, "account-a");
+    let writable = dir.path().join("writable");
+    std::fs::create_dir_all(&writable).expect("writable dir");
+    let writable = std::fs::canonicalize(writable).expect("canonical writable dir");
+    let protected_file = protected.join("blocked");
+    let writable_file = writable.join("allowed");
+    let script = format!(
+        "touch '{}' 2>/dev/null || true; touch '{}'",
+        protected_file.display(),
+        writable_file.display()
+    );
+    let mut command = command_for_external_codex_home(std::path::Path::new("/bin/sh"), &protected)
+        .expect("sandbox command");
+    command.args(["-c", &script]);
+    let status = command.status().expect("run sandbox");
+    assert!(status.success());
+    assert!(!protected_file.exists());
+    assert!(writable_file.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn read_only_probe_sandbox_denies_writes_globally() {
+    let dir = TempDir::new().expect("tempdir");
+    let target = dir.path().join("blocked");
+    let script = format!(
+        "printf probe >/dev/null || exit 7; touch '{}' 2>/dev/null && exit 8; exit 0",
+        target.display()
+    );
+    let mut command =
+        command_for_read_only_probe(std::path::Path::new("/bin/sh")).expect("probe sandbox");
+    command.args(["-c", &script]);
+    assert!(
+        command.status().expect("run sandbox").success(),
+        "character-device write-data must work while ordinary files stay read-only"
+    );
+    assert!(!target.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn external_home_redirected_after_import_is_rejected_before_spawn() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().expect("tempdir");
+    let home = external_home_fixture(&dir, "account-a");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside");
+    let outside = std::fs::canonicalize(outside).expect("canonical outside");
+    std::fs::remove_dir(&home).expect("remove original empty home");
+    symlink(&outside, &home).expect("replace home with symlink");
+
+    let error = command_for_external_codex_home(std::path::Path::new("/bin/sh"), &home)
+        .expect_err("replaced home must fail closed");
+    assert!(error.contains("changed after import"));
+    assert!(!outside.join("escaped").exists());
 }
 
 #[test]
@@ -482,9 +772,154 @@ fn update_follows_the_tri_state_contract() {
 }
 
 #[test]
-fn login_command_quotes_the_directory() {
-    let command = codex_login_command(std::path::Path::new("/data/codex homes/acct"));
-    assert_eq!(command, "CODEX_HOME=\"/data/codex homes/acct\" codex login");
+fn login_command_names_the_resolved_cli_by_path_and_single_quotes_only_when_needed() {
+    let dir = std::path::Path::new("/data/codex homes/acct");
+    assert_eq!(
+        codex_login_command(dir, Some(std::path::Path::new("/usr/local/bin/codex"))),
+        "CODEX_HOME='/data/codex homes/acct' /usr/local/bin/codex login"
+    );
+    assert_eq!(
+        codex_login_command(dir, Some(std::path::Path::new("/opt/my tools/codex"))),
+        "CODEX_HOME='/data/codex homes/acct' '/opt/my tools/codex' login"
+    );
+    assert_eq!(
+        codex_login_command(
+            std::path::Path::new("/it's/home"),
+            Some(std::path::Path::new("/usr/local/bin/codex"))
+        ),
+        "CODEX_HOME='/it'\\''s/home' /usr/local/bin/codex login"
+    );
+}
+
+#[test]
+fn login_command_falls_back_to_the_command_builtin_when_the_cli_is_not_on_path() {
+    // `command` is a POSIX builtin (sh, bash, zsh, fish): it runs the real
+    // executable even when a `codex` shell function or alias is defined.
+    assert_eq!(
+        codex_login_command(std::path::Path::new("/data/acct"), None),
+        "CODEX_HOME=/data/acct command codex login"
+    );
+}
+
+#[test]
+fn login_command_never_uses_double_or_typographic_quotes() {
+    // Double quotes are what macOS text substitution turns into “smart”
+    // quotes when the owner retypes the command; the shell then waits on
+    // `dquote>`. Only ASCII single quotes, and only when needed.
+    for binary in [Some(std::path::Path::new("/opt/my tools/codex")), None] {
+        let command =
+            codex_login_command(std::path::Path::new("/data/codex homes/it's acct"), binary);
+        assert!(!command.contains('"'), "{command}");
+        assert!(
+            !command
+                .chars()
+                .any(|c| matches!(c, '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}')),
+            "{command}"
+        );
+    }
+}
+
+/// Run `command` through a real shell whose prelude defines the owner's
+/// `codex` wrapper (a function that appends `--profile bypass`, which
+/// `codex login` rejects) and an alias; the fake CLI records what actually
+/// reached it. Returns the record for each shell that is installed.
+#[cfg(unix)]
+fn run_login_command_under_wrapped_shells(
+    command: &str,
+    record: &std::path::Path,
+    extra_path: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    let prelude_common = format!(
+        "codex() {{ printf 'ARGS=FUNCTION-INTERCEPTED %s\\n' \"$*\" > '{}'; }}\n",
+        record.display()
+    );
+    let mut results = Vec::new();
+    for shell in ["sh", "bash", "zsh"] {
+        let mut probe = std::process::Command::new(shell);
+        probe.args(["-c", "true"]);
+        if !probe.status().map(|s| s.success()).unwrap_or(false) {
+            continue;
+        }
+        let _ = std::fs::remove_file(record);
+        let alias = if shell == "zsh" {
+            "setopt aliases\nalias codex='codex --profile bypass'\n"
+        } else if shell == "bash" {
+            "shopt -s expand_aliases\nalias codex='codex --profile bypass'\n"
+        } else {
+            ""
+        };
+        let script = format!("{prelude_common}{alias}{command}\n");
+        let mut cmd = std::process::Command::new(shell);
+        cmd.arg("-c").arg(&script);
+        if let Some(dir) = extra_path {
+            // Prepend the fake CLI's directory; the shells themselves must
+            // stay resolvable (Rust looks the program up in the child's PATH).
+            let inherited = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{inherited}", dir.display()));
+        }
+        let output = cmd.output().expect("run shell");
+        assert!(
+            output.status.success(),
+            "{shell} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recorded = std::fs::read_to_string(record).unwrap_or_default();
+        results.push((shell.to_string(), recorded));
+    }
+    assert!(!results.is_empty(), "at least sh must be available");
+    results
+}
+
+#[cfg(unix)]
+fn fake_codex_recorder(bin_dir: &std::path::Path, record: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).expect("bin dir");
+    let fake = bin_dir.join("codex");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf 'ARGS=%s\\nHOME=%s\\n' \"$*\" \"$CODEX_HOME\" > '{}'\n",
+            record.display()
+        ),
+    )
+    .expect("write fake codex");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    fake
+}
+
+#[cfg(unix)]
+#[test]
+fn login_command_bypasses_a_codex_shell_function_and_alias() {
+    let temp = TempDir::new().expect("tempdir");
+    // Space and apostrophe in both the CLI path and the account home.
+    let bin_dir = temp.path().join("it's tools");
+    let record = temp.path().join("record.txt");
+    let fake = fake_codex_recorder(&bin_dir, &record);
+    let home = temp.path().join("codex homes").join("acct's");
+    std::fs::create_dir_all(&home).expect("home");
+
+    // Resolved path: the command names the executable directly.
+    let command = codex_login_command(&home, Some(&fake));
+    for (shell, recorded) in run_login_command_under_wrapped_shells(&command, &record, None) {
+        assert_eq!(
+            recorded,
+            format!("ARGS=login\nHOME={}\n", home.display()),
+            "{shell}: the wrapper function/alias must not reach the CLI"
+        );
+    }
+
+    // Unresolved CLI: `command codex login` with the fake dir on PATH.
+    let fallback = codex_login_command(&home, None);
+    for (shell, recorded) in
+        run_login_command_under_wrapped_shells(&fallback, &record, Some(&bin_dir))
+    {
+        assert_eq!(
+            recorded,
+            format!("ARGS=login\nHOME={}\n", home.display()),
+            "{shell}: `command` must bypass the wrapper function"
+        );
+    }
 }
 
 #[test]

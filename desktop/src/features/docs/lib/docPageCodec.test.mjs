@@ -91,6 +91,29 @@ test("parseDocPageEvent: valid event yields a page with event provenance", () =>
   });
 });
 
+test("doc page events preserve both database directive forms byte for byte", () => {
+  const body = [
+    "# Data",
+    "",
+    ":::db 11111111-2222-4333-8444-555555555555",
+    "",
+    ":::db 11111111-2222-4333-8444-555555555555 board",
+  ].join("\n");
+  const input = buildDocPageEventInput({
+    id: PAGE_ID,
+    title: "Data",
+    body,
+    parentId: null,
+    order: 0,
+    createdAt: 1,
+    updatedAt: 1,
+  });
+  const parsed = parseDocPageEvent(
+    makeEvent({ content: input.content, tags: input.tags, kind: input.kind }),
+  );
+  assert.equal(parsed?.body, body);
+});
+
 test("parseDocPageEvent: a legacy kind-30078 page still parses, marked legacy", () => {
   // Pre-migration pages live on the shared NIP-78 kind; losing them would be
   // data loss, so the codec accepts both kinds and records which one it saw.
@@ -302,6 +325,7 @@ test("buildDocPageEventInput: icon and deleted appear only when set", () => {
 });
 
 test("buildDocPageEventInput → parseDocPageEvent round trip", () => {
+  const affineEpoch = "11111111-1111-4111-8111-111111111111";
   const input = buildDocPageEventInput({
     id: PAGE_ID,
     title: "Round",
@@ -311,6 +335,7 @@ test("buildDocPageEventInput → parseDocPageEvent round trip", () => {
     icon: "🔁",
     createdAt: 10,
     updatedAt: 20,
+    affineEpoch,
   });
   const page = parseDocPageEvent({
     ...makeEvent(),
@@ -325,6 +350,7 @@ test("buildDocPageEventInput → parseDocPageEvent round trip", () => {
   assert.equal(page.icon, "🔁");
   assert.equal(page.createdAt, 10);
   assert.equal(page.updatedAt, 20);
+  assert.equal(page.affineEpoch, affineEpoch);
   assert.equal(page.deleted, false);
 });
 
@@ -376,6 +402,13 @@ test("docPageContentEquals: any visible field difference counts", () => {
     docPageContentEquals(BASE_CONTENT, { ...BASE_CONTENT, deleted: true }),
     false,
   );
+  assert.equal(
+    docPageContentEquals(BASE_CONTENT, {
+      ...BASE_CONTENT,
+      affineEpoch: "11111111-1111-4111-8111-111111111111",
+    }),
+    false,
+  );
 });
 
 test("measureDocPageContentBytes: counts UTF-8 bytes of the serialized content", () => {
@@ -390,4 +423,51 @@ test("measureDocPageContentBytes: counts UTF-8 bytes of the serialized content",
     body: "가나다라",
   });
   assert.equal(hangul - ascii, 4 * 3 - 4, "each Hangul syllable is 3 bytes");
+});
+
+test("structured AFFiNE payload survives signed-content round trips and changes equality", () => {
+  const before = parseDocPageEvent(makeEvent());
+  const affine = { version: 1, data: "AQID" };
+  const page = { ...before, affine };
+  const input = buildDocPageEventInput(page);
+  const decoded = parseDocPageEvent(makeEvent({ content: input.content }));
+  assert.deepEqual(decoded.affine, affine);
+  assert.equal(docPageContentEquals(before, page), false);
+  assert.equal(
+    docPageContentEquals(page, {
+      ...page,
+      affine: { version: 1, data: "BAUG" },
+    }),
+    false,
+  );
+  assert.ok(
+    measureDocPageContentBytes(page) > measureDocPageContentBytes(before),
+  );
+});
+
+test("unsupported structured payload retains the newest read-only head", () => {
+  const original = JSON.parse(makeEvent().content);
+  for (const affine of [
+    null,
+    { version: 1, data: "" },
+    { version: 1, data: "bad base64" },
+    { version: 3, data: "AQID" },
+  ]) {
+    const event = makeEvent({
+      content: JSON.stringify({ ...original, affine }),
+    });
+    const page = parseDocPageEvent(event);
+    assert.equal(page?.unsupportedEditor, true);
+    assert.equal(page?.eventId, event.id);
+  }
+});
+
+test("linked database envelope version survives event encoding and decoding", () => {
+  const original = parseDocPageEvent(makeEvent());
+  const affine = { version: 2, data: "AQID" };
+  const input = buildDocPageEventInput({ ...original, affine });
+  assert.deepEqual(
+    parseDocPageEvent(makeEvent({ content: input.content })).affine,
+    affine,
+  );
 });

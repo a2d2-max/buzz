@@ -147,6 +147,7 @@ export function AppShell() {
   const {
     goAgents,
     goChannel,
+    goDatabases,
     goDocs,
     goHome,
     goNewMessage,
@@ -884,6 +885,7 @@ export function AppShell() {
                           onSelectAgents={() => void goAgents()}
                           onSelectBoard={() => void goBoard()}
                           onSelectChannel={handleSidebarChannelSelect}
+                          onSelectDatabases={() => void goDatabases()}
                           onSelectDocs={() => void goDocs()}
                           onOpenSearchResult={handleOpenSearchResult}
                           searchChannels={channels}

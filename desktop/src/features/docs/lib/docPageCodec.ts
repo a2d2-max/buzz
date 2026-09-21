@@ -1,3 +1,4 @@
+import { parseDocBlobReference } from "./docBlobReference";
 import type { RelayEvent } from "@/shared/api/types";
 import {
   COMMUNITY_DOC_D_PREFIX,
@@ -24,11 +25,47 @@ export const COMMUNITY_DOC_QUERY_KINDS: readonly number[] = [
   KIND_COMMUNITY_DOC_LEGACY,
 ];
 
+/** Versioned, base64 encoded BlockSuite document state. Markdown is its preview. */
+export type AffineDocPayload = { version: 1 | 2 | 3; data: string };
+
+/** Validate the bounded envelope before an editor attempts to decode it. */
+export function isAffineDocPayload(
+  value: unknown,
+  maxInlineLength = 262144,
+): value is AffineDocPayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const data = value as Record<string, unknown>;
+  if (data.version === 3) {
+    if (typeof data.data !== "string" || data.data.length > 4096) return false;
+    try {
+      parseDocBlobReference(data.data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return (
+    (data.version === 1 || data.version === 2) &&
+    typeof data.data === "string" &&
+    data.data.length > 0 &&
+    data.data.length <= maxInlineLength &&
+    data.data.length % 4 === 0 &&
+    /^[A-Za-z0-9+/]*={0,2}$/.test(data.data)
+  );
+}
+
 /** JSON body of a page event (kind 30623, d="doc:<uuid>", t="community-doc"). */
 export type DocPageContent = {
   title: string;
   /** Markdown source. */
   body: string;
+  /** Lossless editor state; never drop when publishing tree or metadata changes. */
+  affine?: AffineDocPayload;
+  /**
+   * CRDT lineage created by a delete. Restores and later edits carry it so a
+   * stale pre-delete author head cannot be merged back into the document.
+   */
+  affineEpoch?: string;
   /** Parent page id, or `null` for a top-level page. */
   parentId: string | null;
   /** Sibling sort key; lower renders first. */
@@ -46,6 +83,10 @@ export type DocPageContent = {
 /** One resolved page version, carrying the relay event it came from. */
 export type DocPage = DocPageContent & {
   id: string;
+  /** Keep unsupported heads visible and refuse writes instead of falling back to old content. */
+  unsupportedEditor?: boolean;
+  /** Multiple structured branches could not be combined without data loss. */
+  structuredMergeConflict?: boolean;
   /** Pubkey that signed this version (not necessarily the page creator). */
   author: string;
   eventId: string;
@@ -119,6 +160,8 @@ export function parseDocPageEvent(event: RelayEvent): DocPage | null {
   const content = raw as Record<string, unknown>;
   if (typeof content.title !== "string") return null;
   if (typeof content.body !== "string") return null;
+  const unsupportedEditor =
+    content.affine !== undefined && !isAffineDocPayload(content.affine);
   if (
     content.parentId !== null &&
     content.parentId !== undefined &&
@@ -137,6 +180,7 @@ export function parseDocPageEvent(event: RelayEvent): DocPage | null {
       ? content.parentId
       : null;
   const page: DocPage = {
+    ...(unsupportedEditor ? { unsupportedEditor: true } : {}),
     id,
     author: event.pubkey,
     eventId: event.id,
@@ -150,6 +194,19 @@ export function parseDocPageEvent(event: RelayEvent): DocPage | null {
     updatedAt: finiteNumberOr(content.updatedAt, fallbackMs),
     deleted: content.deleted === true,
   };
+  if (
+    typeof content.affineEpoch === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      content.affineEpoch,
+    )
+  ) {
+    page.affineEpoch = content.affineEpoch.toLowerCase();
+  }
+  if (isAffineDocPayload(content.affine))
+    page.affine = {
+      version: content.affine.version,
+      data: content.affine.data,
+    };
   if (typeof content.icon === "string" && content.icon.length > 0) {
     page.icon = content.icon;
   }
@@ -164,6 +221,9 @@ export function docPageContentEquals(
   return (
     a.title === b.title &&
     a.body === b.body &&
+    a.affine?.version === b.affine?.version &&
+    a.affine?.data === b.affine?.data &&
+    a.affineEpoch === b.affineEpoch &&
     a.parentId === b.parentId &&
     a.order === b.order &&
     (a.icon ?? undefined) === (b.icon ?? undefined) &&
@@ -195,6 +255,8 @@ export function buildDocPageEventInput(
   const content: Record<string, unknown> = {
     title: page.title,
     body: page.body,
+    ...(page.affine ? { affine: page.affine } : {}),
+    ...(page.affineEpoch ? { affineEpoch: page.affineEpoch } : {}),
     parentId: page.parentId,
     order: page.order,
     ...(page.icon ? { icon: page.icon } : {}),

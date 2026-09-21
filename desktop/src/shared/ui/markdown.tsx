@@ -109,8 +109,10 @@ import {
   visibleImageGalleryForTrigger,
 } from "./markdown/imageLightbox";
 import { MarkdownTable } from "./markdown/MarkdownTable";
+import { MarkdownDocDatabaseBlock } from "./markdown/MarkdownDocDatabaseBlock";
 import { ProgressiveImage } from "./markdown/ProgressiveImage";
 import { MessageLinkPill } from "./markdown/MessageLinkPill";
+import { getMarkdownComponents } from "./markdown/componentCache";
 import { renderCachedMarkdown } from "./markdown/nodeCache";
 import { useMessageLinkPreviews } from "./markdown/useMessageLinkPreviews";
 import {
@@ -1378,6 +1380,7 @@ export function createMarkdownComponents(
   }
 
   return {
+    "doc-database-block": MarkdownDocDatabaseBlock,
     spoiler: ({
       children,
       ...props
@@ -1638,47 +1641,13 @@ export function createMarkdownComponents(
   } as Components;
 }
 
-/**
- * The component map only varies by the four boolean render flags, so at most
- * sixteen instances ever exist. Module-stable maps mean cached markdown
- * element trees (see ./markdown/nodeCache.ts) never embed per-mount closures.
- */
-const MARKDOWN_COMPONENT_SCHEMA_VERSION = "8";
-const markdownComponentsByVariant = new Map<string, MarkdownComponentSet>();
-
-type MarkdownComponentSet = { components: Components; variant: string };
-
-/**
- * Returns the component map together with the `variant` token that fully
- * identifies it. The token doubles as the variant segment of the parse-cache
- * key (see nodeCache.ts), so the map partitioning and the key partitioning
- * come from one place and cannot drift apart: a new render flag added here
- * automatically partitions the cache too.
- */
-function getMarkdownComponents(
-  interactive: boolean,
-  leadingInlineContent: boolean,
-  mediaInset: boolean,
-  blockCode: boolean,
-): MarkdownComponentSet {
-  const variant = `${MARKDOWN_COMPONENT_SCHEMA_VERSION}:${interactive ? "i" : ""}${leadingInlineContent ? "l" : ""}${mediaInset ? "m" : ""}${blockCode ? "c" : ""}`;
-  let entry = markdownComponentsByVariant.get(variant);
-  if (!entry) {
-    entry = {
-      components: createMarkdownComponents(interactive, mediaInset, blockCode),
-      variant,
-    };
-    markdownComponentsByVariant.set(variant, entry);
-  }
-  return entry;
-}
-
 function MarkdownInner({
   channelNames,
   className,
   configNudgeAuthorPubkey,
   content,
   customEmoji,
+  docsDatabases = false,
   hardLineBreaks = true,
   imetaByUrl,
   interactive = true,
@@ -1692,6 +1661,7 @@ function MarkdownInner({
   onRemoveLinkPreviewsForEveryone,
   mentionNames,
   mentionPubkeysByName,
+  renderDocDatabase,
   searchQuery,
   snapshotSharedBy,
   videoReviewContext,
@@ -1741,6 +1711,7 @@ function MarkdownInner({
       onOpenEntityLink,
       onOpenMessageLink,
       relayOrigin,
+      renderDocDatabase,
       resolveChannelReferences: true,
       snapshotSharedBy,
       onImportSnapshotFromUrl: (
@@ -1762,6 +1733,7 @@ function MarkdownInner({
       onOpenEntityLink,
       onOpenMessageLink,
       relayOrigin,
+      renderDocDatabase,
       snapshotSharedBy,
       goAgents,
     ],
@@ -1786,10 +1758,14 @@ function MarkdownInner({
   // null), skip the parse entirely — it would be thrown away unrendered.
   const hasLeadingInlineContent = leadingInlineContent != null;
   const componentSet = getMarkdownComponents(
-    interactive,
-    hasLeadingInlineContent,
-    mediaInset,
-    blockCode,
+    {
+      blockCode,
+      docsDatabases,
+      interactive,
+      leadingInlineContent: hasLeadingInlineContent,
+      mediaInset,
+    },
+    createMarkdownComponents,
   );
   const markdownNode =
     configNudge === null
@@ -1798,6 +1774,7 @@ function MarkdownInner({
           components: componentSet.components,
           content: processedContent,
           customEmoji,
+          docsDatabases,
           hardLineBreaks,
           leadingInlineContent: hasLeadingInlineContent,
           mentionNames,

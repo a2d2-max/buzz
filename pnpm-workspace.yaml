@@ -1,5 +1,6 @@
 packages:
   - "desktop"
+  - "docs-editor"
   - "web"
   - "admin-web"
   - "tv"
@@ -8,6 +9,9 @@ allowBuilds:
   core-js: false
   esbuild: true
 overrides:
+  # Keep the isolated BlockSuite CSS compiler on the verified Vite 7 toolchain.
+  "@vanilla-extract/compiler>vite-node": "3.2.4"
+  "@vanilla-extract/compiler>vite": "7.3.5"
   # Force a single copy of the dismissable-layer. Radix packages otherwise
   # resolve different versions (react-menu pulled 1.1.11, react-dialog 1.1.15),
   # and each copy keeps its own module-level saved <body> pointer-events style —

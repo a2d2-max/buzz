@@ -76,7 +76,9 @@ pub async fn set_persona_shared(
 pub async fn update_persona_and_publish(
     input: crate::managed_agents::UpdatePersonaRequest,
     app: AppHandle,
+    caller: tauri::Webview,
 ) -> Result<SetPersonaSharedResult, String> {
+    crate::commands::upstream_apps::ensure_trusted_caller(&caller)?;
     let (_, prepared) =
         super::update::update_persona_with(input, app.clone(), |app, state, persona| {
             // Strict path: this command's contract is to report the publication

@@ -263,7 +263,8 @@ pub(super) async fn fetch_blob_bytes_with_cap(
     // A no-redirect client keeps the minted media auth token from being
     // forwarded across origins by a relay-issued 3xx (redirect-hop SSRF); a
     // 3xx is returned verbatim and rejected by the `is_success` check below.
-    let mut req = state.media_fetch_client.get(url).timeout(DOWNLOAD_TIMEOUT);
+    let req = state.media_fetch_client.get(url).timeout(DOWNLOAD_TIMEOUT);
+    let mut req = crate::company_identity::attach_to_no_redirect_request(state, url, req)?;
 
     // Every caller pre-validates `url` against the relay origin via
     // `validate_download_url`, satisfying the mint_media_get_auth safety

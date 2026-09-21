@@ -3,9 +3,11 @@ import { Plus } from "lucide-react";
 
 import { useCodexAccountsQuery } from "@/features/agents/useCodexAccounts";
 import { Button } from "@/shared/ui/button";
+import { isMacPlatform } from "@/shared/lib/platform";
 
 import { AddCodexAccountDialog } from "./AddCodexAccountDialog";
 import { CodexAccountRow } from "./CodexAccountRow";
+import { ImportOrcaCodexAccountsDialog } from "./ImportOrcaCodexAccountsDialog";
 import { SettingsOptionGroup } from "./SettingsOptionGroup";
 
 /**
@@ -17,24 +19,38 @@ import { SettingsOptionGroup } from "./SettingsOptionGroup";
  */
 export function CodexAccountsSettingsCard() {
   const [addOpen, setAddOpen] = React.useState(false);
+  const [importOpen, setImportOpen] = React.useState(false);
   const accountsQuery = useCodexAccountsQuery();
   const accounts = accountsQuery.data ?? [];
 
   return (
     <SettingsOptionGroup
       data-testid="settings-codex-accounts"
-      description="OpenAI logins Codex agents can run on. Each agent picks one in its settings; API keys stay in the OS keychain."
+      description="OpenAI logins Codex agents can run on. Add one here or import an existing Orca login, then choose it per agent."
       headerAction={
-        <Button
-          data-testid="codex-accounts-add-button"
-          onClick={() => setAddOpen(true)}
-          size="sm"
-          type="button"
-          variant="outline"
-        >
-          <Plus className="h-4 w-4" />
-          Add account
-        </Button>
+        <div className="flex gap-2">
+          {isMacPlatform() ? (
+            <Button
+              data-testid="codex-accounts-import-orca"
+              onClick={() => setImportOpen(true)}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              Import from Orca
+            </Button>
+          ) : null}
+          <Button
+            data-testid="codex-accounts-add-button"
+            onClick={() => setAddOpen(true)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <Plus className="h-4 w-4" />
+            Add account
+          </Button>
+        </div>
       }
       title="Codex accounts"
     >
@@ -68,6 +84,10 @@ export function CodexAccountsSettingsCard() {
       </div>
 
       <AddCodexAccountDialog onOpenChange={setAddOpen} open={addOpen} />
+      <ImportOrcaCodexAccountsDialog
+        onOpenChange={setImportOpen}
+        open={importOpen}
+      />
     </SettingsOptionGroup>
   );
 }

@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import remarkChannelDeepLinks from "@/features/messages/lib/remarkChannelDeepLinks";
 import remarkMessageLinks from "@/features/messages/lib/remarkMessageLinks";
 import remarkEntityLinks from "@/features/messages/lib/remarkEntityLinks";
+import remarkDocDatabases from "@/features/docs/lib/remarkDocDatabases";
 import rehypeImageGallery from "@/shared/lib/rehypeImageGallery";
 import rehypeLeadingInlineContent from "@/shared/lib/rehypeLeadingInlineContent";
 import rehypeSearchHighlight from "@/shared/lib/rehypeSearchHighlight";
@@ -68,6 +69,8 @@ export type MarkdownParseInputs = {
   components: Components;
   content: string;
   customEmoji?: CustomEmoji[];
+  /** Enables the Docs-only database block grammar. */
+  docsDatabases?: boolean;
   /** Omit or true for chat-style `<br>` on every newline. */
   hardLineBreaks?: boolean;
   /** Inserts the runtime-provided leading content marker during parsing. */
@@ -106,6 +109,7 @@ function buildMarkdownElement(input: MarkdownParseInputs): React.ReactElement {
     components: input.components,
     remarkPlugins: [
       remarkGfm,
+      ...(input.docsDatabases ? [remarkDocDatabases] : []),
       ...(input.hardLineBreaks === false ? [] : [remarkBreaks]),
       remarkSpoilers,
       remarkChannelDeepLinks,
@@ -144,6 +148,7 @@ export function renderCachedMarkdown(
   const key =
     segment(input.hardLineBreaks === false ? "soft" : "hard") +
     segment(input.variant) +
+    segment(input.docsDatabases ? "docs-databases" : "") +
     segment(input.leadingInlineContent ? "leading" : "") +
     listSegment(input.mentionNames) +
     listSegment(input.channelNames) +

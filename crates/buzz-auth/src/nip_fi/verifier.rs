@@ -203,13 +203,10 @@ impl<S: IssuerKeySource> IssuerKeySource for std::sync::Arc<S> {
     }
 }
 
-/// A fixed issuer→snapshot key source for the in-crate verifier tests,
-/// standing in for the `jwks` runtime. It is `cfg(test)`-only — not behind a
-/// downstream-selectable Cargo feature — so no dependent crate can enable it to
-/// reconstruct the authority. An honest source returns only the snapshot bound
-/// to the exact issuer requested, the invariant the real runtime source
-/// guarantees.
-#[cfg(test)]
+/// A fixed issuer→snapshot key source for tests, standing in for the `jwks`
+/// runtime. It remains crate-private; the narrow test-utils facade can exercise
+/// the real verifier without exposing authority construction to dependents.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Clone, Default)]
 pub(crate) struct StaticIssuerKeySource {
     snapshots: std::collections::HashMap<String, AssertionKeySet>,
@@ -218,7 +215,7 @@ pub(crate) struct StaticIssuerKeySource {
     misbound: Option<AssertionKeySet>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl StaticIssuerKeySource {
     /// Build an honest source from a set of snapshots, keyed by each snapshot's
     /// issuer.
@@ -235,6 +232,7 @@ impl StaticIssuerKeySource {
     /// A hostile/buggy source that returns the given snapshot — bound to a
     /// different issuer than requested — for every lookup, to exercise the
     /// verifier's defensive issuer re-check.
+    #[cfg(test)]
     pub(crate) fn misbinding(snapshot: AssertionKeySet) -> Self {
         Self {
             snapshots: std::collections::HashMap::new(),
@@ -243,10 +241,10 @@ impl StaticIssuerKeySource {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl sealed::Sealed for StaticIssuerKeySource {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl IssuerKeySource for StaticIssuerKeySource {
     fn key_set(&self, issuer: &str) -> Option<AssertionKeySet> {
         self.misbound

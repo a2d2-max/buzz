@@ -273,3 +273,25 @@ test("deriveShellRoute_docsRoutesSelectTheDocsView", () => {
 test("deriveShellRoute_docsPrefixMustBeAPathSegment", () => {
   assert.equal(deriveShellRoute("/docsx").selectedView, "home");
 });
+
+test("deriveShellRoute selects databases and only its path segment", () => {
+  assert.deepEqual(deriveShellRoute("/databases"), {
+    selectedChannelId: null,
+    selectedView: "databases",
+  });
+  assert.deepEqual(deriveShellRoute("/databases/database-id"), {
+    selectedChannelId: null,
+    selectedView: "databases",
+  });
+  assert.equal(deriveShellRoute("/databases-old").selectedView, "home");
+});
+
+test("upstream app routes do not activate Inbox or its background actions", () => {
+  for (const path of ["/apps/affine", "/apps/plane"]) {
+    assert.deepEqual(deriveShellRoute(path), {
+      selectedChannelId: null,
+      selectedView: "upstream",
+    });
+  }
+  assert.equal(deriveShellRoute("/apps/unknown").selectedView, "home");
+});

@@ -127,6 +127,10 @@ function updatePersonaPayload(input: UpdatePersonaInput) {
     envVars: input.envVars,
     // Same absent-vs-present contract as envVars for the behavioral quad.
     behavior: input.behavior,
+    // These retain their tri-state meaning across the Tauri boundary:
+    // absent = preserve linked instances, null = app login, id = stored login.
+    claudeAccountId: input.claudeAccountId,
+    codexAccountId: input.codexAccountId,
   };
 }
 

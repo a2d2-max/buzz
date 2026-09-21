@@ -1,3 +1,5 @@
+import { getIdentity } from "@/shared/api/tauriIdentity";
+import { storeDocBlob, type DocBlobScope } from "./docBlobStorage";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
@@ -11,6 +13,12 @@ import {
 } from "@/shared/constants/kinds";
 
 import { resolveCurrentRelayContentLimit } from "./docContentLimit";
+import {
+  addDocVersionHeads,
+  type DocVersionHeads,
+  resolveAllDocVersionHeads,
+  resolveDocVersionHeads,
+} from "./docStructuredMerge";
 import {
   dedicatedDocKindMarkedUnsupported,
   isUnknownKindRejection,
@@ -30,7 +38,6 @@ import {
 import { planDocPagePublish } from "./docPublishPlan";
 import { fetchDocPagesToExhaustion } from "./docsHistory";
 import {
-  applyDocPageVersion,
   buildDocTree,
   collectDescendantIds,
   type DocTreeNode,
@@ -48,6 +55,8 @@ export const DOCS_PAGES_QUERY_KEY = ["docs", "pages"] as const;
 type DocPageMap = Map<string, DocPage>;
 type DocsSnapshot = {
   pages: DocPageMap;
+  /** Current NIP-33 head for every author/kind coordinate, grouped by page. */
+  heads: DocVersionHeads;
   truncated: boolean;
   /** Doc-kind rows (30623 + legacy 30078) the last scan inspected. */
   scanned: number;
@@ -61,8 +70,10 @@ type DocsSnapshot = {
   watermark: number | undefined;
 };
 const EMPTY_PAGES: DocPageMap = new Map();
+const EMPTY_HEADS: DocVersionHeads = new Map();
 const EMPTY_SNAPSHOT: DocsSnapshot = {
   pages: EMPTY_PAGES,
+  heads: EMPTY_HEADS,
   truncated: false,
   scanned: 0,
   watermark: undefined,
@@ -120,7 +131,10 @@ export class DocTooLargeError extends Error {
 }
 
 export type DocPagePatch = Partial<
-  Pick<DocPageContent, "title" | "body" | "parentId" | "order" | "icon">
+  Pick<
+    DocPageContent,
+    "title" | "body" | "parentId" | "order" | "icon" | "affine" | "affineEpoch"
+  >
 >;
 
 export type DocUpdateOptions = {
@@ -187,16 +201,17 @@ function levelPages(tree: DocTreeNode[], parentId: string | null): DocPage[] {
  * Startup order: the live subscription on the doc kinds (30623 + legacy
  * 30078) with `#t=community-doc` is
  * opened first, and only once it is ready does the history scan run — so the
- * two overlap and nothing published in between is missed. Every fetched or
- * live version is collapsed to the newest per page id across all authors.
- * Writes sign and publish a full page event, then fold the signed copy into
- * the cache so the tree reflects the edit immediately. A socket reconnect
+ * two overlap and nothing published in between is missed. Metadata follows
+ * the existing relay LWW order while valid BlockSuite/Yjs heads from every
+ * author are merged before editing. Writes sign and publish a full page event,
+ * then fold the signed copy through that same merge seam. A socket reconnect
  * invalidates the snapshot (the live REQ carries `limit: 0` and replays no
  * history on its own).
  */
 export function useCommunityDocs(): CommunityDocs {
   const queryClient = useQueryClient();
   const [subscriptionSettled, setSubscriptionSettled] = React.useState(false);
+  const mergeGenerationRef = React.useRef(new Map<string, number>());
 
   const query = useQuery({
     queryKey: DOCS_PAGES_QUERY_KEY,
@@ -223,15 +238,51 @@ export function useCommunityDocs(): CommunityDocs {
           fetchEvents: (filter) => relayClient.fetchEvents(filter),
         });
       }
-      // Live events can land while the scan is in flight; keep whichever
-      // version is newer per page rather than letting the snapshot win.
+      // Live events can land while the scan is in flight. Retain every
+      // author/kind head so structured branches can be merged, rather than
+      // collapsing to one event before the Yjs consumer sees them.
       const cached =
         queryClient.getQueryData<DocsSnapshot>(DOCS_PAGES_QUERY_KEY);
+      let heads = addDocVersionHeads(
+        previous?.heads ?? EMPTY_HEADS,
+        history.pages,
+      );
+      if (cached?.heads) {
+        heads = addDocVersionHeads(
+          heads,
+          [...cached.heads.values()].flatMap((versions) => [
+            ...versions.values(),
+          ]),
+        );
+      }
+      const relayScope = await getRelayWsUrl();
+      let pages = await resolveAllDocVersionHeads(heads);
+      if ((await getRelayWsUrl()) !== relayScope)
+        throw Error("The active community changed while merging documents.");
+      // One final bounded fold closes the longer blob-download window. A live
+      // callback that wins after this point fences its own async result by the
+      // per-page generation below.
+      const latestCached =
+        queryClient.getQueryData<DocsSnapshot>(DOCS_PAGES_QUERY_KEY);
+      if (latestCached?.heads) {
+        const latestHeads = addDocVersionHeads(
+          heads,
+          [...latestCached.heads.values()].flatMap((versions) => [
+            ...versions.values(),
+          ]),
+        );
+        if (latestHeads !== heads) {
+          heads = latestHeads;
+          pages = await resolveAllDocVersionHeads(heads);
+          if ((await getRelayWsUrl()) !== relayScope)
+            throw Error(
+              "The active community changed while merging documents.",
+            );
+        }
+      }
       return {
-        pages: pickLatestDocPages([
-          ...(cached?.pages.values() ?? []),
-          ...history.pages,
-        ]),
+        pages,
+        heads,
         truncated: history.truncated,
         scanned: history.scanned,
         // A shorter incremental scan must not pull the watermark back.
@@ -249,16 +300,54 @@ export function useCommunityDocs(): CommunityDocs {
     staleTime: 60_000,
   });
 
-  const applyPage = React.useCallback(
-    (page: DocPage) => {
+  const applyPages = React.useCallback(
+    async (incoming: readonly DocPage[]) => {
+      if (incoming.length < 1) return;
+      const affected = new Set(incoming.map((page) => page.id));
+      const generations = new Map<string, number>();
+      for (const id of affected) {
+        const generation = (mergeGenerationRef.current.get(id) ?? 0) + 1;
+        mergeGenerationRef.current.set(id, generation);
+        generations.set(id, generation);
+      }
+      const captured = new Map<string, Map<string, DocPage>>();
       queryClient.setQueryData<DocsSnapshot>(
         DOCS_PAGES_QUERY_KEY,
         (previous) => {
           const current = previous ?? EMPTY_SNAPSHOT;
-          const pages = applyDocPageVersion(current.pages, page);
-          return pages === current.pages ? current : { ...current, pages };
+          const heads = addDocVersionHeads(current.heads, incoming);
+          for (const id of affected) {
+            const versions = heads.get(id);
+            if (versions) captured.set(id, versions);
+          }
+          if (heads === current.heads) return current;
+          // Metadata remains responsive while large out-of-line snapshots
+          // hydrate. The resolved CRDT state replaces these LWW placeholders.
+          const pages = pickLatestDocPages([
+            ...current.pages.values(),
+            ...incoming,
+          ]);
+          return { ...current, heads, pages };
         },
       );
+      const relayScope = await getRelayWsUrl();
+      for (const [id, versions] of captured) {
+        const resolved = await resolveDocVersionHeads(versions.values());
+        if (mergeGenerationRef.current.get(id) !== generations.get(id))
+          continue;
+        if ((await getRelayWsUrl()) !== relayScope)
+          throw Error("The active community changed while merging documents.");
+        queryClient.setQueryData<DocsSnapshot>(
+          DOCS_PAGES_QUERY_KEY,
+          (previous) => {
+            if (!previous || previous.heads.get(id) !== versions)
+              return previous;
+            const pages = new Map(previous.pages);
+            pages.set(id, resolved);
+            return { ...previous, pages };
+          },
+        );
+      }
     },
     [queryClient],
   );
@@ -266,9 +355,15 @@ export function useCommunityDocs(): CommunityDocs {
   const applyEvent = React.useCallback(
     (event: RelayEvent) => {
       const page = parseDocPageEvent(event);
-      if (page) applyPage(page);
+      if (page)
+        void applyPages([page]).catch((error) => {
+          console.warn("[docs] structured branch merge failed", error);
+          void queryClient.invalidateQueries({
+            queryKey: DOCS_PAGES_QUERY_KEY,
+          });
+        });
     },
-    [applyPage],
+    [applyPages, queryClient],
   );
 
   React.useEffect(() => {
@@ -353,14 +448,10 @@ export function useCommunityDocs(): CommunityDocs {
         const page = parseDocPageEvent(event);
         if (page && page.id === id) versions.push(page);
       }
-      const cached = readPages().get(id);
-      const newest = pickLatestDocPages(
-        cached ? [cached, ...versions] : versions,
-      ).get(id);
-      if (newest) applyPage(newest);
-      return newest;
+      await applyPages(versions);
+      return readPages().get(id);
     },
-    [applyPage, readPages],
+    [applyPages, readPages],
   );
 
   /** Signs and publishes one version on exactly `kind` — no fallback. */
@@ -369,10 +460,19 @@ export function useCommunityDocs(): CommunityDocs {
       content: DocPageContent & { id: string },
       kind: number,
       known: DocPage | undefined,
+      scope?: DocBlobScope,
     ): Promise<DocPage> => {
       const bytes = measureDocPageContentBytes(content);
       const { relayUrl, maxContentBytes } =
         await resolveCurrentRelayContentLimit();
+      if (
+        scope &&
+        (scope.relay !== relayUrl ||
+          (await getIdentity()).pubkey !== scope.pubkey)
+      )
+        throw new Error(
+          "The active community or identity changed before saving.",
+        );
       if (bytes > maxContentBytes) {
         throw new DocTooLargeError(bytes, maxContentBytes);
       }
@@ -387,6 +487,8 @@ export function useCommunityDocs(): CommunityDocs {
         ...buildDocPageEventInput(content, kind),
         createdAt,
       });
+      if (scope && event.pubkey !== scope.pubkey)
+        throw new Error("The signing identity changed before saving.");
       const page = parseDocPageEvent(event);
       if (!page) throw new Error("Signed page event did not round-trip.");
       let currentRelayUrl: string;
@@ -407,10 +509,10 @@ export function useCommunityDocs(): CommunityDocs {
         "Timed out publishing the page.",
         "Failed to publish the page.",
       );
-      applyPage(page);
+      await applyPages([page]);
       return page;
     },
-    [applyPage],
+    [applyPages],
   );
 
   /**
@@ -427,6 +529,7 @@ export function useCommunityDocs(): CommunityDocs {
     async (
       content: DocPageContent & { id: string },
       known: DocPage | undefined,
+      scope?: DocBlobScope,
     ): Promise<DocPage> => {
       // Unknown URL (early Tauri failure): still publish, just without a
       // durable verdict to consult or update.
@@ -435,10 +538,15 @@ export function useCommunityDocs(): CommunityDocs {
         relayUrl !== null &&
         dedicatedDocKindMarkedUnsupported(relayUrl, Date.now())
       ) {
-        return publishPageAs(content, KIND_COMMUNITY_DOC_LEGACY, known);
+        return publishPageAs(content, KIND_COMMUNITY_DOC_LEGACY, known, scope);
       }
       try {
-        const page = await publishPageAs(content, KIND_COMMUNITY_DOC, known);
+        const page = await publishPageAs(
+          content,
+          KIND_COMMUNITY_DOC,
+          known,
+          scope,
+        );
         if (relayUrl !== null) markDedicatedDocKindAccepted(relayUrl);
         return page;
       } catch (error) {
@@ -446,7 +554,7 @@ export function useCommunityDocs(): CommunityDocs {
         if (relayUrl !== null) {
           markDedicatedDocKindRejected(relayUrl, Date.now());
         }
-        return publishPageAs(content, KIND_COMMUNITY_DOC_LEGACY, known);
+        return publishPageAs(content, KIND_COMMUNITY_DOC_LEGACY, known, scope);
       }
     },
     [publishPageAs],
@@ -479,7 +587,12 @@ export function useCommunityDocs(): CommunityDocs {
       for (const cached of candidates) {
         try {
           const newest = await fetchNewestVersion(cached.id);
-          if (!newest || newest.eventKind !== KIND_COMMUNITY_DOC_LEGACY) {
+          if (
+            !newest ||
+            newest.unsupportedEditor ||
+            newest.structuredMergeConflict ||
+            newest.eventKind !== KIND_COMMUNITY_DOC_LEGACY
+          ) {
             continue;
           }
           // The migration must land on the dedicated kind or not happen at
@@ -490,6 +603,10 @@ export function useCommunityDocs(): CommunityDocs {
               id: newest.id,
               title: newest.title,
               body: newest.body,
+              ...(newest.affine ? { affine: newest.affine } : {}),
+              ...(newest.affineEpoch
+                ? { affineEpoch: newest.affineEpoch }
+                : {}),
               parentId: newest.parentId,
               order: newest.order,
               ...(newest.icon ? { icon: newest.icon } : {}),
@@ -579,6 +696,8 @@ export function useCommunityDocs(): CommunityDocs {
           id,
           title: newest.title,
           body: newest.body,
+          ...(newest.affine ? { affine: newest.affine } : {}),
+          ...(newest.affineEpoch ? { affineEpoch: newest.affineEpoch } : {}),
           parentId: newest.parentId,
           order: newest.order,
           icon: newest.icon,
@@ -590,7 +709,18 @@ export function useCommunityDocs(): CommunityDocs {
       });
       if (plan.kind === "conflict") throw new DocConflictError(plan.newest);
       if (plan.kind === "noop") return plan.newest;
-      return publishPage(plan.content, newest);
+      let uploadScope: DocBlobScope | undefined;
+      const stored = await storeDocBlob(plan.content, undefined, (scope) => {
+        uploadScope = scope;
+      });
+      if (stored !== plan.content) {
+        const current = await fetchNewestVersion(id);
+        if (!current || current.eventId !== newest.eventId) {
+          if (current) throw new DocConflictError(current);
+          throw new Error("The document disappeared during upload.");
+        }
+      }
+      return publishPage(stored, newest, uploadScope);
     },
     [fetchNewestVersion, publishPage],
   );
@@ -605,7 +735,7 @@ export function useCommunityDocs(): CommunityDocs {
 
   const deletePage = React.useCallback<CommunityDocs["deletePage"]>(
     async (id) => {
-      await republish(id, { deleted: true });
+      await republish(id, { deleted: true, affineEpoch: crypto.randomUUID() });
     },
     [republish],
   );

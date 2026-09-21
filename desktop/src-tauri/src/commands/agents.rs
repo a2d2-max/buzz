@@ -1062,6 +1062,7 @@ fn run_managed_agent_deletion<T>(
     base_dir: &std::path::Path,
     pubkey: &str,
     records: &mut Vec<ManagedAgentRecord>,
+    cleanup: impl FnOnce() -> Result<(), String>,
     delete: impl FnOnce(&mut Vec<ManagedAgentRecord>) -> Result<T, String>,
 ) -> Result<T, String> {
     recover_pending_assignment_cleanup(base_dir, |pending_pubkey| {
@@ -1069,7 +1070,13 @@ fn run_managed_agent_deletion<T>(
             .iter()
             .any(|record| record.pubkey.eq_ignore_ascii_case(pending_pubkey))
     })?;
-    with_agent_assignments_cleared(base_dir, pubkey, || delete(records))
+    with_agent_assignments_cleared(base_dir, pubkey, || {
+        // Keep the durable record and private key until both data-home scopes
+        // are gone. A failed cleanup therefore leaves the same Delete action
+        // available for an idempotent retry.
+        cleanup()?;
+        delete(records)
+    })
 }
 
 #[tauri::command]
@@ -1129,14 +1136,20 @@ pub async fn delete_managed_agent(
             if !records.iter().any(|record| record.pubkey == pubkey) {
                 return Err(format!("agent {pubkey} not found"));
             }
-            run_managed_agent_deletion(&base_dir, &pubkey, &mut records, |records| {
-                if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
-                    stop_managed_agent_process(&app, record, &mut runtimes)?;
-                }
-                state.clear_agent_session_caches(&pubkey);
-                records.retain(|record| record.pubkey != pubkey);
-                save_managed_agents(&app, records)
-            })?;
+            if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
+                stop_managed_agent_process(&app, record, &mut runtimes)?;
+            }
+            state.clear_agent_session_caches(&pubkey);
+            run_managed_agent_deletion(
+                &base_dir,
+                &pubkey,
+                &mut records,
+                || remove_agent_data_homes(&app, &base_dir, &pubkey),
+                |records| {
+                    records.retain(|record| record.pubkey != pubkey);
+                    save_managed_agents(&app, records)
+                },
+            )?;
             crate::managed_agents::delete_agent_key(&pubkey);
             // Tombstone after confirmed removal (inside lock; every published
             // agent tombstones). The NIP-IA kind:9035 archive request — which
@@ -1150,6 +1163,31 @@ pub async fn delete_managed_agent(
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+fn remove_agent_data_homes(
+    app: &AppHandle,
+    base_dir: &std::path::Path,
+    pubkey: &str,
+) -> Result<(), String> {
+    use crate::managed_agents::agent_home;
+    let owned_result = agent_home::remove_agent_homes(base_dir, pubkey);
+    let global_env = crate::managed_agents::load_global_agent_config(app)
+        .map(|config| config.env_vars)
+        .map_err(|error| {
+            format!("cannot delete agent until its data homes are cleaned: {error}")
+        })?;
+    let hermes_result = agent_home::hermes_root(&global_env, agent_home::platform_hermes_root)
+        .and_then(|root| agent_home::remove_hermes_profile(&root, pubkey));
+    match (owned_result, hermes_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(owned), Ok(())) | (Ok(()), Err(owned)) => Err(format!(
+            "cannot delete agent until its data homes are cleaned: {owned}"
+        )),
+        (Err(owned), Err(hermes)) => Err(format!(
+            "cannot delete agent until its data homes are cleaned: {owned}; {hermes}"
+        )),
+    }
 }
 
 // Remote agent shutdown is handled entirely by the frontend:

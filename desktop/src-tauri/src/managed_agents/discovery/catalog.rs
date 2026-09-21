@@ -8,6 +8,9 @@ use super::runtime_metadata::{
     KnownAcpRuntime, BUZZ_AGENT_EFFORT_VALUES, GOOSE_EFFORT_NORMALIZATION,
 };
 use super::{BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL};
+use crate::managed_agents::agent_home::{
+    DataHomeKind, BUZZ_AGENT_ACCOUNT_REASON, GOOSE_ACCOUNT_REASON,
+};
 
 pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
     KnownAcpRuntime {
@@ -48,6 +51,8 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         auth_probe_args: None,
         oauth_token_env_var: None,
         supports_codex_accounts: false,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: Some(GOOSE_ACCOUNT_REASON),
     },
     KnownAcpRuntime {
         id: "claude",
@@ -85,6 +90,8 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         auth_probe_args: Some(&["claude", "auth", "status"]),
         oauth_token_env_var: Some(crate::managed_agents::claude_accounts::CLAUDE_OAUTH_TOKEN_ENV),
         supports_codex_accounts: false,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     KnownAcpRuntime {
         id: "codex",
@@ -123,6 +130,8 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         auth_probe_args: Some(&["codex", "login", "status"]),
         oauth_token_env_var: None,
         supports_codex_accounts: true,
+        data_home: DataHomeKind::CodexHome,
+        account_unsupported_reason: None,
     },
     KnownAcpRuntime {
         id: "buzz-agent",
@@ -160,5 +169,7 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         auth_probe_args: None,
         oauth_token_env_var: None,
         supports_codex_accounts: false,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: Some(BUZZ_AGENT_ACCOUNT_REASON),
     },
 ];

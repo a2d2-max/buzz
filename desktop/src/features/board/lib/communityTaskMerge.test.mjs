@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { serializeCommunityTaskContent } from "./communityTaskCodec.ts";
 import {
+  communityTaskContentOf,
   canDeleteCommunityTask,
   canEditCommunityTask,
   honoredCommunityTaskSigners,
@@ -113,8 +114,8 @@ test("a removed assignee can no longer edit, even with a newer stamp", () => {
   assert.equal(task?.title, "Bob removed");
 });
 
-test("an assignee can hand the card to someone else", () => {
-  // Alice -> Bob; Bob adds Carol; Carol's later edit is honored.
+test("only the author may grant task editing authority", () => {
+  // Bob cannot grant Carol edit authority without an author revision.
   const task = resolveCommunityTaskLineage(ALICE, "card-1", [
     revision({ updatedAt: 100, assignees: [BOB] }),
     revision({ signer: BOB, updatedAt: 200, assignees: [BOB, CAROL] }),
@@ -125,7 +126,7 @@ test("an assignee can hand the card to someone else", () => {
       title: "Carol's edit",
     }),
   ]);
-  assert.equal(task?.title, "Carol's edit");
+  assert.equal(task?.title, "rev 100 by a");
   assert.deepEqual(
     [
       ...honoredCommunityTaskSigners(ALICE, [
@@ -133,7 +134,7 @@ test("an assignee can hand the card to someone else", () => {
         revision({ signer: BOB, updatedAt: 200, assignees: [BOB, CAROL] }),
       ]),
     ].sort(),
-    [ALICE, BOB, CAROL].sort(),
+    [ALICE, BOB].sort(),
   );
 });
 
@@ -150,7 +151,7 @@ test("the honored set does not depend on event order", () => {
     [...revisions].reverse(),
   );
   assert.deepEqual(forward, backward);
-  assert.equal(forward?.title, "Carol");
+  assert.equal(forward?.title, "rev 100 by a");
 });
 
 test("the author's tombstone retires the card despite newer assignee edits", () => {
@@ -354,5 +355,69 @@ test("latestOwnCommunityTaskEventCreatedAt only looks at the signer's own events
   assert.equal(
     latestOwnCommunityTaskEventCreatedAt(events, "card-9", ALICE),
     undefined,
+  );
+});
+
+test("custom fields survive task content extraction and a moved revision; clear stays empty", () => {
+  const customFields = [
+    { id: "x", name: "Estimate", type: "number", value: 0 },
+  ];
+  const first = revision({ customFields });
+  const task = resolveCommunityTaskLineage(ALICE, "card-1", [first]);
+  const moved = revision({
+    ...communityTaskContentOf(task),
+    status: "doing",
+    updatedAt: 101,
+  });
+  assert.deepEqual(
+    resolveCommunityTaskLineage(ALICE, "card-1", [first, moved]).customFields,
+    customFields,
+  );
+  const cleared = revision({
+    ...moved.content,
+    customFields: [],
+    updatedAt: 102,
+  });
+  assert.deepEqual(
+    communityTaskContentOf(
+      resolveCommunityTaskLineage(ALICE, "card-1", [first, moved, cleared]),
+    ).customFields,
+    [],
+  );
+  const stranger = revision({ signer: MALLORY, customFields, updatedAt: 999 });
+  assert.deepEqual(
+    resolveCommunityTaskLineage(ALICE, "card-1", [first, cleared, stranger])
+      .customFields,
+    [],
+  );
+});
+
+test("explicit document clear survives old relay replay and a subsequent status move", async () => {
+  const { communityTaskContentOf } = await import("./communityTaskMerge.ts");
+  const docs = [
+    {
+      pageId: "11111111-1111-4111-8111-111111111111",
+      relayUrl: "wss://example.test",
+      title: "Linked document",
+    },
+  ];
+  const linked = event(revision({ documents: docs, updatedAt: 100 }));
+  const cleared = event(revision({ documents: [], updatedAt: 200 }));
+  let cache = upsertCommunityTaskEvent([linked], cleared);
+  cache = upsertCommunityTaskEvent(cache, linked);
+  assert.deepEqual(mergeCommunityTaskEvents(cache)[0].documents, []);
+  const moved = event(
+    revision({
+      ...communityTaskContentOf(mergeCommunityTaskEvents(cache)[0]),
+      status: "doing",
+      updatedAt: 300,
+    }),
+  );
+  const reconnected = mergeCommunityTaskEvents([moved]);
+  assert.equal(reconnected[0].status, "doing");
+  assert.deepEqual(reconnected[0].documents, []);
+  assert.deepEqual(
+    mergeCommunityTaskEvents([linked, cleared, moved])[0].documents,
+    [],
   );
 });

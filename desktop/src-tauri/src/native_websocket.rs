@@ -12,7 +12,11 @@ use crate::native_websocket_batch::{is_auth_challenge, FrameBatch, BATCH_MAX_SER
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message},
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{HeaderName, HeaderValue},
+        protocol::{frame::coding::CloseCode, CloseFrame, Message},
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -127,15 +131,35 @@ impl WebSocketManager {
     }
 }
 
+#[cfg(test)]
 async fn open_connection(
     manager: &WebSocketManager,
     url: &str,
     on_message: Channel<InvokeResponseBody>,
 ) -> Result<Id, String> {
+    open_connection_scoped(manager, url, on_message, None).await
+}
+
+async fn open_connection_scoped(
+    manager: &WebSocketManager,
+    url: &str,
+    on_message: Channel<InvokeResponseBody>,
+    company_identity: Option<crate::company_identity::ScopedCompanyIdentity>,
+) -> Result<Id, String> {
     let connect_cancel = manager.connect_cancel.lock().await.clone();
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| error.to_string())?;
+    if let Some(evidence) = company_identity.as_ref() {
+        let value = HeaderValue::from_str(evidence.header_value())
+            .map_err(|_| "company identity assertion is malformed".to_string())?;
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static("nostr-federated-identity"), value);
+    }
     let (socket, _) = tokio::select! {
         _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
-        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url)) => result
+        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)) => result
             .map_err(|_| "WebSocket connection timed out".to_string())?
             .map_err(|error| error.to_string())?,
     };
@@ -155,6 +179,16 @@ async fn open_connection(
     };
     let (sender, receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
     let cancel = CancellationToken::new();
+    if let Some(evidence) = company_identity {
+        let session_invalidated = evidence.invalidated();
+        let connection_cancel = cancel.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::select! {
+                _ = session_invalidated.cancelled() => connection_cancel.cancel(),
+                _ = connection_cancel.cancelled() => {}
+            }
+        });
+    }
     let handle = Arc::new(ConnectionHandle {
         sender,
         cancel: cancel.clone(),
@@ -181,11 +215,13 @@ async fn open_connection(
 #[tauri::command]
 async fn connect(
     manager: tauri::State<'_, WebSocketManager>,
+    app_state: tauri::State<'_, crate::app_state::AppState>,
     url: String,
     on_message: Channel<InvokeResponseBody>,
     _config: Option<serde_json::Value>,
 ) -> Result<Id, String> {
-    open_connection(manager.inner(), &url, on_message).await
+    let company_identity = crate::company_identity::websocket_evidence(&app_state, &url)?;
+    open_connection_scoped(manager.inner(), &url, on_message, company_identity).await
 }
 
 pub(crate) async fn send_message(
@@ -373,7 +409,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use tokio::io::duplex;
-    use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::{handshake::server::Request, protocol::Role},
+        WebSocketStream,
+    };
 
     fn silent_channel() -> Channel<InvokeResponseBody> {
         Channel::new(|_: InvokeResponseBody| Ok(()))
@@ -398,6 +438,110 @@ mod tests {
             Ok(())
         });
         (channel, deliveries)
+    }
+
+    #[tokio::test]
+    // tokio-tungstenite's callback trait fixes the error type to its large
+    // HTTP error response; this test cannot box or narrow that external type.
+    #[allow(clippy::result_large_err)]
+    async fn production_connect_sends_scoped_header_and_clear_closes_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (header_tx, header_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut header_tx = Some(header_tx);
+            let mut socket = accept_hdr_async(stream, move |request: &Request, response| {
+                let header = request
+                    .headers()
+                    .get("nostr-federated-identity")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                if let Some(tx) = header_tx.take() {
+                    let _ = tx.send(header);
+                }
+                Ok(response)
+            })
+            .await
+            .unwrap();
+            while socket.next().await.is_some() {}
+        });
+
+        let session = Arc::new(crate::company_identity::CompanyIdentitySession::default());
+        let request = crate::company_identity::CompanyIdentityAssertionRequest {
+            relay_origin: url.clone(),
+            nostr_pubkey: "11".repeat(32),
+        };
+        session
+            .install(
+                &request,
+                crate::company_identity::ProducedCompanyIdentityAssertion::new(
+                    "native.websocket.assertion".to_string(),
+                    std::time::SystemTime::now() + Duration::from_secs(60),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let evidence = session
+            .for_websocket_upgrade(&url, &url, &"11".repeat(32))
+            .unwrap();
+        let manager = WebSocketManager::default();
+        let id = open_connection_scoped(&manager, &url, silent_channel(), evidence)
+            .await
+            .unwrap();
+        assert_eq!(
+            header_rx.await.unwrap().as_deref(),
+            Some("Bearer native.websocket.assertion")
+        );
+
+        session.clear();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !manager.connections.lock().await.contains_key(&id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clearing the company session must close its native socket");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_redirect_is_not_followed() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("ws://127.0.0.1:{}/", target.local_addr().unwrap().port());
+        let target_hit = Arc::new(AtomicBool::new(false));
+        let target_hit_task = Arc::clone(&target_hit);
+        let target_task = tokio::spawn(async move {
+            if tokio::time::timeout(Duration::from_millis(500), target.accept())
+                .await
+                .is_ok()
+            {
+                target_hit_task.store(true, Ordering::SeqCst);
+            }
+        });
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", source.local_addr().unwrap());
+        let source_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let result =
+            open_connection_scoped(&WebSocketManager::default(), &url, silent_channel(), None)
+                .await;
+        assert!(result.is_err());
+        source_task.await.unwrap();
+        target_task.await.unwrap();
+        assert!(!target_hit.load(Ordering::SeqCst));
     }
 
     /// Drives the real `run_connection` loop over a live in-memory socket, so

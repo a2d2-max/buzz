@@ -6,6 +6,7 @@ mod build_identity;
 mod builderlab;
 mod channel_head_cache;
 mod commands;
+mod company_identity;
 mod deep_link;
 mod egress_guard;
 mod event_sync;
@@ -58,6 +59,7 @@ use builderlab::*;
 #[doc(hidden)]
 pub use commands::print_agent_access_owner_only_probe_if_requested;
 use commands::*;
+use company_identity::{clear_company_identity_session, get_company_identity_status};
 use deep_link::{
     acknowledge_pending_community_deep_link, acknowledge_pending_entity_deep_link,
     acknowledge_pending_navigation_deep_link, clear_pending_navigation_deep_links,
@@ -92,6 +94,7 @@ use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 #[cfg(target_os = "macos")]
 use tauri::Listener;
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
+use tauri::{WebviewWindowBuilder, Wry};
 use tauri_plugin_window_state::StateFlags;
 #[cfg(target_os = "macos")]
 use tray_menu::show_main_window;
@@ -197,6 +200,7 @@ pub fn run() {
                 })
                 .build(),
         )
+        .plugin(engine_launch_plugin())
         .plugin(native_websocket::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init());
@@ -235,6 +239,8 @@ pub fn run() {
         .manage(observed_unread::ObservedUnreadStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
         .setup(move |app| {
+            create_build_scoped_main_webview(app)?;
+            register_upstream_login_capabilities(app.handle())?;
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
             {
@@ -357,7 +363,7 @@ pub fn run() {
             // Start the localhost media streaming proxy. Uses the shared HTTP
             // client so VPN tunnelling applies. The port is stored in AppState
             // and exposed to the frontend via the `get_media_proxy_port` command.
-            let proxy_client = state.http_client.clone();
+            let proxy_client = state.media_fetch_client.clone();
             let proxy_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 let port = media_proxy::spawn_media_proxy(proxy_client, proxy_handle.clone()).await;
@@ -521,6 +527,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_upstream_app_availability,
+            go_back_upstream_app,
+            probe_upstream_app,
+            sync_upstream_app,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,
@@ -541,6 +551,8 @@ pub fn run() {
             cancel_builderlab_login,
             get_builderlab_auth,
             clear_builderlab_auth,
+            get_company_identity_status,
+            clear_company_identity_session,
             get_builderlab_nostr_identity,
             bind_builderlab_nostr_identity,
             delete_builderlab_nostr_identity,
@@ -719,11 +731,16 @@ pub fn run() {
             get_runtime_file_config,
             get_baked_build_env_keys,
             get_baked_build_env,
+            account_quota,
             put_agent_session_config,
             get_global_agent_config,
             set_global_agent_config,
             list_claude_accounts,
             add_claude_account,
+            get_claude_login_command,
+            start_claude_account_login,
+            poll_claude_account_login,
+            cancel_claude_account_login,
             rename_claude_account,
             remove_claude_account,
             test_claude_account,
@@ -733,6 +750,11 @@ pub fn run() {
             remove_codex_account,
             test_codex_account,
             get_codex_login_command,
+            start_codex_account_login,
+            poll_codex_account_login,
+            cancel_codex_account_login,
+            list_orca_codex_accounts,
+            import_orca_codex_accounts,
             mesh_start_node,
             mesh_stop_node,
             mesh_node_status,
@@ -740,6 +762,7 @@ pub fn run() {
             mesh_installed_models,
             mesh_model_catalog,
             update_managed_agent,
+            update_managed_agent_accounts_batch,
             discover_backend_providers,
             probe_backend_provider,
             persona_catalog::fetch_persona_catalog,
@@ -956,4 +979,37 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+/// Creates the main window with a build-scoped WKWebView data store when an
+/// isolated QA build explicitly opts in. Normal builds keep Tauri's configured
+/// default window and data store unchanged.
+fn create_build_scoped_main_webview(
+    app: &mut tauri::App<Wry>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(identifier) = option_env!("BUZZ_BUILD_MAIN_DATA_STORE_UUID") else {
+        return Ok(());
+    };
+    if app.get_webview_window("main").is_some() {
+        return Err(std::io::Error::other(
+            "BUZZ_BUILD_MAIN_DATA_STORE_UUID requires the configured main window to set create=false",
+        )
+        .into());
+    }
+    let store = uuid::Uuid::parse_str(identifier).map_err(|error| {
+        std::io::Error::other(format!(
+            "BUZZ_BUILD_MAIN_DATA_STORE_UUID must be a UUID: {error}"
+        ))
+    })?;
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .ok_or_else(|| std::io::Error::other("isolated QA build has no main window config"))?;
+    WebviewWindowBuilder::from_config(app.handle(), config)?
+        .data_store_identifier(*store.as_bytes())
+        .build()?;
+    Ok(())
 }

@@ -288,6 +288,15 @@ desktop-release-build target="aarch64-apple-darwin":
     pnpm install
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 
+# Validate the fork-owned, public-only Buzz, AFFiNE, and Plane production origins.
+desktop-a2d2-release-config-check:
+    node desktop/scripts/a2d2-cloud-build-env.mjs --check
+
+# Build the normal production-identity desktop with all A2D2 public origins baked in.
+# This delegates to the canonical local release recipe and never selects a demo identity.
+desktop-a2d2-release-build target="aarch64-apple-darwin":
+    node desktop/scripts/a2d2-release-build.mjs {{quote(target)}}
+
 # Build an unsigned named macOS demo DMG with isolated app and runtime identities.
 desktop-demo-build demo_name target="aarch64-apple-darwin":
     #!/usr/bin/env bash

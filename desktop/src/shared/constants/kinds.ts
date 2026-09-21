@@ -69,6 +69,11 @@ export const COMMUNITY_TASK_T_TAG = "community-task";
 // pages — on the shared 30078 window the relay applies `#t` after the SQL
 // LIMIT, so every refetch had to scan every app-data row.
 export const KIND_COMMUNITY_DOC = 30623;
+// Notion-style community databases. Schemas and rows use separate NIP-33
+// kinds so each row is its own LWW/conflict boundary and schema scans do not
+// share a relay window with row traffic.
+export const KIND_COMMUNITY_DATABASE_SCHEMA = 30624;
+export const KIND_COMMUNITY_DATABASE_ROW = 30625;
 // Where docs lived before the dedicated kind: the shared NIP-78 window,
 // distinguished only by the d prefix + t tag. Still read (and migrated
 // forward on sight) so no page published by an older build is lost; never
@@ -76,6 +81,11 @@ export const KIND_COMMUNITY_DOC = 30623;
 export const KIND_COMMUNITY_DOC_LEGACY = 30078;
 export const COMMUNITY_DOC_TAG = "community-doc";
 export const COMMUNITY_DOC_D_PREFIX = "doc:";
+export const KIND_COMMUNITY_DATABASE_LEGACY = 30078;
+export const COMMUNITY_DATABASE_SCHEMA_TAG = "community-db";
+export const COMMUNITY_DATABASE_SCHEMA_D_PREFIX = "db:";
+export const COMMUNITY_DATABASE_ROW_TAG = "community-db-row";
+export const COMMUNITY_DATABASE_ROW_D_PREFIX = "dbrow:";
 // NIP-33 persona/team/managed-agent projection events (d-tag keyed). Published
 // backend-side as secrets-stripped snapshots; the inbound sync hook subscribes
 // to all three to patch local records. Mirror of buzz-core's KIND_PERSONA etc.

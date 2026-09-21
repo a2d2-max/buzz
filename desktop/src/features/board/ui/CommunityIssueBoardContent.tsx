@@ -1,3 +1,8 @@
+import { CommunityIssuesView } from "./CommunityIssuesView";
+import {
+  DEFAULT_ISSUE_VIEW,
+  type CommunityIssueViewItem,
+} from "@/features/board/lib/communityIssueView";
 import { ArrowLeft } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -16,10 +21,7 @@ import { useUpdateProjectIssueStatusMutation } from "@/features/projects/issueSt
 import { useIssueStatusOverlays } from "@/features/projects/issueStatusOverlay";
 import type { IssueBoardDropStatus } from "@/features/projects/lib/issueBoardColumns";
 import type { ProjectWorkItemSection } from "@/features/projects/projectWorkItems";
-import {
-  ProjectIssueBoard,
-  type ProjectIssueBoardItem,
-} from "@/features/projects/ui/ProjectIssueBoard";
+import type { ProjectIssueBoardItem } from "@/features/projects/ui/ProjectIssueBoard";
 import { ProjectIssueDetail } from "@/features/projects/ui/ProjectIssuesPanel";
 import { ProjectPanelState } from "@/features/projects/ui/ProjectPanelState";
 import { ProjectsWorkItemsLoadNotice } from "@/features/projects/ui/ProjectsWorkItemsLoadNotice";
@@ -72,6 +74,7 @@ export function CommunityIssueBoardContent({
   viewer,
   workItems,
 }: CommunityIssueBoardContentProps) {
+  const [viewState, setViewState] = React.useState(DEFAULT_ISSUE_VIEW);
   const { mutateAsync } = useUpdateProjectIssueStatusMutation();
   const issues = React.useMemo(
     () => workItems.map(({ issue }) => issue),
@@ -83,12 +86,13 @@ export function CommunityIssueBoardContent({
   const { apply, begin, rollBack } = useIssueStatusOverlays(issues);
   const statusesUnavailable = failedSections.includes("statuses");
 
-  const items = React.useMemo<ProjectIssueBoardItem[]>(
+  const items = React.useMemo<CommunityIssueViewItem[]>(
     () =>
       workItems.map(({ issue, project, repository }) => ({
         issue: apply(issue),
         project: repository,
         projectName: project.name,
+        projectId: project.id,
       })),
     [apply, workItems],
   );
@@ -203,7 +207,10 @@ export function CommunityIssueBoardContent({
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {loadNotice}
-      <ProjectIssueBoard
+      <CommunityIssuesView
+        state={viewState}
+        setState={setViewState}
+        viewer={viewer}
         canMoveIssue={canMoveIssue}
         items={items}
         moveLockedReason={

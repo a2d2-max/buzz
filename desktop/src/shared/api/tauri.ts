@@ -32,8 +32,10 @@ import type {
   CreateManagedAgentInput,
   AgentModelsResponse,
   UpdateManagedAgentInput,
+  UpdateManagedAgentAccountsBatchInput,
   AcpAvailabilityStatus,
   AcpRuntimeCatalogEntry,
+  AgentDataHome,
   AuthStatus,
   CommandAvailability,
   InstallRuntimeResult,
@@ -185,6 +187,8 @@ export type RawAcpRuntimeCatalogEntry = {
   thinking_env_var?: string | null;
   oauth_token_env_var?: string | null;
   supports_codex_accounts?: boolean;
+  data_home?: AgentDataHome | null;
+  account_unsupported_reason?: string | null;
   max_tokens_env_var?: string | null;
   context_limit_env_var?: string | null;
   max_rounds_env_var?: string | null;
@@ -694,6 +698,8 @@ export function fromRawAcpRuntimeCatalogEntry(
     thinkingEnvVar: entry.thinking_env_var ?? null,
     oauthTokenEnvVar: entry.oauth_token_env_var ?? null,
     supportsCodexAccounts: entry.supports_codex_accounts ?? false,
+    dataHome: entry.data_home ?? "none",
+    accountUnsupportedReason: entry.account_unsupported_reason ?? null,
     maxTokensEnvVar: entry.max_tokens_env_var ?? null,
     contextLimitEnvVar: entry.context_limit_env_var ?? null,
     maxRoundsEnvVar: entry.max_rounds_env_var ?? null,
@@ -1037,6 +1043,15 @@ export async function updateManagedAgent(
     agent: fromRawManagedAgent(response.agent),
     profileSyncError: response.profile_sync_error,
   };
+}
+
+/** Atomically replace account bindings for every selected managed agent. */
+export async function updateManagedAgentAccountsBatch(
+  input: UpdateManagedAgentAccountsBatchInput,
+): Promise<string[]> {
+  return invokeTauri<string[]>("update_managed_agent_accounts_batch", {
+    input,
+  });
 }
 
 // ── Backend provider discovery ────────────────────────────────────────────────

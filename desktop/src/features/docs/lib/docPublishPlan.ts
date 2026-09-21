@@ -1,4 +1,8 @@
 import {
+  hasDocDatabaseDirective,
+  preservesDocDatabaseDirectives,
+} from "./docDatabaseDirective";
+import {
   type DocPage,
   type DocPageContent,
   docPageContentEquals,
@@ -39,8 +43,36 @@ export function planDocPagePublish({
   newest: DocPage | undefined;
   next: DocPageContent & { id: string };
 }): DocPublishPlan {
+  if (newest?.unsupportedEditor)
+    throw new Error("This document needs a newer editor; writing is disabled.");
+  if (newest?.structuredMergeConflict)
+    throw new Error(
+      "Structured document branches could not be combined safely; writing is disabled.",
+    );
   if (newest && baseEventId !== undefined && newest.eventId !== baseEventId) {
     return { kind: "conflict", newest };
+  }
+  if (
+    !newest?.affine &&
+    next.affine &&
+    (hasDocDatabaseDirective(newest?.body ?? "") ||
+      hasDocDatabaseDirective(next.body)) &&
+    (next.affine.version !== 2 ||
+      !preservesDocDatabaseDirectives(newest?.body ?? "", next.body))
+  ) {
+    throw new Error(
+      "Linked databases must be preserved by a compatible structured editor.",
+    );
+  }
+  if (
+    newest?.affine &&
+    (!next.affine ||
+      (next.affine.data === newest.affine.data &&
+        (next.title !== newest.title || next.body !== newest.body)))
+  ) {
+    throw new Error(
+      "Open this page in the structured editor to change its content.",
+    );
   }
   if (
     newest &&

@@ -54,6 +54,11 @@ import {
   KIND_CHANNEL_THREAD_SUMMARY,
   KIND_CHANNEL_WINDOW_BOUNDS,
   KIND_DM_VISIBILITY,
+  KIND_COMMUNITY_DOC,
+  KIND_COMMUNITY_DOC_LEGACY,
+  KIND_COMMUNITY_DATABASE_LEGACY,
+  KIND_COMMUNITY_DATABASE_ROW,
+  KIND_COMMUNITY_DATABASE_SCHEMA,
   KIND_EVENT_REMINDER,
   KIND_GIT_ISSUE,
   KIND_GIT_PATCH,
@@ -202,6 +207,12 @@ type MockHuddleSeed = {
 type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
+    /** Community database schema/row history served by the mock relay. */
+    databaseEvents?: RelayEvent[];
+    /** Holds each mock database history response for observable loading UI. */
+    databaseHistoryDelayMs?: number;
+    /** Community Docs page history served by the mock relay. */
+    docEvents?: RelayEvent[];
     /** Tauri window label exposed to the app. Defaults to the main window. */
     windowLabel?: string;
     ttsSettings?: {
@@ -1085,21 +1096,25 @@ type MockSubscription = {
    *  owner-scoped live subscription (e.g. the observer-archive `24200`
    *  reconciliation gate) independently of channel-scoped ones. */
   ownerPubkeys: string[];
+  filters: MockFilter[];
 };
 
 type MockFilter = {
   "#a"?: string[];
   "#buzz-channel"?: string[];
   "#d"?: string[];
+  "#db"?: string[];
   "#e"?: string[];
   "#h"?: string[];
   "#p"?: string[];
+  "#t"?: string[];
   authors?: string[];
   ids?: string[];
   kinds?: number[];
   limit?: number;
   since?: number;
   until?: number;
+  before_id?: string;
 };
 
 type MockSocket = {
@@ -1358,6 +1373,16 @@ declare global {
       kind: number;
       tags: string[][];
     }>;
+    /** Database events accepted by the mock relay. */
+    __BUZZ_E2E_ACCEPTED_DATABASE_EVENTS__?: RelayEvent[];
+    /** Docs page events accepted by the mock relay. */
+    __BUZZ_E2E_ACCEPTED_DOC_EVENTS__?: RelayEvent[];
+    /** Database filters observed by the mock relay. */
+    __BUZZ_E2E_DATABASE_QUERY_FILTERS__?: MockFilter[];
+    /** Rejects the next database event once with a visible relay error. */
+    __BUZZ_E2E_FAIL_NEXT_DATABASE_PUBLISH__?: (message?: string) => void;
+    /** Replaces one database coordinate without notifying live subscribers. */
+    __BUZZ_E2E_REPLACE_DATABASE_HEAD__?: (event: RelayEvent) => void;
     /** Project event kinds rejected once, in order, to exercise retry flows. */
     __BUZZ_E2E_REJECT_PROJECT_EVENT_KINDS__?: number[];
     /** Makes the mock relay reject project announcements as an unknown kind. */
@@ -3308,6 +3333,9 @@ const mockUserStatuses: RelayEvent[] = [];
 const mockReminderEvents: RelayEvent[] = [];
 const mockPersonaEvents: RelayEvent[] = [];
 const mockTeamCatalogEvents: RelayEvent[] = [];
+const mockDatabaseEvents: RelayEvent[] = [];
+const mockDocEvents: RelayEvent[] = [];
+let mockDatabasePublishFailure: string | null = null;
 let mockRelayMembers: RawRelayMember[] = [];
 const mockSockets = new Map<number, MockSocket>();
 const mockAuthResponses: Array<{ success: boolean; message: string }> = [];
@@ -5036,9 +5064,117 @@ function emitMockGlobalEvent(event: RelayEvent) {
       if (subscription.kinds && !subscription.kinds.includes(event.kind)) {
         continue;
       }
+      if (
+        subscription.filters.length > 0 &&
+        !subscription.filters.some((filter) =>
+          mockEventMatchesFilter(event, filter),
+        )
+      )
+        continue;
       sendWsText(socket.handler, ["EVENT", subId, event]);
     }
   }
+}
+
+function mockEventMatchesFilter(
+  event: RelayEvent,
+  filter: MockFilter,
+): boolean {
+  if (filter.kinds && !filter.kinds.includes(event.kind)) return false;
+  if (filter.authors && !filter.authors.includes(event.pubkey)) return false;
+  if (filter.ids && !filter.ids.some((id) => event.id.startsWith(id)))
+    return false;
+  if (filter.since !== undefined && event.created_at < filter.since)
+    return false;
+  if (filter.until !== undefined && event.created_at > filter.until)
+    return false;
+  if (
+    filter.until !== undefined &&
+    filter.before_id &&
+    event.created_at === filter.until &&
+    event.id <= filter.before_id
+  )
+    return false;
+  for (const [key, values] of Object.entries(filter)) {
+    if (!key.startsWith("#") || !Array.isArray(values)) continue;
+    const tagName = key.slice(1);
+    const tagValues = values as unknown[];
+    if (
+      !event.tags.some(
+        (tag) => tag[0] === tagName && tagValues.includes(tag[1]),
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isMockDatabaseFilter(filter: MockFilter): boolean {
+  return Boolean(
+    filter.kinds?.some((kind) =>
+      [KIND_COMMUNITY_DATABASE_SCHEMA, KIND_COMMUNITY_DATABASE_ROW].includes(
+        kind,
+      ),
+    ) ||
+      filter["#t"]?.some((tag) =>
+        ["community-db", "community-db-row"].includes(tag),
+      ) ||
+      filter["#d"]?.some(
+        (tag) => tag.startsWith("db:") || tag.startsWith("dbrow:"),
+      ),
+  );
+}
+
+function emitMockDatabaseHistory(
+  socket: MockSocket,
+  subId: string,
+  filter: MockFilter,
+) {
+  window.__BUZZ_E2E_DATABASE_QUERY_FILTERS__ ??= [];
+  window.__BUZZ_E2E_DATABASE_QUERY_FILTERS__.push(filter);
+  const events = mockDatabaseEvents
+    .filter((event) => mockEventMatchesFilter(event, filter))
+    .sort(
+      (left, right) =>
+        right.created_at - left.created_at || left.id.localeCompare(right.id),
+    )
+    .slice(0, filter.limit ?? 50);
+  const emit = () => {
+    for (const event of events)
+      sendWsText(socket.handler, ["EVENT", subId, event]);
+    sendWsText(socket.handler, ["EOSE", subId]);
+  };
+  const delayMs = getConfig()?.mock?.databaseHistoryDelayMs ?? 0;
+  if (delayMs > 0) window.setTimeout(emit, delayMs);
+  else emit();
+}
+
+function isMockDocsFilter(filter: MockFilter): boolean {
+  return Boolean(
+    filter.kinds?.some((kind) =>
+      [KIND_COMMUNITY_DOC, KIND_COMMUNITY_DOC_LEGACY].includes(kind),
+    ) ||
+      filter["#t"]?.includes("community-doc") ||
+      filter["#d"]?.some((tag) => tag.startsWith("doc:")),
+  );
+}
+
+function emitMockDocsHistory(
+  socket: MockSocket,
+  subId: string,
+  filter: MockFilter,
+) {
+  const events = mockDocEvents
+    .filter((event) => mockEventMatchesFilter(event, filter))
+    .sort(
+      (left, right) =>
+        right.created_at - left.created_at || left.id.localeCompare(right.id),
+    )
+    .slice(0, filter.limit ?? 50);
+  for (const event of events)
+    sendWsText(socket.handler, ["EVENT", subId, event]);
+  sendWsText(socket.handler, ["EOSE", subId]);
 }
 
 function hasMockLiveSubscription(channelId: string, kind?: number) {
@@ -10878,12 +11014,21 @@ function sendToMockSocket(args: {
           channelIds.size > 0 ? [...channelIds] : [GLOBAL_MOCK_SUBSCRIPTION],
         kinds: kinds.size > 0 ? [...kinds] : null,
         ownerPubkeys: [...ownerPubkeys],
+        filters,
       });
       sendWsText(socket.handler, ["EOSE", subId]);
       return;
     }
 
     const filter = rest[1] as MockFilter;
+    if (isMockDatabaseFilter(filter)) {
+      emitMockDatabaseHistory(socket, subId, filter);
+      return;
+    }
+    if (isMockDocsFilter(filter)) {
+      emitMockDocsHistory(socket, subId, filter);
+      return;
+    }
     if (filter.kinds?.includes(13534)) {
       sendWsText(socket.handler, [
         "EVENT",
@@ -11058,6 +11203,44 @@ function sendToMockSocket(args: {
 
   if (type === "EVENT") {
     const event = rest[0] as RelayEvent;
+
+    if (
+      [KIND_COMMUNITY_DATABASE_SCHEMA, KIND_COMMUNITY_DATABASE_ROW].includes(
+        event.kind,
+      ) ||
+      (event.kind === KIND_COMMUNITY_DATABASE_LEGACY &&
+        event.tags.some(
+          (tag) =>
+            tag[0] === "t" &&
+            ["community-db", "community-db-row"].includes(tag[1]),
+        ))
+    ) {
+      if (mockDatabasePublishFailure) {
+        const message = mockDatabasePublishFailure;
+        mockDatabasePublishFailure = null;
+        sendWsText(socket.handler, ["OK", event.id, false, message]);
+        return;
+      }
+      mockDatabaseEvents.push(event);
+      window.__BUZZ_E2E_ACCEPTED_DATABASE_EVENTS__ ??= [];
+      window.__BUZZ_E2E_ACCEPTED_DATABASE_EVENTS__.push(event);
+      emitMockGlobalEvent(event);
+      sendWsText(socket.handler, ["OK", event.id, true, ""]);
+      return;
+    }
+
+    if (
+      event.kind === KIND_COMMUNITY_DOC ||
+      (event.kind === KIND_COMMUNITY_DOC_LEGACY &&
+        event.tags.some((tag) => tag[0] === "t" && tag[1] === "community-doc"))
+    ) {
+      mockDocEvents.push(event);
+      window.__BUZZ_E2E_ACCEPTED_DOC_EVENTS__ ??= [];
+      window.__BUZZ_E2E_ACCEPTED_DOC_EVENTS__.push(event);
+      emitMockGlobalEvent(event);
+      sendWsText(socket.handler, ["OK", event.id, true, ""]);
+      return;
+    }
 
     if (event.kind === KIND_AGENT_OBSERVER_FRAME) {
       const frame = event.tags.find((tag) => tag[0] === "frame")?.[1];
@@ -11378,6 +11561,43 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPersonaCatalogEvents(config);
   resetMockObservedUnread();
   resetMockTeamCatalogEvents(config);
+  mockDatabaseEvents.splice(
+    0,
+    mockDatabaseEvents.length,
+    ...(config.mock?.databaseEvents ?? []).map((event) =>
+      structuredClone(event),
+    ),
+  );
+  window.__BUZZ_E2E_ACCEPTED_DATABASE_EVENTS__ = [];
+  window.__BUZZ_E2E_DATABASE_QUERY_FILTERS__ = [];
+  mockDatabasePublishFailure = null;
+  window.__BUZZ_E2E_FAIL_NEXT_DATABASE_PUBLISH__ = (
+    message = "mock database publish failed",
+  ) => {
+    mockDatabasePublishFailure = message;
+  };
+  window.__BUZZ_E2E_REPLACE_DATABASE_HEAD__ = (event) => {
+    const dTag = event.tags.find((tag) => tag[0] === "d")?.[1];
+    if (!dTag || (!dTag.startsWith("db:") && !dTag.startsWith("dbrow:"))) {
+      throw new Error("A database replacement needs a database d-tag.");
+    }
+    for (let index = mockDatabaseEvents.length - 1; index >= 0; index -= 1) {
+      if (
+        mockDatabaseEvents[index]?.tags.some(
+          (tag) => tag[0] === "d" && tag[1] === dTag,
+        )
+      ) {
+        mockDatabaseEvents.splice(index, 1);
+      }
+    }
+    mockDatabaseEvents.push(structuredClone(event));
+  };
+  mockDocEvents.splice(
+    0,
+    mockDocEvents.length,
+    ...(config.mock?.docEvents ?? []).map((event) => structuredClone(event)),
+  );
+  window.__BUZZ_E2E_ACCEPTED_DOC_EVENTS__ = [];
   resetMockSaveSubscriptions(config);
   resetMockPendingCommunityDeepLinks(config);
   resetMockPendingNavigationDeepLinks(config);
@@ -14634,6 +14854,13 @@ export function maybeInstallE2eTauriMocks() {
       case "plugin:window|set_focus":
       case "plugin:window|set_badge_count":
       case "plugin:window|set_badge_label":
+        return null;
+      case "get_upstream_app_availability":
+        return ["affine", "plane"];
+      case "probe_upstream_app":
+        return (payload as { session: string }).session;
+      case "go_back_upstream_app":
+      case "sync_upstream_app":
         return null;
       case "plugin:updater|check":
         return handleUpdaterCheck(activeConfig);

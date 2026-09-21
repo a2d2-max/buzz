@@ -8,8 +8,9 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         apply_persona_behavior, effective_agent_command, load_managed_agents, load_personas,
-        managed_agent_avatar_url, save_managed_agents, save_personas, try_regenerate_nest,
-        validate_agent_definition_text, AgentDefinition, ManagedAgentRecord, UpdatePersonaRequest,
+        managed_agent_avatar_url, try_regenerate_nest, validate_agent_definition_text,
+        with_claude_account_store, AccountProvider, AgentDefinition, ManagedAgentRecord,
+        UpdatePersonaRequest,
     },
     util::now_iso,
 };
@@ -18,6 +19,110 @@ use super::{normalize_description, pending, retain_persona_pending, trim_optiona
 
 #[cfg(test)]
 mod name_propagation_tests;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersonaInstanceAccountUpdates {
+    claude_account_id: Option<Option<String>>,
+    codex_account_id: Option<Option<String>>,
+}
+
+fn validate_account_update(
+    provider: &str,
+    update: Option<Option<String>>,
+    known: &dyn Fn(&str) -> bool,
+) -> Result<Option<Option<String>>, String> {
+    let Some(update) = update else {
+        return Ok(None);
+    };
+    let next = update
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    if let Some(id) = next.as_deref() {
+        if !known(id) {
+            return Err(format!("{provider} account {id} not found"));
+        }
+    }
+    Ok(Some(next))
+}
+
+fn validate_persona_instance_account_updates(
+    claude_account_id: Option<Option<String>>,
+    codex_account_id: Option<Option<String>>,
+    claude_known: &dyn Fn(&str) -> bool,
+    codex_known: &dyn Fn(&str) -> bool,
+) -> Result<PersonaInstanceAccountUpdates, String> {
+    Ok(PersonaInstanceAccountUpdates {
+        claude_account_id: validate_account_update("Claude", claude_account_id, claude_known)?,
+        codex_account_id: validate_account_update("Codex", codex_account_id, codex_known)?,
+    })
+}
+
+/// Apply a validated tri-state patch to every community instance linked to
+/// the definition. The caller persists the resulting snapshot in one atomic
+/// write with the definition itself.
+fn apply_persona_instance_account_updates(
+    records: &mut [ManagedAgentRecord],
+    persona_id: &str,
+    updates: &PersonaInstanceAccountUpdates,
+    updated_at: &str,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for record in records
+        .iter_mut()
+        .filter(|record| record.persona_id.as_deref() == Some(persona_id))
+    {
+        let mut record_changed = false;
+        if let Some(next) = updates.claude_account_id.as_ref() {
+            if record.claude_account_id.as_ref() != next.as_ref() {
+                record.claude_account_id = next.clone();
+                record_changed = true;
+            }
+        }
+        if let Some(next) = updates.codex_account_id.as_ref() {
+            if record.codex_account_id.as_ref() != next.as_ref() {
+                record.codex_account_id = next.clone();
+                record_changed = true;
+            }
+        }
+        if record_changed {
+            record.updated_at = updated_at.to_string();
+            changed.push(record.pubkey.clone());
+        }
+    }
+    changed
+}
+
+/// Proof that one definition and the complete linked-instance snapshot were
+/// handed to the unified atomic writer. The command consumes this token to
+/// obtain its result, so deleting the production persistence call leaves no
+/// persona value for the retain/publish phase.
+#[derive(Debug)]
+#[must_use]
+struct PersistedPersonaSnapshot(AgentDefinition);
+
+impl PersistedPersonaSnapshot {
+    fn into_persona(self) -> AgentDefinition {
+        self.0
+    }
+}
+
+/// Production persistence seam for a definition edit. Tests drive this same
+/// function with a temporary on-disk writer, making both the definition and
+/// every linked account choice deletion-falsifiable at the save boundary.
+fn persist_persona_snapshot(
+    personas: &[AgentDefinition],
+    records: &[ManagedAgentRecord],
+    result: AgentDefinition,
+    save: impl FnOnce(&[ManagedAgentRecord], &[ManagedAgentRecord]) -> Result<(), String>,
+) -> Result<PersistedPersonaSnapshot, String> {
+    let definitions: Vec<_> = personas
+        .iter()
+        .cloned()
+        .map(AgentDefinition::into_agent_record)
+        .collect();
+    save(&definitions, records)?;
+    Ok(PersistedPersonaSnapshot(result))
+}
 
 /// Return value of the `update_persona` command. Uses flatten so all
 /// `AgentDefinition` fields appear at the top level of the JSON response —
@@ -125,7 +230,9 @@ type ProfileSyncParams = Vec<(
 pub async fn update_persona(
     input: UpdatePersonaRequest,
     app: AppHandle,
+    caller: tauri::Webview,
 ) -> Result<UpdatePersonaResult, String> {
+    crate::commands::upstream_apps::ensure_trusted_caller(&caller)?;
     let (persona, ()) = update_persona_with(input, app, |app, state, persona| {
         retain_persona_pending(app, state, persona);
         // F2: immediately refresh any shared 30178 heads that include this
@@ -170,6 +277,35 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 .managed_agents_store_lock
                 .lock()
                 .map_err(|error| error.to_string())?;
+
+            // Resolve and validate every selected id before mutating either
+            // half of the unified agent snapshot. A stale picker therefore
+            // cannot update a prefix of the linked instances.
+            let claude_accounts = if input.claude_account_id.is_some() {
+                with_claude_account_store(&app, |store| store.list(AccountProvider::Claude))?
+            } else {
+                Vec::new()
+            };
+            let codex_accounts = if input.codex_account_id.is_some() {
+                with_claude_account_store(&app, |store| store.list(AccountProvider::Codex))?
+            } else {
+                Vec::new()
+            };
+            let account_updates = validate_persona_instance_account_updates(
+                input.claude_account_id.clone(),
+                input.codex_account_id.clone(),
+                &|id| claude_accounts.iter().any(|account| account.id == id),
+                &|id| codex_accounts.iter().any(|account| account.id == id),
+            )?;
+            let mut records = load_managed_agents(&app)?;
+            let account_updated_at = now_iso();
+            apply_persona_instance_account_updates(
+                &mut records,
+                &input.id,
+                &account_updates,
+                &account_updated_at,
+            );
+
             let mut personas = load_personas(&app)?;
             pending::project_active_persona_sharing(&app, &state, &mut personas);
             let persona = personas
@@ -209,59 +345,41 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             apply_persona_behavior(persona, input.behavior)?;
             persona.updated_at = now_iso();
 
-            let result = persona.clone();
-            save_personas(&app, &personas)?;
+            let pending_result = persona.clone();
 
-            let retained = retain(&app, &state, &result)?;
-            try_regenerate_nest(&app);
-
-            // If the avatar, display_name, or effective description changed,
-            // propagate to linked agent records and collect relay profile sync
-            // params for the async phase. An about-only change touches no
-            // record bytes but still republishes each linked kind:0 profile.
-            let sync_params: ProfileSyncParams = if avatar_changed || name_changed || about_changed
-            {
-                let mut records = load_managed_agents(&app)?;
-                let mut params: ProfileSyncParams = Vec::new();
-                let mut agents_modified = false;
+            // Propagate definition identity changes in the same in-memory
+            // instance snapshot and collect relay profile sync parameters.
+            let renamed: Vec<String> = if name_changed {
+                propagate_persona_name_rename(
+                    &mut records,
+                    &pending_result.id,
+                    &old_display_name,
+                    &pending_result.display_name,
+                )
+            } else {
+                Vec::new()
+            };
+            let mut sync_params: ProfileSyncParams = Vec::new();
+            if avatar_changed || name_changed || about_changed {
                 let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
-
-                // Propagate the display_name rename to instances that still
-                // carry the old definition display_name (pool-named instances
-                // keep their individualised name) in one pass; the loop below
-                // only decides which records need a relay profile sync.
-                let renamed: Vec<String> = if name_changed {
-                    propagate_persona_name_rename(
-                        &mut records,
-                        &result.id,
-                        &old_display_name,
-                        &result.display_name,
-                    )
-                } else {
-                    Vec::new()
-                };
-
                 for record in records.iter_mut() {
-                    if record.persona_id.as_deref() != Some(&result.id) {
+                    if record.persona_id.as_deref() != Some(&pending_result.id) {
                         continue;
                     }
-                    let was_renamed = renamed.contains(&record.pubkey);
                     let update = prepare_linked_profile_update(
                         record,
-                        &result,
-                        was_renamed,
+                        &pending_result,
+                        renamed.contains(&record.pubkey),
                         avatar_changed,
                         about_changed,
                     );
-
-                    agents_modified = agents_modified || update.record_changed;
                     if update.profile_sync_required {
                         if let Ok(agent_keys) = nostr::Keys::parse(&record.private_key_nsec) {
                             let relay_url = crate::relay::effective_agent_relay_url(
                                 &record.relay_url,
                                 &workspace_relay,
                             );
-                            params.push((
+                            sync_params.push((
                                 agent_keys,
                                 relay_url,
                                 record.name.clone(),
@@ -272,24 +390,33 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                         }
                     }
                 }
+            }
 
-                if agents_modified {
-                    save_managed_agents(&app, &records)?;
-                    // Keep retained kind:30177 identity records in lockstep with
-                    // the rename (#2423): `record.name` is part of the published
-                    // identity projection, so skipping this strands the relay on
-                    // the stale name→pubkey binding until the next boot reconcile.
-                    // Avatar-only edits are excluded — the avatar is not in the
-                    // projection, so retaining would be a guaranteed no-op.
-                    for record in records.iter().filter(|r| renamed.contains(&r.pubkey)) {
-                        crate::commands::agents::retain_managed_agent_pending(&app, &state, record);
-                    }
-                }
+            // Definitions and linked instances share managed-agents.json.
+            // Commit the entire user action in one owner-only atomic replace;
+            // no separate account batch or restart-only retry state remains.
+            let result = persist_persona_snapshot(
+                &personas,
+                &records,
+                pending_result,
+                |definitions, records| {
+                    crate::managed_agents::storage::save_agent_definitions_and_managed_agents(
+                        &app,
+                        definitions,
+                        records,
+                    )
+                },
+            )?
+            .into_persona();
 
-                params
-            } else {
-                Vec::new()
-            };
+            let retained = retain(&app, &state, &result)?;
+            try_regenerate_nest(&app);
+
+            // Keep retained kind:30177 identity records in lockstep with a
+            // rename after the shared snapshot is durable.
+            for record in records.iter().filter(|r| renamed.contains(&r.pubkey)) {
+                crate::commands::agents::retain_managed_agent_pending(&app, &state, record);
+            }
 
             Ok((result, retained, sync_params))
         }

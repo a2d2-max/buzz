@@ -41,6 +41,17 @@ test("scanUnsupportedMarkdown: fenced code is not scanned", () => {
   );
 });
 
+test("scanUnsupportedMarkdown keeps escaped database directives in source mode", () => {
+  const database = "11111111-2222-4333-8444-555555555555";
+  assert.deepEqual(scanUnsupportedMarkdown(`\\:::db ${database}`), [
+    "escaped database directives",
+  ]);
+  assert.deepEqual(
+    scanUnsupportedMarkdown(`\`\`\`text\n\\:::db ${database}\n\`\`\``),
+    [],
+  );
+});
+
 test("compareRenderedMarkdown: identical structure and text is faithful", () => {
   const result = compareRenderedMarkdown(
     "<h1>Title</h1><p>Hello <strong>bold</strong></p>",
@@ -75,4 +86,23 @@ test("compareRenderedMarkdown: paragraph wrapping and line breaks do not count",
     "<ul><li>a</li><li>b</li></ul><p>x<br>y</p>",
   );
   assert.equal(result.faithful, true);
+});
+
+test("compareRenderedMarkdown: database ids and ordered view ids are semantic", () => {
+  const database =
+    '<div data-doc-database-block data-database-id="11111111-2222-4333-8444-555555555555" data-view-id="table"></div>';
+  const same = compareRenderedMarkdown(
+    `${database}${database}`,
+    `${database}${database}`,
+  );
+  assert.deepEqual(same, { faithful: true, reasons: [] });
+  const changed = compareRenderedMarkdown(
+    database,
+    database.replace('data-view-id="table"', 'data-view-id="board"'),
+  );
+  assert.equal(changed.faithful, false);
+  assert.deepEqual(changed.reasons, ["database blocks"]);
+  const removed = compareRenderedMarkdown(database, "<div></div>");
+  assert.equal(removed.faithful, false);
+  assert.ok(removed.reasons.includes("database blocks"));
 });

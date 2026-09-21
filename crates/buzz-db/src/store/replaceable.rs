@@ -117,6 +117,8 @@ async fn replace_parameterized_event_in_transaction_impl(
         .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
     let received_at = Utc::now();
 
+    super::community_task::lock_and_validate(tx, community_id, event, d_tag).await?;
+
     let lock_key = event_replacement_lock_key(
         community_id,
         kind_i32,
@@ -352,6 +354,13 @@ async fn replace_parameterized_event_in_transaction_impl(
     }
 
     crate::insert_mentions_in_transaction(&mut savepoint, community_id, event, channel_id).await?;
+    crate::engine_projection::enqueue_community_task_projection_in_transaction(
+        &mut savepoint,
+        community_id,
+        event,
+        d_tag,
+    )
+    .await?;
     savepoint.commit().await?;
 
     Ok(ParameterizedReplaceResult::new(

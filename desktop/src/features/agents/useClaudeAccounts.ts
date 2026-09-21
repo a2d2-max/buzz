@@ -11,12 +11,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   addClaudeAccount,
+  getClaudeLoginCommand,
   listClaudeAccounts,
   removeClaudeAccount,
   renameClaudeAccount,
   testClaudeAccount,
 } from "@/shared/api/tauriClaudeAccounts";
-import type { ClaudeAccount } from "@/shared/api/types";
+import type { ClaudeAccount, ClaudeAuthKind } from "@/shared/api/types";
 
 import { managedAgentsQueryKey } from "./hooks";
 
@@ -35,16 +36,28 @@ export function useClaudeAccountsQuery(options?: { enabled?: boolean }) {
 export function useAddClaudeAccountMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: { label: string; token: string }) =>
-      addClaudeAccount(input),
+    mutationFn: (input: {
+      label: string;
+      authKind: ClaudeAuthKind;
+      token?: string;
+    }) => addClaudeAccount(input),
     onSuccess: (account) => {
       queryClient.setQueryData<ClaudeAccount[]>(
         claudeAccountsQueryKey,
         (current) => [...(current ?? []), account],
       );
+      return queryClient.invalidateQueries({
+        queryKey: claudeAccountsQueryKey,
+      });
     },
-    onSettled: () =>
+    onError: () =>
       queryClient.invalidateQueries({ queryKey: claudeAccountsQueryKey }),
+  });
+}
+
+export function useClaudeLoginCommandMutation() {
+  return useMutation({
+    mutationFn: (id: string) => getClaudeLoginCommand(id),
   });
 }
 

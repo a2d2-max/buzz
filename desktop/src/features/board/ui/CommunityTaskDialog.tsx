@@ -1,3 +1,9 @@
+import type { CommunityTaskFieldDefinition } from "../lib/communityTaskCustomFields";
+import { CommunityTaskCustomFields } from "./CommunityTaskCustomFields";
+import {
+  type CommunityTaskCustomField,
+  parseCommunityTaskCustomFields,
+} from "../lib/communityTaskCustomFields";
 import * as React from "react";
 
 import { COMMUNITY_TASK_TITLE_MAX_LENGTH } from "@/features/board/lib/communityTaskCodec";
@@ -19,19 +25,25 @@ export type CommunityTaskDraft = {
   title: string;
   body: string;
   due?: number;
+  customFields?: CommunityTaskCustomField[];
 };
 
 export function CommunityTaskDialog({
+  definitions = [],
   isCreating,
   onCreate,
   onOpenChange,
   open,
 }: {
+  definitions?: CommunityTaskFieldDefinition[];
   isCreating: boolean;
   onCreate: (draft: CommunityTaskDraft) => Promise<void>;
   onOpenChange: (open: boolean) => void;
   open: boolean;
 }) {
+  const [customFields, setCustomFields] = React.useState<
+    CommunityTaskCustomField[]
+  >([]);
   const [title, setTitle] = React.useState("");
   const [body, setBody] = React.useState("");
   const [dueInput, setDueInput] = React.useState("");
@@ -41,6 +53,7 @@ export function CommunityTaskDialog({
 
   React.useEffect(() => {
     if (!open) return;
+    setCustomFields([]);
     setTitle("");
     setBody("");
     setDueInput("");
@@ -60,8 +73,11 @@ export function CommunityTaskDialog({
     submitInFlightRef.current = true;
     setErrorMessage(null);
     try {
+      if (parseCommunityTaskCustomFields(customFields) === undefined)
+        throw new Error("Give every custom field a name and a valid value.");
       const due = dateInputValueToDue(dueInput);
       await onCreate({
+        ...(customFields.length ? { customFields } : {}),
         title: trimmedTitle,
         body: body.trim(),
         ...(due === undefined ? {} : { due }),
@@ -194,6 +210,12 @@ export function CommunityTaskDialog({
               />
             </div>
           </div>
+          <CommunityTaskCustomFields
+            definitions={definitions}
+            fields={customFields}
+            onChange={setCustomFields}
+            disabled={isCreating}
+          />
           {errorMessage ? (
             <p
               className="text-sm text-destructive"

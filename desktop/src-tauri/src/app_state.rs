@@ -22,6 +22,10 @@ pub struct AppState {
     /// recovery flags are cleared so `get_identity` reports a consistent state.
     pub(crate) identity_storage: AtomicU8,
     pub http_client: reqwest::Client,
+    /// No-redirect client used whenever a request carries the confidential
+    /// company identity assertion. Redirect refusal prevents a relay-issued
+    /// 3xx from forwarding that non-standard credential to another origin.
+    pub company_identity_http_client: reqwest::Client,
     /// A no-redirect client for authenticated relay media fetches (download,
     /// clipboard copy, snapshot, editor). Every caller pre-validates the URL
     /// origin, but the app-wide `http_client` follows redirects by default, so
@@ -32,6 +36,13 @@ pub struct AppState {
     /// validated relay origin.
     pub media_fetch_client: reqwest::Client,
     pub relay_url_override: Mutex<Option<String>>,
+    /// Live full-product child mounts eligible for the narrow managed-session
+    /// launch bridge. Entries contain public scope only; no provider token or
+    /// Nostr private key is ever stored here.
+    pub(crate) upstream_mounts: Mutex<HashMap<String, crate::commands::UpstreamMountRecord>>,
+    /// Provider-issued NIP-FI assertion held only in process memory and fenced
+    /// to the exact active relay origin and Nostr public key.
+    pub company_identity: Arc<crate::company_identity::CompanyIdentitySession>,
     pub workspace_apply_lock: Arc<AsyncMutex<()>>,
     pub workspace_apply_generation: AtomicU64,
     /// Defers managed-agent restore until `apply_workspace` installs relay and identity.
@@ -45,6 +56,12 @@ pub struct AppState {
     /// Never perform network I/O while holding this lock.
     pub managed_agent_runtime_transition: Mutex<()>,
     pub managed_agents_store_lock: Mutex<()>,
+    /// In-app `codex login` runs, keyed by Codex account id. Finished runs
+    /// remain available for the local settings UI to read until replaced.
+    pub codex_login_sessions:
+        Mutex<HashMap<String, crate::managed_agents::codex_login::CodexLoginSession>>,
+    pub claude_login_sessions:
+        Mutex<HashMap<String, crate::managed_agents::codex_login::CodexLoginSession>>,
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
     pub provider_deploy_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -198,6 +215,12 @@ pub fn build_app_state() -> AppState {
         None => (Keys::generate(), IdentityStorage::Ephemeral),
     };
 
+    let media_fetch_client = build_media_fetch_client().expect(
+        "media_fetch_client must build with redirect::Policy::none(); a \
+         redirect-following fallback would forward authenticated relay \
+         headers across origins (redirect-hop SSRF)",
+    );
+
     AppState {
         keys: Mutex::new(keys),
         identity_storage: AtomicU8::new(identity_storage as u8),
@@ -207,12 +230,11 @@ pub fn build_app_state() -> AppState {
             .pool_max_idle_per_host(2)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
-        media_fetch_client: build_media_fetch_client().expect(
-            "media_fetch_client must build with redirect::Policy::none(); a \
-             redirect-following fallback would forward the minted media auth \
-             header across origins (redirect-hop SSRF)",
-        ),
+        company_identity_http_client: media_fetch_client.clone(),
+        media_fetch_client,
         relay_url_override: Mutex::new(None),
+        upstream_mounts: Mutex::new(HashMap::new()),
+        company_identity: Arc::new(crate::company_identity::CompanyIdentitySession::default()),
         workspace_apply_lock: Arc::new(AsyncMutex::new(())),
         workspace_apply_generation: AtomicU64::new(0),
         managed_agent_restore_pending: AtomicBool::new(false),
@@ -221,6 +243,8 @@ pub fn build_app_state() -> AppState {
         managed_agent_runtime_transition: Mutex::new(()),
         identity_mutation: Mutex::new(()),
         managed_agents_store_lock: Mutex::new(()),
+        codex_login_sessions: Mutex::new(HashMap::new()),
+        claude_login_sessions: Mutex::new(HashMap::new()),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
         provider_deploy_locks: Mutex::new(HashMap::new()),

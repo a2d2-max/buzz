@@ -1,3 +1,5 @@
+import { useCommunityTaskSchema } from "../lib/useCommunityTaskSchema";
+import { CommunityTaskSchema } from "./CommunityTaskSchema";
 import { useQueryClient } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import * as React from "react";
@@ -37,7 +39,7 @@ import {
   type CommunityTaskDraft,
 } from "./CommunityTaskDialog";
 import { CommunityTaskSheet } from "./CommunityTaskSheet";
-import { CommunityTasksBoard } from "./CommunityTasksBoard";
+import { CommunityTasksView } from "./CommunityTasksView";
 
 const EMPTY_EVENTS: RelayEvent[] = [];
 
@@ -58,6 +60,7 @@ function orderAtBottom(
 
 export type CommunityTasksBoardPanelProps = {
   className?: string;
+  onOpenDocument?: (pageId: string) => void;
 };
 
 /**
@@ -69,6 +72,7 @@ export type CommunityTasksBoardPanelProps = {
  */
 export function CommunityTasksBoardPanel({
   className,
+  onOpenDocument,
 }: CommunityTasksBoardPanelProps = {}) {
   const queryClient = useQueryClient();
   const { query: eventsQuery, queryKey } = useCommunityTasks();
@@ -76,6 +80,7 @@ export function CommunityTasksBoardPanel({
   const viewer = identityQuery.data?.pubkey
     ? normalizePubkey(identityQuery.data.pubkey)
     : null;
+  const schema = useCommunityTaskSchema(queryKey[1], viewer);
   const { isPending: isSaving, mutateAsync: save } =
     useSaveCommunityTaskMutation();
   const writeQueue = React.useRef(new CommunityTaskWriteQueue()).current;
@@ -220,6 +225,8 @@ export function CommunityTasksBoardPanel({
         updatedAt: now,
       };
       if (draft.due !== undefined) content.due = draft.due;
+      if (draft.customFields !== undefined)
+        content.customFields = draft.customFields;
       await save({ content, id: newCommunityTaskId() });
       toast.success("Task created.");
     },
@@ -239,6 +246,9 @@ export function CommunityTasksBoardPanel({
           status: content.status,
           title: content.title,
         };
+        next.documents = content.documents ?? [];
+        if (content.customFields !== undefined)
+          next.customFields = content.customFields;
         if (content.due === undefined) delete next.due;
         else next.due = content.due;
         if (content.status !== fresh.status) {
@@ -288,7 +298,7 @@ export function CommunityTasksBoardPanel({
     // Also covers the moment before the live subscription is armed and
     // history is allowed to start.
     body = <BuzzLoadingState label="Loading tasks" />;
-  } else if (visibleTasks.length === 0) {
+  } else if (visibleTasks.length === 0 && eventsQuery.error) {
     body = (
       <ProjectPanelState
         action={eventsQuery.error ? undefined : newTaskButton}
@@ -305,23 +315,16 @@ export function CommunityTasksBoardPanel({
     );
   } else {
     body = (
-      <>
-        <div className="flex shrink-0 items-center justify-between gap-2 px-4 py-3">
-          <p className="text-xs text-muted-foreground">
-            {visibleTasks.length === 1
-              ? "1 task"
-              : `${visibleTasks.length} tasks`}
-          </p>
-          {newTaskButton}
-        </div>
-        <CommunityTasksBoard
-          canMoveTask={canMoveTask}
-          onMoveTask={handleMoveTask}
-          onOpenTask={handleOpenTask}
-          profiles={profiles}
-          tasks={visibleTasks}
-        />
-      </>
+      <CommunityTasksView
+        relayUrl={queryKey[1]}
+        canMoveTask={canMoveTask}
+        newTaskButton={newTaskButton}
+        onMoveTask={handleMoveTask}
+        onOpenTask={handleOpenTask}
+        profiles={profiles}
+        tasks={visibleTasks}
+        viewer={viewer}
+      />
     );
   }
 
@@ -330,14 +333,23 @@ export function CommunityTasksBoardPanel({
       className={cn("flex min-h-0 flex-1 flex-col", className)}
       data-testid="community-tasks-board-panel"
     >
+      <CommunityTaskSchema
+        key={JSON.stringify([queryKey[1], viewer])}
+        schema={schema}
+        user={viewer}
+      />
       {body}
       <CommunityTaskDialog
+        definitions={schema.query.data}
         isCreating={isSaving}
         onCreate={handleCreate}
         onOpenChange={setDialogOpen}
         open={dialogOpen}
       />
       <CommunityTaskSheet
+        definitions={schema.query.data}
+        relayUrl={queryKey[1]}
+        onOpenDocument={onOpenDocument}
         canDelete={
           selectedTask ? canDeleteCommunityTask(selectedTask, viewer) : false
         }

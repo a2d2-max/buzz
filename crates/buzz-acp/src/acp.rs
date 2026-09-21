@@ -4549,7 +4549,28 @@ mod tests {
     #[tokio::test]
     async fn claude_named_adapter_wire_lifecycle_records_prompt_and_cost() {
         let script = r#"
+            set -eu
+            read -r INIT
+            case "$INIT" in
+                *'"method":"initialize"'*) ;;
+                *) exit 91 ;;
+            esac
+            INIT_ID=$(printf '%s' "$INIT" | sed -E 's/.*"id":([0-9]+).*/\1/')
+            echo '{"jsonrpc":"2.0","id":'"$INIT_ID"',"result":{"protocolVersion":2,"agentCapabilities":{}}}'
+
+            read -r NEW
+            case "$NEW" in
+                *'"method":"session/new"'*) ;;
+                *) exit 92 ;;
+            esac
+            NEW_ID=$(printf '%s' "$NEW" | sed -E 's/.*"id":([0-9]+).*/\1/')
+            echo '{"jsonrpc":"2.0","id":'"$NEW_ID"',"result":{"sessionId":"wire-session"}}'
+
             read -r REQ
+            case "$REQ" in
+                *'"method":"session/prompt"'*) ;;
+                *) exit 93 ;;
+            esac
             ID=$(printf '%s' "$REQ" | sed -E 's/.*"id":([0-9]+).*/\1/')
             echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"wire-session","update":{"sessionUpdate":"usage_update","cost":{"amount":0.5,"currency":"USD"}}}}'
             echo '{"jsonrpc":"2.0","id":'"$ID"',"result":{"stopReason":"end_turn","usage":{"inputTokens":7,"outputTokens":3,"totalTokens":10,"cachedReadTokens":2}}}'
@@ -4557,6 +4578,19 @@ mod tests {
         "#;
         let (mut client, dir) = spawn_named_script("claude-code", script).await;
         assert_eq!(client.standard_adapter, Some(StandardAdapterKind::Claude));
+
+        let initialized = client.initialize().await.expect("wire initialize");
+        assert_eq!(initialized["protocolVersion"], 2);
+        let session_id = client
+            .session_new(
+                dir.to_str().expect("utf8 adapter directory"),
+                Vec::new(),
+                None,
+                None,
+            )
+            .await
+            .expect("wire session/new");
+        assert_eq!(session_id, "wire-session");
         client.notify_session_spawned("wire-session");
 
         let stop = client

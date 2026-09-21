@@ -285,15 +285,16 @@ async fn stalled_query_request_times_out_with_classified_error() {
         }
     });
 
-    let client = reqwest::Client::new();
+    let state = crate::app_state::build_app_state();
     let url = format!("http://{addr}/query");
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         super::send_query_request(
-            &client,
+            &state,
             &url,
             "Nostr test-auth",
             None,
+            &"00".repeat(32),
             b"[]".to_vec(),
             Duration::from_millis(200),
         ),
@@ -345,15 +346,16 @@ async fn stalled_response_body_times_out_with_classified_error() {
         }
     });
 
-    let client = reqwest::Client::new();
+    let state = crate::app_state::build_app_state();
     let url = format!("http://{addr}/query");
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         super::send_query_request(
-            &client,
+            &state,
             &url,
             "Nostr test-auth",
             None,
+            &"00".repeat(32),
             b"[]".to_vec(),
             Duration::from_millis(200),
         ),
@@ -406,15 +408,16 @@ async fn stalled_error_response_body_times_out_with_classified_error() {
         }
     });
 
-    let client = reqwest::Client::new();
+    let state = crate::app_state::build_app_state();
     let url = format!("http://{addr}/query");
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         super::send_query_request(
-            &client,
+            &state,
             &url,
             "Nostr test-auth",
             None,
+            &"00".repeat(32),
             b"[]".to_vec(),
             Duration::from_millis(200),
         ),
@@ -463,15 +466,16 @@ async fn non_stalled_error_response_yields_status_message() {
         }
     });
 
-    let client = reqwest::Client::new();
+    let state = crate::app_state::build_app_state();
     let url = format!("http://{addr}/query");
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         super::send_query_request(
-            &client,
+            &state,
             &url,
             "Nostr test-auth",
             None,
+            &"00".repeat(32),
             b"[]".to_vec(),
             Duration::from_millis(200),
         ),

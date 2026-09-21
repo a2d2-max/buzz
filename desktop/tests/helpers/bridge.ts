@@ -146,6 +146,12 @@ type MockInstallRuntimeResult = {
 };
 
 type MockBridgeOptions = {
+  /** Community database schema/row history served by the mock relay. */
+  databaseEvents?: RelayEvent[];
+  /** Holds each mock database history response for observable loading UI. */
+  databaseHistoryDelayMs?: number;
+  /** Community Docs page history served by the mock relay. */
+  docEvents?: RelayEvent[];
   /** Tauri window label exposed to the app. Defaults to the main window. */
   windowLabel?: string;
   ttsSettings?: {

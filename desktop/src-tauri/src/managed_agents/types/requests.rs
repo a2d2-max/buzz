@@ -132,6 +132,13 @@ pub struct UpdatePersonaRequest {
     /// present = validate and replace the fields as a unit.
     #[serde(default)]
     pub behavior: Option<PersonaBehaviorRequest>,
+    /// Apply one Claude account choice to every instance linked to this definition.
+    /// Absent = untouched; null = return to the app login; string = stored account id.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub claude_account_id: Option<Option<String>>,
+    /// Same tri-state contract as `claude_account_id`, for Codex.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub codex_account_id: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,9 +286,45 @@ pub struct UpdateManagedAgentRequest {
     pub codex_account_id: Option<Option<String>>,
 }
 
+/// One account-only patch in a single-snapshot multi-agent update.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedAgentAccountPatchRequest {
+    pub pubkey: String,
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub claude_account_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub codex_account_id: Option<Option<String>>,
+}
+
+/// Account changes committed together to the unified agent registry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateManagedAgentAccountsBatchRequest {
+    pub updates: Vec<ManagedAgentAccountPatchRequest>,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persona_account_fields_preserve_wire_tristate() {
+        let base = serde_json::json!({
+            "id": "definition-1",
+            "displayName": "Definition",
+            "systemPrompt": "Prompt"
+        });
+        let omitted: UpdatePersonaRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(omitted.claude_account_id, None);
+        assert_eq!(omitted.codex_account_id, None);
+
+        let mut present = base;
+        present["claudeAccountId"] = serde_json::Value::Null;
+        present["codexAccountId"] = serde_json::Value::String("codex-1".to_string());
+        let present: UpdatePersonaRequest = serde_json::from_value(present).unwrap();
+        assert_eq!(present.claude_account_id, Some(None));
+        assert_eq!(present.codex_account_id, Some(Some("codex-1".to_string())));
+    }
 
     fn record_with_quad() -> AgentDefinition {
         let mut record = record_without_quad();

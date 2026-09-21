@@ -47,6 +47,190 @@ fn local_record() -> ManagedAgentRecord {
     // BackendKind deserializes as Local when the field is absent (the json! above).
 }
 
+fn account_patch(
+    pubkey: &str,
+    claude_account_id: Option<Option<&str>>,
+    codex_account_id: Option<Option<&str>>,
+) -> crate::managed_agents::ManagedAgentAccountPatchRequest {
+    crate::managed_agents::ManagedAgentAccountPatchRequest {
+        pubkey: pubkey.to_string(),
+        claude_account_id: claude_account_id.map(|value| value.map(str::to_string)),
+        codex_account_id: codex_account_id.map(|value| value.map(str::to_string)),
+    }
+}
+
+fn provider_account(
+    id: &str,
+    provider: crate::managed_agents::AccountProvider,
+) -> crate::managed_agents::ProviderAccount {
+    crate::managed_agents::ProviderAccount {
+        id: id.to_string(),
+        label: id.to_string(),
+        created_at: "2026-09-21T00:00:00Z".to_string(),
+        token_hint: String::new(),
+        provider,
+        auth_kind: None,
+        claude_auth_kind: None,
+        config_dir: None,
+        external_home: None,
+    }
+}
+
+#[test]
+fn account_batch_validates_every_patch_before_mutating_registry() {
+    let mut first = local_record();
+    first.pubkey = "first".to_string();
+    first.claude_account_id = Some("old-claude".to_string());
+    let mut second = local_record();
+    second.pubkey = "second".to_string();
+    second.codex_account_id = Some("old-codex".to_string());
+    let records = vec![first, second];
+    let before = records.clone();
+
+    let error = prepare_account_batch(
+        &records,
+        UpdateManagedAgentAccountsBatchRequest {
+            updates: vec![
+                account_patch("first", Some(Some("claude-1")), None),
+                account_patch("second", None, Some(Some("missing-codex"))),
+            ],
+        },
+        &|id| id == "claude-1",
+        &|_| false,
+    )
+    .expect_err("one stale account id rejects the complete batch");
+
+    assert!(error.contains("account missing-codex not found"));
+    assert_eq!(records, before, "preparation cannot mutate a batch prefix");
+}
+
+#[test]
+fn prepared_account_batch_applies_set_clear_and_untouched_atomically() {
+    let mut first = local_record();
+    first.pubkey = "first".to_string();
+    first.claude_account_id = Some("old-claude".to_string());
+    first.codex_account_id = Some("keep-codex".to_string());
+    let mut second = local_record();
+    second.pubkey = "second".to_string();
+    second.claude_account_id = Some("old-claude".to_string());
+    let mut unrelated = local_record();
+    unrelated.pubkey = "unrelated".to_string();
+    unrelated.claude_account_id = Some("unrelated-claude".to_string());
+    let mut records = vec![first, second, unrelated];
+
+    let prepared = prepare_account_batch(
+        &records,
+        UpdateManagedAgentAccountsBatchRequest {
+            updates: vec![
+                account_patch("first", Some(Some("claude-1")), None),
+                account_patch("second", Some(None), Some(Some("codex-1"))),
+            ],
+        },
+        &|id| id == "claude-1",
+        &|id| id == "codex-1",
+    )
+    .expect("all targets and account ids are valid");
+    let changed = apply_prepared_account_batch(&mut records, &prepared, "2026-09-21T00:00:00Z")
+        .expect("prepared targets remain in the same snapshot");
+
+    assert_eq!(changed, vec!["first", "second"]);
+    assert_eq!(records[0].claude_account_id.as_deref(), Some("claude-1"));
+    assert_eq!(records[0].codex_account_id.as_deref(), Some("keep-codex"));
+    assert_eq!(records[1].claude_account_id, None);
+    assert_eq!(records[1].codex_account_id.as_deref(), Some("codex-1"));
+    assert_eq!(
+        records[2].claude_account_id.as_deref(),
+        Some("unrelated-claude")
+    );
+    assert_eq!(records[2].updated_at, "");
+}
+
+#[test]
+fn account_batch_production_seam_persists_all_changes_once() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("managed-agents.json");
+    let writes = std::cell::Cell::new(0usize);
+
+    let mut first = local_record();
+    first.pubkey = "first".to_string();
+    first.claude_account_id = Some("old-claude".to_string());
+    let mut second = local_record();
+    second.pubkey = "second".to_string();
+    second.codex_account_id = Some("old-codex".to_string());
+    let mut unrelated = local_record();
+    unrelated.pubkey = "unrelated".to_string();
+    unrelated.claude_account_id = Some("claude-keep".to_string());
+
+    let changed = apply_and_persist_account_batch(
+        vec![first, second, unrelated],
+        UpdateManagedAgentAccountsBatchRequest {
+            updates: vec![
+                account_patch("first", Some(Some("claude-next")), None),
+                account_patch("second", None, Some(Some("codex-next"))),
+            ],
+        },
+        &[provider_account(
+            "claude-next",
+            crate::managed_agents::AccountProvider::Claude,
+        )],
+        &[provider_account(
+            "codex-next",
+            crate::managed_agents::AccountProvider::Codex,
+        )],
+        "2026-09-21T00:00:01Z",
+        |records| {
+            writes.set(writes.get() + 1);
+            let payload = serde_json::to_vec_pretty(records).map_err(|error| error.to_string())?;
+            crate::managed_agents::storage::atomic_write_json_restricted(&path, &payload)
+        },
+    )
+    .expect("complete batch persists");
+
+    assert_eq!(changed, vec!["first", "second"]);
+    assert_eq!(writes.get(), 1, "one user action writes one snapshot");
+    let saved: Vec<ManagedAgentRecord> =
+        serde_json::from_slice(&std::fs::read(&path).expect("saved registry exists"))
+            .expect("saved registry parses");
+    assert_eq!(saved[0].claude_account_id.as_deref(), Some("claude-next"));
+    assert_eq!(saved[1].codex_account_id.as_deref(), Some("codex-next"));
+    assert_eq!(saved[2].claude_account_id.as_deref(), Some("claude-keep"));
+}
+
+#[test]
+fn account_batch_stale_target_keeps_store_bytes_unchanged() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("managed-agents.json");
+    let before = br#"[{"pubkey":"sentinel"}]\n"#;
+    std::fs::write(&path, before).expect("seed sentinel store");
+
+    let mut existing = local_record();
+    existing.pubkey = "existing".to_string();
+    let error = apply_and_persist_account_batch(
+        vec![existing],
+        UpdateManagedAgentAccountsBatchRequest {
+            updates: vec![account_patch(
+                "disappeared",
+                Some(Some("claude-next")),
+                None,
+            )],
+        },
+        &[provider_account(
+            "claude-next",
+            crate::managed_agents::AccountProvider::Claude,
+        )],
+        &[],
+        "2026-09-21T00:00:01Z",
+        |records| {
+            let payload = serde_json::to_vec_pretty(records).map_err(|error| error.to_string())?;
+            crate::managed_agents::storage::atomic_write_json_restricted(&path, &payload)
+        },
+    )
+    .expect_err("stale target rejects the whole action");
+
+    assert!(error.contains("agent disappeared not found"));
+    assert_eq!(std::fs::read(&path).expect("sentinel remains"), before);
+}
+
 // ── Production-entered seam tests (apply_record_field_updates) ──────────────
 //
 // These tests call `apply_record_field_updates`, the same function production

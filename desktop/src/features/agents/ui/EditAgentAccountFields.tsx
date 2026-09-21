@@ -14,7 +14,7 @@ import * as React from "react";
 
 import { useClaudeAccountsQuery } from "@/features/agents/useClaudeAccounts";
 import { useCodexAccountsQuery } from "@/features/agents/useCodexAccounts";
-import type { AcpRuntimeCatalogEntry, ManagedAgent } from "@/shared/api/types";
+import type { ManagedAgent } from "@/shared/api/types";
 
 import {
   claudeAccountSelectionValue,
@@ -26,8 +26,13 @@ import {
   hasManualCodexAuth,
   resolveCodexAccountSubmission,
 } from "./codexAccountOptions";
+import {
+  type AccountSectionFacts,
+  accountSectionModel,
+} from "./editAgentAccountSection";
 import { EditAgentClaudeAccountField } from "./EditAgentClaudeAccountField";
 import { EditAgentCodexAccountField } from "./EditAgentCodexAccountField";
+import { PersonaDropdownField } from "./PersonaDropdownField";
 
 export type EditAgentAccountSelections = ReturnType<
   typeof useEditAgentAccountSelections
@@ -44,9 +49,7 @@ export function useEditAgentAccountSelections({
   /** The same layered env the spawn reads, so persona/global values count. */
   envVars: Readonly<Record<string, string>>;
   open: boolean;
-  prospectiveRuntime:
-    | Pick<AcpRuntimeCatalogEntry, "oauthTokenEnvVar" | "supportsCodexAccounts">
-    | undefined;
+  prospectiveRuntime: AccountSectionFacts | undefined;
   /** Identity of the edited agent (its pubkey); a switch drops selections. */
   resetKey: string;
 }) {
@@ -66,10 +69,13 @@ export function useEditAgentAccountSelections({
     }
   }, [open, resetKey]);
 
-  // Both pickers gate on a catalog capability, not a harness id.
-  const claudeTokenEnvVar = prospectiveRuntime?.oauthTokenEnvVar ?? null;
-  const supportsCodexAccounts =
-    prospectiveRuntime?.supportsCodexAccounts ?? false;
+  // Both pickers gate on a catalog capability, not a harness id; the
+  // section itself is always rendered (see `accountSectionModel`).
+  const section = accountSectionModel(prospectiveRuntime);
+  const claudeTokenEnvVar = section.claudePicker
+    ? (prospectiveRuntime?.oauthTokenEnvVar ?? null)
+    : null;
+  const supportsCodexAccounts = section.codexPicker;
   const claudeAccountsQuery = useClaudeAccountsQuery({
     enabled: open && claudeTokenEnvVar != null,
   });
@@ -123,6 +129,7 @@ export function useEditAgentAccountSelections({
     codexAccountsQuery,
     codexManualAuth,
     codexValue,
+    section,
     setClaudeSelection,
     setCodexSelection,
     submissions,
@@ -130,7 +137,14 @@ export function useEditAgentAccountSelections({
   };
 }
 
-/** Renders whichever account picker the prospective runtime supports. */
+/**
+ * The account section, present for every runtime: whichever picker the
+ * prospective runtime supports, or — when it supports none — a disabled
+ * "Account" field carrying the catalog's reason, so the owner sees why an
+ * account cannot be assigned instead of a missing field. Below it, the
+ * memory note says whether this agent's memory is kept under its own
+ * identity (per-agent data home) for this runtime.
+ */
 export function EditAgentAccountFields({
   disabled,
   selections,
@@ -138,8 +152,12 @@ export function EditAgentAccountFields({
   disabled: boolean;
   selections: EditAgentAccountSelections;
 }) {
+  const { section } = selections;
   return (
     <>
+      {section.unsupportedReason !== null ? (
+        <EditAgentAccountUnsupportedField reason={section.unsupportedReason} />
+      ) : null}
       {selections.claudeTokenEnvVar ? (
         <EditAgentClaudeAccountField
           accounts={selections.claudeAccountsQuery.data ?? null}
@@ -163,6 +181,52 @@ export function EditAgentAccountFields({
           value={selections.codexValue}
         />
       ) : null}
+      <p
+        className="text-xs text-muted-foreground"
+        data-isolated={section.memoryIsolated ? "true" : "false"}
+        data-testid="edit-agent-memory-note"
+      >
+        {section.memoryNote}
+      </p>
     </>
+  );
+}
+
+const UNSUPPORTED_OPTION = [
+  {
+    value: "default",
+    label: "Default (this runtime's own sign-in)",
+  },
+] as const;
+
+/**
+ * The disabled account field for runtimes no Buzz account can be lent to.
+ * Same label and control as the pickers, so the section keeps its place;
+ * the hint carries the catalog's reason.
+ */
+function EditAgentAccountUnsupportedField({ reason }: { reason: string }) {
+  return (
+    <div className="space-y-1.5">
+      <label
+        className="text-sm font-medium text-foreground"
+        htmlFor="edit-agent-account-unsupported"
+      >
+        Account
+      </label>
+      <PersonaDropdownField
+        disabled
+        id="edit-agent-account-unsupported"
+        onValueChange={() => undefined}
+        options={UNSUPPORTED_OPTION}
+        placeholder="Default"
+        value="default"
+      />
+      <p
+        className="text-xs text-muted-foreground"
+        data-testid="edit-agent-account-unsupported-reason"
+      >
+        {reason}
+      </p>
+    </div>
   );
 }

@@ -61,7 +61,14 @@ function pageTail(events: readonly RelayEvent[]): RelayEvent | null {
  * and the cards are picked out here by d-tag. The `t` tag still earns its
  * keep on the live subscription, where there is no limit to fall behind.
  */
-export async function fetchCommunityTaskEvents(): Promise<RelayEvent[]> {
+export function fetchCommunityTaskEvents(): Promise<RelayEvent[]> {
+  return fetchCommunityTaskAppData(isCommunityTaskEvent);
+}
+
+/** Bounded app-data history walk shared by tasks and their field definitions. */
+export async function fetchCommunityTaskAppData(
+  accept: (event: RelayEvent) => boolean,
+): Promise<RelayEvent[]> {
   const cards: RelayEvent[] = [];
   const seen = new Set<string>();
   let cursor: { until: number; before_id: string } | undefined;
@@ -74,11 +81,11 @@ export async function fetchCommunityTaskEvents(): Promise<RelayEvent[]> {
     for (const event of events) {
       if (seen.has(event.id)) continue;
       seen.add(event.id);
-      if (isCommunityTaskEvent(event)) cards.push(event);
+      if (accept(event)) cards.push(event);
     }
     const tail = pageTail(events);
     if (tail === null || events.length < COMMUNITY_TASK_HISTORY_PAGE_LIMIT) {
-      break;
+      return cards;
     }
     // A full page that hands back the cursor we sent cannot be walked past;
     // pretending it was the last page would drop every older card. Fail
@@ -90,7 +97,9 @@ export async function fetchCommunityTaskEvents(): Promise<RelayEvent[]> {
     }
     cursor = { until: tail.created_at, before_id: tail.id };
   }
-  return cards;
+  throw new Error(
+    "Could not load tasks: the history limit was reached. Narrow the community history before retrying.",
+  );
 }
 
 /** Every signer's current event for one card — at most one row per signer. */

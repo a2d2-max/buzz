@@ -44,12 +44,20 @@ function docEvent({ id, eventId, author, createdAt, content }) {
   };
 }
 
-// V1 has an empty body so the page opens straight into the editor.
 const V1 = docEvent({
   id: PAGE_ID,
   eventId: "v1",
   author: AUTHOR_ME,
   createdAt: 1_000,
+  // Keep this conflict test on the Markdown source editor. A table is
+  // intentionally lossless-only, so JSDOM never needs ProseMirror geometry.
+  content: { body: "| Column |\n| --- |\n| Original |" },
+});
+const FRESH = docEvent({
+  id: PAGE_ID,
+  eventId: "fresh",
+  author: AUTHOR_ME,
+  createdAt: 900,
   content: {},
 });
 const V2 = docEvent({
@@ -162,6 +170,9 @@ before(() => {
       }
       if (command === "get_relay_ws_url") {
         return Promise.resolve(TEST_RELAY_URL);
+      }
+      if (command === "get_identity") {
+        return Promise.resolve({ pubkey: AUTHOR_ME, display_name: "Tester" });
       }
       return Promise.reject(new Error(`unmocked: ${command}`));
     },
@@ -277,6 +288,8 @@ test("an edit based on an older version is refused, then published only after 'K
     versionsByDTag: { [`doc:${PAGE_ID}`]: [V1, V2] },
   });
   try {
+    const edit = await waitFor(() => docs.view.getByTestId("doc-start-edit"));
+    fireEvent.click(edit);
     const title = await waitFor(() => docs.view.getByTestId("doc-title-input"));
     fireEvent.change(title, { target: { value: "mine" } });
     fireEvent.click(docs.view.getByTestId("doc-finish-edit"));
@@ -304,6 +317,31 @@ test("an edit based on an older version is refused, then published only after 'K
     assert.ok(docs.published[0].created_at > V2.created_at, "rebased onto v2");
     await waitFor(() =>
       assert.equal(docs.view.queryByTestId("doc-remote-change"), null),
+    );
+  } finally {
+    docs.restore();
+  }
+});
+
+test("a fresh empty page opens the structured AFFiNE editor immediately", async () => {
+  const { waitFor } = await import("@testing-library/react");
+  const docs = await mountDocsScreen({
+    history: [FRESH],
+    pageId: PAGE_ID,
+    versionsByDTag: { [`doc:${PAGE_ID}`]: [FRESH] },
+  });
+  try {
+    await waitFor(() =>
+      assert.ok(
+        docs.view.container.querySelector(
+          'iframe[title="AFFiNE document editor"]',
+        ),
+      ),
+    );
+    assert.equal(
+      docs.view.queryByTestId("doc-title-input"),
+      null,
+      "fresh pages must not start in the Markdown editor",
     );
   } finally {
     docs.restore();

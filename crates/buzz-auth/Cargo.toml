@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Authentication and authorization for Buzz"
 
 [features]
-test-utils = []
+test-utils = ["jsonwebtoken/use_pem"]
 dev = []
 
 [dev-dependencies]

@@ -33,6 +33,7 @@ fn claude_agent_with_its_own_token_needs_no_cli_login() {
         config_file_path: None,
         effective_command: "claude-agent-acp".to_string(),
         oauth_token_supplied: true,
+        selected_claude_account_unready: false,
     };
     let missing = collect_missing_requirements(&effective, known_acp_runtime("claude-agent-acp"));
     assert!(
@@ -51,8 +52,56 @@ fn token_supplied_follows_the_account_or_env_only_for_token_reading_runtimes() {
         &[],
         claude,
         &global,
+        true,
     );
     assert!(with_account.oauth_token_supplied);
+
+    let with_unready_account = resolve_effective_agent_env(
+        &record("claude-agent-acp", Some("acct"), &[]),
+        &[],
+        claude,
+        &global,
+        false,
+    );
+    assert!(
+        !with_unready_account.oauth_token_supplied,
+        "a selected empty or missing config-directory account is not ready"
+    );
+
+    let unready_account_with_manual_env = resolve_effective_agent_env(
+        &record(
+            "claude-agent-acp",
+            Some("acct"),
+            &[("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-manual")],
+        ),
+        &[],
+        claude,
+        &global,
+        false,
+    );
+    assert!(
+        !unready_account_with_manual_env.oauth_token_supplied,
+        "a selected missing/empty account stays authoritative over a manual token"
+    );
+    assert!(unready_account_with_manual_env.selected_claude_account_unready);
+    assert!(
+        !collect_missing_requirements(&unready_account_with_manual_env, claude).is_empty(),
+        "selected-unready must be NotReady without consulting ambient Claude auth"
+    );
+
+    let ready_account_with_manual_env = resolve_effective_agent_env(
+        &record(
+            "claude-agent-acp",
+            Some("acct"),
+            &[("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-manual")],
+        ),
+        &[],
+        claude,
+        &global,
+        true,
+    );
+    assert!(ready_account_with_manual_env.oauth_token_supplied);
+    assert!(!ready_account_with_manual_env.selected_claude_account_unready);
 
     let with_env = resolve_effective_agent_env(
         &record(
@@ -63,6 +112,7 @@ fn token_supplied_follows_the_account_or_env_only_for_token_reading_runtimes() {
         &[],
         claude,
         &global,
+        false,
     );
     assert!(with_env.oauth_token_supplied);
 
@@ -75,16 +125,27 @@ fn token_supplied_follows_the_account_or_env_only_for_token_reading_runtimes() {
         &[],
         claude,
         &global,
+        false,
     );
     assert!(!blank_env.oauth_token_supplied, "a blank value is no token");
 
-    let neither =
-        resolve_effective_agent_env(&record("claude-agent-acp", None, &[]), &[], claude, &global);
+    let neither = resolve_effective_agent_env(
+        &record("claude-agent-acp", None, &[]),
+        &[],
+        claude,
+        &global,
+        false,
+    );
     assert!(!neither.oauth_token_supplied);
 
     let goose = known_acp_runtime("goose");
-    let goose_with_account =
-        resolve_effective_agent_env(&record("goose", Some("acct"), &[]), &[], goose, &global);
+    let goose_with_account = resolve_effective_agent_env(
+        &record("goose", Some("acct"), &[]),
+        &[],
+        goose,
+        &global,
+        true,
+    );
     assert!(
         !goose_with_account.oauth_token_supplied,
         "runtimes without an OAuth token env var never count as supplied"

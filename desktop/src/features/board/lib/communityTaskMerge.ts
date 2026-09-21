@@ -57,24 +57,13 @@ function newestSignedBy(
   return newest;
 }
 
-/**
- * The signers whose revisions count for one lineage: the author, plus
- * everyone the newest honored revision assigns, repeated until the set stops
- * growing. Growing-only makes the loop terminate and keeps the result
- * independent of the order the relay returned events in.
- */
+/** Task authors control edit grants; delegated edits never grant further authority. */
 export function honoredCommunityTaskSigners(
   author: string,
   revisions: readonly CommunityTaskRevision[],
 ): Set<string> {
-  const honored = new Set([author]);
-  for (;;) {
-    const newest = newestSignedBy(revisions, honored);
-    if (newest === null) return honored;
-    const before = honored.size;
-    for (const assignee of newest.content.assignees) honored.add(assignee);
-    if (honored.size === before) return honored;
-  }
+  const own = newestSignedBy(revisions, new Set([author]));
+  return new Set([author, ...(own?.content.assignees ?? [])]);
 }
 
 export function communityTaskKey(author: string, id: string): string {
@@ -108,13 +97,23 @@ export function resolveCommunityTaskLineage(
   const own = newestSignedBy(lineage, new Set([author]));
   if (own === null || own.content.deleted) return null;
 
-  const live = lineage.filter((revision) => !revision.content.deleted);
+  const live = lineage.filter(
+    (revision) =>
+      !revision.content.deleted &&
+      revision.content.createdAt === own.content.createdAt &&
+      (revision.signer === author ||
+        (revision.content.assignees.length === own.content.assignees.length &&
+          revision.content.assignees.every((key) =>
+            own.content.assignees.includes(key),
+          ))),
+  );
   const honored = honoredCommunityTaskSigners(author, live);
   const newest = newestSignedBy(live, honored);
   if (newest === null) return null;
   return {
     ...newest.content,
     author,
+    assignees: own.content.assignees,
     id,
     key: communityTaskKey(author, id),
     signer: newest.signer,
@@ -167,7 +166,9 @@ export function communityTaskContentOf(
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   };
+  if (task.customFields !== undefined) content.customFields = task.customFields;
   if (task.due !== undefined) content.due = task.due;
+  if (task.documents !== undefined) content.documents = task.documents;
   return content;
 }
 

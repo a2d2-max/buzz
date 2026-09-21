@@ -24,6 +24,7 @@ import type { CommunityTaskStatus } from "@/features/board/lib/communityTaskCode
 import {
   COMMUNITY_TASK_COLUMN_ORDER,
   COMMUNITY_TASK_STATUS_LABELS,
+  compareCommunityTasksInColumn,
   communityTasksByStatus,
   resolveCommunityTaskDrop,
 } from "@/features/board/lib/communityTaskColumns";
@@ -236,19 +237,26 @@ function BoardColumn({
  */
 export function CommunityTasksBoard({
   canMoveTask,
+  compareTasks = compareCommunityTasksInColumn,
   onMoveTask,
   onOpenTask,
   profiles,
   tasks,
 }: {
   canMoveTask: (task: CommunityTask) => boolean;
+  compareTasks?: (a: CommunityTask, b: CommunityTask) => number;
   onMoveTask: (task: CommunityTask, status: CommunityTaskStatus) => void;
   onOpenTask: (task: CommunityTask) => void;
   profiles?: UserProfileLookup;
   tasks: CommunityTask[];
 }) {
   const [activeTaskKey, setActiveTaskKey] = React.useState<string | null>(null);
-  const columns = React.useMemo(() => communityTasksByStatus(tasks), [tasks]);
+  const columns = React.useMemo(() => {
+    const grouped = communityTasksByStatus(tasks);
+    for (const status of COMMUNITY_TASK_COLUMN_ORDER)
+      grouped[status].sort(compareTasks);
+    return grouped;
+  }, [tasks, compareTasks]);
 
   // Without these, dnd-kit announces the draggable id — a UUID read out one
   // character at a time.

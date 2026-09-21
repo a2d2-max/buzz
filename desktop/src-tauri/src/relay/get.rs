@@ -23,9 +23,7 @@ pub async fn get_relay_json<T: DeserializeOwned>(
         path_with_query
     );
     let auth = build_nip98_auth_header(&Method::GET, &url, &[], state)?;
-    let response = state
-        .http_client
-        .get(&url)
+    let response = crate::company_identity::relay_request(state, Method::GET, &url)?
         .header("Authorization", auth)
         .send()
         .await

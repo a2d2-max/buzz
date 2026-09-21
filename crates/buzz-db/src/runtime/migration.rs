@@ -702,7 +702,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 44);
+        assert_eq!(migrations.len(), 45);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1287,6 +1287,44 @@ mod postgres_tests {
             desired_schema.contains("'rate_limit_violations'\n    ]::TEXT[])"),
             "schema.sql exclusion list must match the pre-0041 body after ledger removal"
         );
+
+        assert_eq!(migrations[44].version, 45);
+        let engine_projections = migrations[44].sql.as_str();
+        for table in [
+            "engine_projection_bindings",
+            "engine_principal_mappings",
+            "engine_projection_heads",
+        ] {
+            assert!(
+                engine_projections.contains(&format!("CREATE TABLE {table}")),
+                "migration 45 must create {table}"
+            );
+            assert!(
+                desired_schema.contains(&format!("CREATE TABLE {table}")),
+                "schema.sql must declare {table}"
+            );
+        }
+        assert!(engine_projections.contains("UNIQUE (community_id, provider)"));
+        assert!(engine_projections.contains("PRIMARY KEY (community_id, id)"));
+        assert!(engine_projections.contains("workspace_slug ~ '^[A-Za-z0-9_-]{1,48}$'"));
+        assert_eq!(
+            engine_projections
+                .matches("FOREIGN KEY (community_id, binding_id)")
+                .count(),
+            2
+        );
+        assert!(engine_projections.contains("state_map - ARRAY['todo', 'doing', 'done']"));
+        assert!(engine_projections.contains("jsonb_typeof(state_map->'todo') = 'string'"));
+        assert!(engine_projections.contains("desired_generation > applied_generation"));
+        assert!(engine_projections.contains("create_state TEXT NOT NULL DEFAULT 'safe'"));
+        assert!(engine_projections.contains("create_state IN ('safe', 'uncertain')"));
+        assert!(engine_projections.contains("engine_projection_heads_reconcile_idx"));
+        assert!(engine_projections.contains("WHERE desired_generation > 0"));
+        assert!(desired_schema.contains("state_map - ARRAY['todo', 'doing', 'done']"));
+        assert!(desired_schema.contains("workspace_slug ~ '^[A-Za-z0-9_-]{1,48}$'"));
+        assert!(desired_schema.contains("create_state TEXT NOT NULL DEFAULT 'safe'"));
+        assert!(desired_schema.contains("create_state IN ('safe', 'uncertain')"));
+        assert!(desired_schema.contains("engine_projection_heads_reconcile_idx"));
     }
 
     #[test]

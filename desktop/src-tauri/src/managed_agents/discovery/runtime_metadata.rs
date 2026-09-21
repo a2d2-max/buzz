@@ -170,6 +170,10 @@ pub(crate) struct KnownAcpRuntime {
     /// for key accounts). Exposed on `AcpRuntimeCatalogEntry` the same way as
     /// `oauth_token_env_var`, so UI and spawn can never disagree.
     pub supports_codex_accounts: bool,
+    /// Per-agent memory home assigned by this runtime family.
+    pub data_home: crate::managed_agents::agent_home::DataHomeKind,
+    /// Specific explanation when neither stored account kind applies.
+    pub account_unsupported_reason: Option<&'static str>,
 }
 
 impl KnownAcpRuntime {

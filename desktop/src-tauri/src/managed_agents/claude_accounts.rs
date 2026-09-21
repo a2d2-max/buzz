@@ -33,8 +33,13 @@ use crate::secret_store::SecretStore;
 
 /// Env var the Claude Code CLI reads for a subscription OAuth token.
 pub(crate) const CLAUDE_OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+/// Env var relocating Claude Code's per-login config and keychain namespace.
+pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+pub(crate) const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+pub(crate) const ANTHROPIC_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
 
 const ACCOUNTS_FILE_NAME: &str = "claude-accounts.json";
+const CLAUDE_CONFIGS_DIR_NAME: &str = "claude-configs";
 const MAX_LABEL_CHARS: usize = 64;
 /// Real `claude setup-token` output is far longer; anything shorter is a paste
 /// mistake, and the `…last4` hint would otherwise disclose a large share of it.
@@ -61,6 +66,15 @@ pub enum CodexAuthKind {
     Chatgpt,
 }
 
+/// How a Claude account authenticates. Missing on historical records, which
+/// are the original setup-token kind.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAuthKind {
+    SetupToken,
+    ConfigDir,
+}
+
 /// One stored provider account. Never carries the secret.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderAccount {
@@ -84,6 +98,38 @@ pub struct ProviderAccount {
     /// Codex-only: how the account authenticates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_kind: Option<CodexAuthKind>,
+    /// Claude-only auth kind. Historical `None` records are setup tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_auth_kind: Option<ClaudeAuthKind>,
+    /// App-owned config directory for a Claude `config_dir` login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<PathBuf>,
+    /// Read-only Orca-owned home for an imported Codex ChatGPT login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_home: Option<PathBuf>,
+}
+
+/// One trusted external Codex home discovered from Orca.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalCodexAccount {
+    pub label: String,
+    pub home_dir: PathBuf,
+}
+
+impl ExternalCodexAccount {
+    pub(crate) fn new(label: impl Into<String>, home_dir: PathBuf) -> Self {
+        Self {
+            label: label.into(),
+            home_dir,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportExternalCodexAccountsResult {
+    pub imported: Vec<ProviderAccount>,
+    pub skipped_existing_paths: Vec<PathBuf>,
+    pub skipped_label_conflicts: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -152,8 +198,30 @@ impl<'a> ProviderAccountStore<'a> {
             uuid::Uuid::new_v4().to_string(),
             AccountProvider::Claude,
             None,
+            Some(ClaudeAuthKind::SetupToken),
             label,
             Some(token),
+            None,
+            None,
+        )
+    }
+
+    /// Store a Claude login whose credentials live in an app-owned config
+    /// directory and Claude's config-specific keychain service.
+    pub(crate) fn add_claude_config_dir(
+        &self,
+        label: &str,
+        config_dir: PathBuf,
+    ) -> Result<ProviderAccount, String> {
+        self.add_with_secret(
+            uuid::Uuid::new_v4().to_string(),
+            AccountProvider::Claude,
+            None,
+            Some(ClaudeAuthKind::ConfigDir),
+            label,
+            None,
+            Some(config_dir),
+            None,
         )
     }
 
@@ -191,17 +259,107 @@ impl<'a> ProviderAccountStore<'a> {
             (CodexAuthKind::Chatgpt, Some(_)) => {
                 Err("a ChatGPT-login account does not take an API key".to_string())
             }
-            _ => self.add_with_secret(id, AccountProvider::Codex, Some(auth_kind), label, api_key),
+            _ => self.add_with_secret(
+                id,
+                AccountProvider::Codex,
+                Some(auth_kind),
+                None,
+                label,
+                api_key,
+                None,
+                None,
+            ),
         }
     }
 
+    /// Add external Orca Codex homes in one metadata write. The original
+    /// directories remain external and read-only; only their canonical paths
+    /// are retained. Re-importing the same path is an idempotent skip.
+    pub(crate) fn import_external_codex_accounts(
+        &self,
+        candidates: &[ExternalCodexAccount],
+    ) -> Result<ImportExternalCodexAccountsResult, String> {
+        let mut file = self.read()?;
+        let mut known_paths: std::collections::BTreeSet<PathBuf> = file
+            .accounts
+            .iter()
+            .filter_map(|account| account.external_home.as_ref())
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+            .collect();
+        let mut imported = Vec::new();
+        let mut skipped_existing_paths = Vec::new();
+        let mut skipped_label_conflicts = Vec::new();
+
+        for candidate in candidates {
+            let home_dir = std::fs::canonicalize(&candidate.home_dir).map_err(|error| {
+                format!(
+                    "cannot import Codex account \"{}\": home directory is unavailable: {error}",
+                    candidate.label
+                )
+            })?;
+            if !home_dir.is_dir() {
+                return Err(format!(
+                    "cannot import Codex account \"{}\": home path is not a directory",
+                    candidate.label
+                ));
+            }
+            if known_paths.contains(&home_dir) {
+                if !skipped_existing_paths.contains(&home_dir) {
+                    skipped_existing_paths.push(home_dir);
+                }
+                continue;
+            }
+            let label = normalize_label(&candidate.label)?;
+            if file.accounts.iter().any(|account| {
+                account.provider == AccountProvider::Codex
+                    && account.label.eq_ignore_ascii_case(&label)
+            }) {
+                if !skipped_label_conflicts
+                    .iter()
+                    .any(|known: &String| known.eq_ignore_ascii_case(&label))
+                {
+                    skipped_label_conflicts.push(label);
+                }
+                continue;
+            }
+            known_paths.insert(home_dir.clone());
+            let account = ProviderAccount {
+                id: uuid::Uuid::new_v4().to_string(),
+                label,
+                created_at: crate::util::now_iso(),
+                token_hint: String::new(),
+                provider: AccountProvider::Codex,
+                auth_kind: Some(CodexAuthKind::Chatgpt),
+                claude_auth_kind: None,
+                config_dir: None,
+                external_home: Some(home_dir),
+            };
+            file.accounts.push(account.clone());
+            imported.push(account);
+        }
+        if !imported.is_empty() {
+            self.write(&file)?;
+        }
+        Ok(ImportExternalCodexAccountsResult {
+            imported,
+            skipped_existing_paths,
+            skipped_label_conflicts,
+        })
+    }
+
+    // 인자 9개는 계정 등록에 필요한 값이 그대로 넘어오는 것이라, 묶음 구조체로 바꾸는
+    // 정리는 codex-accounts 작업 쪽에서 한다. 여기서는 clippy 게이트만 넘긴다.
+    #[allow(clippy::too_many_arguments)]
     fn add_with_secret(
         &self,
         id: String,
         provider: AccountProvider,
         auth_kind: Option<CodexAuthKind>,
+        claude_auth_kind: Option<ClaudeAuthKind>,
         label: &str,
         secret: Option<&str>,
+        config_dir: Option<PathBuf>,
+        external_home: Option<PathBuf>,
     ) -> Result<ProviderAccount, String> {
         let label = normalize_label(label)?;
         let secret = secret.map(normalize_token).transpose()?;
@@ -215,6 +373,9 @@ impl<'a> ProviderAccountStore<'a> {
             token_hint: secret.as_deref().map(token_hint).unwrap_or_default(),
             provider,
             auth_kind,
+            claude_auth_kind,
+            config_dir,
+            external_home,
         };
         let name = token_keyring_name(provider, &account.id);
         if let Some(ref secret) = secret {
@@ -271,7 +432,9 @@ impl<'a> ProviderAccountStore<'a> {
             .ok_or_else(|| not_found(id))?;
         let removed = file.accounts.remove(index);
         self.write(&file)?;
-        if removed.auth_kind == Some(CodexAuthKind::Chatgpt) {
+        if removed.auth_kind == Some(CodexAuthKind::Chatgpt)
+            || removed.claude_auth_kind == Some(ClaudeAuthKind::ConfigDir)
+        {
             return Ok((removed, None));
         }
         let warning = self
@@ -406,29 +569,39 @@ fn token_hint(token: &str) -> String {
 
 // ── Spawn-time resolution ────────────────────────────────────────────────────
 
-/// The token to inject for a spawn, or `None` when the agent runs on the
-/// app's own Claude login. Only the Claude runtime reads the token, so a
-/// stale account on a Goose/Codex agent is ignored rather than fatal; on a
-/// Claude agent a missing account fails closed — silently launching on a
-/// different subscription than the one the owner picked is worse than not
-/// launching.
-pub(crate) fn claude_account_spawn_token(
+/// Spawn-time Claude authentication. Config-dir accounts do not touch the app
+/// keyring; Claude itself resolves the config-specific keychain entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeSpawnAuth {
+    SetupToken(String),
+    ConfigDir(PathBuf),
+}
+
+/// What to hand the spawn, or `None` when the agent runs on the app's own
+/// Claude login. Fails closed in both bad cases: a runtime that never reads the
+/// account (a stale pick on a Goose/Codex/Hermes agent) would silently start on
+/// whatever login it finds — the global fallback the owner did not pick — and a
+/// missing account is just as wrong. Not launching beats launching on a
+/// different subscription.
+pub(crate) fn claude_account_spawn_auth(
     account_id: Option<&str>,
     runtime_is_claude: bool,
-    lookup: impl Fn(&str) -> Result<Option<String>, String>,
-) -> Result<Option<String>, String> {
+    lookup: impl Fn(&str) -> Result<Option<ClaudeSpawnAuth>, String>,
+) -> Result<Option<ClaudeSpawnAuth>, String> {
     let Some(id) = account_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return Ok(None);
     };
     if !runtime_is_claude {
-        return Ok(None);
+        return Err(
+            "this runtime cannot sign in with a Claude account, so the one picked for the agent would be ignored — pick Default (or a supported runtime) in the agent's settings before starting it"
+                .to_string(),
+        );
     }
-    match lookup(id)? {
-        Some(token) => Ok(Some(token)),
-        None => Err(format!(
+    lookup(id)?.map(Some).ok_or_else(|| {
+        format!(
             "Claude account {id} no longer exists — pick another account (or Default) in the agent's settings before starting it"
-        )),
-    }
+        )
+    })
 }
 
 /// Whether the spawn will hand `runtime` an OAuth token: the record names a
@@ -439,16 +612,35 @@ pub(crate) fn oauth_token_supplied(
     record: &ManagedAgentRecord,
     runtime: Option<&KnownAcpRuntime>,
     env: &BTreeMap<String, String>,
+    named_account_ready: bool,
 ) -> bool {
     runtime
         .and_then(|r| r.oauth_token_env_var)
         .is_some_and(|key| {
-            record
+            match record
                 .claude_account_id
                 .as_deref()
-                .is_some_and(|id| !id.trim().is_empty())
-                || env.get(key).is_some_and(|value| !value.trim().is_empty())
+                .filter(|id| !id.trim().is_empty())
+            {
+                Some(_) => named_account_ready,
+                None => env.get(key).is_some_and(|value| !value.trim().is_empty()),
+            }
         })
+}
+
+pub(crate) fn selected_claude_account_unready(
+    record: &ManagedAgentRecord,
+    runtime: Option<&KnownAcpRuntime>,
+    named_account_ready: bool,
+) -> bool {
+    runtime
+        .and_then(|runtime| runtime.oauth_token_env_var)
+        .is_some()
+        && record
+            .claude_account_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        && !named_account_ready
 }
 
 /// Write the picked account's token onto the spawn command.
@@ -463,11 +655,22 @@ pub(crate) fn oauth_token_supplied(
 pub(crate) fn apply_claude_account_env(
     command: &mut std::process::Command,
     oauth_token_env_var: Option<&str>,
-    token: Option<&str>,
+    auth: Option<&ClaudeSpawnAuth>,
 ) {
-    if let (Some(key), Some(token)) = (oauth_token_env_var, token) {
-        command.env_remove("ANTHROPIC_API_KEY");
-        command.env(key, token);
+    let (Some(key), Some(auth)) = (oauth_token_env_var, auth) else {
+        return;
+    };
+    command.env_remove(ANTHROPIC_API_KEY_ENV);
+    command.env_remove(ANTHROPIC_AUTH_TOKEN_ENV);
+    match auth {
+        ClaudeSpawnAuth::SetupToken(token) => {
+            command.env_remove(CLAUDE_CONFIG_DIR_ENV);
+            command.env(key, token);
+        }
+        ClaudeSpawnAuth::ConfigDir(config_dir) => {
+            command.env_remove(key);
+            command.env(CLAUDE_CONFIG_DIR_ENV, config_dir);
+        }
     }
 }
 
@@ -527,12 +730,215 @@ pub(crate) fn with_claude_account_store<R: tauri::Runtime, T>(
     f(&ProviderAccountStore::new(path, tokens))
 }
 
-/// Keyring lookup for the spawn path: `Ok(None)` when the account is gone.
-pub(crate) fn lookup_claude_account_token<R: tauri::Runtime>(
+/// Resolve either historical setup-token auth or a config-directory login.
+pub(crate) fn lookup_claude_account_auth<R: tauri::Runtime>(
     app: &AppHandle<R>,
     id: &str,
-) -> Result<Option<String>, String> {
-    with_claude_account_store(app, |store| store.token(id))
+) -> Result<Option<ClaudeSpawnAuth>, String> {
+    let Some(account) = with_claude_account_store(app, |store| store.find(id))? else {
+        return Ok(None);
+    };
+    if account.provider != AccountProvider::Claude {
+        return Ok(None);
+    }
+    match account
+        .claude_auth_kind
+        .unwrap_or(ClaudeAuthKind::SetupToken)
+    {
+        ClaudeAuthKind::SetupToken => with_claude_account_store(app, |store| store.token(id))
+            .map(|token| token.map(ClaudeSpawnAuth::SetupToken)),
+        ClaudeAuthKind::ConfigDir => account
+            .config_dir
+            .ok_or_else(|| {
+                format!(
+                    "Claude account \"{}\" has no config directory",
+                    account.label
+                )
+            })
+            .and_then(|path| {
+                config_dir_spawn_auth(&account.label, path, |path| {
+                    validate_recorded_claude_config_dir(app, path)
+                })
+            })
+            .map(Some),
+    }
+}
+
+/// Readiness for a stored Claude account without opening its secret. Setup
+/// tokens keep their historical metadata-based readiness; config-directory
+/// accounts require one of Claude's documented login marker files.
+pub(crate) fn claude_account_readiness_supplied<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: Option<&str>,
+) -> bool {
+    let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    let Ok(Some(account)) = with_claude_account_store(app, |store| store.find(id)) else {
+        return false;
+    };
+    if account.provider != AccountProvider::Claude {
+        return false;
+    }
+    match account
+        .claude_auth_kind
+        .unwrap_or(ClaudeAuthKind::SetupToken)
+    {
+        ClaudeAuthKind::SetupToken => true,
+        ClaudeAuthKind::ConfigDir => account.config_dir.is_some_and(|path| {
+            config_dir_spawn_auth(&account.label, path, |path| {
+                validate_recorded_claude_config_dir(app, path)
+            })
+            .is_ok()
+        }),
+    }
+}
+
+pub(crate) fn claude_config_dir<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+) -> Result<PathBuf, String> {
+    Ok(managed_agents_base_dir(app)?
+        .join(CLAUDE_CONFIGS_DIR_NAME)
+        .join(id))
+}
+
+pub(crate) fn is_app_owned_claude_config_dir(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+) -> bool {
+    let Ok(relative) = dir.strip_prefix(root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && relative.as_os_str() == name
+        && dir.as_os_str() == root.join(name).as_os_str()
+}
+
+pub(crate) fn validate_recorded_claude_config_dir<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    dir: &std::path::Path,
+) -> Result<bool, String> {
+    let owned_root = managed_agents_base_dir(app)?.join(CLAUDE_CONFIGS_DIR_NAME);
+    if !is_app_owned_claude_config_dir(&owned_root, dir) {
+        return Err(format!(
+            "refusing to use a Claude config directory outside the app-owned account root ({})",
+            dir.display()
+        ));
+    }
+    validate_existing_claude_config_dir(dir)
+}
+
+pub(crate) fn validate_existing_claude_config_dir(dir: &std::path::Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing to follow a symlink at the Claude config directory ({})",
+            dir.display()
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(format!(
+            "Claude config path is not a directory ({})",
+            dir.display()
+        )),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "failed to inspect the Claude config directory ({}): {error}",
+            dir.display()
+        )),
+    }
+}
+
+fn claude_config_dir_login_present(dir: &std::path::Path) -> Result<bool, String> {
+    for name in [".claude.json", "oauth-account.json"] {
+        let marker = dir.join(name);
+        match std::fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect Claude login marker ({}): {error}",
+                    marker.display()
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn config_dir_spawn_auth(
+    label: &str,
+    path: PathBuf,
+    validate: impl FnOnce(&std::path::Path) -> Result<bool, String>,
+) -> Result<ClaudeSpawnAuth, String> {
+    let exists = validate(&path)?;
+    if exists && claude_config_dir_login_present(&path)? {
+        return Ok(ClaudeSpawnAuth::ConfigDir(path));
+    }
+    Err(format!(
+        "Claude account \"{label}\" is not logged in yet — run `{}` once, then start the agent",
+        claude_login_command(&path)
+    ))
+}
+
+/// Remove only the exact app-owned directory shape minted above. A corrupt or
+/// hand-edited record can never turn account removal into arbitrary deletion.
+pub(crate) fn remove_claude_config_dir<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    account: &ProviderAccount,
+) -> Option<String> {
+    if account.claude_auth_kind != Some(ClaudeAuthKind::ConfigDir) {
+        return None;
+    }
+    let Some(dir) = account.config_dir.as_ref() else {
+        return Some(
+            "Claude config directory was not recorded; account metadata was kept".to_string(),
+        );
+    };
+    match validate_recorded_claude_config_dir(app, dir) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => return Some(format!("{error}; account metadata was kept")),
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => None,
+        Err(error) => Some(format!(
+            "Claude directory could not be deleted ({}): {error}; account metadata was kept",
+            dir.display()
+        )),
+    }
+}
+
+pub(crate) fn claude_login_command(dir: &std::path::Path) -> String {
+    format!("CLAUDE_CONFIG_DIR=\"{}\" claude login", dir.display())
+}
+
+/// Configure the one-time browser login for an app-owned account directory.
+///
+/// `auth login --claudeai` rather than the bare `claude login` TUI: the bare
+/// form asks for a theme and a login method first and cannot run without a
+/// terminal, while this subcommand goes straight to the browser, so the app can
+/// run it in the background and the owner only sees the sign-in page.
+///
+/// The env carries the same contract `apply_claude_account_env` applies at
+/// spawn — this account's directory wins, every ambient competitor is dropped —
+/// so the login lands on the account the owner picked rather than on a stray
+/// key exported in their shell.
+pub(crate) fn configure_claude_login_command(
+    command: &mut std::process::Command,
+    dir: &std::path::Path,
+) {
+    command.args(["auth", "login", "--claudeai"]);
+    command.env(CLAUDE_CONFIG_DIR_ENV, dir);
+    command.env_remove(ANTHROPIC_API_KEY_ENV);
+    command.env_remove(ANTHROPIC_AUTH_TOKEN_ENV);
+    command.env_remove(CLAUDE_OAUTH_TOKEN_ENV);
 }
 
 #[cfg(test)]

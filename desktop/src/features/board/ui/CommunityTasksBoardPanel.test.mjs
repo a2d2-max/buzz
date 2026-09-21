@@ -37,7 +37,14 @@ const TEST_QUERY_DEFAULTS = {
   },
 };
 
-async function seedEvent({ assignees = [], status = "todo" } = {}) {
+async function seedEvent({
+  assignees = [],
+  status = "todo",
+  id = CARD_ID,
+  title = "Ship the board",
+  body = "",
+  due,
+} = {}) {
   const { serializeCommunityTaskContent } = await import(
     "../lib/communityTaskCodec.ts"
   );
@@ -47,13 +54,14 @@ async function seedEvent({ assignees = [], status = "todo" } = {}) {
     created_at: 1_000,
     kind: 30078,
     tags: [
-      ["d", `community-task:${CARD_ID}`],
+      ["d", `community-task:${id}`],
       ["t", "community-task"],
     ],
     content: serializeCommunityTaskContent({
       author: AUTHOR,
-      title: "Ship the board",
-      body: "",
+      title,
+      body,
+      ...(due === undefined ? {} : { due }),
       status,
       assignees,
       order: 1,
@@ -394,4 +402,233 @@ test("a signed-out viewer cannot create tasks", async (t) => {
     container.querySelector("[data-testid='community-task-new']").disabled,
     true,
   );
+});
+
+test("search survives layout changes and a no-match filter can be cleared", async (t) => {
+  const { fireEvent, screen } = await import("@testing-library/react");
+  await installSeams({ signing: async () => ({ pubkey: AUTHOR }) });
+  const { queryClient } = await renderPanel({
+    events: [
+      await seedEvent({
+        id: "alpha",
+        title: "Alpha",
+        body: "Release checklist",
+      }),
+      await seedEvent({ id: "beta", title: "Beta", status: "doing" }),
+    ],
+    viewer: AUTHOR,
+  });
+  t.after(() => queryClient.clear());
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search tasks" }), {
+    target: { value: " RELEASE " },
+  });
+  assert.equal(screen.getAllByTestId("community-task-card").length, 1);
+  assert.match(screen.getByTestId("community-task-card").textContent, /Alpha/);
+  fireEvent.click(screen.getByRole("button", { name: "List view" }));
+  assert.equal(screen.getAllByTestId("community-task-row").length, 1);
+  assert.match(screen.getByTestId("community-task-row").textContent, /Alpha/);
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search tasks" }), {
+    target: { value: "missing" },
+  });
+  assert.ok(screen.getByText("No matching tasks"));
+  fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+  assert.equal(screen.getAllByTestId("community-task-row").length, 2);
+});
+
+test("status and assignment filters intersect while list opening uses existing read-only permissions", async (t) => {
+  const { fireEvent, screen } = await import("@testing-library/react");
+  await installSeams({ signing: async () => ({ pubkey: STRANGER }) });
+  const { queryClient } = await renderPanel({
+    events: [
+      await seedEvent({
+        id: "mine",
+        title: "Assigned to me",
+        assignees: [STRANGER],
+        status: "doing",
+      }),
+      await seedEvent({
+        id: "other",
+        title: "Someone else's task",
+        status: "doing",
+      }),
+      await seedEvent({
+        id: "future",
+        title: "Future task",
+        assignees: [STRANGER],
+      }),
+    ],
+    viewer: STRANGER,
+  });
+  t.after(() => queryClient.clear());
+  fireEvent.change(
+    screen.getByRole("combobox", { name: "Filter by assignee" }),
+    { target: { value: "mine" } },
+  );
+  fireEvent.change(screen.getByRole("combobox", { name: "Filter by status" }), {
+    target: { value: "doing" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "List view" }));
+  assert.equal(screen.getAllByTestId("community-task-row").length, 1);
+  assert.match(
+    screen.getByTestId("community-task-row").textContent,
+    /Assigned to me/,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Open Someone else's task" }),
+  );
+  assert.ok(screen.getByTestId("community-task-readonly"));
+  assert.equal(screen.queryByTestId("community-task-sheet-save"), null);
+});
+
+test("due sorting works in both layouts and overdue excludes completed tasks", async (t) => {
+  const { fireEvent, screen } = await import("@testing-library/react");
+  await installSeams({ signing: async () => ({ pubkey: AUTHOR }) });
+  const { queryClient } = await renderPanel({
+    events: [
+      await seedEvent({ id: "no-due", title: "No due" }),
+      await seedEvent({ id: "later", title: "Later", due: 978480000 }),
+      await seedEvent({ id: "earlier", title: "Earlier", due: 978393600 }),
+      await seedEvent({
+        id: "completed",
+        title: "Completed",
+        due: 978307200,
+        status: "done",
+      }),
+    ],
+    viewer: AUTHOR,
+  });
+  t.after(() => queryClient.clear());
+  fireEvent.change(screen.getByRole("combobox", { name: "Sort tasks" }), {
+    target: { value: "due" },
+  });
+  const todo = screen.getAllByTestId("community-task-column")[0];
+  assert.deepEqual(
+    [...todo.querySelectorAll("[data-task-id]")].map((el) => el.dataset.taskId),
+    ["earlier", "later", "no-due"],
+  );
+  fireEvent.change(
+    screen.getByRole("combobox", { name: "Filter by due date" }),
+    { target: { value: "overdue" } },
+  );
+  fireEvent.click(screen.getByRole("button", { name: "List view" }));
+  assert.deepEqual(
+    screen.getAllByTestId("community-task-row").map((el) => el.dataset.taskId),
+    ["earlier", "later"],
+  );
+});
+
+test("timeline places deadlines by calendar date, navigates weeks and opens undated tasks", async (t) => {
+  const { fireEvent, screen } = await import("@testing-library/react");
+  const { timelineWeekStart } = await import("../lib/communityTaskTimeline.ts");
+  await installSeams({ signing: async () => ({ pubkey: AUTHOR }) });
+  const start = timelineWeekStart();
+  const { queryClient } = await renderPanel({
+    events: [
+      await seedEvent({
+        id: "this-week",
+        title: "This week's delivery",
+        due: start,
+      }),
+      await seedEvent({
+        id: "next-week",
+        title: "Next week's delivery",
+        due: start + 7 * 86400,
+      }),
+      await seedEvent({ id: "unscheduled", title: "Unscheduled work" }),
+    ],
+    viewer: AUTHOR,
+  });
+  t.after(() => queryClient.clear());
+  fireEvent.click(screen.getByRole("button", { name: "Timeline view" }));
+  assert.ok(screen.getByRole("button", { name: "Open This week's delivery" }));
+  assert.equal(
+    screen.queryByRole("button", { name: "Open Next week's delivery" }),
+    null,
+  );
+  assert.ok(screen.getByText("1 dated tasks outside this week"));
+  fireEvent.click(screen.getByRole("button", { name: "Next week" }));
+  assert.ok(screen.getByRole("button", { name: "Open Next week's delivery" }));
+  assert.equal(
+    screen.queryByRole("button", { name: "Open This week's delivery" }),
+    null,
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Open Unscheduled work" }),
+  );
+  assert.ok(screen.getByTestId("community-task-sheet-save"));
+});
+
+test("custom fields persist through panel create, edit, move and explicit removal", async (t) => {
+  const { act, fireEvent, screen } = await import("@testing-library/react");
+  const { published } = await installSeams({
+    signing: async () => ({ pubkey: AUTHOR }),
+  });
+  const { queryClient, container } = await renderPanel({
+    events: [],
+    viewer: AUTHOR,
+  });
+  t.after(() => queryClient.clear());
+  fireEvent.click(screen.getByTestId("community-task-new"));
+  fireEvent.change(screen.getByTestId("community-task-dialog-title"), {
+    target: { value: "Fields roundtrip" },
+  });
+  fireEvent.change(screen.getByRole("textbox", { name: "New field name" }), {
+    target: { value: "Estimate" },
+  });
+  fireEvent.change(screen.getByRole("combobox", { name: "New field type" }), {
+    target: { value: "number" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Add field" }));
+  fireEvent.change(
+    screen.getByRole("spinbutton", { name: "Value: Estimate" }),
+    { target: { value: "0" } },
+  );
+  await act(async () => {
+    fireEvent.submit(
+      screen.getByTestId("community-task-dialog").querySelector("form"),
+    );
+  });
+  await settleUntil(() => published.length === 1);
+  const initial = JSON.parse(published[0].content).customFields;
+  assert.equal(initial[0].value, 0);
+  assert.equal(initial[0].type, "number");
+  fireEvent.click(screen.getByRole("button", { name: "List view" }));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Open Fields roundtrip" }),
+  );
+  fireEvent.change(
+    screen.getByRole("spinbutton", { name: "Value: Estimate" }),
+    { target: { value: "2.5" } },
+  );
+  await act(async () => {
+    fireEvent.submit(
+      screen.getByTestId("community-task-sheet-save").closest("form"),
+    );
+  });
+  await settleUntil(() => published.length === 2);
+  assert.equal(JSON.parse(published[1].content).customFields[0].value, 2.5);
+  fireEvent.click(screen.getByRole("button", { name: "Board view" }));
+  await keyboardDrag(
+    container.querySelector("[data-testid='community-task-drag-handle']"),
+    1,
+  );
+  await settleUntil(() => published.length === 3);
+  assert.equal(JSON.parse(published[2].content).status, "doing");
+  assert.equal(JSON.parse(published[2].content).customFields[0].value, 2.5);
+  assert.deepEqual(JSON.parse(published[2].content).documents, []);
+  fireEvent.click(screen.getByRole("button", { name: "List view" }));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Open Fields roundtrip" }),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Remove field: Estimate" }),
+  );
+  await act(async () => {
+    fireEvent.submit(
+      screen.getByTestId("community-task-sheet-save").closest("form"),
+    );
+  });
+  await settleUntil(() => published.length === 4);
+  assert.deepEqual(JSON.parse(published[3].content).customFields, []);
 });

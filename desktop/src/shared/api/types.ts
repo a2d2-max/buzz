@@ -499,6 +499,9 @@ export type AuthStatus =
   | { status: "not_applicable" }
   | { status: "unknown" };
 
+/** Per-agent data home a runtime gets (see `AcpRuntimeCatalogEntry.dataHome`). */
+export type AgentDataHome = "none" | "hermes_profile" | "codex_home";
+
 export type AcpRuntimeCatalogEntry = {
   id: string;
   label: string;
@@ -526,6 +529,10 @@ export type AcpRuntimeCatalogEntry = {
    * way `oauthTokenEnvVar` gates Claude's.
    */
   supportsCodexAccounts: boolean;
+  /** Per-agent memory home, or `none` when the runtime still shares its default. */
+  dataHome: AgentDataHome;
+  /** Explanation shown when neither stored account type applies. */
+  accountUnsupportedReason: string | null;
   /**
    * Canonical accepted effort values for this runtime, in display order.
    *
@@ -738,6 +745,38 @@ export type UpdateManagedAgentInput = {
   codexAccountId?: string | null;
 };
 
+export type ManagedAgentAccountPatchInput = Pick<
+  UpdateManagedAgentInput,
+  "pubkey" | "claudeAccountId" | "codexAccountId"
+>;
+
+export type UpdateManagedAgentAccountsBatchInput = {
+  updates: ManagedAgentAccountPatchInput[];
+};
+
+export type QuotaWindow = {
+  label: string;
+  /** Unknown stays null; it must never be rendered as a measured zero. */
+  usedPercent: number | null;
+  resetsAt: string | null;
+};
+
+export type AccountQuotaState =
+  | "ok"
+  | "limit_reached"
+  | "needs_login"
+  | "not_applicable"
+  | "unavailable";
+
+/** Provider-reported remaining plan quota, separate from local spend totals. */
+export type AccountQuota = {
+  state: AccountQuotaState;
+  plan: string | null;
+  windows: QuotaWindow[];
+  /** Failure reason or provider note. Never contains a credential. */
+  message: string | null;
+};
+
 /**
  * A named Claude subscription account. The OAuth token lives in the OS
  * keyring and never reaches the frontend; `tokenHint` is `…` + its last four.
@@ -747,7 +786,10 @@ export type ClaudeAccount = {
   label: string;
   createdAt: string;
   tokenHint: string;
+  authKind: ClaudeAuthKind;
 };
+
+export type ClaudeAuthKind = "setup_token" | "config_dir";
 
 export type ClaudeAccountTestResult = {
   ok: boolean;
@@ -777,6 +819,21 @@ export type CodexAccount = {
   /** `…` + the key's last four; empty for `chatgpt` accounts. */
   tokenHint: string;
   authKind: CodexAuthKind;
+  source: "app" | "orca";
+};
+
+export type OrcaCodexAccount = {
+  id: string;
+  email: string;
+  workspaceLabel: string | null;
+  homePath: string;
+  alreadyImported: boolean;
+};
+
+export type ImportOrcaCodexAccountsResult = {
+  imported: CodexAccount[];
+  skippedExistingCount: number;
+  skippedLabelConflicts: string[];
 };
 
 export type CodexAccountTestResult = {
@@ -790,6 +847,23 @@ export type RemoveCodexAccountResult = {
   detachedAgentPubkeys: string[];
   /** Set when the keyring entry or Codex directory could not be deleted. */
   warning: string | null;
+};
+
+export type CodexLoginState =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
+
+export type CodexLoginSession = {
+  /** Unique backend session id used to reject delayed polls after restart. */
+  generation: string;
+  state: CodexLoginState;
+  message: string | null;
+  authUrl: string | null;
+  startedAt: string;
+  finishedAt: string | null;
 };
 // Persona (agent definition) types live in a sibling module to keep this
 // file inside the repo-wide size ratchet; re-exported so import paths

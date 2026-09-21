@@ -23,6 +23,7 @@ import {
 } from "@protected-feature-components";
 import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
+import { InlineAgentAccountSelector } from "./InlineAgentAccountSelector";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import { PersonaActionsMenu } from "./PersonaActionsMenu";
@@ -341,6 +342,9 @@ function AgentPersonaCard({
           <ProtectedBestieCardBadge agent={agent} isBestie={isBestie} />
         ) : null
       }
+      footerControl={
+        agent ? <InlineAgentAccountSelector agent={agent} /> : null
+      }
       label={title}
       subtitle={subtitle}
       onClick={() => {
@@ -432,6 +436,7 @@ function StandaloneAgentCard({
       footerAccessory={
         <ProtectedBestieCardBadge agent={agent} isBestie={isBestie} />
       }
+      footerControl={<InlineAgentAccountSelector agent={agent} />}
       label={title}
       subtitle={
         // Definition-less instance: no authored description exists, so fall

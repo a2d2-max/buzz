@@ -1,0 +1,28 @@
+{
+  "name": "@a2d2/docs-editor",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/typecheck.mjs && vite build",
+    "dev": "vite",
+    "test": "node --experimental-strip-types --test src/*.test.mjs",
+    "typecheck": "node scripts/typecheck.mjs"
+  },
+  "dependencies": {
+    "@blocksuite/affine": "0.22.4",
+    "@toeverything/theme": "1.1.23",
+    "lit": "3.3.1",
+    "rxjs": "^7.8.2",
+    "y-protocols": "^1.0.6",
+    "yjs": "13.6.27",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@vanilla-extract/vite-plugin": "5.2.6",
+    "vite": "7.3.5",
+    "typescript": "6.0.3",
+    "@types/node": "26.4.1"
+  }
+}

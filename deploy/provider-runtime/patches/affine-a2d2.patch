@@ -1,0 +1,3392 @@
+diff --git a/packages/backend/server/schema.prisma b/packages/backend/server/schema.prisma
+index 54c72e0..17dd3cd 100644
+--- a/packages/backend/server/schema.prisma
++++ b/packages/backend/server/schema.prisma
+@@ -53,6 +53,7 @@ model User {
+   workspaceMemberLastAccesses WorkspaceMemberLastAccess[]
+   quotaState                  EffectiveUserQuotaState?
+   ownedQuotaStates            EffectiveWorkspaceQuotaState[]
++  a2d2PrincipalBinding        A2d2PrincipalBinding?
+ 
+   @@index([email])
+   @@map("users")
+@@ -209,12 +210,45 @@ model Workspace {
+   docGrants                  DocGrant[]
+   mcpCredentials             McpCredential[]
+   artifacts                  WorkspaceArtifact[]
++  a2d2CommunityBinding       A2d2CommunityBinding?
+ 
+   @@index([lastCheckEmbeddings])
+   @@index([createdAt])
+   @@map("workspaces")
+ }
+ 
++model A2d2CommunityBinding {
++  communityId String   @id @map("community_id") @db.VarChar
++  workspaceId String   @unique @map("workspace_id") @db.VarChar
++  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
++  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
++
++  workspace  Workspace              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
++  principals A2d2PrincipalBinding[]
++
++  @@unique([communityId, workspaceId])
++  @@map("a2d2_community_bindings")
++}
++
++model A2d2PrincipalBinding {
++  communityId  String   @map("community_id") @db.VarChar
++  workspaceId  String   @map("workspace_id") @db.VarChar
++  pubkey       String   @db.Char(64)
++  principalKey String   @unique @map("principal_key") @db.VarChar
++  userId       String   @unique @map("user_id") @db.VarChar
++  role         String   @db.Text
++  active       Boolean  @default(true)
++  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
++  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
++
++  community A2d2CommunityBinding @relation(fields: [communityId, workspaceId], references: [communityId, workspaceId], onDelete: Cascade)
++  user      User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
++
++  @@id([communityId, pubkey])
++  @@index([communityId, workspaceId, active])
++  @@map("a2d2_principal_bindings")
++}
++
+ model Entitlement {
+   id            String    @id @default(uuid()) @db.VarChar
+   targetType    String    @map("target_type") @db.Text
+diff --git a/packages/backend/server/src/base/config/config.ts b/packages/backend/server/src/base/config/config.ts
+index 1f5e1bc..d6f1228 100644
+--- a/packages/backend/server/src/base/config/config.ts
++++ b/packages/backend/server/src/base/config/config.ts
+@@ -1,3 +1,3 @@
+-import { ApplyType } from '../utils';
++import { ApplyType } from '../utils/types';
+ 
+ export class Config extends ApplyType<AppConfig>() {}
+diff --git a/packages/backend/server/src/base/websocket/adapter.ts b/packages/backend/server/src/base/websocket/adapter.ts
+index fed2369..ef8fa25 100644
+--- a/packages/backend/server/src/base/websocket/adapter.ts
++++ b/packages/backend/server/src/base/websocket/adapter.ts
+@@ -25,6 +25,7 @@ export class SocketIoAdapter extends IoAdapter {
+     const logger = this.app.get(AFFiNELogger);
+     const config = this.app.get(WEBSOCKET_OPTIONS) as Config['websocket'] & {
+       canActivate: (socket: Socket) => Promise<boolean>;
++      canActivatePacket?: (socket: Socket) => Promise<boolean>;
+     };
+     const url = this.app.get(URLHelper);
+     const allowedOrigins = buildCorsAllowedOrigins(url);
+@@ -70,6 +71,27 @@ export class SocketIoAdapter extends IoAdapter {
+       });
+     }
+ 
++    if (config.canActivatePacket) {
++      server.on('connection', socket => {
++        socket.use((_event, next) => {
++          config
++            .canActivatePacket?.(socket)
++            .then(pass => {
++              if (pass) {
++                next();
++                return;
++              }
++              socket.disconnect(true);
++              next(new AuthenticationRequired());
++            })
++            .catch(error => {
++              socket.disconnect(true);
++              next(error);
++            });
++        });
++      });
++    }
++
+     const pubClient = this.app.get(SocketIoRedis);
+     const subClient = pubClient.duplicate();
+ 
+diff --git a/packages/backend/server/src/core/auth/controller.ts b/packages/backend/server/src/core/auth/controller.ts
+index 4c9aac4..39521ce 100644
+--- a/packages/backend/server/src/core/auth/controller.ts
++++ b/packages/backend/server/src/core/auth/controller.ts
+@@ -30,6 +30,7 @@ import {
+ import { Models } from '../../models';
+ import { validators } from '../utils/validators';
+ import { getAbuseRequestSource } from '../workspaces/abuse';
++import { A2d2ManagedAuthService } from './a2d2/service';
+ import { AuthSessionService } from './auth-session';
+ import { Public } from './guard';
+ import {
+@@ -76,7 +77,8 @@ export class AuthController {
+     private readonly sessionExchange: SessionExchangeService,
+     private readonly authSessions: AuthSessionService,
+     private readonly models: Models,
+-    private readonly config: Config
++    private readonly config: Config,
++    private readonly a2d2: A2d2ManagedAuthService
+   ) {
+     if (env.dev) {
+       // set DNS servers in dev mode
+@@ -199,6 +201,17 @@ export class AuthController {
+       return;
+     }
+ 
++    if (req.authType === 'a2d2') {
++      const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
++      const csrfHeader = req.get('x-affine-csrf-token');
++      if (!csrfHeader || !csrfCookie || csrfCookie !== csrfHeader) {
++        throw new ActionForbidden();
++      }
++      await this.a2d2.signOut(req, res);
++      res.status(HttpStatus.OK).send({});
++      return;
++    }
++
+     const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
+     const csrfHeader = req.get('x-affine-csrf-token');
+     if (!csrfHeader || !csrfCookie || csrfCookie !== csrfHeader) {
+@@ -361,7 +374,7 @@ export class AuthController {
+     if (req.authType === 'jwt') {
+       const principal = session as Partial<AuthSessionPrincipal> | undefined;
+       if (principal?.authSessionId) return;
+-    } else if (req.authType === 'session') {
++    } else if (req.authType === 'session' || req.authType === 'a2d2') {
+       const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
+       const csrfHeader = req.get('x-affine-csrf-token');
+       if (csrfHeader && csrfCookie && csrfCookie === csrfHeader) return;
+diff --git a/packages/backend/server/src/core/auth/guard.ts b/packages/backend/server/src/core/auth/guard.ts
+index 47095c5..d7e87d7 100644
+--- a/packages/backend/server/src/core/auth/guard.ts
++++ b/packages/backend/server/src/core/auth/guard.ts
+@@ -23,6 +23,7 @@ import {
+   UnsupportedClientVersion,
+ } from '../../base';
+ import { WEBSOCKET_OPTIONS } from '../../base/websocket';
++import { A2d2ManagedAuthService } from './a2d2/service';
+ import { AccessTokenService, SessionAccessTokenError } from './access-token';
+ import { AuthSessionService } from './auth-session';
+ import { extractTokenFromHeader } from './input';
+@@ -45,6 +46,7 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+   private auth!: AuthService;
+   private accessTokens!: AccessTokenService;
+   private authSessions!: AuthSessionService;
++  private a2d2!: A2d2ManagedAuthService;
+   private readonly cachedVersionRange = new Map<string, semver.Range | null>();
+   private static readonly HARD_REQUIRED_VERSION = '>=0.25.0';
+   private static readonly CANARY_REQUIRED_VERSION = 'canary (within 2 months)';
+@@ -61,6 +63,15 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+     this.auth = this.ref.get(AuthService, { strict: false });
+     this.accessTokens = this.ref.get(AccessTokenService, { strict: false });
+     this.authSessions = this.ref.get(AuthSessionService, { strict: false });
++    this.a2d2 = this.ref.get(A2d2ManagedAuthService, { strict: false });
++  }
++
++  get managedAuthEnabled() {
++    return this.a2d2.enabled;
++  }
++
++  async revalidateManagedSocket(req: Request) {
++    return await this.a2d2.authenticate(req);
+   }
+ 
+   async canActivate(context: ExecutionContext) {
+@@ -99,6 +110,8 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+       throw new AccessDenied('Invalid internal request');
+     }
+ 
++    this.a2d2.assertRequestAllowed(req);
++
+     // api is public
+     const isPublic = this.reflector.getAllAndOverride<boolean>(
+       PUBLIC_ENTRYPOINT_SYMBOL,
+@@ -132,6 +145,11 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+     res?: Response,
+     isPublic = false
+   ): Promise<AuthenticatedRequestSession | null> {
++    if (this.a2d2.enabled) {
++      if (req.path?.startsWith('/api/a2d2/session/')) return null;
++      const session = await this.a2d2.authenticate(req, res);
++      return session ? { type: 'cookie_session', session } : null;
++    }
+     const bearer = req.headers.authorization
+       ? extractTokenFromHeader(req.headers.authorization)
+       : undefined;
+@@ -358,6 +376,15 @@ export const AuthWebsocketOptionsProvider: FactoryProvider = {
+ 
+         return !!session;
+       },
++      canActivatePacket: async (socket: Socket) => {
++        if (!guard.managedAuthEnabled) return true;
++        const upgradeReq = socket.client.request as Request;
++        try {
++          return !!(await guard.revalidateManagedSocket(upgradeReq));
++        } catch {
++          return false;
++        }
++      },
+     };
+   },
+   inject: [Config, AuthGuard],
+diff --git a/packages/backend/server/src/core/auth/index.ts b/packages/backend/server/src/core/auth/index.ts
+index f367229..d6d1f82 100644
+--- a/packages/backend/server/src/core/auth/index.ts
++++ b/packages/backend/server/src/core/auth/index.ts
+@@ -9,6 +9,11 @@ import { MailModule } from '../mail';
+ import { QuotaModule } from '../quota';
+ import { UserModule } from '../user';
+ import { AccessTokenService } from './access-token';
++import {
++  A2d2BrokerClient,
++  A2d2ManagedAuthService,
++  A2d2SessionController,
++} from './a2d2';
+ import { AuthSessionService } from './auth-session';
+ import { AuthChallengeStore } from './challenge-store';
+ import { AuthController } from './controller';
+@@ -49,6 +54,8 @@ import { AuthSigningKeyResolver } from './signing-key-resolver';
+     AuthSigningKeyResolver,
+     AuthCronJob,
+     AuthWebsocketOptionsProvider,
++    A2d2BrokerClient,
++    A2d2ManagedAuthService,
+   ],
+   exports: [
+     AuthService,
+@@ -63,8 +70,9 @@ import { AuthSigningKeyResolver } from './signing-key-resolver';
+     AuthSessionService,
+     AuthSigningKeyRing,
+     AuthWebsocketOptionsProvider,
++    A2d2ManagedAuthService,
+   ],
+-  controllers: [AuthController],
++  controllers: [AuthController, A2d2SessionController],
+ })
+ export class AuthModule {}
+ 
+@@ -79,5 +87,6 @@ export { AuthSessionService } from './auth-session';
+ export { OpenAppAuthService } from './open-app';
+ export { ClientTokenType } from './resolver';
+ export { AccessTokenService, AuthService, SessionIssuer };
++export { A2d2ManagedAuthService } from './a2d2';
+ export * from './session';
+ export { AuthSigningKeyRing } from './signing-key';
+diff --git a/packages/backend/server/src/core/auth/resolver.ts b/packages/backend/server/src/core/auth/resolver.ts
+index c5bfe84..85fe9d8 100644
+--- a/packages/backend/server/src/core/auth/resolver.ts
++++ b/packages/backend/server/src/core/auth/resolver.ts
+@@ -30,6 +30,7 @@ import type { MailDeliveryMetadata } from '../mail/types';
+ import { UserType } from '../user/types';
+ import { validators } from '../utils/validators';
+ import { getAbuseRequestSource } from '../workspaces/abuse';
++import { A2d2AuthError } from './a2d2/error';
+ import { Public } from './guard';
+ import { AuthService } from './service';
+ import { CurrentUser } from './session';
+@@ -56,6 +57,12 @@ export class AuthResolver {
+     private readonly config: Config
+   ) {}
+ 
++  private assertVendorAccountMutationAllowed() {
++    if (this.config.a2d2Auth.enabled) {
++      throw new A2d2AuthError('scope_or_membership_denied');
++    }
++  }
++
+   private mailMetadata(
+     context: GraphqlContext,
+     expiresAt?: Date
+@@ -85,6 +92,7 @@ export class AuthResolver {
+     @CurrentUser() currentUser: CurrentUser,
+     @Parent() user: UserType
+   ): Promise<ClientTokenType> {
++    this.assertVendorAccountMutationAllowed();
+     if (user.id !== currentUser.id) {
+       throw new ActionForbidden();
+     }
+@@ -105,6 +113,7 @@ export class AuthResolver {
+     @Args('newPassword') newPassword: string,
+     @Args('userId', { type: () => String, nullable: true }) userId?: string
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!userId) {
+       throw new LinkExpired();
+     }
+@@ -133,6 +142,7 @@ export class AuthResolver {
+     @Args('token') token: string,
+     @Args('email') email: string
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     // @see [sendChangeEmail]
+     const valid = await this.models.verificationToken.verify(
+       TokenType.VerifyEmail,
+@@ -166,6 +176,7 @@ export class AuthResolver {
+     _email: string | undefined,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!user.emailVerified) {
+       throw new EmailVerificationRequired();
+     }
+@@ -197,6 +208,7 @@ export class AuthResolver {
+     _email: string | undefined,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     const { token, expiresAt } =
+       await this.models.verificationToken.createWithExpiresAt(
+         TokenType.ChangePassword,
+@@ -225,6 +237,7 @@ export class AuthResolver {
+     @Args('callbackUrl') callbackUrl: string,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!user.emailVerified) {
+       throw new EmailVerificationRequired();
+     }
+@@ -252,6 +265,7 @@ export class AuthResolver {
+     @Args('callbackUrl') callbackUrl: string,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!token) {
+       throw new EmailTokenNotFound();
+     }
+@@ -302,6 +316,7 @@ export class AuthResolver {
+     @Args('callbackUrl') callbackUrl: string,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     const { token, expiresAt } =
+       await this.models.verificationToken.createWithExpiresAt(
+         TokenType.VerifyEmail,
+@@ -322,6 +337,7 @@ export class AuthResolver {
+     @CurrentUser() user: CurrentUser,
+     @Args('token') token: string
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!token) {
+       throw new EmailTokenNotFound();
+     }
+@@ -351,6 +367,7 @@ export class AuthResolver {
+     @Args('userId') userId: string,
+     @Args('callbackUrl') callbackUrl: string
+   ): Promise<string> {
++    this.assertVendorAccountMutationAllowed();
+     const token = await this.models.verificationToken.create(
+       TokenType.ChangePassword,
+       userId
+diff --git a/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts b/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
+index 1b7ee0a..57989ad 100644
+--- a/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
++++ b/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
+@@ -880,6 +880,34 @@ test('new realtime providers publish changed events from domain events', t => {
+   );
+ });
+ 
++test('managed mode realtime membership snapshot omits vendor invite link', async t => {
++  const registry = new RealtimeRegistry();
++  const provider = new WorkspaceMembersRealtimeProvider(
++    {
++      get: async () => ({ inviteId: 'vendor-link' }),
++      ttl: async () => 60,
++    } as never,
++    { link: (path: string) => `https://app.affine.pro${path}` } as never,
++    {
++      user: () => ({
++        workspace: () => ({ assert: async () => {} }),
++      }),
++    } as never,
++    {} as never,
++    registry,
++    undefined,
++    { a2d2Auth: { enabled: true } } as never
++  );
++  provider.onModuleInit();
++
++  t.deepEqual(
++    await registry
++      .getRequest('workspace.invite-link.get')
++      .handle({ id: 'managed-user' } as never, { workspaceId: 'space' }),
++    { inviteLink: null }
++  );
++});
++
+ test('quota realtime provider exposes effective quota state snapshots', async t => {
+   const registry = new RealtimeRegistry();
+   const provider = new QuotaStateRealtimeProvider(
+diff --git a/packages/backend/server/src/core/user/resolver.ts b/packages/backend/server/src/core/user/resolver.ts
+index 7e8c36a..236c565 100644
+--- a/packages/backend/server/src/core/user/resolver.ts
++++ b/packages/backend/server/src/core/user/resolver.ts
+@@ -16,6 +16,7 @@ import { isNil, omitBy } from 'lodash-es';
+ 
+ import {
+   CannotDeleteOwnAccount,
++  Config,
+   EventBus,
+   type FileUpload,
+   ImageFormatNotSupported,
+@@ -32,6 +33,7 @@ import {
+   UserSettingsSchema,
+ } from '../../models';
+ import { processImage } from '../../native';
++import { A2d2AuthError } from '../auth/a2d2/error';
+ import { Public } from '../auth/guard';
+ import { sessionUser } from '../auth/service';
+ import { CurrentUser } from '../auth/session';
+@@ -50,11 +52,18 @@ import {
+   UserType,
+ } from './types';
+ 
++function assertVendorAccountMutationAllowed(config: Config) {
++  if (config.a2d2Auth.enabled) {
++    throw new A2d2AuthError('scope_or_membership_denied');
++  }
++}
++
+ @Resolver(() => UserType)
+ export class UserResolver {
+   constructor(
+     private readonly storage: AvatarStorage,
+-    private readonly models: Models
++    private readonly models: Models,
++    private readonly config: Config
+   ) {}
+ 
+   @Throttle('strict')
+@@ -115,6 +124,7 @@ export class UserResolver {
+     @Args({ name: 'avatar', type: () => GraphQLUpload })
+     avatar: FileUpload
+   ) {
++    assertVendorAccountMutationAllowed(this.config);
+     if (!user) {
+       throw new UserNotFound();
+     }
+@@ -155,6 +165,7 @@ export class UserResolver {
+     @CurrentUser() user: CurrentUser,
+     @Args('input', { type: () => UpdateUserInput }) input: UpdateUserInput
+   ): Promise<UserType> {
++    assertVendorAccountMutationAllowed(this.config);
+     input = omitBy(input, isNil);
+ 
+     if (Object.keys(input).length === 0) {
+@@ -169,6 +180,7 @@ export class UserResolver {
+     description: 'Remove user avatar',
+   })
+   async removeAvatar(@CurrentUser() user: CurrentUser) {
++    assertVendorAccountMutationAllowed(this.config);
+     if (!user) {
+       throw new UserNotFound();
+     }
+@@ -180,6 +192,7 @@ export class UserResolver {
+   async deleteAccount(
+     @CurrentUser() user: CurrentUser
+   ): Promise<DeleteAccount> {
++    assertVendorAccountMutationAllowed(this.config);
+     await this.models.user.delete(user.id);
+     return { success: true };
+   }
+@@ -271,7 +284,8 @@ const UserImportResultType = createUnionType({
+ export class UserManagementResolver {
+   constructor(
+     private readonly db: PrismaClient,
+-    private readonly models: Models
++    private readonly models: Models,
++    private readonly config: Config
+   ) {}
+ 
+   @Query(() => Int, {
+@@ -340,8 +354,10 @@ export class UserManagementResolver {
+     description: 'Create a new user',
+   })
+   async createUser(
+-    @Args({ name: 'input', type: () => CreateUserInput }) input: CreateUserInput
++    @Args({ name: 'input', type: () => CreateUserInput })
++    input: CreateUserInput
+   ) {
++    assertVendorAccountMutationAllowed(this.config);
+     const { id } = await this.models.user.create({
+       ...input,
+       registered: true,
+@@ -358,6 +374,7 @@ export class UserManagementResolver {
+     @Args({ name: 'input', type: () => ImportUsersInput })
+     input: ImportUsersInput
+   ): Promise<(typeof UserImportResultType)[]> {
++    assertVendorAccountMutationAllowed(this.config);
+     const results = await this.models.user.importUsers(input.users);
+ 
+     return results.map((result, i) => {
+@@ -379,6 +396,7 @@ export class UserManagementResolver {
+     @CurrentUser() user: CurrentUser,
+     @Args('id') id: string
+   ): Promise<DeleteAccount> {
++    assertVendorAccountMutationAllowed(this.config);
+     if (user.id === id) {
+       throw new CannotDeleteOwnAccount();
+     }
+@@ -393,6 +411,7 @@ export class UserManagementResolver {
+     @Args('id') id: string,
+     @Args('input') input: ManageUserInput
+   ): Promise<UserType> {
++    assertVendorAccountMutationAllowed(this.config);
+     const user = await this.db.user.findUnique({
+       where: { id },
+     });
+@@ -418,6 +437,7 @@ export class UserManagementResolver {
+     description: 'Ban an user',
+   })
+   async banUser(@Args('id') id: string): Promise<UserType> {
++    assertVendorAccountMutationAllowed(this.config);
+     return sessionUser(await this.models.user.ban(id));
+   }
+ 
+@@ -425,6 +445,7 @@ export class UserManagementResolver {
+     description: 'Reenable an banned user',
+   })
+   async enableUser(@Args('id') id: string): Promise<UserType> {
++    assertVendorAccountMutationAllowed(this.config);
+     return sessionUser(await this.models.user.enable(id));
+   }
+ }
+diff --git a/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts b/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
+index fd90008..7eea477 100644
+--- a/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
++++ b/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
+@@ -3,7 +3,6 @@ import { createHash } from 'node:crypto';
+ import {
+   createInviteLinkMutation,
+   inviteByEmailsMutation,
+-  WorkspaceInviteLinkExpireTime,
+ } from '@affine/graphql';
+ import { PrismaClient, WorkspaceMemberStatus } from '@prisma/client';
+ import test from 'ava';
+@@ -13,8 +12,8 @@ import Sinon from 'sinon';
+ import { createApp, type TestingApp } from '../../../__tests__/e2e/test';
+ import { Mockers } from '../../../__tests__/mocks';
+ import { Config } from '../../../base';
+-import { ActionForbidden, TooManyRequest } from '../../../base/error';
+-import { Models, WorkspaceRole } from '../../../models';
++import { TooManyRequest } from '../../../base/error';
++import { Models } from '../../../models';
+ import {
+   getAbuseRequestSource,
+   InviteAbuseDispositionService,
+diff --git a/packages/backend/server/src/core/workspaces/realtime.ts b/packages/backend/server/src/core/workspaces/realtime.ts
+index 21b57ce..f37c081 100644
+--- a/packages/backend/server/src/core/workspaces/realtime.ts
++++ b/packages/backend/server/src/core/workspaces/realtime.ts
+@@ -10,6 +10,7 @@ import { z } from 'zod';
+ 
+ import {
+   Cache,
++  Config,
+   isValidCacheTtl,
+   OnEvent,
+   QueryTooLong,
+@@ -216,7 +217,8 @@ export class WorkspaceMembersRealtimeProvider implements OnModuleInit {
+     private readonly ac: PermissionAccess,
+     private readonly models: Models,
+     @Optional() private readonly registry?: RealtimeRegistry,
+-    @Optional() private readonly publisher?: RealtimePublisher
++    @Optional() private readonly publisher?: RealtimePublisher,
++    @Optional() private readonly config?: Config
+   ) {}
+ 
+   onModuleInit() {
+@@ -356,6 +358,10 @@ export class WorkspaceMembersRealtimeProvider implements OnModuleInit {
+   ): Promise<WorkspaceInviteLinkSnapshot | null> {
+     await this.assertInviteManage(user.id, workspaceId);
+ 
++    if (this.config?.a2d2Auth.enabled) {
++      return null;
++    }
++
+     const cacheId = `workspace:inviteLink:${workspaceId}`;
+     const id = await this.cache.get<{ inviteId: string }>(cacheId);
+     if (!id) {
+diff --git a/packages/backend/server/src/core/workspaces/resolvers/member.ts b/packages/backend/server/src/core/workspaces/resolvers/member.ts
+index 3ab1afb..b04a9ff 100644
+--- a/packages/backend/server/src/core/workspaces/resolvers/member.ts
++++ b/packages/backend/server/src/core/workspaces/resolvers/member.ts
+@@ -109,6 +109,12 @@ export class WorkspaceMemberResolver {
+     private readonly runtime: BackendRuntimeProvider
+   ) {}
+ 
++  private assertVendorMembershipMutationAllowed() {
++    if (this.config.a2d2Auth.enabled) {
++      throw new ActionForbidden('Workspace membership is managed by A2D2.');
++    }
++  }
++
+   private async assertCanInviteOrShare(
+     userId: string,
+     context: {
+@@ -235,6 +241,7 @@ export class WorkspaceMemberResolver {
+     @Args('workspaceId') workspaceId: string,
+     @Args({ name: 'emails', type: () => [String] }) emails: string[]
+   ): Promise<InviteResult[]> {
++    this.assertVendorMembershipMutationAllowed();
+     await this.ac
+       .user(me.id)
+       .workspace(workspaceId)
+@@ -427,6 +434,10 @@ export class WorkspaceMemberResolver {
+       .workspace(workspace.id)
+       .assert('Workspace.Users.Manage');
+ 
++    if (this.config.a2d2Auth.enabled) {
++      return null;
++    }
++
+     const cacheId = `workspace:inviteLink:${workspace.id}`;
+     const id = await this.cache.get<{ inviteId: string }>(cacheId);
+     if (id) {
+@@ -448,6 +459,7 @@ export class WorkspaceMemberResolver {
+     @Args('expireTime', { type: () => WorkspaceInviteLinkExpireTime })
+     expireTime: WorkspaceInviteLinkExpireTime
+   ): Promise<InviteLink> {
++    this.assertVendorMembershipMutationAllowed();
+     await this.ac
+       .user(user.id)
+       .workspace(workspaceId)
+@@ -511,6 +523,7 @@ export class WorkspaceMemberResolver {
+     @Args('workspaceId') workspaceId: string,
+     @Args('userId') userId: string
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     await this.ac
+       .user(me.id)
+       .workspace(workspaceId)
+@@ -567,6 +580,7 @@ export class WorkspaceMemberResolver {
+     @Args('userId') userId: string,
+     @Args('permission', { type: () => WorkspaceRole }) newRole: WorkspaceRole
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     await this.ac
+       .user(user.id)
+       .workspace(workspaceId)
+@@ -642,6 +656,7 @@ export class WorkspaceMemberResolver {
+     @Args('workspaceId') workspaceId: string,
+     @Args('userId') userId: string
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     if (userId === me.id) {
+       throw new CanNotRevokeYourself();
+     }
+@@ -697,6 +712,7 @@ export class WorkspaceMemberResolver {
+     })
+     _sendAcceptMail: boolean
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     const role = await this.models.workspaceUser.getById(inviteId);
+     // invitation by email
+     if (role) {
+@@ -759,6 +775,7 @@ export class WorkspaceMemberResolver {
+     })
+     _workspaceName?: string
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     const role = await this.models.workspaceUser.getActive(
+       workspaceId,
+       user.id
+diff --git a/packages/backend/server/src/global.d.ts b/packages/backend/server/src/global.d.ts
+index 8a90ad7..7fc6aef 100644
+--- a/packages/backend/server/src/global.d.ts
++++ b/packages/backend/server/src/global.d.ts
+@@ -1,7 +1,7 @@
+ declare namespace Express {
+   interface Request {
+     session?: import('./core/auth/session').Session;
+-    authType?: 'jwt' | 'session';
++    authType?: 'jwt' | 'session' | 'a2d2';
+   }
+ }
+ 
+diff --git a/packages/frontend/apps/web/package.json b/packages/frontend/apps/web/package.json
+index 4ae07de..2cf14f4 100644
+--- a/packages/frontend/apps/web/package.json
++++ b/packages/frontend/apps/web/package.json
+@@ -23,6 +23,7 @@
+   "devDependencies": {
+     "@types/react": "^19.0.1",
+     "@types/react-dom": "^19.0.2",
+-    "typescript": "npm:@typescript/typescript6@6.0.2"
++    "typescript": "npm:@typescript/typescript6@6.0.2",
++    "vitest": "^4.1.10"
+   }
+ }
+diff --git a/packages/frontend/apps/web/src/app.tsx b/packages/frontend/apps/web/src/app.tsx
+index 6b91cb6..7a7b91a 100644
+--- a/packages/frontend/apps/web/src/app.tsx
++++ b/packages/frontend/apps/web/src/app.tsx
+@@ -2,6 +2,7 @@ import { AffineContext } from '@affine/core/components/context';
+ import { AppContainer } from '@affine/core/desktop/components/app-container';
+ import { router } from '@affine/core/desktop/router';
+ import { configureCommonModules } from '@affine/core/modules';
++import { AuthService, DefaultServerService } from '@affine/core/modules/cloud';
+ import { I18nProvider } from '@affine/core/modules/i18n';
+ import { LifecycleService } from '@affine/core/modules/lifecycle';
+ import {
+@@ -10,6 +11,7 @@ import {
+ } from '@affine/core/modules/storage';
+ import { PopupWindowProvider } from '@affine/core/modules/url';
+ import { configureBrowserWorkbenchModule } from '@affine/core/modules/workbench';
++import { WorkspacesService } from '@affine/core/modules/workspace';
+ import { configureBrowserWorkspaceFlavours } from '@affine/core/modules/workspace-engine';
+ import createEmotionCache from '@affine/core/utils/create-emotion-cache';
+ import { getWorkerUrl } from '@affine/env/worker';
+@@ -95,6 +97,27 @@ window.addEventListener('focus', () => {
+ });
+ frameworkProvider.get(LifecycleService).applicationStart();
+ 
++export async function prepareA2d2ManagedWorkspace(workspaceId: string) {
++  const server = frameworkProvider.get(DefaultServerService).server;
++  await server.waitForConfigRevalidation();
++  const session = await server.scope.framework
++    .get(AuthService)
++    .session.revalidateOnce();
++  if (!session?.account) {
++    throw new Error('A2D2 managed session was not accepted');
++  }
++
++  const workspaces = frameworkProvider.get(WorkspacesService);
++  await workspaces.list.waitForRevalidation();
++  const managedWorkspace = workspaces.list.workspaces$.value.find(
++    workspace =>
++      workspace.id === workspaceId && workspace.flavour === 'affine-cloud'
++  );
++  if (!managedWorkspace) {
++    throw new Error('A2D2 managed workspace is unavailable');
++  }
++}
++
+ export function App() {
+   return (
+     <Suspense>
+diff --git a/packages/frontend/apps/web/src/index.tsx b/packages/frontend/apps/web/src/index.tsx
+index 01a9436..7fa42a1 100644
+--- a/packages/frontend/apps/web/src/index.tsx
++++ b/packages/frontend/apps/web/src/index.tsx
+@@ -4,9 +4,23 @@ import { Telemetry } from '@affine/core/components/telemetry';
+ import { StrictMode } from 'react';
+ import { createRoot } from 'react-dom/client';
+ 
+-import { App } from './app';
++import {
++  isManagedWorkspacePath,
++  managedWorkspacePath,
++  prepareA2d2ManagedLaunch,
++} from './a2d2-managed-auth';
+ 
+-function mountApp() {
++async function mountApp() {
++  const workspaceId = await prepareA2d2ManagedLaunch();
++  const { App, prepareA2d2ManagedWorkspace } = await import('./app');
++  if (workspaceId) {
++    await prepareA2d2ManagedWorkspace(workspaceId);
++    const workspacePath = managedWorkspacePath(workspaceId);
++    if (!isManagedWorkspacePath(workspaceId, location.pathname)) {
++      location.replace(workspacePath);
++      return;
++    }
++  }
+   // oxlint-disable-next-line typescript/no-non-null-assertion
+   const root = document.getElementById('app')!;
+   createRoot(root).render(
+@@ -17,8 +31,13 @@ function mountApp() {
+   );
+ }
+ 
+-try {
+-  mountApp();
+-} catch (err) {
++void mountApp().catch(err => {
+   console.error('Failed to bootstrap app', err);
+-}
++  const root = document.getElementById('app');
++  if (
++    root &&
++    (window.a2d2Engine || localStorage.getItem('a2d2-managed-workspace-id'))
++  ) {
++    root.textContent = 'A2D2 sign-in is unavailable. Please retry from A2D2.';
++  }
++});
+diff --git a/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx b/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
+index a3efb76..a9b90f0 100644
+--- a/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
++++ b/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
+@@ -10,6 +10,7 @@ export const InviteMembersButton = () => {
+   const workspace = useService(WorkspaceService).workspace;
+ 
+   const isLocal = workspace.flavour === 'local';
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
+ 
+   const dialogService = useService(WorkspaceDialogService);
+   const onOpenInviteMembersModal = useCallback(() => {
+@@ -20,7 +21,7 @@ export const InviteMembersButton = () => {
+ 
+   const t = useI18n();
+ 
+-  if (isLocal) {
++  if (isLocal || managedByA2d2) {
+     return null;
+   }
+ 
+diff --git a/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx b/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
+index e501388..7ff5d9a 100644
+--- a/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
++++ b/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
+@@ -56,6 +56,7 @@ export const CloudWorkspaceMembersPanel = ({
+   onChangeSettingState: (settingState: SettingState) => void;
+   isTeam?: boolean;
+ }) => {
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
+   const workspaceShareSettingService = useService(WorkspaceShareSettingService);
+   const subscription = useService(WorkspaceSubscriptionService).subscription;
+   const workspaceSubscription = useLiveData(subscription.subscription$);
+@@ -86,10 +87,14 @@ export const CloudWorkspaceMembersPanel = ({
+   }, [membersService]);
+ 
+   useEffect(() => {
+-    if (isOwnerOrAdmin) {
++    if (isOwnerOrAdmin && !managedByA2d2) {
+       workspaceShareSettingService.sharePreview.revalidateInviteLink();
+     }
+-  }, [isOwnerOrAdmin, workspaceShareSettingService.sharePreview]);
++  }, [
++    isOwnerOrAdmin,
++    managedByA2d2,
++    workspaceShareSettingService.sharePreview,
++  ]);
+ 
+   const workspaceQuotaService = useService(WorkspaceQuotaService);
+   useEffect(() => {
+@@ -296,8 +301,12 @@ export const CloudWorkspaceMembersPanel = ({
+ 
+   return (
+     <>
+-      <SettingRow name={title} desc={desc} spreadCol={!!isOwnerOrAdmin}>
+-        {isOwnerOrAdmin ? (
++      <SettingRow
++        name={title}
++        desc={managedByA2d2 ? 'Workspace membership is managed by A2D2.' : desc}
++        spreadCol={!!isOwnerOrAdmin && !managedByA2d2}
++      >
++        {isOwnerOrAdmin && !managedByA2d2 ? (
+           <>
+             <Button onClick={openInviteModal}>{t['Invite Members']()}</Button>
+             {!isTeam ? (
+@@ -327,8 +336,8 @@ export const CloudWorkspaceMembersPanel = ({
+ 
+       <div className={styles.membersPanel}>
+         <MemberList
+-          isOwner={!!isOwner}
+-          isAdmin={!!isAdmin}
++          isOwner={!managedByA2d2 && !!isOwner}
++          isAdmin={!managedByA2d2 && !!isAdmin}
+           goToTeamBilling={goToTeamBilling}
+         />
+       </div>
+diff --git a/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx b/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
+index 6f39e9c..97fe4bd 100644
+--- a/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
++++ b/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
+@@ -14,6 +14,7 @@ export function AppDownloadButton({
+   style?: React.CSSProperties;
+ }) {
+   const [show, setShow] = useState(true);
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
+ 
+   const handleClose = useCatchEventCallback(() => {
+     setShow(false);
+@@ -26,7 +27,7 @@ export function AppDownloadButton({
+     open(url, '_blank');
+   }, []);
+ 
+-  if (!show) {
++  if (managedByA2d2 || !show) {
+     return null;
+   }
+   return (
+diff --git a/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx b/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
+index 91c5bbb..f14a825 100644
+--- a/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
++++ b/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
+@@ -36,6 +36,9 @@ export const OpenInAppCard = () => {
+   }, []);
+ 
+   const appIcon = appIconMap[BUILD_CONFIG.appBuildType];
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
++
++  if (managedByA2d2) return null;
+ 
+   return (
+     <div
+diff --git a/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx b/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
+index 8116a48..a7f1402 100644
+--- a/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
++++ b/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
+@@ -13,10 +13,15 @@ const WebOpenInAppGuard = ({ children }: { children: React.ReactNode }) => {
+   }
+   const service = useService(OpenInAppService);
+   const shouldOpenInApp = useLiveData(service.showOpenInAppPage$);
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
+ 
+   useEffect(() => {
+-    service?.bootstrap();
+-  }, [service]);
++    if (managedByA2d2) {
++      service.hideOpenInAppPage();
++    } else {
++      service.bootstrap();
++    }
++  }, [managedByA2d2, service]);
+ 
+   const onOpenHere = useCallback(
+     (e: React.MouseEvent) => {
+@@ -27,9 +32,11 @@ const WebOpenInAppGuard = ({ children }: { children: React.ReactNode }) => {
+   );
+ 
+   if (shouldOpenInApp === undefined) {
+-    return null;
++    return managedByA2d2 ? children : null;
+   }
+ 
++  if (managedByA2d2) return children;
++
+   return shouldOpenInApp && !environment.isMobile ? (
+     <OpenInAppPage openHereClicked={onOpenHere} mode="open-doc" />
+   ) : (
+diff --git a/yarn.lock b/yarn.lock
+index fbf69c4..9490dac 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -1086,6 +1086,7 @@ __metadata:
+     react-dom: "npm:^19.2.1"
+     react-router-dom: "npm:^6.30.4"
+     typescript: "npm:@typescript/typescript6@6.0.2"
++    vitest: "npm:^4.1.10"
+   languageName: unknown
+   linkType: soft
+ 
+diff --git a/deploy/a2d2/.env.example b/deploy/a2d2/.env.example
+new file mode 100644
+index 0000000..fb87c74
+--- /dev/null
++++ b/deploy/a2d2/.env.example
+@@ -0,0 +1,10 @@
++# Load the custom image archive and use the exact ID recorded in IMAGE.json.
++AFFINE_IMAGE=sha256:REPLACE_WITH_VERIFIED_A2D2_AFFINE_IMAGE_ID
++POSTGRES_PASSWORD=REPLACE_WITH_RANDOM_LOCAL_PASSWORD
++AFFINE_EXTERNAL_URL=http://127.0.0.1:3010
++AFFINE_SERVER_HOST=127.0.0.1
++AFFINE_SERVER_HTTPS=false
++AFFINE_A2D2_AUTH_ENABLED=true
++AFFINE_A2D2_BROKER_URL=REPLACE_WITH_PRIVATE_BUZZ_ENGINE_BROKER_URL
++AFFINE_A2D2_ORIGIN=http://127.0.0.1:3010
++AFFINE_A2D2_ENGINE_SECRET=REPLACE_WITH_RANDOM_SHARED_ENGINE_SECRET_AT_LEAST_32_BYTES
+diff --git a/deploy/a2d2/.env.remote.example b/deploy/a2d2/.env.remote.example
+new file mode 100644
+index 0000000..28b9db6
+--- /dev/null
++++ b/deploy/a2d2/.env.remote.example
+@@ -0,0 +1,12 @@
++# Load the task-owned archive first, then set this to its exact local image ID.
++AFFINE_IMAGE=sha256:REPLACE_WITH_VERIFIED_A2D2_AFFINE_IMAGE_ID
++POSTGRES_IMAGE=pgvector/pgvector@sha256:eac621400b7b7ff52493883e41e930e3d104695fea5b68cc0c42370cf7880067
++REDIS_IMAGE=redis@sha256:1db42ccef14898aa29bae778452d567534b59c107129cbc1163fb552de184d3c
++POSTGRES_PASSWORD=REPLACE_WITH_RANDOM_HEX_SECRET
++AFFINE_EXTERNAL_URL=https://affine.a2d2.space
++AFFINE_SERVER_HOST=affine.a2d2.space
++AFFINE_SERVER_HTTPS=true
++AFFINE_A2D2_AUTH_ENABLED=true
++AFFINE_A2D2_BROKER_URL=REPLACE_WITH_PRIVATE_BUZZ_ENGINE_BROKER_URL
++AFFINE_A2D2_ORIGIN=https://affine.a2d2.space
++AFFINE_A2D2_ENGINE_SECRET=REPLACE_WITH_RANDOM_SHARED_ENGINE_SECRET_AT_LEAST_32_BYTES
+diff --git a/deploy/a2d2/.gitignore b/deploy/a2d2/.gitignore
+new file mode 100644
+index 0000000..70aefaa
+--- /dev/null
++++ b/deploy/a2d2/.gitignore
+@@ -0,0 +1,4 @@
++.env
++*.private.json
++.env.remote
++__pycache__/
+diff --git a/deploy/a2d2/Dockerfile.managed b/deploy/a2d2/Dockerfile.managed
+new file mode 100644
+index 0000000..faacbf8
+--- /dev/null
++++ b/deploy/a2d2/Dockerfile.managed
+@@ -0,0 +1,33 @@
++# syntax=docker/dockerfile:1.7
++
++FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS assets
++WORKDIR /app
++
++COPY ./packages/backend/server /app
++COPY ./packages/frontend/apps/web/dist /app/static
++COPY ./packages/frontend/admin/dist /app/static/admin
++COPY ./packages/frontend/apps/mobile/dist /app/static/mobile
++
++ARG TARGETARCH
++ARG TARGETVARIANT
++RUN apt-get update && \
++  apt-get install -y --no-install-recommends openssl ca-certificates && \
++  rm -rf /var/lib/apt/lists/*
++RUN AFFINE_DOCKER_CLEAN=1 TARGETARCH="${TARGETARCH}" TARGETVARIANT="${TARGETVARIANT}" node ./scripts/docker-clean.mjs
++
++FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
++WORKDIR /app
++
++ARG SOURCE_REVISION
++ARG IMAGE_VERSION
++LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
++LABEL org.opencontainers.image.version="${IMAGE_VERSION}"
++
++COPY --from=assets /app /app
++RUN apt-get update && \
++  apt-get install -y --no-install-recommends openssl libjemalloc2 && \
++  rm -rf /var/lib/apt/lists/*
++
++ENV LD_PRELOAD=libjemalloc.so.2
++EXPOSE 3010
++CMD ["node", "./dist/main.js"]
+diff --git a/deploy/a2d2/IMAGE.json b/deploy/a2d2/IMAGE.json
+new file mode 100644
+index 0000000..78b3296
+--- /dev/null
++++ b/deploy/a2d2/IMAGE.json
+@@ -0,0 +1,12 @@
++{
++  "archive": "AFFINE_MANAGED_LINUX_AMD64_20260917.tar.gz",
++  "archiveBytes": 226001032,
++  "archiveSha256": "cad8fa9f8c942afabea4d5321be1c26e3279f4f3c1a1a0a512ee82a7e37e1d8d",
++  "imageId": "sha256:eaa9d4050acf053a1320eda24a6cb3e84619827602ec633313a09e1ddead6ed7",
++  "nodeBase": "node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5",
++  "platform": "linux/amd64",
++  "reviewedSource": "b4c8548c09da21b2898443559a5b846f0ccf5dd8",
++  "reviewedSourceTag": "v0.27.4",
++  "sourceManifest": "SOURCE_IMAGE_MANIFEST.json",
++  "sourceManifestSha256": "e7497180af97ae4dbda544ded77b9d28b0dd7c4d2dcc207f0a47fbb7a58ec883"
++}
+diff --git a/deploy/a2d2/README.md b/deploy/a2d2/README.md
+new file mode 100644
+index 0000000..cc8e1f3
+--- /dev/null
++++ b/deploy/a2d2/README.md
+@@ -0,0 +1,49 @@
++# A2D2 관리형 AFFiNE 런타임
++
++이 구성은 AFFiNE v0.27.4 전체 웹 UI와 서버를 사용하면서 로그인과 회원
++권한을 A2D2 relay membership에 연결한다. 별도 AFFiNE 가입, 비밀번호,
++OAuth와 관리자 계정 생성은 관리형 모드에서 차단된다. 확인한 원본 기준은
++태그 `v0.27.4`, 커밋 `b4c8548c09da21b2898443559a5b846f0ccf5dd8`이다.
++
++현재 저장 방식은 A2D2가 소유한 GCP의 AFFiNE Postgres와 blob storage를
++백업·운영하는 방식이다. AFFiNE 문서 데이터를 Nostr canonical storage로
++전면 교체하는 작업은 포함하지 않는다.
++
++## 이미지 빌드
++
++[`build-managed-image.sh`](build-managed-image.sh)는 현재 소스의 web, admin,
++mobile, server를 빌드하고 공식 production-focus 의존성을 만든 뒤 pinned
++Node base로 Linux amd64 이미지를 생성한다. 원본 `server-native` 파일은
++공식 v0.27.4 플랫폼별 image digest에서만 가져오며 SHA-256을 검사한다.
++
++```sh
++./build-managed-image.sh /private/output a2d2-affine-managed:0.27.4-a2d2
++```
++
++출력의 `image-build-result.txt`와 archive SHA-256을 함께 보관한다. 서버
++bundle 명령은 일부 오류에서 exit 0을 반환할 수 있으므로 recipe는
++`compiled successfully`를 요구하고 Rspack 오류 문자열도 거부한다.
++
++## 실행 계약
++
++1. [`IMAGE.json`](IMAGE.json)의 exact image ID와 일치하는 archive만 load한다.
++2. `.env.remote.example`을 mode 0600 파일로 복사하고 secret 값을 채운다.
++3. `AFFINE_A2D2_ORIGIN`은 브라우저가 보는 정확한 HTTPS root origin과 같아야
++   한다. broker URL은 private service 경로이며 외부 UI에 노출하지 않는다.
++4. `AFFINE_A2D2_ENGINE_SECRET`은 Buzz와 AFFiNE가 공유하는 32-byte 이상의
++   provider 전용 비밀이다. 이미지나 저장소에 넣지 않는다.
++5. `./start.sh .env.remote`는 exact local image ID를 확인하고 Postgres/Redis만
++   pinned registry digest로 pull한다.
++
++호스트에는 `127.0.0.1:3010`만 공개한다. TLS ingress는 Host와 WebSocket을
++보존해 `/api/*`, `/graphql`, `/socket.io/*`, static routes와 workspace routes를
++같은 backend로 전달해야 한다. Postgres, Redis, storage와 config volume은
++기존 A2D2 AFFiNE 전용 volume을 그대로 사용한다. `down -v`는 금지한다.
++
++관리형 최초 workspace는 검증된 relay owner만 만들 수 있다. 이후 동일
++community의 owner/admin/member는 각각 AFFiNE owner/admin/collaborator 기술
++principal에 결합된다. 모든 HTTP 요청과 Socket.IO packet은 broker session을
++다시 확인한다. 같은 session의 동시 확인은 합쳐지고, 서로 다른 in-flight
++확인은 128개에서 fail closed된다.
++
++운영 순서와 rollback 조건은 [`REMOTE.md`](REMOTE.md)를 따른다.
+diff --git a/deploy/a2d2/REMOTE.md b/deploy/a2d2/REMOTE.md
+new file mode 100644
+index 0000000..87cfb4e
+--- /dev/null
++++ b/deploy/a2d2/REMOTE.md
+@@ -0,0 +1,52 @@
++# GCP Linux amd64 배포 handoff
++
++## 배포 전
++
++1. 현재 AFFiNE Postgres의 logical backup, storage volume, config volume을 같은
++   시점에 보존하고 checksum을 기록한다. 원본 volume을 지우거나 재사용
++   이름을 바꾸지 않는다.
++2. custom image archive를 load한 뒤 `docker image inspect`의 exact ID가
++   [`IMAGE.json`](IMAGE.json)과 같은지 확인한다. moving tag는 사용하지 않는다.
++3. mode 0600 `.env.remote`에 public origin, private broker URL, DB password와
++   provider HMAC secret을 넣는다. 출력·로그·compose render에 secret 값을
++   남기지 않는다.
++4. migration을 backup clone에서 먼저 실행하고 기존 workspace/doc/blob 수와
++   hash가 보존되는지 확인한다. 신규 표는 community와 A2D2 principal mapping만
++   추가하며 원본 AFFiNE 데이터 표를 재작성하지 않는다.
++
++```sh
++docker load < affine-managed-linux-amd64.tar.gz
++docker image inspect sha256:EXACT_IMAGE_ID
++./start.sh .env.remote
++```
++
++## 배포 후 최소 검증
++
++- `/info`와 원본 root HTML이 모두 200인지 확인한다.
++- 검증된 relay owner가 최초 관리형 workspace를 한 번 만들고, 재로그인해 같은
++  workspace를 재사용하는지 확인한다.
++- 원본 Page 본문, PNG blob, Edgeless shape를 생성한 뒤 새 session과 app restart
++  후 재열기한다. blob은 source와 exact SHA-256을 비교한다.
++- 기존 vendor signup/password/OAuth와 vendor account admin mutation은 거부되고
++  별도 메일이 발송되지 않아야 한다.
++- member 제거 뒤 다음 HTTP 요청과 Socket.IO packet이 거부되는지 확인한다.
++- 기존 문서/workspace/blob 수, migration 상태, error log, restart/OOM count를
++  cutover 전 baseline과 비교한다.
++
++## Rollback
++
++- migration 전 또는 사용자 write 전 실패: 서비스를 중지하고 검증된 backup
++  clone으로 원본 image가 기동되는지 확인한 뒤 backup+원본 image를 복구한다.
++- migration 뒤 관리형 workspace/doc/blob write가 발생한 후에는 예전 DB backup
++  복구로 되돌리지 않는다. 새 데이터를 잃기 때문이다. 동일 schema를 읽는
++  검증된 custom image로 roll forward하거나 관리형 auth를 비활성화한 동일
++  image로 서비스 가용성을 회복한다.
++- 원본 official v0.27.4 image가 신규 migration 기록을 허용하는지는 clone에서
++  실제 startup으로 확인하기 전 rollback artifact로 간주하지 않는다. migration
++  row 삭제, checksum 변경, table drop으로 우회하지 않는다.
++- A2D2 broker/session 장애는 provider mapping을 삭제하는 이유가 아니다. 5xx는
++  fail closed/retry하고, authoritative membership denial일 때만 해당 principal을
++  비활성화한다.
++
++브라우저 harness의 관리형 auth와 provider persistence 증거는 native Tauri
++managed-launch 증거와 별개다. 최종 배포 판정에는 둘 다 필요하다.
+diff --git a/deploy/a2d2/REMOTE_IMAGES.json b/deploy/a2d2/REMOTE_IMAGES.json
+new file mode 100644
+index 0000000..4e8481e
+--- /dev/null
++++ b/deploy/a2d2/REMOTE_IMAGES.json
+@@ -0,0 +1,9 @@
++{
++  "platform": "linux/amd64",
++  "affineVersion": "0.27.4-a2d2-20260917",
++  "images": {
++    "affine": "sha256:eaa9d4050acf053a1320eda24a6cb3e84619827602ec633313a09e1ddead6ed7",
++    "postgres": "pgvector/pgvector@sha256:eac621400b7b7ff52493883e41e930e3d104695fea5b68cc0c42370cf7880067",
++    "redis": "redis@sha256:1db42ccef14898aa29bae778452d567534b59c107129cbc1163fb552de184d3c"
++  }
++}
+diff --git a/deploy/a2d2/build-managed-image.sh b/deploy/a2d2/build-managed-image.sh
+new file mode 100755
+index 0000000..65af4c9
+--- /dev/null
++++ b/deploy/a2d2/build-managed-image.sh
+@@ -0,0 +1,96 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++repo=$(cd "$(dirname "$0")/../.." && pwd)
++out=${1:?Usage: build-managed-image.sh OUT_DIR [IMAGE_TAG]}
++tag=${2:-a2d2-affine-managed:0.27.4-a2d2}
++expected_revision=b4c8548c09da21b2898443559a5b846f0ccf5dd8
++image_version=0.27.4-a2d2
++builder=${A2D2_DOCKER_BUILDER:-desktop-linux}
++stage=$(mktemp -d)
++mkdir -p "$out"
++trap 'rm -rf "$stage"' EXIT
++
++cd "$repo"
++test "$(git rev-parse HEAD)" = "$expected_revision"
++
++# The pinned upstream images are used only as immutable sources for the
++# unchanged native addon that the official build workflow downloads separately.
++extract_native() {
++  digest=$1
++  name=$2
++  expected=$3
++  target="packages/backend/native/$name"
++  if [ ! -f "$target" ] || [ "$(shasum -a 256 "$target" | awk '{print $1}')" != "$expected" ]; then
++    container=$(docker create "ghcr.io/toeverything/affine@$digest")
++    trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$stage"' EXIT
++    docker cp "$container:/app/dist/$name" "$target"
++    docker rm "$container" >/dev/null
++    trap 'rm -rf "$stage"' EXIT
++  fi
++  test "$(shasum -a 256 "$target" | awk '{print $1}')" = "$expected"
++}
++
++mkdir -p packages/backend/native
++extract_native sha256:c312116a134184947d98749c8a8e29f4e3bc97f4f2a51c9a3497f9baea2eec2b \
++  server-native.x64.node 325288c6872b68f66cf5bb25fc16516af7e1adaaf12a4e973a02b25caf45270b
++extract_native sha256:adb3cea3eb4a50a6116dbab7dc045252b54ede3e73828a85a58daf78da3b1f6d \
++  server-native.arm64.node f47aa138462d8b296bef53cb0020b0f3bcde87f45fbf3830ffda2022afc93529
++extract_native sha256:558feb6d651ac5433a3c05d0c5459f3e5cbc659c1bc531598c6768163da630ff \
++  server-native.armv7.node 8c1ff199683211e1b5290b3769a235cd31f9b90f0bd3ef9cd342acaf3c145305
++
++yarn affine @affine/web build 2>&1 | tee "$out/web-build.log"
++yarn affine @affine/admin build 2>&1 | tee "$out/admin-build.log"
++yarn affine @affine/mobile build 2>&1 | tee "$out/mobile-build.log"
++yarn affine @affine/server build 2>&1 | tee "$out/server-build.log"
++grep -q 'compiled successfully' "$out/server-build.log"
++if grep -Eq 'Rspack compilation failed|Module not found|ERROR in ' "$out/server-build.log"; then
++  echo 'Server bundle contains a compilation error' >&2
++  exit 1
++fi
++
++# Mirror the official build-images workflow without replacing this checkout's
++# developer node_modules: make the production focus in a disposable context.
++rsync -a \
++  --exclude='.git' --exclude='node_modules' --exclude='target' \
++  --exclude='dist' --exclude='.cache' \
++  "$repo/" "$stage/"
++mkdir -p \
++  "$stage/packages/backend/server" \
++  "$stage/packages/frontend/apps/web" \
++  "$stage/packages/frontend/apps/mobile" \
++  "$stage/packages/frontend/admin"
++rsync -a "$repo/packages/backend/server/dist/" "$stage/packages/backend/server/dist/"
++rsync -a "$repo/packages/frontend/apps/web/dist/" "$stage/packages/frontend/apps/web/dist/"
++rsync -a "$repo/packages/frontend/apps/mobile/dist/" "$stage/packages/frontend/apps/mobile/dist/"
++rsync -a "$repo/packages/frontend/admin/dist/" "$stage/packages/frontend/admin/dist/"
++
++cd "$stage"
++yarn config set --json supportedArchitectures.os '["current","linux"]'
++yarn config set --json supportedArchitectures.cpu '["current","x64","arm64","arm"]'
++yarn config set --json supportedArchitectures.libc '["current","glibc"]'
++yarn workspaces focus @affine/server --production
++yarn workspace @affine/server prisma generate
++mv node_modules packages/backend/server/node_modules
++test -x packages/backend/server/node_modules/.bin/prisma
++test -d packages/backend/server/node_modules/@node-rs/argon2-linux-x64-gnu
++
++docker buildx build --builder "$builder" --platform linux/amd64 --pull --load \
++  -f deploy/a2d2/Dockerfile.managed \
++  --build-arg "SOURCE_REVISION=$expected_revision" \
++  --build-arg "IMAGE_VERSION=$image_version" \
++  -t "$tag" . 2>&1 | tee "$out/image-build.log"
++
++image_id=$(docker image inspect "$tag" --format '{{.Id}}')
++test "$(docker image inspect "$tag" --format '{{.Architecture}}/{{.Os}}')" = 'amd64/linux'
++docker save "$tag" | gzip -1 > "$out/affine-managed-linux-amd64.tar.gz"
++archive_sha=$(shasum -a 256 "$out/affine-managed-linux-amd64.tar.gz" | awk '{print $1}')
++cat > "$out/image-build-result.txt" <<EOF
++source_revision=$expected_revision
++image_tag=$tag
++image_id=$image_id
++platform=linux/amd64
++base_image=node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
++archive=affine-managed-linux-amd64.tar.gz
++archive_sha256=$archive_sha
++EOF
+diff --git a/deploy/a2d2/compose.yml b/deploy/a2d2/compose.yml
+new file mode 100644
+index 0000000..e12b87f
+--- /dev/null
++++ b/deploy/a2d2/compose.yml
+@@ -0,0 +1,73 @@
++name: a2d2-affine-full
++x-affine: &affine
++  image: ${AFFINE_IMAGE:?Set a verified AFFiNE image digest}
++  volumes:
++    - storage:/root/.affine/storage
++    - config:/root/.affine/config
++  environment: &environment
++    REDIS_SERVER_HOST: redis
++    DATABASE_URL: postgresql://affine:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/affine
++    DEPLOYMENT_TYPE: selfhosted
++    AFFINE_SERVER_EXTERNAL_URL: ${AFFINE_EXTERNAL_URL:-http://127.0.0.1:3010}
++    AFFINE_SERVER_HOST: ${AFFINE_SERVER_HOST:-127.0.0.1}
++    AFFINE_SERVER_PORT: '3010'
++    AFFINE_SERVER_HTTPS: ${AFFINE_SERVER_HTTPS:-false}
++    AFFINE_A2D2_AUTH_ENABLED: ${AFFINE_A2D2_AUTH_ENABLED:-false}
++    AFFINE_A2D2_BROKER_URL: ${AFFINE_A2D2_BROKER_URL:-}
++    AFFINE_A2D2_ORIGIN: ${AFFINE_A2D2_ORIGIN:-}
++    AFFINE_A2D2_ENGINE_SECRET: ${AFFINE_A2D2_ENGINE_SECRET:-}
++services:
++  affine:
++    <<: *affine
++    ports:
++      - '127.0.0.1:3010:3010'
++    depends_on:
++      migration:
++        condition: service_completed_successfully
++    healthcheck:
++      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:3010/info").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))']
++      interval: 15s
++      timeout: 5s
++      retries: 12
++      start_period: 30s
++    restart: unless-stopped
++  migration:
++    <<: *affine
++    command: ['sh', '-c', 'node ./scripts/self-host-predeploy.js']
++    depends_on:
++      postgres:
++        condition: service_healthy
++      redis:
++        condition: service_healthy
++    restart: 'no'
++  postgres:
++    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg16}
++    environment:
++      POSTGRES_USER: affine
++      POSTGRES_DB: affine
++      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
++      POSTGRES_INITDB_ARGS: --data-checksums
++    volumes:
++      - postgres:/var/lib/postgresql/data
++    healthcheck:
++      test: ['CMD-SHELL', 'pg_isready -U affine -d affine']
++      interval: 5s
++      timeout: 3s
++      retries: 20
++    restart: unless-stopped
++  redis:
++    image: ${REDIS_IMAGE:-redis:7-alpine}
++    command: ['redis-server', '--appendonly', 'yes']
++    volumes:
++      - redis:/data
++    healthcheck:
++      test: ['CMD', 'redis-cli', 'ping']
++      interval: 5s
++      timeout: 3s
++      retries: 20
++    restart: unless-stopped
++volumes:
++  postgres:
++  redis:
++  storage:
++  config:
+diff --git a/deploy/a2d2/start.sh b/deploy/a2d2/start.sh
+new file mode 100755
+index 0000000..336c556
+--- /dev/null
++++ b/deploy/a2d2/start.sh
+@@ -0,0 +1,18 @@
++#!/bin/sh
++set -eu
++cd "$(dirname "$0")"
++config_file=${1:?Usage: ./start.sh .env.remote}
++[ -f "$config_file" ] || { echo 'Environment file missing' >&2; exit 1; }
++docker compose --env-file "$config_file" -f compose.yml config --quiet
++if docker compose --env-file "$config_file" -f compose.yml config --images | grep -Ev '(^sha256:[0-9a-f]{64}$|@sha256:[0-9a-f]{64}$)'; then
++  echo 'All remote images must use an exact local image ID or registry digest' >&2
++  exit 1
++fi
++affine_image=$(awk -F= '$1 == "AFFINE_IMAGE" { print substr($0, index($0, "=") + 1) }' "$config_file")
++if ! printf '%s\n' "$affine_image" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
++  echo 'AFFINE_IMAGE must be the exact local sha256 image ID from the handoff manifest' >&2
++  exit 1
++fi
++docker image inspect "$affine_image" >/dev/null
++docker compose --env-file "$config_file" -f compose.yml pull postgres redis
++docker compose --env-file "$config_file" -f compose.yml up -d
+diff --git a/deploy/a2d2/test_verify_runtime.py b/deploy/a2d2/test_verify_runtime.py
+new file mode 100644
+index 0000000..c037722
+--- /dev/null
++++ b/deploy/a2d2/test_verify_runtime.py
+@@ -0,0 +1,73 @@
++import importlib.util
++from pathlib import Path
++import threading
++import json
++import hashlib
++import unittest
++import urllib.error
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++spec = importlib.util.spec_from_file_location('verify_runtime', Path(__file__).with_name('verify_runtime.py'))
++runtime = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(runtime)
++
++class RuntimeProbeTests(unittest.TestCase):
++    def probe(self, root_status=200, info_version='0.27.4', **options):
++        class Handler(BaseHTTPRequestHandler):
++            def do_POST(self):
++                data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
++                self.send_response(200)
++                self.send_header('Set-Cookie', 'identity=' + data['email'] + '; Path=/; HttpOnly')
++                self.end_headers(); self.wfile.write(b'{}')
++            def do_GET(self):
++                if self.path.startswith('/api/workspaces/'):
++                    allowed = self.headers.get('Cookie') == 'identity=owner@example.com'
++                    self.send_response(200 if allowed else 403)
++                    self.send_header('Content-Type', 'application/octet-stream')
++                    self.end_headers(); self.wfile.write(b'saved-document' if allowed else b'denied')
++                    return
++                if self.path == '/info':
++                    body = ('{"compatibility":"' + info_version + '","type":"selfhosted"}').encode()
++                    self.send_response(200)
++                    self.send_header('Content-Type', 'application/json')
++                else:
++                    body = b'<html>AFFiNE</html>'
++                    self.send_response(root_status)
++                    self.send_header('Content-Type', 'text/html')
++                self.end_headers()
++                self.wfile.write(body)
++            def log_message(self, *args): pass
++        server = HTTPServer(('127.0.0.1', 0), Handler)
++        thread = threading.Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        try:
++            return runtime.probe('http://127.0.0.1:' + str(server.server_port), **options)
++        finally:
++            server.shutdown(); server.server_close(); thread.join()
++
++    def test_html_and_version_are_both_required(self):
++        result = self.probe()
++        self.assertEqual(result['uiStatus'], 200)
++        self.assertEqual(result['version'], '0.27.4')
++        self.assertEqual(result['login'], 'not-tested')
++
++    def test_liveness_success_cannot_hide_ui_failure(self):
++        with self.assertRaises(urllib.error.HTTPError) as failure: self.probe(root_status=500)
++        self.assertEqual(failure.exception.code, 500)
++        failure.exception.close()
++
++    def test_login_document_and_outsider_denial(self):
++        result = self.probe(workspace='workspace', doc='doc', email='owner@example.com', password='test-only', other_email='outsider@example.com', other_password='test-only')
++        self.assertEqual(result['documentSha256'], hashlib.sha256(b'saved-document').hexdigest())
++        self.assertEqual(result['anonymousDenied'], 403)
++        self.assertEqual(result['otherAccount']['deniedStatus'], 403)
++
++    def test_changed_document_does_not_pass_restart_check(self):
++        with self.assertRaisesRegex(RuntimeError, 'document-hash-mismatch'):
++            self.probe(workspace='workspace', doc='doc', email='owner@example.com', password='test-only', expected='wrong')
++
++    def test_unexpected_image_version_is_rejected(self):
++        with self.assertRaisesRegex(RuntimeError, 'version-mismatch'):
++            self.probe(info_version='different')
++
++if __name__ == '__main__': unittest.main()
+diff --git a/deploy/a2d2/verify_runtime.py b/deploy/a2d2/verify_runtime.py
+new file mode 100644
+index 0000000..d5281e2
+--- /dev/null
++++ b/deploy/a2d2/verify_runtime.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""Probe complete AFFiNE runtime, optionally login and compare a saved server document.
++Credentials are read from environment and cookies remain only in memory.
++This does not create business data or claim native UI/third-party OAuth coverage.
++"""
++import argparse
++import hashlib
++import http.cookiejar
++import json
++import os
++from pathlib import Path
++import urllib.error
++import urllib.parse
++import urllib.request
++
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, *args, **kwargs):
++        raise RuntimeError('unexpected-http-redirect')
++
++def client():
++    return urllib.request.build_opener(NoRedirect(), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
++
++def request(opener, url, data=None):
++    body = None if data is None else json.dumps(data).encode()
++    req = urllib.request.Request(url, data=body, headers={'Content-Type':'application/json'} if body else {})
++    with opener.open(req, timeout=30) as response:
++        content = response.read(32 * 1024 * 1024 + 1)
++        if len(content) > 32 * 1024 * 1024: raise RuntimeError('response-too-large')
++        return response.status, response.headers.get('Content-Type',''), content
++
++def login(opener, base, email, password):
++    parsed = urllib.parse.urlparse(base)
++    if parsed.scheme != 'https' and parsed.hostname not in ('localhost','127.0.0.1','::1'):
++        raise RuntimeError('credentials-require-https-or-loopback')
++    status, _, _ = request(opener, base + '/api/auth/sign-in', {'email':email,'password':password})
++    if status != 200: raise RuntimeError('login-failed')
++
++def denied(opener, url):
++    try:
++        request(opener, url)
++    except urllib.error.HTTPError as error:
++        if error.code in (401,403,404):
++            code = error.code; error.close(); return code
++        raise
++    raise RuntimeError('private-document-readable-by-outsider')
++
++def probe(base, workspace=None, doc=None, expected=None, email=None, password=None,
++          other_email=None, other_password=None, save_binary=None):
++    base = base.rstrip('/')
++    parsed = urllib.parse.urlparse(base)
++    if parsed.scheme not in ('http','https') or parsed.username or parsed.password:
++        raise RuntimeError('invalid-base-url')
++    opener = client()
++    _, _, raw = request(opener, base + '/info')
++    info = json.loads(raw)
++    if info.get('compatibility') != '0.27.4': raise RuntimeError('version-mismatch')
++    status, content_type, html = request(opener, base + '/')
++    if status != 200 or 'text/html' not in content_type or b'<html' not in html.lower():
++        raise RuntimeError('ui-not-html')
++    result = {'baseUrl':base,'version':info['compatibility'],'uiStatus':status,'login':'not-tested','document':'not-tested','otherAccount':'not-tested'}
++    if bool(email) != bool(password): raise RuntimeError('both-login-values-required')
++    if email:
++        login(opener, base, email, password)
++        result['login'] = 'passed'
++    if workspace or doc:
++        if not (workspace and doc and email): raise RuntimeError('document-check-requires-login-workspace-doc')
++        url = base + '/api/workspaces/' + urllib.parse.quote(workspace,safe='') + '/docs/' + urllib.parse.quote(doc,safe='')
++        _, content_type, binary = request(opener, url)
++        if 'application/octet-stream' not in content_type or not binary: raise RuntimeError('document-not-binary')
++        digest = hashlib.sha256(binary).hexdigest()
++        if expected and digest != expected: raise RuntimeError('document-hash-mismatch')
++        if save_binary: Path(save_binary).write_bytes(binary)
++        result.update(document='passed',documentSha256=digest,documentBytes=len(binary),anonymousDenied=denied(client(),url))
++        if other_email or other_password:
++            if not (other_email and other_password): raise RuntimeError('both-other-account-values-required')
++            other = client(); login(other,base,other_email,other_password)
++            result['otherAccount'] = {'deniedStatus':denied(other,url)}
++    return result
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--base-url',required=True)
++    parser.add_argument('--workspace'); parser.add_argument('--doc')
++    parser.add_argument('--expected-sha256'); parser.add_argument('--save-binary')
++    parser.add_argument('--out',required=True)
++    args = parser.parse_args()
++    result = probe(args.base_url,args.workspace,args.doc,args.expected_sha256,
++                   os.getenv('AFFINE_QA_EMAIL'),os.getenv('AFFINE_QA_PASSWORD'),
++                   os.getenv('AFFINE_OTHER_EMAIL'),os.getenv('AFFINE_OTHER_PASSWORD'),args.save_binary)
++    Path(args.out).write_text(json.dumps(result,indent=2))
++    print(json.dumps(result))
+diff --git a/packages/backend/server/migrations/20260917000000_a2d2_managed_auth/migration.sql b/packages/backend/server/migrations/20260917000000_a2d2_managed_auth/migration.sql
+new file mode 100644
+index 0000000..459f794
+--- /dev/null
++++ b/packages/backend/server/migrations/20260917000000_a2d2_managed_auth/migration.sql
+@@ -0,0 +1,39 @@
++CREATE TABLE "a2d2_community_bindings" (
++  "community_id" VARCHAR NOT NULL,
++  "workspace_id" VARCHAR NOT NULL,
++  "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  "updated_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  CONSTRAINT "a2d2_community_bindings_pkey" PRIMARY KEY ("community_id"),
++  CONSTRAINT "a2d2_community_bindings_community_workspace_key" UNIQUE ("community_id", "workspace_id"),
++  CONSTRAINT "a2d2_community_bindings_workspace_id_key" UNIQUE ("workspace_id"),
++  CONSTRAINT "a2d2_community_bindings_community_id_check"
++    CHECK ("community_id" ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
++  CONSTRAINT "a2d2_community_bindings_workspace_id_fkey"
++    FOREIGN KEY ("workspace_id") REFERENCES "workspaces"("id") ON DELETE CASCADE
++);
++
++CREATE TABLE "a2d2_principal_bindings" (
++  "community_id" VARCHAR NOT NULL,
++  "workspace_id" VARCHAR NOT NULL,
++  "pubkey" CHAR(64) NOT NULL,
++  "principal_key" VARCHAR NOT NULL,
++  "user_id" VARCHAR NOT NULL,
++  "role" TEXT NOT NULL,
++  "active" BOOLEAN NOT NULL DEFAULT true,
++  "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  "updated_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  CONSTRAINT "a2d2_principal_bindings_pkey" PRIMARY KEY ("community_id", "pubkey"),
++  CONSTRAINT "a2d2_principal_bindings_principal_key_key" UNIQUE ("principal_key"),
++  CONSTRAINT "a2d2_principal_bindings_user_id_key" UNIQUE ("user_id"),
++  CONSTRAINT "a2d2_principal_bindings_pubkey_check" CHECK ("pubkey" ~ '^[0-9a-f]{64}$'),
++  CONSTRAINT "a2d2_principal_bindings_role_check" CHECK ("role" IN ('owner', 'admin', 'member')),
++  CONSTRAINT "a2d2_principal_bindings_principal_key_check" CHECK (length("principal_key") BETWEEN 1 AND 512),
++  CONSTRAINT "a2d2_principal_bindings_community_fkey"
++    FOREIGN KEY ("community_id", "workspace_id")
++    REFERENCES "a2d2_community_bindings"("community_id", "workspace_id") ON DELETE CASCADE,
++  CONSTRAINT "a2d2_principal_bindings_user_id_fkey"
++    FOREIGN KEY ("user_id") REFERENCES "users"("id") ON DELETE CASCADE
++);
++
++CREATE INDEX "a2d2_principal_bindings_community_workspace_active_idx"
++  ON "a2d2_principal_bindings"("community_id", "workspace_id", "active");
+diff --git a/packages/backend/server/src/core/auth/a2d2/__tests__/broker.spec.ts b/packages/backend/server/src/core/auth/a2d2/__tests__/broker.spec.ts
+new file mode 100644
+index 0000000..1f6363e
+--- /dev/null
++++ b/packages/backend/server/src/core/auth/a2d2/__tests__/broker.spec.ts
+@@ -0,0 +1,155 @@
++import { createHash, createHmac } from 'node:crypto';
++import {
++  createServer,
++  type IncomingMessage,
++  type ServerResponse,
++} from 'node:http';
++
++import ava, { type ExecutionContext } from 'ava';
++
++import type { Config } from '../../../../base/config/config';
++import { A2d2BrokerClient } from '../broker';
++import { A2d2AuthError } from '../error';
++
++const SECRET = 'a'.repeat(32);
++const COMMUNITY_ID = '11111111-1111-4111-8111-111111111111';
++const PUBKEY = 'b'.repeat(64);
++
++async function withBroker(
++  t: ExecutionContext,
++  handler: (req: IncomingMessage, res: ServerResponse, body: string) => void
++) {
++  const server = createServer((req, res) => {
++    const chunks: Buffer[] = [];
++    req.on('data', chunk => chunks.push(Buffer.from(chunk)));
++    req.on('end', () => handler(req, res, Buffer.concat(chunks).toString()));
++  });
++  await new Promise<void>((resolve, reject) => {
++    server.once('error', reject);
++    server.listen(0, '127.0.0.1', resolve);
++  });
++  t.teardown(() => new Promise<void>(resolve => server.close(() => resolve())));
++  const address = server.address();
++  if (!address || typeof address === 'string') throw new Error('no address');
++  const config = {
++    a2d2Auth: {
++      enabled: true,
++      brokerUrl: `http://127.0.0.1:${address.port}`,
++      origin: 'https://affine.example',
++      engineSecret: SECRET,
++    },
++  } as Config;
++  const client = new A2d2BrokerClient(config);
++  client.onModuleInit();
++  return client;
++}
++
++function success(res: ServerResponse) {
++  res.writeHead(200, { 'content-type': 'application/json' });
++  res.end(
++    JSON.stringify({
++      session_token: 's'.repeat(32),
++      community_id: COMMUNITY_ID,
++      pubkey: PUBKEY,
++      role: 'owner',
++      principal_key: `affine:${COMMUNITY_ID}:${PUBKEY}`,
++      expires_at: Math.floor(Date.now() / 1000) + 60,
++    })
++  );
++}
++
++ava('broker signs the exact exchange body and binds AFFiNE scope', async t => {
++  const client = await withBroker(t, (req, res, body) => {
++    t.is(req.url, '/api/engine/v1/exchange');
++    const timestamp = req.headers['x-a2d2-engine-timestamp'];
++    const signature = req.headers['x-a2d2-engine-signature'];
++    t.is(typeof timestamp, 'string');
++    t.is(typeof signature, 'string');
++    const bodyHash = createHash('sha256').update(body).digest('hex');
++    t.is(
++      signature,
++      createHmac('sha256', SECRET)
++        .update(`${timestamp}\n${bodyHash}`)
++        .digest('hex')
++    );
++    t.deepEqual(JSON.parse(body), {
++      code: 'one-time-code',
++      product: 'affine',
++      origin: 'https://affine.example',
++      mount_session: '22222222-2222-4222-8222-222222222222',
++      callback_state: 'state',
++    });
++    success(res);
++  });
++
++  const principal = await client.exchange({
++    code: 'one-time-code',
++    mountSession: '22222222-2222-4222-8222-222222222222',
++    callbackState: 'state',
++  });
++  t.is(principal.community_id, COMMUNITY_ID);
++  t.is(principal.pubkey, PUBKEY);
++});
++
++ava(
++  'broker rejects redirects without forwarding the signed request',
++  async t => {
++    let requests = 0;
++    const client = await withBroker(t, (_req, res) => {
++      requests += 1;
++      res.writeHead(302, { location: 'http://127.0.0.1:1/capture' });
++      res.end();
++    });
++
++    const error = await t.throwsAsync(
++      client.exchange({
++        code: 'code',
++        mountSession: '22222222-2222-4222-8222-222222222222',
++        callbackState: 'state',
++      })
++    );
++    t.true(error instanceof A2d2AuthError);
++    t.is((error as A2d2AuthError).code, 'broker_unavailable');
++    t.is(requests, 1);
++  }
++);
++
++ava('broker preserves the stable membership denial code', async t => {
++  const client = await withBroker(t, (_req, res) => {
++    res.writeHead(403, { 'content-type': 'application/json' });
++    res.end(JSON.stringify({ error: 'scope_or_membership_denied' }));
++  });
++
++  const error = await t.throwsAsync(client.check('s'.repeat(32)));
++  t.true(error instanceof A2d2AuthError);
++  t.is((error as A2d2AuthError).code, 'scope_or_membership_denied');
++});
++
++ava('broker sends the complete scoped revoke body', async t => {
++  const client = await withBroker(t, (req, res, body) => {
++    t.is(req.url, '/api/engine/v1/session/revoke');
++    t.deepEqual(JSON.parse(body), {
++      session_token: 's'.repeat(32),
++      product: 'affine',
++      origin: 'https://affine.example',
++    });
++    res.writeHead(204);
++    res.end();
++  });
++
++  await t.notThrowsAsync(client.revoke('s'.repeat(32)));
++});
++
++ava(
++  'broker distinguishes an expired session from membership removal',
++  async t => {
++    const client = await withBroker(t, (_req, res) => {
++      res.writeHead(401, { 'content-type': 'application/json' });
++      res.end(JSON.stringify({ error: 'session_invalid_or_expired' }));
++    });
++
++    const error = await t.throwsAsync(client.check('s'.repeat(32)));
++    t.true(error instanceof A2d2AuthError);
++    t.is((error as A2d2AuthError).code, 'session_invalid_or_expired');
++  }
++);
+diff --git a/packages/backend/server/src/core/auth/a2d2/__tests__/managed-auth.e2e.ts b/packages/backend/server/src/core/auth/a2d2/__tests__/managed-auth.e2e.ts
+new file mode 100644
+index 0000000..b119a9f
+--- /dev/null
++++ b/packages/backend/server/src/core/auth/a2d2/__tests__/managed-auth.e2e.ts
+@@ -0,0 +1,574 @@
++import { randomUUID } from 'node:crypto';
++
++import {
++  inviteByEmailsMutation,
++  WorkspaceInviteLinkExpireTime,
++} from '@affine/graphql';
++import { PrismaClient } from '@prisma/client';
++import ava, { type TestFn } from 'ava';
++import { io, type Socket } from 'socket.io-client';
++import type { Response } from 'supertest';
++import { applyUpdate, Array as YArray, Doc as YDoc } from 'yjs';
++
++import { createTestingApp, type TestingApp } from '../../../../__tests__/utils';
++import { Mockers } from '../../../../__tests__/mocks';
++import { AppModule } from '../../../../app.module';
++import { ActionForbidden } from '../../../../base/error';
++import { Config, ConfigModule } from '../../../../base/config';
++import { Models, WorkspaceRole } from '../../../../models';
++import { WorkspaceMemberResolver } from '../../../workspaces/resolvers/member';
++import { A2d2BrokerClient, type A2d2BrokerPrincipal } from '../broker';
++import { A2d2AuthError, type A2d2AuthErrorCode } from '../error';
++import { A2d2ManagedAuthService } from '../service';
++
++const ORIGIN = 'https://affine.a2d2.test';
++const COMMUNITY_ID = '11111111-1111-4111-8111-111111111111';
++const PUBKEY = 'a'.repeat(64);
++
++class FakeBroker {
++  readonly enabled = true;
++  origin = ORIGIN;
++  exchangePrincipal = this.principal();
++  checkError: A2d2AuthErrorCode | null = null;
++  checkCount = 0;
++  checkGate: Promise<void> | null = null;
++  acceptAnyToken = false;
++  revoked: string[] = [];
++
++  reset() {
++    this.origin = ORIGIN;
++    this.exchangePrincipal = this.principal();
++    this.checkError = null;
++    this.checkCount = 0;
++    this.checkGate = null;
++    this.acceptAnyToken = false;
++    this.revoked = [];
++  }
++
++  principal(overrides: Partial<A2d2BrokerPrincipal> = {}): A2d2BrokerPrincipal {
++    const communityId = overrides.community_id ?? COMMUNITY_ID;
++    const pubkey = overrides.pubkey ?? PUBKEY;
++    return {
++      session_token: 's'.repeat(64),
++      community_id: communityId,
++      pubkey,
++      role: 'owner',
++      principal_key: `affine:${communityId}:${pubkey}`,
++      expires_at: Math.floor(Date.now() / 1000) + 10 * 60,
++      ...overrides,
++    };
++  }
++
++  async exchange() {
++    return this.exchangePrincipal;
++  }
++
++  async check(sessionToken: string) {
++    this.checkCount += 1;
++    await this.checkGate;
++    if (this.checkError) throw new A2d2AuthError(this.checkError);
++    if (
++      !this.acceptAnyToken &&
++      sessionToken !== this.exchangePrincipal.session_token
++    ) {
++      throw new A2d2AuthError('session_invalid_or_expired');
++    }
++    return this.exchangePrincipal;
++  }
++
++  async revoke(sessionToken: string) {
++    this.revoked.push(sessionToken);
++  }
++}
++
++type Context = {
++  app: TestingApp;
++  broker: FakeBroker;
++  db: PrismaClient;
++  models: Models;
++};
++
++const test = ava as TestFn<Context>;
++
++function setCookieHeaders(res: Response) {
++  const value = res.headers['set-cookie'];
++  return typeof value === 'string' ? [value] : (value ?? []);
++}
++
++function cookiePair(res: Response, name: string) {
++  const cookie = setCookieHeaders(res).find(value =>
++    value.startsWith(`${name}=`)
++  );
++  if (!cookie) throw new Error(`Missing cookie ${name}`);
++  return cookie.split(';', 1)[0];
++}
++
++async function exchangeOwner(app: TestingApp, broker: FakeBroker) {
++  const begin = await app
++    .POST('/api/a2d2/session/begin')
++    .set('Origin', broker.origin)
++    .expect(201);
++  const stateCookie = cookiePair(begin, '__Host-a2d2-affine-callback-state');
++  const exchange = await app
++    .POST('/api/a2d2/session/exchange')
++    .set('Origin', broker.origin)
++    .set('Cookie', stateCookie)
++    .send({
++      code: 'one-time-code',
++      mount_session: randomUUID(),
++      state: begin.body.state,
++    })
++    .expect(201);
++  return {
++    begin,
++    exchange,
++    cookie: cookiePair(exchange, '__Host-a2d2-affine-session'),
++    csrf: cookiePair(exchange, 'affine_csrf_token'),
++  };
++}
++
++test.before(async t => {
++  const broker = new FakeBroker();
++  const app = await createTestingApp({
++    imports: [
++      ConfigModule.override({
++        a2d2Auth: {
++          enabled: true,
++          brokerUrl: 'https://relay.a2d2.test',
++          origin: ORIGIN,
++          engineSecret: 't'.repeat(32),
++        },
++        server: {
++          hosts: ['localhost', '127.0.0.1'],
++          https: true,
++        },
++      }),
++      AppModule,
++    ],
++    tapModule(builder) {
++      builder.overrideProvider(A2d2BrokerClient).useValue(broker);
++    },
++  });
++
++  t.context = {
++    app,
++    broker,
++    db: app.get(PrismaClient),
++    models: app.get(Models),
++  };
++});
++
++test.beforeEach(async t => {
++  t.context.broker.reset();
++  await t.context.app.initTestingDB();
++});
++
++test.after.always(async t => {
++  await t.context.app?.close();
++});
++
++test.serial(
++  'managed exchange provisions one principal and enforces workspace isolation',
++  async t => {
++    const { app, broker, db, models } = t.context;
++
++    await app
++      .POST('/api/a2d2/session/begin')
++      .set('Origin', 'https://wrong.example')
++      .expect(400);
++
++    const { begin, exchange, cookie } = await exchangeOwner(app, broker);
++    t.true(exchange.body.authenticated);
++    t.true(Number.isSafeInteger(exchange.body.expires_at));
++    const stateHeader = setCookieHeaders(begin).find(value =>
++      value.startsWith('__Host-a2d2-affine-callback-state=')
++    );
++    t.regex(stateHeader ?? '', /; HttpOnly; Secure; SameSite=Strict/);
++    t.regex(stateHeader ?? '', /; Path=\//);
++
++    const sessionHeader = setCookieHeaders(exchange).find(value =>
++      value.startsWith('__Host-a2d2-affine-session=')
++    );
++    t.regex(sessionHeader ?? '', /; HttpOnly; Secure; SameSite=Strict/);
++    t.false(sessionHeader?.includes(broker.exchangePrincipal.session_token));
++
++    const current = await app
++      .GET('/api/auth/session')
++      .set('Cookie', cookie)
++      .expect(200);
++    t.regex(current.body.user.email, /@internal\.invalid$/);
++    t.is(current.body.user.password, undefined);
++
++    await app.GET('/api/auth/methods').set('Cookie', cookie).expect(200);
++
++    const vendorAccountEmail = 'separate-vendor-account@example.com';
++    const createVendorAccount = await app
++      .POST('/graphql')
++      .set('Cookie', cookie)
++      .set('x-operation-name', 'a2d2CreateVendorAccountDenied')
++      .send({
++        query: `mutation {
++          createUser(input: { email: "${vendorAccountEmail}", name: "Vendor" }) {
++            id
++          }
++        }`,
++      })
++      .expect(200);
++    t.true(Array.isArray(createVendorAccount.body.errors));
++    t.is(await db.user.count({ where: { email: vendorAccountEmail } }), 0);
++    t.is(app.mails.send.callCount, 0);
++
++    const binding = await db.a2d2PrincipalBinding.findUniqueOrThrow({
++      where: {
++        communityId_pubkey: {
++          communityId: COMMUNITY_ID,
++          pubkey: PUBKEY,
++        },
++      },
++      include: { user: true },
++    });
++    t.true(binding.active);
++    t.is(binding.role, 'owner');
++    t.is(binding.user.password, null);
++    t.is(app.mails.send.callCount, 0);
++
++    const initializedRoot = await models.doc.get(
++      binding.workspaceId,
++      binding.workspaceId
++    );
++    t.truthy(initializedRoot);
++    const decodedRoot = new YDoc();
++    applyUpdate(decodedRoot, initializedRoot!.blob);
++    const rootPages = decodedRoot.getMap('meta').get('pages');
++    t.true(rootPages instanceof YArray);
++    t.deepEqual((rootPages as YArray<unknown>).toArray(), []);
++    const firstRootBytes = Buffer.from(initializedRoot!.blob);
++    await exchangeOwner(app, broker);
++    const retriedRoot = await models.doc.get(
++      binding.workspaceId,
++      binding.workspaceId
++    );
++    t.deepEqual(Buffer.from(retriedRoot!.blob), firstRootBytes);
++
++    const otherUser = await models.user.create({
++      email: 'other-workspace@internal.invalid',
++      password: null,
++      emailVerifiedAt: new Date(),
++      registered: true,
++    });
++    const otherWorkspace = await models.workspace.create(otherUser.id);
++    const deniedEnableAi = !otherWorkspace.enableAi;
++
++    await app
++      .GET(`/api/workspaces/${otherWorkspace.id}/docs/${otherWorkspace.id}`)
++      .set('Cookie', cookie)
++      .expect(403);
++
++    const mutation = await app
++      .POST('/graphql')
++      .set('Cookie', cookie)
++      .set('x-operation-name', 'a2d2CrossTenantWrite')
++      .send({
++        query: `mutation {
++          updateWorkspace(input: { id: "${otherWorkspace.id}", enableAi: ${deniedEnableAi} }) {
++            id
++          }
++        }`,
++      })
++      .expect(200);
++    t.true(Array.isArray(mutation.body.errors));
++    t.is(
++      await db.workspace.count({
++        where: { id: otherWorkspace.id, enableAi: deniedEnableAi },
++      }),
++      0
++    );
++  }
++);
++
++test.serial(
++  'managed mode blocks vendor membership changes while default mode still invites',
++  async t => {
++    const { app, db } = t.context;
++    const config = app.get(Config);
++    const resolver = app.get(WorkspaceMemberResolver);
++    const owner = await app.create(Mockers.User);
++    const target = await app.create(Mockers.User);
++    const workspace = await app.create(Mockers.Workspace, {
++      owner: { id: owner.id },
++    });
++    const unmanagedEmail = `unmanaged-${Date.now()}@example.com`;
++
++    config.a2d2Auth.enabled = false;
++    await app.login(owner);
++    await app.gql({
++      query: inviteByEmailsMutation,
++      variables: { workspaceId: workspace.id, emails: [unmanagedEmail] },
++    });
++    t.is(await db.user.count({ where: { email: unmanagedEmail } }), 1);
++    t.is(
++      await db.workspaceUser.count({
++        where: { workspaceId: workspace.id, user: { email: unmanagedEmail } },
++      }),
++      1
++    );
++
++    const managedEmail = `managed-${Date.now()}@example.com`;
++    const userCount = await db.user.count();
++    const memberCount = await db.workspaceUser.count({
++      where: { workspaceId: workspace.id },
++    });
++    const mailCount = app.mails.send.callCount;
++    const notificationCount = app.queue.count('notification.sendInvitation');
++    config.a2d2Auth.enabled = true;
++
++    await t.throwsAsync(
++      app.gql({
++        query: inviteByEmailsMutation,
++        variables: { workspaceId: workspace.id, emails: [managedEmail] },
++      })
++    );
++
++    const attempts = [
++      () =>
++        resolver.inviteMembers(
++          owner as never,
++          { req: {} } as never,
++          workspace.id,
++          [managedEmail]
++        ),
++      () =>
++        resolver.createInviteLink(
++          owner as never,
++          workspace.id,
++          WorkspaceInviteLinkExpireTime.OneDay
++        ),
++      () => resolver.approveMember(owner as never, workspace.id, target.id),
++      () =>
++        resolver.grantMember(
++          owner as never,
++          workspace.id,
++          target.id,
++          WorkspaceRole.Collaborator
++        ),
++      () => resolver.revokeMember(owner as never, workspace.id, target.id),
++      () =>
++        resolver.acceptInviteById(
++          owner as never,
++          'vendor-invite',
++          workspace.id,
++          false
++        ),
++      () => resolver.leaveWorkspace(owner as never, workspace.id),
++    ];
++    for (const attempt of attempts) {
++      const error = await t.throwsAsync(attempt);
++      t.true(error instanceof ActionForbidden);
++    }
++
++    t.is(await db.user.count(), userCount);
++    t.is(
++      await db.workspaceUser.count({ where: { workspaceId: workspace.id } }),
++      memberCount
++    );
++    t.is(app.mails.send.callCount, mailCount);
++    t.is(app.queue.count('notification.sendInvitation'), notificationCount);
++  }
++);
++
++test.serial(
++  'non-owner cannot bootstrap a community and callback state is consumed',
++  async t => {
++    const { app, broker, db } = t.context;
++    broker.exchangePrincipal = broker.principal({ role: 'admin' });
++
++    const begin = await app
++      .POST('/api/a2d2/session/begin')
++      .set('Origin', broker.origin)
++      .expect(201);
++    const stateCookie = cookiePair(begin, '__Host-a2d2-affine-callback-state');
++    const body = {
++      code: 'one-time-code',
++      mount_session: randomUUID(),
++      state: begin.body.state,
++    };
++    await app
++      .POST('/api/a2d2/session/exchange')
++      .set('Origin', broker.origin)
++      .set('Cookie', stateCookie)
++      .send(body)
++      .expect(409);
++    await app
++      .POST('/api/a2d2/session/exchange')
++      .set('Origin', broker.origin)
++      .set('Cookie', stateCookie)
++      .send(body)
++      .expect(410);
++    t.is(await db.a2d2CommunityBinding.count(), 0);
++    t.is(await db.a2d2PrincipalBinding.count(), 0);
++  }
++);
++
++test.serial(
++  'session errors preserve transient state and only membership removal disables principal',
++  async t => {
++    const { app, broker, db } = t.context;
++    const { cookie } = await exchangeOwner(app, broker);
++
++    broker.checkError = 'broker_unavailable';
++    const unavailable = await app
++      .GET('/api/auth/session')
++      .set('Cookie', cookie)
++      .expect(503);
++    t.false(
++      setCookieHeaders(unavailable).some(value =>
++        value.startsWith('__Host-a2d2-affine-session=')
++      )
++    );
++
++    broker.checkError = 'session_invalid_or_expired';
++    const expired = await app
++      .GET('/api/auth/session')
++      .set('Cookie', cookie)
++      .expect(401);
++    t.true(
++      setCookieHeaders(expired).some(value =>
++        value.startsWith('__Host-a2d2-affine-session=;')
++      )
++    );
++    t.true(
++      (
++        await db.a2d2PrincipalBinding.findUniqueOrThrow({
++          where: {
++            communityId_pubkey: {
++              communityId: COMMUNITY_ID,
++              pubkey: PUBKEY,
++            },
++          },
++        })
++      ).active
++    );
++
++    broker.checkError = 'scope_or_membership_denied';
++    await app.GET('/api/auth/session').set('Cookie', cookie).expect(403);
++    t.false(
++      (
++        await db.a2d2PrincipalBinding.findUniqueOrThrow({
++          where: {
++            communityId_pubkey: {
++              communityId: COMMUNITY_ID,
++              pubkey: PUBKEY,
++            },
++          },
++        })
++      ).active
++    );
++  }
++);
++
++test.serial(
++  'managed mode blocks vendor sign-in and revalidates every socket packet',
++  async t => {
++    const { app, broker, db } = t.context;
++    const { cookie } = await exchangeOwner(app, broker);
++
++    await app
++      .POST('/api/auth/sign-in')
++      .send({ email: 'vendor@example.com', password: 'password' })
++      .expect(403);
++
++    const socket: Socket = io(app.url(), {
++      transports: ['websocket'],
++      extraHeaders: { Cookie: cookie },
++      reconnection: false,
++    });
++    await new Promise<void>((resolve, reject) => {
++      const timeout = setTimeout(
++        () => reject(new Error('socket connect timeout')),
++        2_000
++      );
++      socket.once('connect', () => {
++        clearTimeout(timeout);
++        resolve();
++      });
++      socket.once('connect_error', reject);
++    });
++
++    broker.checkError = 'scope_or_membership_denied';
++    const disconnected = new Promise<void>((resolve, reject) => {
++      const timeout = setTimeout(
++        () => reject(new Error('socket did not disconnect')),
++        2_000
++      );
++      socket.once('disconnect', () => {
++        clearTimeout(timeout);
++        resolve();
++      });
++    });
++    socket.emit('a2d2:membership-check');
++    await disconnected;
++
++    t.true(broker.checkCount >= 2);
++    t.false(
++      (
++        await db.a2d2PrincipalBinding.findUniqueOrThrow({
++          where: {
++            communityId_pubkey: {
++              communityId: COMMUNITY_ID,
++              pubkey: PUBKEY,
++            },
++          },
++        })
++      ).active
++    );
++  }
++);
++
++test.serial(
++  'session checks coalesce per token and cap distinct in-flight work',
++  async t => {
++    const { app, broker } = t.context;
++    const { cookie } = await exchangeOwner(app, broker);
++    let releaseChecks!: () => void;
++    broker.checkGate = new Promise(resolve => {
++      releaseChecks = resolve;
++    });
++
++    const sameSession = Array.from({ length: 8 }, () =>
++      app
++        .GET('/api/auth/session')
++        .set('Cookie', cookie)
++        .expect(200)
++        .then(() => undefined)
++    );
++    await new Promise(resolve => setTimeout(resolve, 20));
++    t.is(broker.checkCount, 1);
++    releaseChecks();
++    await Promise.all(sameSession);
++
++    broker.checkCount = 0;
++    broker.acceptAnyToken = true;
++    let releaseDistinctChecks!: () => void;
++    broker.checkGate = new Promise(resolve => {
++      releaseDistinctChecks = resolve;
++    });
++    const service = app.get(A2d2ManagedAuthService);
++    const checkBrokerSession = (
++      service as unknown as {
++        checkBrokerSession(token: string): Promise<A2d2BrokerPrincipal>;
++      }
++    ).checkBrokerSession.bind(service);
++    const distinctChecks = Array.from({ length: 128 }, (_, index) =>
++      checkBrokerSession(`session-${index}`)
++    );
++    await new Promise(resolve => setTimeout(resolve, 20));
++    const capacityError = await t.throwsAsync(
++      checkBrokerSession('session-over-cap'),
++      { instanceOf: A2d2AuthError }
++    );
++    t.is((capacityError as A2d2AuthError).code, 'broker_unavailable');
++    t.is(broker.checkCount, 128);
++    releaseDistinctChecks();
++    await Promise.all(distinctChecks);
++  }
++);
+diff --git a/packages/backend/server/src/core/auth/a2d2/broker.ts b/packages/backend/server/src/core/auth/a2d2/broker.ts
+new file mode 100644
+index 0000000..35ddaab
+--- /dev/null
++++ b/packages/backend/server/src/core/auth/a2d2/broker.ts
+@@ -0,0 +1,222 @@
++import { createHash, createHmac } from 'node:crypto';
++
++import { Injectable, OnModuleInit } from '@nestjs/common';
++import { z } from 'zod';
++
++import { Config } from '../../../base/config/config';
++import { A2d2AuthError, type A2d2AuthErrorCode } from './error';
++
++const PRODUCT = 'affine';
++const MAX_RESPONSE_BYTES = 16 * 1024;
++const REQUEST_TIMEOUT_MS = 5_000;
++
++const BrokerPrincipalSchema = z
++  .object({
++    session_token: z.string().min(32).max(4096),
++    community_id: z.string().uuid(),
++    pubkey: z.string().regex(/^[0-9a-f]{64}$/),
++    role: z.enum(['owner', 'admin', 'member']),
++    principal_key: z.string().min(1).max(512),
++    expires_at: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
++  })
++  .strict();
++
++export type A2d2BrokerPrincipal = z.infer<typeof BrokerPrincipalSchema>;
++
++const BrokerErrorSchema = z
++  .object({
++    error: z.enum([
++      'invalid_request',
++      'server_auth_invalid',
++      'session_invalid_or_expired',
++      'session_scope_mismatch',
++      'scope_or_membership_denied',
++      'launch_invalid_or_expired',
++      'broker_unavailable',
++    ]),
++  })
++  .strict();
++
++@Injectable()
++export class A2d2BrokerClient implements OnModuleInit {
++  private brokerOrigin: string | null = null;
++  private affineOrigin: string | null = null;
++
++  constructor(private readonly config: Config) {}
++
++  onModuleInit() {
++    if (!this.config.a2d2Auth.enabled) return;
++
++    this.brokerOrigin = this.parseOrigin(
++      this.config.a2d2Auth.brokerUrl,
++      'broker'
++    );
++    this.affineOrigin = this.parseOrigin(this.config.a2d2Auth.origin, 'AFFiNE');
++    if (Buffer.byteLength(this.config.a2d2Auth.engineSecret, 'utf8') < 32) {
++      throw new Error('AFFINE_A2D2_ENGINE_SECRET must be at least 32 bytes.');
++    }
++  }
++
++  get enabled() {
++    return this.config.a2d2Auth.enabled;
++  }
++
++  get origin() {
++    if (!this.affineOrigin) throw new A2d2AuthError('broker_unavailable');
++    return this.affineOrigin;
++  }
++
++  async exchange(input: {
++    code: string;
++    mountSession: string;
++    callbackState: string;
++  }) {
++    return await this.request('/api/engine/v1/exchange', {
++      code: input.code,
++      product: PRODUCT,
++      origin: this.origin,
++      mount_session: input.mountSession,
++      callback_state: input.callbackState,
++    });
++  }
++
++  async check(sessionToken: string) {
++    return await this.request('/api/engine/v1/session/check', {
++      session_token: sessionToken,
++      product: PRODUCT,
++      origin: this.origin,
++    });
++  }
++
++  async revoke(sessionToken: string) {
++    await this.request(
++      '/api/engine/v1/session/revoke',
++      {
++        session_token: sessionToken,
++        product: PRODUCT,
++        origin: this.origin,
++      },
++      true
++    );
++  }
++
++  private parseOrigin(value: string, label: string) {
++    let parsed: URL;
++    try {
++      parsed = new URL(value);
++    } catch {
++      throw new Error(`AFFINE_A2D2_${label.toUpperCase()} origin is invalid.`);
++    }
++    const isLoopback =
++      parsed.hostname === '127.0.0.1' ||
++      parsed.hostname === 'localhost' ||
++      parsed.hostname === '::1';
++    if (
++      parsed.protocol !== 'https:' &&
++      !(isLoopback && parsed.protocol === 'http:')
++    ) {
++      throw new Error(`AFFINE_A2D2_${label.toUpperCase()} must use HTTPS.`);
++    }
++    if (
++      parsed.username ||
++      parsed.password ||
++      parsed.search ||
++      parsed.hash ||
++      (parsed.pathname !== '/' && parsed.pathname !== '')
++    ) {
++      throw new Error(`AFFINE_A2D2_${label.toUpperCase()} must be an origin.`);
++    }
++    return parsed.origin;
++  }
++
++  private async request(
++    path: string,
++    input: Record<string, string>,
++    expectEmpty = false
++  ): Promise<A2d2BrokerPrincipal> {
++    if (!this.enabled || !this.brokerOrigin) {
++      throw new A2d2AuthError('broker_unavailable');
++    }
++
++    const body = JSON.stringify(input);
++    const timestamp = Math.floor(Date.now() / 1000).toString();
++    const bodyHash = createHash('sha256').update(body).digest('hex');
++    const signature = createHmac('sha256', this.config.a2d2Auth.engineSecret)
++      .update(`${timestamp}\n${bodyHash}`)
++      .digest('hex');
++
++    let response: Response;
++    try {
++      response = await fetch(new URL(path, this.brokerOrigin), {
++        method: 'POST',
++        headers: {
++          'content-type': 'application/json',
++          'x-a2d2-engine-timestamp': timestamp,
++          'x-a2d2-engine-signature': signature,
++        },
++        body,
++        redirect: 'manual',
++        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
++      });
++    } catch {
++      throw new A2d2AuthError('broker_unavailable');
++    }
++
++    if (response.status >= 300 && response.status < 400) {
++      await response.body?.cancel();
++      throw new A2d2AuthError('broker_unavailable');
++    }
++    if (expectEmpty && response.status === 204) {
++      return undefined as never;
++    }
++
++    const payload = await this.readBoundedJson(response);
++    if (!response.ok) {
++      const parsed = BrokerErrorSchema.safeParse(payload);
++      throw new A2d2AuthError(
++        parsed.success
++          ? (parsed.data.error as A2d2AuthErrorCode)
++          : 'broker_unavailable'
++      );
++    }
++
++    const parsed = BrokerPrincipalSchema.safeParse(payload);
++    if (!parsed.success || parsed.data.expires_at * 1000 <= Date.now()) {
++      throw new A2d2AuthError('broker_unavailable');
++    }
++    return parsed.data;
++  }
++
++  private async readBoundedJson(response: Response): Promise<unknown> {
++    if (!response.body) return null;
++    const reader = response.body.getReader();
++    const chunks: Uint8Array[] = [];
++    let size = 0;
++    try {
++      while (true) {
++        const { done, value } = await reader.read();
++        if (done) break;
++        size += value.byteLength;
++        if (size > MAX_RESPONSE_BYTES) {
++          await reader.cancel();
++          throw new A2d2AuthError('broker_unavailable');
++        }
++        chunks.push(value);
++      }
++    } catch (error) {
++      if (error instanceof A2d2AuthError) throw error;
++      throw new A2d2AuthError('broker_unavailable');
++    }
++    const bytes = new Uint8Array(size);
++    let offset = 0;
++    for (const chunk of chunks) {
++      bytes.set(chunk, offset);
++      offset += chunk.byteLength;
++    }
++    try {
++      return JSON.parse(new TextDecoder().decode(bytes));
++    } catch {
++      throw new A2d2AuthError('broker_unavailable');
++    }
++  }
++}
+diff --git a/packages/backend/server/src/core/auth/a2d2/config.ts b/packages/backend/server/src/core/auth/a2d2/config.ts
+new file mode 100644
+index 0000000..32cf1fb
+--- /dev/null
++++ b/packages/backend/server/src/core/auth/a2d2/config.ts
+@@ -0,0 +1,44 @@
++import { z } from 'zod';
++
++import { defineModuleConfig } from '../../../base/config';
++
++export interface A2d2AuthConfig {
++  enabled: boolean;
++  brokerUrl: string;
++  origin: string;
++  engineSecret: string;
++}
++
++declare global {
++  interface AppConfigSchema {
++    a2d2Auth: A2d2AuthConfig;
++  }
++}
++
++defineModuleConfig('a2d2Auth', {
++  enabled: {
++    desc: 'Enable A2D2-managed AFFiNE authentication.',
++    default: false,
++    env: ['AFFINE_A2D2_AUTH_ENABLED', 'boolean'],
++    shape: z.boolean(),
++  },
++  brokerUrl: {
++    desc: 'A2D2 relay origin used for managed session exchange.',
++    default: '',
++    env: 'AFFINE_A2D2_BROKER_URL',
++    shape: z.string(),
++  },
++  origin: {
++    desc: 'Exact public AFFiNE origin bound to A2D2 launch sessions.',
++    default: '',
++    env: 'AFFINE_A2D2_ORIGIN',
++    shape: z.string(),
++  },
++  engineSecret: {
++    desc: 'Server-only HMAC key shared with the A2D2 engine broker.',
++    default: '',
++    env: 'AFFINE_A2D2_ENGINE_SECRET',
++    shape: z.string(),
++    internal: true,
++  },
++});
+diff --git a/packages/backend/server/src/core/auth/a2d2/controller.ts b/packages/backend/server/src/core/auth/a2d2/controller.ts
+new file mode 100644
+index 0000000..c33dcef
+--- /dev/null
++++ b/packages/backend/server/src/core/auth/a2d2/controller.ts
+@@ -0,0 +1,69 @@
++import {
++  Body,
++  Controller,
++  Header,
++  HttpCode,
++  HttpStatus,
++  Post,
++  Req,
++  Res,
++} from '@nestjs/common';
++import type { Request, Response } from 'express';
++import { z } from 'zod';
++
++import { Throttle } from '../../../base';
++import { Public } from '../guard';
++import { A2d2AuthError } from './error';
++import { A2d2ManagedAuthService } from './service';
++
++const ExchangeBodySchema = z
++  .object({
++    code: z.string().min(1).max(512),
++    mount_session: z.string().uuid(),
++    state: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
++  })
++  .strict();
++
++@Throttle('strict')
++@Controller('/api/a2d2/session')
++export class A2d2SessionController {
++  constructor(private readonly auth: A2d2ManagedAuthService) {}
++
++  @Public()
++  @Post('/begin')
++  @Header('Cache-Control', 'no-store')
++  begin(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
++    this.auth.assertOrigin(req);
++    return this.auth.begin(res);
++  }
++
++  @Public()
++  @Post('/exchange')
++  @Header('Cache-Control', 'no-store')
++  async exchange(
++    @Req() req: Request,
++    @Res({ passthrough: true }) res: Response,
++    @Body() body?: unknown
++  ) {
++    this.auth.assertOrigin(req);
++    const input = ExchangeBodySchema.safeParse(body);
++    if (!input.success) {
++      this.auth.clearStateCookie(res);
++      throw new A2d2AuthError('invalid_request');
++    }
++    return await this.auth.exchange(req, res, {
++      code: input.data.code,
++      mountSession: input.data.mount_session,
++      state: input.data.state,
++    });
++  }
++
++  @Public()
++  @Post('/revoke')
++  @HttpCode(HttpStatus.NO_CONTENT)
++  async revoke(@Req() req: Request, @Res() res: Response) {
++    this.auth.assertOrigin(req);
++    await this.auth.signOut(req, res);
++    res.status(HttpStatus.NO_CONTENT).send();
++  }
++}
+diff --git a/packages/backend/server/src/core/auth/a2d2/error.ts b/packages/backend/server/src/core/auth/a2d2/error.ts
+new file mode 100644
+index 0000000..2e6a389
+--- /dev/null
++++ b/packages/backend/server/src/core/auth/a2d2/error.ts
+@@ -0,0 +1,38 @@
++import { HttpStatus } from '@nestjs/common';
++
++import { UserFriendlyError } from '../../../base';
++
++export type A2d2AuthErrorCode =
++  | 'invalid_request'
++  | 'server_auth_invalid'
++  | 'session_invalid_or_expired'
++  | 'session_scope_mismatch'
++  | 'scope_or_membership_denied'
++  | 'launch_invalid_or_expired'
++  | 'broker_unavailable'
++  | 'community_not_provisioned'
++  | 'community_owner_conflict';
++
++const STATUS: Record<A2d2AuthErrorCode, HttpStatus> = {
++  invalid_request: HttpStatus.BAD_REQUEST,
++  server_auth_invalid: HttpStatus.UNAUTHORIZED,
++  session_invalid_or_expired: HttpStatus.UNAUTHORIZED,
++  session_scope_mismatch: HttpStatus.FORBIDDEN,
++  scope_or_membership_denied: HttpStatus.FORBIDDEN,
++  launch_invalid_or_expired: HttpStatus.GONE,
++  broker_unavailable: HttpStatus.SERVICE_UNAVAILABLE,
++  community_not_provisioned: HttpStatus.CONFLICT,
++  community_owner_conflict: HttpStatus.CONFLICT,
++};
++
++export class A2d2AuthError extends UserFriendlyError {
++  constructor(readonly code: A2d2AuthErrorCode) {
++    super('action_forbidden', 'http_request_error', code);
++    this.name = code;
++    this.status = STATUS[code];
++  }
++
++  override toJSON() {
++    return { ...super.toJSON(), error: this.code };
++  }
++}
+diff --git a/packages/backend/server/src/core/auth/a2d2/index.ts b/packages/backend/server/src/core/auth/a2d2/index.ts
+new file mode 100644
+index 0000000..6dc0d29
+--- /dev/null
++++ b/packages/backend/server/src/core/auth/a2d2/index.ts
+@@ -0,0 +1,6 @@
++import './config';
++
++export { A2d2BrokerClient } from './broker';
++export { A2d2SessionController } from './controller';
++export { A2d2AuthError } from './error';
++export { A2d2ManagedAuthService } from './service';
+diff --git a/packages/backend/server/src/core/auth/a2d2/service.ts b/packages/backend/server/src/core/auth/a2d2/service.ts
+new file mode 100644
+index 0000000..dd55c19
+--- /dev/null
++++ b/packages/backend/server/src/core/auth/a2d2/service.ts
+@@ -0,0 +1,501 @@
++import { createHash, randomBytes, randomUUID } from 'node:crypto';
++
++import { Injectable, Logger } from '@nestjs/common';
++import { Transactional, TransactionHost } from '@nestjs-cls/transactional';
++import type { TransactionalAdapterPrisma } from '@nestjs-cls/transactional-adapter-prisma';
++import type { Request, Response } from 'express';
++import { Array as YArray, Doc as YDoc, encodeStateAsUpdate } from 'yjs';
++
++import { Cache, CryptoHelper, getRequestCookie } from '../../../base';
++import { Models, WorkspaceMemberStatus, WorkspaceRole } from '../../../models';
++import { QuotaStateService } from '../../quota/state';
++import {
++  CSRF_COOKIE_NAME,
++  SESSION_COOKIE_NAME,
++  USER_COOKIE_NAME,
++} from '../input';
++import { sessionUser } from '../service';
++import type { Session } from '../session';
++import { A2d2BrokerClient, type A2d2BrokerPrincipal } from './broker';
++import { A2d2AuthError } from './error';
++
++const SESSION_COOKIE = '__Host-a2d2-affine-session';
++const STATE_COOKIE = '__Host-a2d2-affine-callback-state';
++const STATE_TTL_MS = 60_000;
++const MAX_CONCURRENT_SESSION_CHECKS = 128;
++
++@Injectable()
++export class A2d2ManagedAuthService {
++  private readonly logger = new Logger(A2d2ManagedAuthService.name);
++  private readonly inFlightSessionChecks = new Map<
++    string,
++    Promise<A2d2BrokerPrincipal>
++  >();
++
++  constructor(
++    private readonly crypto: CryptoHelper,
++    private readonly cache: Cache,
++    private readonly broker: A2d2BrokerClient,
++    private readonly models: Models,
++    private readonly txHost: TransactionHost<TransactionalAdapterPrisma>,
++    private readonly quotaState: QuotaStateService
++  ) {}
++
++  private get db() {
++    return this.txHost.tx;
++  }
++
++  get enabled() {
++    return this.broker.enabled;
++  }
++
++  async begin(res: Response) {
++    this.assertEnabled();
++    const state = randomBytes(32).toString('base64url');
++    const hash = this.sha256(state);
++    const stored = await this.cache.setnx(this.stateKey(hash), true, {
++      ttl: STATE_TTL_MS,
++    });
++    if (!stored) {
++      throw new A2d2AuthError('broker_unavailable');
++    }
++    res.cookie(STATE_COOKIE, hash, {
++      httpOnly: true,
++      secure: true,
++      sameSite: 'strict',
++      path: '/',
++      maxAge: STATE_TTL_MS,
++    });
++    return { state, expires_at: new Date(Date.now() + STATE_TTL_MS) };
++  }
++
++  async exchange(
++    req: Request,
++    res: Response,
++    input: { code: string; mountSession: string; state: string }
++  ) {
++    let stage = 'callback_state';
++    try {
++      this.assertEnabled();
++      const stateHash = getRequestCookie(req, STATE_COOKIE);
++      this.clearStateCookie(res);
++      const inputHash = this.sha256(input.state);
++      const storedState = stateHash
++        ? await this.cache.getAndDelete<boolean>(this.stateKey(stateHash))
++        : undefined;
++      if (
++        !stateHash ||
++        !storedState ||
++        !this.crypto.compare(stateHash, inputHash)
++      ) {
++        throw new A2d2AuthError('launch_invalid_or_expired');
++      }
++
++      stage = 'broker_exchange';
++      const brokerPrincipal = await this.broker.exchange({
++        code: input.code,
++        mountSession: input.mountSession,
++        callbackState: input.state,
++      });
++      stage = 'principal_sync';
++      const principal = await this.syncPrincipal(brokerPrincipal);
++      stage = 'quota_reconcile';
++      await this.quotaState.reconcileUserQuotaState(principal.userId);
++      stage = 'session_cookie';
++      this.setSessionCookie(res, brokerPrincipal);
++      this.logger.log('a2d2_managed_exchange_completed');
++      return {
++        authenticated: true as const,
++        workspace_id: principal.workspaceId,
++        expires_at: brokerPrincipal.expires_at,
++      };
++    } catch (error) {
++      const reason =
++        error instanceof A2d2AuthError ? error.code : 'internal_failure';
++      this.logger.warn(
++        `a2d2_managed_exchange_failed stage=${stage} reason=${reason}`
++      );
++      throw error;
++    }
++  }
++
++  async authenticate(req: Request, res?: Response): Promise<Session | null> {
++    if (!this.enabled) return null;
++    const encryptedToken = getRequestCookie(req, SESSION_COOKIE);
++    if (!encryptedToken) return null;
++
++    let cookie: { sessionToken: string; principalKey: string };
++    try {
++      cookie = this.decryptSessionCookie(encryptedToken);
++    } catch {
++      if (res) this.clearSessionCookies(res);
++      throw new A2d2AuthError('scope_or_membership_denied');
++    }
++
++    try {
++      const brokerPrincipal = await this.checkBrokerSession(
++        cookie.sessionToken
++      );
++      if (brokerPrincipal.principal_key !== cookie.principalKey) {
++        throw new A2d2AuthError('scope_or_membership_denied');
++      }
++      const principal = await this.syncPrincipal(brokerPrincipal);
++      if (!principal.active || principal.user.disabled) {
++        throw new A2d2AuthError('scope_or_membership_denied');
++      }
++      const expiresAt = new Date(brokerPrincipal.expires_at * 1000);
++      const sessionId = `a2d2:${this.sha256(cookie.sessionToken).slice(0, 32)}`;
++      req.authType = 'a2d2';
++      req.session = {
++        id: sessionId,
++        sessionId,
++        userId: principal.userId,
++        expiresAt,
++        signInClientVersion: null,
++        refreshClientVersion: null,
++        createdAt: principal.createdAt,
++        user: sessionUser(principal.user),
++      };
++      return req.session;
++    } catch (error) {
++      if (
++        error instanceof A2d2AuthError &&
++        error.code === 'scope_or_membership_denied'
++      ) {
++        await this.disablePrincipal(cookie.principalKey);
++      }
++      if (
++        res &&
++        error instanceof A2d2AuthError &&
++        [
++          'session_invalid_or_expired',
++          'session_scope_mismatch',
++          'scope_or_membership_denied',
++        ].includes(error.code)
++      ) {
++        this.clearSessionCookies(res);
++      }
++      throw error;
++    }
++  }
++
++  async signOut(req: Request, res: Response) {
++    const encryptedToken = getRequestCookie(req, SESSION_COOKIE);
++    this.clearSessionCookies(res);
++    if (!encryptedToken) return;
++    try {
++      const cookie = this.decryptSessionCookie(encryptedToken);
++      await this.broker.revoke(cookie.sessionToken);
++    } catch (error) {
++      if (
++        error instanceof A2d2AuthError &&
++        (error.code === 'session_invalid_or_expired' ||
++          error.code === 'session_scope_mismatch' ||
++          error.code === 'launch_invalid_or_expired' ||
++          error.code === 'scope_or_membership_denied')
++      ) {
++        return;
++      }
++      throw error;
++    }
++  }
++
++  assertRequestAllowed(req: Request) {
++    if (!this.enabled) return;
++    const path = req.path;
++    if (
++      path.startsWith('/api/oauth') ||
++      path.startsWith('/api/setup') ||
++      (path.startsWith('/api/auth/') &&
++        path !== '/api/auth/session' &&
++        path !== '/api/auth/methods' &&
++        path !== '/api/auth/sign-out')
++    ) {
++      throw new A2d2AuthError('scope_or_membership_denied');
++    }
++  }
++
++  assertOrigin(req: Request) {
++    if (req.get('origin') !== this.broker.origin) {
++      throw new A2d2AuthError('invalid_request');
++    }
++  }
++
++  assertManagedUser(userId: string) {
++    return this.db.a2d2PrincipalBinding.findUnique({
++      where: { userId },
++      select: { userId: true },
++    });
++  }
++
++  clearStateCookie(res: Response) {
++    res.clearCookie(STATE_COOKIE, {
++      secure: true,
++      sameSite: 'strict',
++      path: '/',
++    });
++  }
++
++  private stateKey(hash: string) {
++    return `a2d2:affine:callback_state:${hash}`;
++  }
++
++  private async checkBrokerSession(sessionToken: string) {
++    const key = this.sha256(sessionToken);
++    const inFlight = this.inFlightSessionChecks.get(key);
++    if (inFlight) return await inFlight;
++    if (this.inFlightSessionChecks.size >= MAX_CONCURRENT_SESSION_CHECKS) {
++      throw new A2d2AuthError('broker_unavailable');
++    }
++
++    const check = this.broker.check(sessionToken);
++    this.inFlightSessionChecks.set(key, check);
++    try {
++      return await check;
++    } finally {
++      if (this.inFlightSessionChecks.get(key) === check) {
++        this.inFlightSessionChecks.delete(key);
++      }
++    }
++  }
++
++  private setSessionCookie(res: Response, principal: A2d2BrokerPrincipal) {
++    const expires = new Date(principal.expires_at * 1000);
++    res.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
++    res.clearCookie(USER_COOKIE_NAME, { path: '/' });
++    res.cookie(
++      SESSION_COOKIE,
++      this.crypto.encrypt(
++        JSON.stringify({
++          v: 1,
++          session_token: principal.session_token,
++          principal_key: principal.principal_key,
++        })
++      ),
++      {
++        httpOnly: true,
++        secure: true,
++        sameSite: 'strict',
++        path: '/',
++        expires,
++      }
++    );
++    res.cookie(CSRF_COOKIE_NAME, randomUUID(), {
++      httpOnly: false,
++      secure: true,
++      sameSite: 'strict',
++      path: '/',
++      expires,
++    });
++  }
++
++  clearSessionCookies(res: Response) {
++    res.clearCookie(SESSION_COOKIE, {
++      secure: true,
++      sameSite: 'strict',
++      path: '/',
++    });
++    res.clearCookie(CSRF_COOKIE_NAME, { path: '/' });
++  }
++
++  @Transactional()
++  private async syncPrincipal(broker: A2d2BrokerPrincipal) {
++    await this.db.$executeRaw`
++      SELECT pg_advisory_xact_lock(
++        hashtextextended(${`a2d2:affine:${broker.community_id}`}, 0)
++      )
++    `;
++
++    let binding = await this.db.a2d2CommunityBinding.findUnique({
++      where: { communityId: broker.community_id },
++    });
++    let principal = await this.db.a2d2PrincipalBinding.findUnique({
++      where: {
++        communityId_pubkey: {
++          communityId: broker.community_id,
++          pubkey: broker.pubkey,
++        },
++      },
++      include: { user: true },
++    });
++
++    if (principal && principal.principalKey !== broker.principal_key) {
++      throw new A2d2AuthError('scope_or_membership_denied');
++    }
++
++    if (!binding) {
++      if (broker.role !== 'owner') {
++        throw new A2d2AuthError('community_not_provisioned');
++      }
++      const user = principal?.user ?? (await this.createManagedUser(broker));
++      const workspace = await this.models.workspace.create(user.id);
++      await this.models.workspace.update(workspace.id, { name: 'A2D2' });
++      binding = await this.db.a2d2CommunityBinding.create({
++        data: {
++          communityId: broker.community_id,
++          workspaceId: workspace.id,
++        },
++      });
++      principal = await this.db.a2d2PrincipalBinding.create({
++        data: {
++          communityId: binding.communityId,
++          workspaceId: binding.workspaceId,
++          pubkey: broker.pubkey,
++          principalKey: broker.principal_key,
++          userId: user.id,
++          role: broker.role,
++          active: true,
++        },
++        include: { user: true },
++      });
++      await this.ensureManagedWorkspaceInitialized(
++        binding.workspaceId,
++        principal.userId
++      );
++      return principal;
++    }
++
++    if (!principal) {
++      const user = await this.createManagedUser(broker);
++      principal = await this.db.a2d2PrincipalBinding.create({
++        data: {
++          communityId: binding.communityId,
++          workspaceId: binding.workspaceId,
++          pubkey: broker.pubkey,
++          principalKey: broker.principal_key,
++          userId: user.id,
++          role: broker.role,
++          active: true,
++        },
++        include: { user: true },
++      });
++    }
++
++    await this.syncWorkspaceRole(
++      binding.workspaceId,
++      principal.userId,
++      principal.role,
++      broker.role
++    );
++    if (principal.role !== broker.role || !principal.active) {
++      principal = await this.db.a2d2PrincipalBinding.update({
++        where: {
++          communityId_pubkey: {
++            communityId: broker.community_id,
++            pubkey: broker.pubkey,
++          },
++        },
++        data: { role: broker.role, active: true },
++        include: { user: true },
++      });
++    }
++    await this.ensureManagedWorkspaceInitialized(
++      binding.workspaceId,
++      principal.userId
++    );
++    return principal;
++  }
++
++  private async ensureManagedWorkspaceInitialized(
++    workspaceId: string,
++    editorId: string
++  ) {
++    if (await this.models.doc.exists(workspaceId, workspaceId)) return;
++
++    const rootDoc = new YDoc({ guid: workspaceId });
++    rootDoc.getMap('meta').set('pages', new YArray());
++    await this.models.doc.upsert({
++      spaceId: workspaceId,
++      docId: workspaceId,
++      blob: Buffer.from(encodeStateAsUpdate(rootDoc)),
++      timestamp: Date.now(),
++      editorId,
++    });
++
++    if (!(await this.models.doc.exists(workspaceId, workspaceId))) {
++      throw new A2d2AuthError('broker_unavailable');
++    }
++  }
++
++  private async createManagedUser(broker: A2d2BrokerPrincipal) {
++    const keyHash = createHash('sha256')
++      .update(`${broker.community_id}:${broker.pubkey}`)
++      .digest('hex')
++      .slice(0, 20);
++    const community = broker.community_id.replaceAll('-', '').slice(0, 12);
++    return await this.db.user.create({
++      data: {
++        name: `A2D2 ${broker.pubkey.slice(0, 12)}`,
++        email: `a2d2+${community}.${broker.pubkey.slice(0, 12)}.${keyHash}@internal.invalid`,
++        password: null,
++        emailVerifiedAt: new Date(),
++        registered: true,
++      },
++    });
++  }
++
++  private async syncWorkspaceRole(
++    workspaceId: string,
++    userId: string,
++    previousRole: string,
++    role: A2d2BrokerPrincipal['role']
++  ) {
++    if (role === 'owner') {
++      const currentOwner = await this.db.a2d2PrincipalBinding.findFirst({
++        where: {
++          workspaceId,
++          role: 'owner',
++          active: true,
++          userId: { not: userId },
++        },
++      });
++      if (currentOwner) throw new A2d2AuthError('community_owner_conflict');
++      await this.models.workspaceUser.setOwner(workspaceId, userId);
++      return;
++    }
++    if (previousRole === 'owner') {
++      throw new A2d2AuthError('community_owner_conflict');
++    }
++    await this.models.workspaceUser.set(
++      workspaceId,
++      userId,
++      role === 'admin' ? WorkspaceRole.Admin : WorkspaceRole.Collaborator,
++      { status: WorkspaceMemberStatus.Accepted }
++    );
++  }
++
++  private async disablePrincipal(principalKey: string) {
++    await this.db.a2d2PrincipalBinding.updateMany({
++      where: { principalKey },
++      data: { active: false },
++    });
++  }
++
++  private decryptSessionCookie(encrypted: string) {
++    const value = JSON.parse(this.crypto.decrypt(encrypted)) as unknown;
++    if (
++      !value ||
++      typeof value !== 'object' ||
++      !('v' in value) ||
++      value.v !== 1 ||
++      !('session_token' in value) ||
++      typeof value.session_token !== 'string' ||
++      !('principal_key' in value) ||
++      typeof value.principal_key !== 'string'
++    ) {
++      throw new A2d2AuthError('scope_or_membership_denied');
++    }
++    return {
++      sessionToken: value.session_token,
++      principalKey: value.principal_key,
++    };
++  }
++
++  private sha256(value: string) {
++    return createHash('sha256').update(value).digest('hex');
++  }
++
++  private assertEnabled() {
++    if (!this.enabled) throw new A2d2AuthError('broker_unavailable');
++  }
++}
+diff --git a/packages/frontend/apps/web/src/a2d2-managed-auth.spec.ts b/packages/frontend/apps/web/src/a2d2-managed-auth.spec.ts
+new file mode 100644
+index 0000000..4e1fa11
+--- /dev/null
++++ b/packages/frontend/apps/web/src/a2d2-managed-auth.spec.ts
+@@ -0,0 +1,28 @@
++import { describe, expect, test } from 'vitest';
++
++import {
++  isManagedWorkspacePath,
++  managedWorkspacePath,
++} from './a2d2-managed-auth';
++
++describe('A2D2 managed workspace routing', () => {
++  test('uses the full workspace shell route', () => {
++    expect(managedWorkspacePath('71c0151b-cff6-44fc-9592-b8dbdbcd632a')).toBe(
++      '/workspace/71c0151b-cff6-44fc-9592-b8dbdbcd632a/all'
++    );
++  });
++
++  test('preserves documents only inside the managed workspace', () => {
++    const workspaceId = '71c0151b-cff6-44fc-9592-b8dbdbcd632a';
++    expect(
++      isManagedWorkspacePath(workspaceId, `/workspace/${workspaceId}/doc-1`)
++    ).toBe(true);
++    expect(
++      isManagedWorkspacePath(
++        workspaceId,
++        '/workspace/9ca5aba0-311f-48a8-acd1-89e55bb05718/doc-1'
++      )
++    ).toBe(false);
++    expect(isManagedWorkspacePath(workspaceId, '/all')).toBe(false);
++  });
++});
+diff --git a/packages/frontend/apps/web/src/a2d2-managed-auth.ts b/packages/frontend/apps/web/src/a2d2-managed-auth.ts
+new file mode 100644
+index 0000000..7ce218d
+--- /dev/null
++++ b/packages/frontend/apps/web/src/a2d2-managed-auth.ts
+@@ -0,0 +1,70 @@
++const WORKSPACE_STORAGE_KEY = 'a2d2-managed-workspace-id';
++const WORKSPACE_ID =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++
++type A2d2LaunchResult = {
++  authenticated: true;
++  expires_at: number;
++  workspace_id: string;
++};
++
++declare global {
++  interface Window {
++    a2d2Engine?: Readonly<{
++      launch(): Promise<A2d2LaunchResult>;
++    }>;
++  }
++}
++
++function validWorkspaceId(value: unknown): value is string {
++  return typeof value === 'string' && WORKSPACE_ID.test(value);
++}
++
++async function hasManagedSession() {
++  const response = await fetch('/api/auth/session', {
++    cache: 'no-store',
++    credentials: 'include',
++  });
++  if (!response.ok) return false;
++  const body = (await response.json()) as { user?: { id?: unknown } | null };
++  return typeof body.user?.id === 'string';
++}
++
++/**
++ * Establish the provider-managed A2D2 session before AFFiNE initializes its
++ * cached auth/router state. Normal web builds remain unchanged when the native
++ * bridge and its previously verified workspace marker are both absent.
++ */
++export async function prepareA2d2ManagedLaunch(): Promise<string | null> {
++  const bridge = window.a2d2Engine;
++  const storedWorkspace = localStorage.getItem(WORKSPACE_STORAGE_KEY);
++
++  if (!bridge) {
++    return validWorkspaceId(storedWorkspace) ? storedWorkspace : null;
++  }
++
++  if (validWorkspaceId(storedWorkspace) && (await hasManagedSession())) {
++    return storedWorkspace;
++  }
++
++  localStorage.removeItem(WORKSPACE_STORAGE_KEY);
++  const launch = await bridge.launch();
++  if (
++    launch.authenticated !== true ||
++    !Number.isSafeInteger(launch.expires_at) ||
++    launch.expires_at <= Math.floor(Date.now() / 1000) ||
++    !validWorkspaceId(launch.workspace_id)
++  ) {
++    throw new Error('A2D2 managed session response is invalid');
++  }
++  localStorage.setItem(WORKSPACE_STORAGE_KEY, launch.workspace_id);
++  return launch.workspace_id;
++}
++
++export function managedWorkspacePath(workspaceId: string) {
++  return `/workspace/${workspaceId}/all`;
++}
++
++export function isManagedWorkspacePath(workspaceId: string, pathname: string) {
++  return pathname.startsWith(`/workspace/${workspaceId}/`);
++}

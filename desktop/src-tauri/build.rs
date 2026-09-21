@@ -8,6 +8,16 @@ include!("src/managed_agents/reserved_env_keys.rs");
 use base64::Engine as _;
 
 fn main() {
+    for (source, target) in [
+        ("BUZZ_AFFINE_URL", "BUZZ_DESKTOP_AFFINE_URL"),
+        ("BUZZ_PLANE_URL", "BUZZ_DESKTOP_PLANE_URL"),
+    ] {
+        println!("cargo:rerun-if-env-changed={source}");
+        if let Ok(value) = std::env::var(source) {
+            assert!(!value.contains(['\n', '\r']), "invalid upstream URL");
+            println!("cargo:rustc-env={target}={value}");
+        }
+    }
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_URL");
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_HTTP");
     println!("cargo:rerun-if-env-changed=BUZZ_UPDATER_PUBLIC_KEY");
@@ -154,12 +164,17 @@ fn main() {
     }
 
     tauri_build::try_build(
-        tauri_build::Attributes::new().plugin(
-            "websocket",
-            tauri_build::InlinedPlugin::new()
-                .commands(&["connect", "send", "disconnect", "disconnect_all"])
-                .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
-        ),
+        tauri_build::Attributes::new()
+            .plugin(
+                "websocket",
+                tauri_build::InlinedPlugin::new()
+                    .commands(&["connect", "send", "disconnect", "disconnect_all"])
+                    .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
+            )
+            .plugin(
+                "engine-launch",
+                tauri_build::InlinedPlugin::new().commands(&["mint_upstream_launch_from_child"]),
+            ),
     )
     .expect("failed to build Tauri application");
 }

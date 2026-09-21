@@ -53,6 +53,7 @@ use crate::managed_agents::{
 
 mod cli_login;
 pub(crate) mod cli_probe;
+mod selected_claude;
 
 // ── EffectiveAgentEnv ─────────────────────────────────────────────────────────
 
@@ -81,6 +82,9 @@ pub(crate) struct EffectiveAgentEnv {
     /// readiness must not demand the desktop's own CLI login. Always `false`
     /// for runtimes with neither input.
     pub oauth_token_supplied: bool,
+    /// A named Claude account was selected but its own login is unavailable;
+    /// ambient/global auth must not satisfy readiness in that state.
+    pub selected_claude_account_unready: bool,
     /// The resolved harness binary name (e.g. `"buzz-agent"`, `"goose"`).
     pub effective_command: String,
 }
@@ -170,8 +174,14 @@ pub(crate) fn resolve_effective_harness_descriptor(
 
     // Env: full layered resolution (same as resolve_effective_agent_env).
     // Pass harness_def directly to avoid a second lookup.
-    let effective_env =
-        resolve_effective_agent_env_with_def(record, personas, runtime_meta, global, harness_def);
+    let effective_env = resolve_effective_agent_env_with_def(
+        record,
+        personas,
+        runtime_meta,
+        global,
+        harness_def,
+        false,
+    );
 
     Ok(EffectiveHarnessDescriptor {
         command: effective_command,
@@ -195,6 +205,7 @@ pub(crate) fn resolve_effective_agent_env(
     personas: &[AgentDefinition],
     runtime: Option<&KnownAcpRuntime>,
     global: &GlobalAgentConfig,
+    named_claude_account_ready: bool,
 ) -> EffectiveAgentEnv {
     // Look up the harness definition for definition-level env (preset/custom).
     // Same resolution logic as spawn_agent_child: record runtime id first, then
@@ -215,7 +226,14 @@ pub(crate) fn resolve_effective_agent_env(
         crate::managed_agents::custom_harnesses::lookup_loaded_harness_by_id(runtime_id)
     };
 
-    resolve_effective_agent_env_with_def(record, personas, runtime, global, harness_def)
+    resolve_effective_agent_env_with_def(
+        record,
+        personas,
+        runtime,
+        global,
+        harness_def,
+        named_claude_account_ready,
+    )
 }
 
 /// Inner implementation that accepts a pre-fetched `harness_def` to avoid a
@@ -227,6 +245,7 @@ fn resolve_effective_agent_env_with_def(
     runtime: Option<&KnownAcpRuntime>,
     global: &GlobalAgentConfig,
     harness_def: Option<std::sync::Arc<crate::managed_agents::custom_harnesses::HarnessDefinition>>,
+    named_claude_account_ready: bool,
 ) -> EffectiveAgentEnv {
     let effective_command = crate::managed_agents::record_agent_command(record, personas);
 
@@ -299,13 +318,23 @@ fn resolve_effective_agent_env_with_def(
         effective_model.as_deref(),
     );
 
-    let token_supplied = super::claude_accounts::oauth_token_supplied(record, runtime, &env)
-        || super::codex_accounts::codex_auth_supplied(record, runtime, &env);
+    let token_supplied = super::claude_accounts::oauth_token_supplied(
+        record,
+        runtime,
+        &env,
+        named_claude_account_ready,
+    ) || super::codex_accounts::codex_auth_supplied(record, runtime, &env);
+    let selected_claude_account_unready = super::claude_accounts::selected_claude_account_unready(
+        record,
+        runtime,
+        named_claude_account_ready,
+    );
     EffectiveAgentEnv {
         env,
         config_file_path: runtime.and_then(|r| r.config_file_path),
         effective_command,
         oauth_token_supplied: token_supplied,
+        selected_claude_account_unready,
     }
 }
 
@@ -461,12 +490,13 @@ fn collect_missing_requirements(
         }
         // A per-agent Claude account (or hand-typed token) is what the spawn
         // signs in with; the desktop's own CLI login is irrelevant then.
-        "claude" if effective.oauth_token_supplied => vec![],
-        "claude" => cli_login::requirements(
-            &["claude", "auth", "status"],
-            "complete Claude Code authentication by running the Claude CLI",
-            rt,
-        ),
+        "claude" => selected_claude::requirements(effective, || {
+            cli_login::requirements(
+                &["claude", "auth", "status"],
+                "complete Claude Code authentication by running the Claude CLI",
+                rt,
+            )
+        }),
         // Same as claude: a per-agent Codex account (or hand-typed
         // OPENAI_API_KEY / CODEX_HOME) is what the spawn signs in with.
         "codex" if effective.oauth_token_supplied => vec![],
@@ -697,6 +727,7 @@ mod tests {
             config_file_path: runtime.and_then(|r| r.config_file_path),
             effective_command: command.to_string(),
             oauth_token_supplied: false,
+            selected_claude_account_unready: false,
         }
     }
 
@@ -1090,6 +1121,8 @@ mod tests {
             auth_probe_args: None,
             oauth_token_env_var: None,
             supports_codex_accounts: false,
+            data_home: crate::managed_agents::agent_home::DataHomeKind::None,
+            account_unsupported_reason: None,
         }
     }
 
@@ -1472,93 +1505,6 @@ mod tests {
     // ── resolve_effective_agent_env ─────────────────────────────────────────
 
     #[test]
-    fn resolve_effective_agent_env_user_env_wins_over_structured_fields() {
-        // User env_vars must win over baked defaults; in OSS builds baked map is empty,
-        // so this validates the user-env layer is present in the output.
-        let mut env_vars = BTreeMap::new();
-        env_vars.insert("BUZZ_AGENT_PROVIDER".to_string(), "anthropic".to_string());
-        env_vars.insert(
-            "BUZZ_AGENT_MODEL".to_string(),
-            "claude-opus-4-5".to_string(),
-        );
-        // Minimal record: only the fields resolve_effective_agent_env reads.
-        let record = crate::managed_agents::types::ManagedAgentRecord {
-            description: None,
-            pubkey: "test-pubkey".to_string(),
-            name: "test-agent".to_string(),
-            persona_id: None,
-            private_key_nsec: String::new(),
-            auth_tag: None,
-            relay_url: String::new(),
-            avatar_url: None,
-            acp_command: "buzz-acp".to_string(),
-            agent_command: "buzz-agent".to_string(),
-            agent_command_override: None,
-            agent_args: vec![],
-            mcp_command: String::new(),
-            turn_timeout_seconds: 320,
-            idle_timeout_seconds: None,
-            max_turn_duration_seconds: None,
-            parallelism: 1,
-            system_prompt: None,
-            model: None,
-            provider: None,
-            persona_source_version: None,
-            env_vars,
-            start_on_app_launch: false,
-            auto_restart_on_config_change: true,
-            runtime_pid: None,
-            backend: Default::default(),
-            backend_agent_id: None,
-            provider_policy_pending: false,
-            provider_binary_path: None,
-            team_id: None,
-            persona_team_dir: None,
-            persona_name_in_team: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            last_started_at: None,
-            last_stopped_at: None,
-            last_exit_code: None,
-            last_error: None,
-            last_error_code: None,
-            respond_to: Default::default(),
-            respond_to_allowlist: vec![],
-            display_name: None,
-            slug: None,
-            runtime: None,
-            name_pool: Vec::new(),
-            is_builtin: false,
-            is_active: true,
-            shared: false,
-            source_team: None,
-            source_team_persona_slug: None,
-            catalog_source: None,
-            team_catalog_source: None,
-            definition_respond_to: None,
-            definition_respond_to_allowlist: Vec::new(),
-            definition_parallelism: None,
-            relay_mesh: None,
-            effort_level: None,
-            claude_account_id: None,
-            codex_account_id: None,
-        };
-
-        let runtime = known_acp_runtime_exact("buzz-agent");
-        let effective = resolve_effective_agent_env(&record, &[], runtime, &Default::default());
-
-        // User env_vars must be present in the output (last-write-wins).
-        assert_eq!(
-            effective.env.get("BUZZ_AGENT_PROVIDER").map(String::as_str),
-            Some("anthropic")
-        );
-        assert_eq!(
-            effective.env.get("BUZZ_AGENT_MODEL").map(String::as_str),
-            Some("claude-opus-4-5")
-        );
-    }
-
-    #[test]
     fn buzz_agent_databricks_v2_with_databricks_model_but_no_buzz_agent_model_is_ready() {
         // The baked buzz-releases env sets DATABRICKS_MODEL but not BUZZ_AGENT_MODEL.
         // An agent with only DATABRICKS_MODEL must pass the readiness gate.
@@ -1697,6 +1643,8 @@ mod tests {
     mod claude_account;
     #[path = "codex_account.rs"]
     mod codex_account;
+    #[path = "effective_env.rs"]
+    mod effective_env;
 
     #[path = "openrouter_tests.rs"]
     mod openrouter_tests;

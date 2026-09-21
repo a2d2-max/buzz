@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::managed_agents::agent_home::{DataHomeKind, HERMES_ACCOUNT_REASON};
 use crate::managed_agents::{
     AcpAvailabilityStatus, AcpRuntimeCatalogEntry, AuthStatus, HarnessSource,
 };
@@ -20,6 +21,8 @@ pub(super) struct PresetHarness {
     /// State-specific setup guidance for the wrapped vendor CLI.
     underlying_cli_install_hint: Option<&'static str>,
     underlying_cli_install_instructions_url: Option<&'static str>,
+    data_home: DataHomeKind,
+    account_unsupported_reason: Option<&'static str>,
 }
 
 /// Build one preset catalog entry through an injectable command resolver.
@@ -84,6 +87,8 @@ pub(super) fn preset_catalog_entry(
         thinking_env_var: None,
         oauth_token_env_var: super::oauth_token_env_var_for_command(def.command),
         supports_codex_accounts: super::supports_codex_accounts_for_command(def.command),
+        data_home: super::data_home_for_command(def.command),
+        account_unsupported_reason: super::account_unsupported_reason_for_command(def.command),
         effort_canonical_values: None,
         max_tokens_env_var: None,
         context_limit_env_var: None,
@@ -120,6 +125,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli_install_instructions_url: Some(
             "https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent",
         ),
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     PresetHarness {
         id: "devin",
@@ -131,6 +138,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     PresetHarness {
         id: "cursor",
@@ -142,6 +151,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     PresetHarness {
         id: "omp",
@@ -153,6 +164,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     PresetHarness {
         id: "grok",
@@ -164,6 +177,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     PresetHarness {
         id: "opencode",
@@ -175,6 +190,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     PresetHarness {
         id: "kimi",
@@ -186,6 +203,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     PresetHarness {
         id: "amp",
@@ -197,6 +216,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: Some("amp"),
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
     PresetHarness {
         id: "hermes",
@@ -208,6 +229,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::HermesProfile,
+        account_unsupported_reason: Some(HERMES_ACCOUNT_REASON),
     },
     PresetHarness {
         id: "openclaw",
@@ -226,6 +249,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     },
 ];
 
@@ -259,6 +284,17 @@ pub(crate) fn preset_harness_ids() -> &'static [&'static str] {
 /// is not a known preset.
 ///
 /// Returns a `&'static str` so callers can use it without allocation.
+pub(super) fn preset_for_command(command: &str) -> Option<&'static PresetHarness> {
+    let wanted = super::normalize_command_identity(command);
+    PRESET_HARNESSES
+        .iter()
+        .find(|preset| super::normalize_command_identity(preset.command) == wanted)
+}
+
+pub(super) fn preset_home_facts(preset: &PresetHarness) -> (DataHomeKind, Option<&'static str>) {
+    (preset.data_home, preset.account_unsupported_reason)
+}
+
 pub(super) fn preset_command_for_id(id: &str) -> Option<&'static str> {
     PRESET_HARNESSES
         .iter()
@@ -331,7 +367,7 @@ mod tests {
 
     use crate::managed_agents::{AcpAvailabilityStatus, AuthStatus, HarnessSource};
 
-    use super::{preset_catalog_entry, PresetHarness, PRESET_HARNESSES};
+    use super::{preset_catalog_entry, DataHomeKind, PresetHarness, PRESET_HARNESSES};
 
     /// Amp-shaped preset: an ACP adapter wrapping a separately installed CLI.
     const ADAPTER_PRESET: PresetHarness = PresetHarness {
@@ -344,6 +380,8 @@ mod tests {
         underlying_cli: Some("amp"),
         underlying_cli_install_hint: Some("Install the Amp Test CLI."),
         underlying_cli_install_instructions_url: Some("https://example.com/amp"),
+        data_home: DataHomeKind::None,
+        account_unsupported_reason: None,
     };
 
     #[test]

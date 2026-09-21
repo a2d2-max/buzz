@@ -13,6 +13,7 @@
 const FENCED_CODE = /(```[\s\S]*?```|~~~[\s\S]*?~~~)/g;
 
 const UNSUPPORTED_SYNTAX: ReadonlyArray<[label: string, pattern: RegExp]> = [
+  ["escaped database directives", /^\\:::db /m],
   ["tables", /^\s*\|.*\|\s*\n\s*\|?\s*:?-{3,}/m],
   ["footnotes", /\[\^[^\]\s]+\]/],
   ["task lists", /^\s*[-*+]\s+\[( |x|X)\]\s/m],
@@ -30,7 +31,11 @@ export function scanUnsupportedMarkdown(source: string): string[] {
 /** Wrapping-only tags whose presence differs between loose and tight renderings. */
 const IGNORED_TAGS = new Set(["p", "br"]);
 
-function summarize(html: string): { text: string; tags: Map<string, number> } {
+function summarize(html: string): {
+  databaseBlocks: string[];
+  text: string;
+  tags: Map<string, number>;
+} {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const text = (doc.body.textContent ?? "").replace(/\s+/g, "");
   const tags = new Map<string, number>();
@@ -39,7 +44,13 @@ function summarize(html: string): { text: string; tags: Map<string, number> } {
     if (IGNORED_TAGS.has(tag)) continue;
     tags.set(tag, (tags.get(tag) ?? 0) + 1);
   }
-  return { tags, text };
+  const databaseBlocks = [
+    ...doc.body.querySelectorAll("[data-doc-database-block]"),
+  ].map(
+    (element) =>
+      `${element.getAttribute("data-database-id") ?? ""}\u0000${element.getAttribute("data-view-id") ?? ""}`,
+  );
+  return { databaseBlocks, tags, text };
 }
 
 /**
@@ -57,6 +68,14 @@ export function compareRenderedMarkdown(
   const echoed = summarize(echoedHtml);
   const reasons: string[] = [];
   if (source.text !== echoed.text) reasons.push("text");
+  if (
+    source.databaseBlocks.length !== echoed.databaseBlocks.length ||
+    source.databaseBlocks.some(
+      (signature, index) => signature !== echoed.databaseBlocks[index],
+    )
+  ) {
+    reasons.push("database blocks");
+  }
   for (const [tag, count] of source.tags) {
     if ((echoed.tags.get(tag) ?? 0) !== count) reasons.push(tag);
   }

@@ -40,6 +40,7 @@ import {
   listRelayAgents,
   saveCustomHarness,
   updateManagedAgent,
+  updateManagedAgentAccountsBatch,
 } from "@/shared/api/tauri";
 import type { HarnessDefinitionInput } from "@/shared/api/tauri";
 import { discoverAcpRuntimes } from "@/shared/api/tauriAcpDiscovery";
@@ -77,6 +78,7 @@ import type {
   CreatePersonaInput,
   ManagedAgent,
   UpdateManagedAgentInput,
+  UpdateManagedAgentAccountsBatchInput,
   UpdatePersonaInput,
 } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -491,6 +493,18 @@ export function useUpdateManagedAgentMutation() {
             query.queryKey.includes(lowerPubkey),
         }),
       ]);
+    },
+  });
+}
+
+export function useUpdateManagedAgentAccountsBatchMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: UpdateManagedAgentAccountsBatchInput) =>
+      updateManagedAgentAccountsBatch(input),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey });
     },
   });
 }

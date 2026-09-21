@@ -17,7 +17,9 @@ import {
   writeDocDraftBackup,
 } from "../lib/docDraftBackup";
 import { DocImageNode } from "../lib/docImageNode";
+import { DocDatabaseNode } from "../lib/docDatabaseNode";
 import type { DocPage } from "../lib/docPageCodec";
+import { AffineDocEditor } from "./AffineDocEditor";
 import { DocConflictError } from "../lib/useCommunityDocs";
 import {
   compareRenderedMarkdown,
@@ -33,7 +35,11 @@ export const DOC_AUTOSAVE_DELAY_MS = 1_500;
  */
 export const DOC_AUTOSAVE_MIN_INTERVAL_MS = 5_000;
 
-export type DocDraft = { title: string; body: string };
+export type DocDraft = {
+  title: string;
+  body: string;
+  affine?: DocPage["affine"];
+};
 
 /** `rich` is the TipTap document; `source` is the raw markdown in a textarea. */
 export type DocEditorMode = "rich" | "source";
@@ -46,6 +52,7 @@ export type DocPageEditorHandle = {
 };
 
 type DocPageEditorProps = {
+  structured?: boolean;
   autoFocus?: boolean;
   onAutosaveState: (state: AutosaveState) => void;
   onSave: (draft: DocDraft) => Promise<void>;
@@ -53,7 +60,7 @@ type DocPageEditorProps = {
   ref?: React.Ref<DocPageEditorHandle>;
 };
 
-const DOC_EDITOR_EXTENSIONS = [DocImageNode];
+export const DOC_EDITOR_EXTENSIONS = [DocImageNode, DocDatabaseNode];
 
 /**
  * Heading/list/code rhythm for the contenteditable, mirroring the read view.
@@ -106,7 +113,15 @@ function describeLossyReasons(reasons: string[]): string {
  * save keeps the draft pending and mirrors it to localStorage so it can be
  * offered back the next time the page opens.
  */
-export function DocPageEditor({
+export function DocPageEditor(props: DocPageEditorProps) {
+  return props.structured || props.page.affine ? (
+    <AffineDocEditor {...props} />
+  ) : (
+    <MarkdownDocPageEditor {...props} />
+  );
+}
+
+function MarkdownDocPageEditor({
   autoFocus = false,
   onAutosaveState,
   onSave,
@@ -156,7 +171,7 @@ export function DocPageEditor({
 
   // Drafts are thunks so markdown serialization runs once per save, not once
   // per keystroke. A failed publish leaves a durable copy behind.
-  const scheduler = React.useMemo(
+  const createScheduler = React.useCallback(
     () =>
       createAutosaveScheduler<() => DocDraft>({
         delayMs: DOC_AUTOSAVE_DELAY_MS,
@@ -183,15 +198,16 @@ export function DocPageEditor({
       }),
     [page.id],
   );
-  const schedulerRef = React.useRef<typeof scheduler | null>(null);
-  schedulerRef.current = scheduler;
+  const schedulerRef = React.useRef<ReturnType<typeof createScheduler> | null>(
+    null,
+  );
 
   const scheduleSave = React.useCallback(() => {
-    scheduler.schedule(() => ({
+    schedulerRef.current?.schedule(() => ({
       title: titleRef.current,
       body: currentBody(),
     }));
-  }, [currentBody, scheduler]);
+  }, [currentBody]);
 
   const richText = useRichTextEditor({
     documentMode: true,
@@ -326,27 +342,28 @@ export function DocPageEditor({
   React.useImperativeHandle(
     ref,
     () => ({
-      flush: () => scheduler.flush(),
+      flush: () => schedulerRef.current?.flush() ?? Promise.resolve(false),
       discard: () => {
         discardedRef.current = true;
-        scheduler.dispose();
+        schedulerRef.current?.dispose();
         // The draft was thrown away on purpose; do not offer it back later.
         clearDocDraftBackup(safeLocalStorage(), page.id);
       },
     }),
-    [page.id, scheduler],
+    [page.id],
   );
 
-  React.useEffect(
-    () => () => {
+  React.useEffect(() => {
+    const scheduler = createScheduler();
+    schedulerRef.current = scheduler;
+    return () => {
+      if (schedulerRef.current === scheduler) schedulerRef.current = null;
       if (discardedRef.current) {
         scheduler.dispose();
         return;
       }
-      // Unmount (page switch, leaving Docs): push pending edits out first.
-      // TipTap destroys the editor on the next tick, so serializing here still
-      // sees the live document — materialize the draft now instead of inside
-      // a save that may run after that tick.
+      // Materialize before TipTap is destroyed. Each effect owns its scheduler,
+      // so StrictMode cleanup cannot permanently disable the replacement.
       if (scheduler.isDirty()) {
         const snapshot: DocDraft = {
           title: titleRef.current,
@@ -356,18 +373,17 @@ export function DocPageEditor({
       }
       void scheduler.flush();
       scheduler.dispose();
-    },
-    [currentBody, scheduler],
-  );
+    };
+  }, [createScheduler, currentBody]);
 
   // Blur = "I'm done for now": save unless focus merely moved within the editor.
   const handleBlur = React.useCallback(
     (event: React.FocusEvent<HTMLElement>) => {
       const next = event.relatedTarget;
       if (next instanceof Node && containerRef.current?.contains(next)) return;
-      void scheduler.flush();
+      void schedulerRef.current?.flush();
     },
-    [scheduler],
+    [],
   );
 
   return (

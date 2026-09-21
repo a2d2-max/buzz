@@ -86,6 +86,18 @@ async fn assert_closed(ws: &mut WS) {
     }
 }
 
+/// Prove the server connection task has armed its deadline before advancing
+/// virtual time. Keep socket readiness and close delivery on wall-clock time:
+/// a paused Tokio clock can otherwise auto-advance the assertion timeout while
+/// the OS is still delivering the WebSocket frame.
+async fn arm_connection_timeout(ws: &mut WS) {
+    send(ws, &json!(["REQ", "timeout-ready", {"#p": [P_A]}])).await;
+    let response = recv(ws).await;
+    assert_eq!(response[0], "EOSE");
+    assert_eq!(response[1], "timeout-ready");
+    tokio::time::pause();
+}
+
 /// Generate a random keypair; returns `(SecretKey, pubkey_hex)`.
 fn gen_keypair() -> (SecretKey, String) {
     let secp = Secp256k1::new();
@@ -439,16 +451,19 @@ async fn test_second_sub_same_id() {
 }
 
 /// 9. Connection closes after 120 s (virtual time).
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn test_120s_timeout() {
     let url = start_relay().await;
     let mut ws = connect(&url).await;
+
+    arm_connection_timeout(&mut ws).await;
 
     // Advance virtual time past the connection timeout.
     tokio::time::advance(Duration::from_secs(121)).await;
     // Yield to let the relay task run its deadline branch.
     tokio::task::yield_now().await;
 
+    tokio::time::resume();
     assert_closed(&mut ws).await;
 }
 
@@ -1178,15 +1193,18 @@ async fn test_reader_backpressure_closes() {
 
 /// 42. Connection closes promptly after 120 s (virtual time).
 ///     Explicit duplicate of test 9 with a slightly different assertion style.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn test_cancellation_immediate() {
     let url = start_relay().await;
     let mut ws = connect(&url).await;
+
+    arm_connection_timeout(&mut ws).await;
 
     tokio::time::advance(Duration::from_secs(121)).await;
     tokio::task::yield_now().await;
 
     // The connection must be closed — not just slow.
+    tokio::time::resume();
     assert_closed(&mut ws).await;
 }
 

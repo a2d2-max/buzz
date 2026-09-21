@@ -3172,7 +3172,12 @@ async fn ingest_event_inner(
             .db
             .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+            .map_err(|e| match e {
+                buzz_db::DbError::CommunityTaskRejected(message) => {
+                    IngestError::Rejected(format!("restricted: {message}"))
+                }
+                other => IngestError::Internal(format!("error: {other}")),
+            })?
     } else {
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
         match state

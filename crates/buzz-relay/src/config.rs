@@ -186,6 +186,9 @@ pub struct Config {
     pub slow_client_grace_limit: u8,
     /// Authentication provider configuration.
     pub auth: buzz_auth::AuthConfig,
+    /// Optional NIP-FI company identity enforcement. Off by default; enforce
+    /// mode is accepted only with a complete trusted issuer contract.
+    pub company_identity: crate::company_identity::CompanyIdentityConfig,
     /// Whether REST API requests must present a valid token. Independent of
     /// WebSocket protocol auth, which is *always* required by REQ/EVENT/COUNT.
     pub require_auth_token: bool,
@@ -832,6 +835,7 @@ impl Config {
         let auth = buzz_auth::AuthConfig {
             rate_limits: rate_limit_config_from_env()?,
         };
+        let company_identity = crate::company_identity::CompanyIdentityConfig::from_env()?;
 
         if !require_auth_token {
             warn!(
@@ -1258,6 +1262,7 @@ impl Config {
             max_event_content_bytes,
             slow_client_grace_limit,
             auth,
+            company_identity,
             require_auth_token,
             cors_origins,
             relay_private_key,

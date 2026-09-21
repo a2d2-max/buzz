@@ -1,8 +1,7 @@
 use crate::managed_agents::{
-    command_availability, find_command, is_npm_global_install, normalize_agent_args,
-    oauth_token_env_var_for_command, supports_codex_accounts_for_command, AcpRuntimeCatalogEntry,
-    DiscoverManagedAgentPrereqsRequest, InstallRuntimeResult, ManagedAgentPrereqsInfo,
-    DEFAULT_ACP_COMMAND,
+    command_availability, custom_catalog_entry, find_command, is_npm_global_install,
+    AcpRuntimeCatalogEntry, DiscoverManagedAgentPrereqsRequest, InstallRuntimeResult,
+    ManagedAgentPrereqsInfo, DEFAULT_ACP_COMMAND,
 };
 
 mod forced_single_flight;
@@ -82,9 +81,7 @@ pub async fn save_custom_harness(
     original_id: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<AcpRuntimeCatalogEntry, String> {
-    use crate::managed_agents::{
-        custom_harnesses, AcpAvailabilityStatus, AuthStatus, HarnessSource,
-    };
+    use crate::managed_agents::custom_harnesses;
     use tauri::Manager;
 
     // ── Phase 1: full validation before touching the filesystem ─────────────
@@ -124,48 +121,7 @@ pub async fn save_custom_harness(
     // so concurrent saves never produce a stale registry snapshot (B-6).
     custom_harnesses::save_and_warm(&custom_dir, &definition, rename_old_id.as_deref())?;
 
-    // Resolve availability for the returned catalog entry.
-    let (availability, command_opt, binary_path) = match find_command(&definition.command) {
-        Some(path) => (
-            AcpAvailabilityStatus::Available,
-            Some(definition.command.clone()),
-            Some(path.display().to_string()),
-        ),
-        None => (AcpAvailabilityStatus::NotInstalled, None, None),
-    };
-
-    let default_args = normalize_agent_args(&definition.command, definition.args.clone());
-
-    Ok(AcpRuntimeCatalogEntry {
-        id: definition.id,
-        label: definition.label,
-        avatar_url: String::new(),
-        availability,
-        command: command_opt,
-        binary_path,
-        default_args,
-        mcp_command: None,
-        model_env_var: None,
-        provider_env_var: None,
-        thinking_env_var: None,
-        oauth_token_env_var: oauth_token_env_var_for_command(&definition.command),
-        supports_codex_accounts: supports_codex_accounts_for_command(&definition.command),
-        effort_canonical_values: None,
-        max_tokens_env_var: None,
-        context_limit_env_var: None,
-        max_rounds_env_var: None,
-        install_hint: definition.install_hint,
-        install_instructions_url: definition.install_instructions_url,
-        can_auto_install: false,
-        requires_external_cli: false,
-        underlying_cli_path: None,
-        node_required: false,
-        auth_status: AuthStatus::NotApplicable,
-        login_hint: None,
-        source: HarnessSource::Custom,
-        definition_env: definition.env,
-        max_parallelism: crate::managed_agents::harness_max_parallelism(&definition.command),
-    })
+    Ok(custom_catalog_entry(&definition, find_command))
 }
 
 /// Remove a user-defined harness definition from `<app-data>/custom_harnesses/`.
@@ -452,6 +408,10 @@ async fn restart_setup_mode_agents_after_install(
                     &personas,
                     known_acp_runtime(&effective_cmd),
                     &global,
+                    crate::managed_agents::claude_accounts::claude_account_readiness_supplied(
+                        &app_for_scan,
+                        record.claude_account_id.as_deref(),
+                    ),
                 );
                 let now_ready = matches!(agent_readiness(&effective), AgentReadiness::Ready);
                 let pid_alive = runtimes.iter().any(|(key, runtime)| {
@@ -581,7 +541,16 @@ async fn restart_single_agent_after_install(
         }
 
         let runtime_meta = known_acp_runtime(&effective_cmd);
-        let effective = resolve_effective_agent_env(record, &personas, runtime_meta, &global);
+        let effective = resolve_effective_agent_env(
+            record,
+            &personas,
+            runtime_meta,
+            &global,
+            crate::managed_agents::claude_accounts::claude_account_readiness_supplied(
+                &app_for_stop,
+                record.claude_account_id.as_deref(),
+            ),
+        );
         if !matches!(agent_readiness(&effective), AgentReadiness::Ready) {
             return Err(format!(
                 "agent {pubkey_owned} readiness is still NotReady after install — not bouncing"

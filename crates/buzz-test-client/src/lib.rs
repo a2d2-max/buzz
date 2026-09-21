@@ -64,6 +64,9 @@ impl From<WsClientError> for TestClientError {
             WsClientError::Json(e) => TestClientError::Json(e),
             WsClientError::EventBuilder(s) => TestClientError::EventBuilder(s),
             WsClientError::Url(s) => TestClientError::Url(s),
+            WsClientError::InvalidFederatedAssertion => {
+                TestClientError::AuthFailed("invalid federated identity assertion".to_owned())
+            }
             WsClientError::Timeout => TestClientError::Timeout,
             WsClientError::ConnectionClosed => TestClientError::ConnectionClosed,
             WsClientError::UnexpectedMessage(s) => TestClientError::UnexpectedMessage(s),
@@ -98,6 +101,19 @@ impl BuzzTestClient {
         let inner = NostrWsConnection::connect(url).await?;
         debug!("connected to relay at {url}");
         Ok(Self { inner })
+    }
+
+    /// Connects with one NIP-FI assertion on the upgrade request, then performs
+    /// NIP-42 authentication using `keys`.
+    pub async fn connect_with_federated_assertion(
+        url: &str,
+        keys: &Keys,
+        compact_jws: &str,
+    ) -> Result<Self, TestClientError> {
+        let inner = NostrWsConnection::connect_with_federated_assertion(url, compact_jws).await?;
+        let mut client = Self { inner };
+        client.authenticate(keys).await?;
+        Ok(client)
     }
 
     /// Performs NIP-42 authentication using `keys` against the connected relay.

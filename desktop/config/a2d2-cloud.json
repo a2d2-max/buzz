@@ -1,0 +1,6 @@
+{
+  "BUZZ_AFFINE_URL": "https://affine.a2d2.space",
+  "BUZZ_PLANE_URL": "https://plane.a2d2.space",
+  "BUZZ_RELAY_HTTP": "https://buzz.a2d2lab.com",
+  "BUZZ_RELAY_URL": "wss://buzz.a2d2lab.com"
+}

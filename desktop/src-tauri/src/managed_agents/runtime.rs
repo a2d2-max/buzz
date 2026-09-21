@@ -44,8 +44,9 @@ use process::{
     terminate_runtime_receipt_with, valid_agent_runtime_receipt_with,
 };
 pub(crate) use process::{
-    current_instance_id, process_belongs_to_us, process_has_buzz_marker, process_is_running,
-    terminate_process, terminate_untracked_pair_runtime, valid_agent_runtime_receipt,
+    current_instance_id, kill_owned_process_group, process_belongs_to_us, process_has_buzz_marker,
+    process_is_running, terminate_process, terminate_untracked_pair_runtime,
+    valid_agent_runtime_receipt,
 };
 
 mod orphan_sweep;
@@ -430,8 +431,25 @@ pub(crate) fn apply_effort_to_spawn_command(
 pub(crate) fn spawn_with_effort_proof(
     cmd: &mut std::process::Command,
     _effort: EffortApplied,
+    _data_home: super::agent_home::DataHomeApplied,
 ) -> std::io::Result<std::process::Child> {
     cmd.spawn()
+}
+
+/// Build the production ACP harness command. An imported Codex home protects
+/// the harness and every descendant from writes to Orca's account trees.
+pub(crate) fn build_agent_harness_command(
+    resolved_acp_command: &std::path::Path,
+    codex_auth: Option<&super::codex_accounts::CodexSpawnAuth>,
+) -> Result<std::process::Command, String> {
+    match codex_auth.filter(|auth| auth.external_read_only) {
+        Some(auth) => super::codex_accounts::command_for_external_codex_home(
+            resolved_acp_command,
+            &auth.home_dir,
+        )
+        .map_err(|error| format!("cannot protect imported Codex account: {error}")),
+        None => Ok(std::process::Command::new(resolved_acp_command)),
+    }
 }
 
 /// Spawn an agent process without holding any locks on records or runtimes.
@@ -510,10 +528,10 @@ pub fn spawn_agent_child(
     // user env below and never enters `env_vars` or the spawn snapshot.
     let oauth_token_env_var =
         known_acp_runtime(effective_command).and_then(|r| r.oauth_token_env_var);
-    let claude_account_token = super::claude_accounts::claude_account_spawn_token(
+    let claude_account_auth = super::claude_accounts::claude_account_spawn_auth(
         record.claude_account_id.as_deref(),
         oauth_token_env_var.is_some(),
-        |id| super::claude_accounts::lookup_claude_account_token(app, id),
+        |id| super::claude_accounts::lookup_claude_account_auth(app, id),
     )
     .map_err(|error| format!("cannot spawn agent {}: {error}", record.pubkey))?;
 
@@ -528,6 +546,34 @@ pub fn spawn_agent_child(
         |id| super::codex_accounts::lookup_codex_spawn_auth(app, id),
     )
     .map_err(|error| format!("cannot spawn agent {}: {error}", record.pubkey))?;
+
+    let data_home_plan = {
+        use super::agent_home::{self, DataHomeKind};
+        let data_home_kind = super::discovery::data_home_for_command(effective_command);
+        let agents_base_dir = super::managed_agents_base_dir(app)?;
+        let ctx = agent_home::DataHomeContext {
+            agents_base_dir: &agents_base_dir,
+            hermes_cli: (data_home_kind == DataHomeKind::HermesProfile)
+                .then(|| {
+                    agent_home::resolve_hermes_cli(resolve_command(effective_command).as_deref())
+                })
+                .flatten(),
+            hermes_root: agent_home::hermes_root(&descriptor.env, agent_home::platform_hermes_root)
+                .ok(),
+            path_env: super::readiness::cli_probe::augmented_path(),
+            codex_app_home: agent_home::codex_app_home(&descriptor.env),
+        };
+        agent_home::plan_data_home(
+            data_home_kind,
+            &record.pubkey,
+            codex_account_auth
+                .as_ref()
+                .map(agent_home::codex_sources_for_account)
+                .as_ref(),
+            &ctx,
+        )
+        .map_err(|error| format!("cannot spawn agent {}: {error}", record.pubkey))?
+    };
 
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
@@ -587,7 +633,8 @@ pub fn spawn_agent_child(
         nvm_bin,
     );
 
-    let mut command = std::process::Command::new(&resolved_acp_command);
+    let mut command =
+        build_agent_harness_command(&resolved_acp_command, codex_account_auth.as_ref())?;
     if let Some(home) = super::default_agent_workdir() {
         command.current_dir(home);
     }
@@ -627,8 +674,13 @@ pub fn spawn_agent_child(
 
     // ── Readiness check: set setup-payload if agent is not ready ─────────────
     // `spawned_setup_mode` is stamped on `ManagedAgentProcess` below.
-    let spawned_setup_mode =
-        apply_setup_payload_env(&mut command, record, &descriptor, runtime_meta);
+    let spawned_setup_mode = apply_setup_payload_env(
+        &mut command,
+        record,
+        &descriptor,
+        runtime_meta,
+        claude_account_auth.is_some(),
+    );
     // Emit BUZZ_ACP_IDLE_TIMEOUT only when explicitly set; the harness
     // DEFAULT_IDLE_TIMEOUT_SECS is the single source of truth. The deprecated
     // BUZZ_ACP_TURN_TIMEOUT pinned agents to a stale default (320s).
@@ -787,11 +839,12 @@ pub fn spawn_agent_child(
     super::claude_accounts::apply_claude_account_env(
         &mut command,
         oauth_token_env_var,
-        claude_account_token.as_deref(),
+        claude_account_auth.as_ref(),
     );
     // Same rule for the picked Codex account: its CODEX_HOME (and key) beat
     // hand-typed values in the user env.
     super::codex_accounts::apply_codex_account_env(&mut command, codex_account_auth.as_ref());
+    let data_home = super::agent_home::apply_agent_data_home(&mut command, data_home_plan.as_ref());
     // Resolve once and stamp the same value onto the snapshot below.
     let acp_session_policy = super::apply_app_acp_session_policy_env(app, &mut command);
 
@@ -864,7 +917,7 @@ pub fn spawn_agent_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = spawn_with_effort_proof(&mut command, effort).map_err(|error| {
+    let child = spawn_with_effort_proof(&mut command, effort, data_home).map_err(|error| {
         format!(
             "failed to spawn `{}` for agent {}: {error}",
             resolved_acp_command.display(),

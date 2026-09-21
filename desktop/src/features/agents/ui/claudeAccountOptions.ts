@@ -32,7 +32,9 @@ const PENDING_LABEL = "Loading account…";
  * the query failed). `null` must never be read as "no accounts": a saved
  * selection is then "pending", not "removed".
  */
-export type ClaudeAccountList = readonly ClaudeAccount[] | null;
+export type ClaudeAccountList =
+  | readonly Pick<ClaudeAccount, "id" | "label">[]
+  | null;
 
 /** True when `envVars` carries a non-blank token under `tokenEnvVar`. */
 export function hasManualClaudeToken(
@@ -166,8 +168,14 @@ export function resolveClaudeAccountLabel(
  */
 export function findRuntimeForCommand<
   T extends Pick<AcpRuntimeCatalogEntry, "id" | "command">,
->(runtimes: readonly T[], agentCommand: string): T | undefined {
-  const wanted = agentCommand.trim();
+>(
+  runtimes: readonly T[],
+  agentCommand: string | undefined | null,
+): T | undefined {
+  // A record can reach here without a command (older rows, and agents whose
+  // harness was never resolved); matching nothing beats throwing inside render.
+  const wanted = agentCommand?.trim();
+  if (!wanted) return undefined;
   return (
     runtimes.find((runtime) => runtime.command?.trim() === wanted) ??
     runtimes.find((runtime) => runtime.id === wanted)

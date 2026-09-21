@@ -1,3 +1,4 @@
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import * as React from "react";
 
 import {
@@ -20,6 +21,7 @@ const BOARD_SEARCH_KEYS = ["issue", "tab"] as const;
  * URL so back/forward and reloads restore them.
  */
 export function BoardScreen() {
+  const { goDocs } = useAppNavigation();
   const { applyPatch, values } = useHistorySearchState(BOARD_SEARCH_KEYS);
   const tab = parseBoardTab(values.tab) ?? DEFAULT_BOARD_TAB;
   const selectedIssueId = values.issue;
@@ -80,7 +82,11 @@ export function BoardScreen() {
         className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
         value="tasks"
       >
-        <CommunityTasksBoardPanel />
+        <CommunityTasksBoardPanel
+          onOpenDocument={(pageId) => {
+            void goDocs(pageId);
+          }}
+        />
       </TabsContent>
     </Tabs>
   );

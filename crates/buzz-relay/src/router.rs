@@ -7,8 +7,8 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, FromRequest, State, WebSocketUpgrade},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
-    middleware,
-    response::{IntoResponse, Json},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::{get, post, put},
     Router,
 };
@@ -73,6 +73,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/events", post(api::bridge::submit_event))
         .route("/query", post(api::bridge::query_events))
         .route("/count", post(api::bridge::count_events))
+        .route("/api/engine/v1/launch", post(api::engine_sessions::launch))
+        .route(
+            "/api/engine/v1/exchange",
+            post(api::engine_sessions::exchange),
+        )
+        .route(
+            "/api/engine/v1/session/check",
+            post(api::engine_sessions::check),
+        )
+        .route(
+            "/api/engine/v1/session/revoke",
+            post(api::engine_sessions::revoke),
+        )
         // Relay-owned third-party GIF metadata proxy (NIP-98 auth).
         .route(api::gifs::SEARCH_PATH, post(api::gifs::search))
         .route(api::gifs::SHARE_PATH, post(api::gifs::share))
@@ -202,9 +215,31 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     }
 
     merged
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            company_identity_http_middleware,
+        ))
         .layer(middleware::from_fn(track_metrics))
         .layer(http_trace_layer())
         .layer(build_cors_layer(&state.config.cors_origins))
+}
+
+async fn company_identity_http_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match crate::company_identity::enforce_http_request(
+        &state.company_identity,
+        request.method(),
+        request.uri(),
+        request.headers(),
+    )
+    .await
+    {
+        Ok(()) => next.run(request).await,
+        Err(denial) => crate::company_identity::denial_response(denial),
+    }
 }
 
 fn http_trace_layer() -> TraceLayer<HttpMakeClassifier, fn(&Request<Body>) -> tracing::Span> {
@@ -367,8 +402,14 @@ async fn nip11_or_ws_handler(
             if state.shutting_down.load(Ordering::Relaxed) {
                 return (StatusCode::SERVICE_UNAVAILABLE, "relay restarting").into_response();
             }
+            let federated_assertion = match state.company_identity.verify_headers(&headers).await {
+                Ok(assertion) => assertion,
+                Err(denial) => return crate::company_identity::denial_response(denial),
+            };
             limit_relay_websocket(ws, max_frame_bytes)
-                .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
+                .on_upgrade(move |socket| {
+                    handle_connection(socket, state, addr, tenant, federated_assertion)
+                })
                 .into_response()
         }
         Err(_) => {

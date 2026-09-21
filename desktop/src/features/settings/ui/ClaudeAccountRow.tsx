@@ -2,12 +2,14 @@ import * as React from "react";
 import { EllipsisVertical } from "lucide-react";
 import { toast } from "sonner";
 
+import { useAccountQuotaQuery } from "@/features/agents/useAccountQuota";
 import {
   useRemoveClaudeAccountMutation,
   useRenameClaudeAccountMutation,
   useTestClaudeAccountMutation,
 } from "@/features/agents/useClaudeAccounts";
 import type { ClaudeAccount } from "@/shared/api/types";
+import { getClaudeLoginCommand } from "@/shared/api/tauriClaudeAccounts";
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -17,6 +19,11 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { Input } from "@/shared/ui/input";
 import { Spinner } from "@/shared/ui/spinner";
+
+import { AccountAgentRoster } from "./AccountAgentRoster";
+import { AccountQuotaMeter } from "./AccountQuotaMeter";
+import { ClaudeLoginStatus } from "./ClaudeLoginStatus";
+import { useClaudeAccountLogin } from "./useClaudeAccountLogin";
 
 function errorText(error: unknown, fallback: string) {
   if (error instanceof Error && error.message.trim().length > 0) {
@@ -51,6 +58,13 @@ export function ClaudeAccountRow({ account }: { account: ClaudeAccount }) {
   const rename = useRenameClaudeAccountMutation();
   const remove = useRemoveClaudeAccountMutation();
   const test = useTestClaudeAccountMutation();
+  // Reads when the settings panel mounts this row; a removed account unmounts
+  // it, so a late reading can never land on a row that is gone.
+  const quota = useAccountQuotaQuery(account.id);
+  const testMutate = test.mutate;
+  const login = useClaudeAccountLogin(account.id, {
+    onSucceeded: () => testMutate(account.id),
+  });
 
   React.useEffect(() => {
     if (!editing) {
@@ -133,6 +147,20 @@ export function ClaudeAccountRow({ account }: { account: ClaudeAccount }) {
       });
   }
 
+  async function copyLoginCommand() {
+    try {
+      const command = await getClaudeLoginCommand(account.id);
+      await navigator.clipboard.writeText(command);
+      toast("Login command copied.");
+    } catch (error) {
+      toast.error(errorText(error, "Couldn't copy the login command."));
+    }
+  }
+
+  function signIn() {
+    login.start();
+  }
+
   const renameError = rename.error
     ? errorText(rename.error, "Rename failed.")
     : null;
@@ -200,6 +228,11 @@ export function ClaudeAccountRow({ account }: { account: ClaudeAccount }) {
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <p className="min-w-0 truncate font-medium">{account.label}</p>
+            <span className="rounded-full bg-muted px-2 py-0.5 text-2xs text-muted-foreground">
+              {account.authKind === "config_dir"
+                ? "Browser login"
+                : "Setup token"}
+            </span>
             {account.tokenHint ? (
               <span
                 className="font-mono text-xs text-muted-foreground"
@@ -240,6 +273,22 @@ export function ClaudeAccountRow({ account }: { account: ClaudeAccount }) {
                 align="end"
                 onCloseAutoFocus={(event) => event.preventDefault()}
               >
+                {account.authKind === "config_dir" ? (
+                  <>
+                    <DropdownMenuItem
+                      data-testid={`claude-account-sign-in-${account.id}`}
+                      disabled={
+                        login.startPending || (login.view?.running ?? false)
+                      }
+                      onSelect={signIn}
+                    >
+                      Sign in
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={copyLoginCommand}>
+                      Copy login command
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
                 <DropdownMenuItem
                   data-testid={`claude-account-rename-${account.id}`}
                   onSelect={startRename}
@@ -263,6 +312,21 @@ export function ClaudeAccountRow({ account }: { account: ClaudeAccount }) {
         </div>
       )}
 
+      {editing || confirmingRemove ? null : (
+        <>
+          <AccountQuotaMeter
+            label={account.label}
+            pending={quota.isPending}
+            quota={quota.data}
+          />
+          <AccountAgentRoster
+            accountId={account.id}
+            accountLabel={account.label}
+            provider="claude"
+          />
+        </>
+      )}
+
       {testResult ? (
         <p
           className={
@@ -275,6 +339,25 @@ export function ClaudeAccountRow({ account }: { account: ClaudeAccount }) {
         >
           {testResult.ok ? "Works" : "Failed"} — {testResult.message}
         </p>
+      ) : null}
+
+      {login.startError ? (
+        <p
+          className="mt-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-sm text-destructive"
+          data-testid={`claude-account-login-error-${account.id}`}
+          role="alert"
+        >
+          Couldn't start the login — {login.startError}
+        </p>
+      ) : null}
+      {login.view ? (
+        <ClaudeLoginStatus
+          accountId={account.id}
+          authUrl={login.session?.authUrl ?? null}
+          cancelPending={login.cancelPending}
+          onCancel={login.cancel}
+          view={login.view}
+        />
       ) : null}
       {testError ? (
         <p
@@ -300,6 +383,9 @@ export function ClaudeAccountRow({ account }: { account: ClaudeAccount }) {
           >
             Remove “{account.label}”? Agents using this account switch back to
             the app's own Claude login and will need a restart.
+            {account.authKind === "config_dir"
+              ? " Its app-owned login directory is deleted too."
+              : ""}
           </p>
           <div className="flex justify-end gap-2">
             <Button

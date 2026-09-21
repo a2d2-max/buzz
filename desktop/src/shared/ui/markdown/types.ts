@@ -52,6 +52,11 @@ export type MarkdownRuntime = {
    * validate that clone-URL rewrites point to the active relay only.
    */
   relayOrigin: string | null;
+  /** Per-mount Docs renderer; cached markdown nodes read it from context. */
+  renderDocDatabase?: (
+    databaseId: string,
+    viewId: string | null,
+  ) => React.ReactNode;
   resolveChannelReferences?: boolean;
   /** Display name of the message author sharing an agent snapshot. */
   snapshotSharedBy?: string;
@@ -73,6 +78,8 @@ export type MarkdownProps = {
   channelNames?: string[];
   className?: string;
   content: string;
+  /** Enables the exact standalone Docs database directive transform. */
+  docsDatabases?: boolean;
   customEmoji?: CustomEmoji[];
   /**
    * When true (default), single newlines become `<br>` — chat Enter behavior.
@@ -92,6 +99,8 @@ export type MarkdownProps = {
   agentMentionPubkeysByName?: Record<string, string>;
   mentionNames?: string[];
   mentionPubkeysByName?: Record<string, string>;
+  /** Runtime renderer for Docs database blocks; never captured by parse cache. */
+  renderDocDatabase?: MarkdownRuntime["renderDocDatabase"];
   mediaInset?: boolean;
   /** Event/message identity used only for local preview-image visibility. */
   messageId?: string;

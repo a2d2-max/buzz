@@ -397,3 +397,47 @@ test("a selected task that is not on the board falls through to the board", asyn
     null,
   );
 });
+
+test("issue list intersects search, project, status and assignee filters without losing detail selection", async (t) => {
+  const { fireEvent } = await import("@testing-library/react");
+  const opened = [];
+  const other = {
+    ...workItem({
+      ...backlogIssue,
+      id: "e".repeat(64),
+      title: "Other issue",
+      status: "Done",
+      assignees: [OWNER],
+    }),
+    project: { ...project, id: "other-project", name: "Other project" },
+  };
+  const ui = await renderContent(t, {
+    workItems: [
+      workItem({ ...backlogIssue, content: "release checklist" }),
+      other,
+    ],
+    onSelectedIssueIdChange: (id) => opened.push(id),
+  });
+  fireEvent.click(ui.getByRole("button", { name: "Issue list view" }));
+  fireEvent.change(ui.getByRole("searchbox", { name: "Search issues" }), {
+    target: { value: "checklist" },
+  });
+  assert.equal(ui.queryByRole("button", { name: "Open Other issue" }), null);
+  fireEvent.change(ui.getByLabelText("Issue status"), {
+    target: { value: "Backlog" },
+  });
+  fireEvent.change(ui.getByLabelText("Issue assignee"), {
+    target: { value: "unassigned" },
+  });
+  fireEvent.change(ui.getByLabelText("Issue project"), {
+    target: { value: "project-demo" },
+  });
+  fireEvent.click(ui.getByRole("button", { name: "Open Ship the board" }));
+  assert.deepEqual(opened, [ISSUE_ID]);
+  fireEvent.change(ui.getByLabelText("Issue status"), {
+    target: { value: "Done" },
+  });
+  assert.ok(ui.getByText("No matching issues"));
+  fireEvent.click(ui.getByRole("button", { name: "Clear issue filters" }));
+  assert.ok(ui.getByRole("button", { name: "Open Other issue" }));
+});

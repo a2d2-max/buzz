@@ -1,3 +1,4 @@
+import { loadDocBlob } from "../lib/docBlobStorage";
 import { Check, Pencil, Plus, RotateCcw } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -15,6 +16,7 @@ import {
   type DocPageEditorHandle,
 } from "./DocPageEditor";
 import { docPageLabel } from "./DocsTree";
+import { DocDatabaseReadBlock } from "./DocDatabaseBlock";
 
 type DocPagePaneProps = {
   /** Root-to-parent chain, excluding the page itself. */
@@ -73,6 +75,36 @@ export function DocPagePane({
   const [mode, setMode] = React.useState<"view" | "edit">(() =>
     !page.deleted && page.body.trim() === "" ? "edit" : "view",
   );
+  const [structured, setStructured] = React.useState(!!page.affine);
+  const [loadedBody, setLoadedBody] = React.useState<{
+    eventId: string;
+    body?: string;
+    error?: string;
+  } | null>(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    if (page.affine?.version === 3)
+      void loadDocBlob(page).then(
+        (value) => {
+          if (!cancelled)
+            setLoadedBody({ eventId: page.eventId, body: value.body });
+        },
+        (cause) => {
+          if (!cancelled)
+            setLoadedBody({ eventId: page.eventId, error: String(cause) });
+        },
+      );
+    return () => {
+      cancelled = true;
+    };
+  }, [page]);
+  const viewBody =
+    page.affine?.version === 3
+      ? loadedBody?.eventId === page.eventId
+        ? loadedBody.body
+        : undefined
+      : page.body;
+
   const [saveState, setSaveState] = React.useState<AutosaveState>("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
   // Event id the editor's content is based on; bumps after every own save.
@@ -97,6 +129,12 @@ export function DocPagePane({
     mode === "edit" &&
     page.eventId !== baseEventId &&
     page.eventId !== dismissedEventId;
+  const renderDocDatabase = React.useCallback(
+    (databaseId: string, viewId: string | null) => (
+      <DocDatabaseReadBlock databaseId={databaseId} viewId={viewId} />
+    ),
+    [],
+  );
 
   const handleSave = React.useCallback(
     async (draft: DocDraft) => {
@@ -176,6 +214,28 @@ export function DocPagePane({
         : SAVE_STATUS_LABEL[saveState]
       : "";
 
+  if (page.structuredMergeConflict)
+    return (
+      <div className="flex flex-1 flex-col gap-3 p-6">
+        <h1 className="text-2xl font-semibold">{label}</h1>
+        <p role="alert">
+          Concurrent structured changes could not be combined safely. This
+          preview is read-only so no branch is overwritten.
+        </p>
+        <Markdown blockCode content={page.body} />
+      </div>
+    );
+  if (page.unsupportedEditor)
+    return (
+      <div className="flex flex-1 flex-col gap-3 p-6">
+        <h1 className="text-2xl font-semibold">{label}</h1>
+        <p role="alert">
+          This page uses an unsupported editor format. Update a2d2 to edit it.
+          Its preview is read-only.
+        </p>
+        <Markdown blockCode content={page.body} />
+      </div>
+    );
   return (
     <div
       className="flex min-h-0 min-w-0 flex-1 flex-col"
@@ -236,6 +296,19 @@ export function DocPagePane({
               variant="outline"
             >
               Retry
+            </Button>
+          ) : null}
+          {mode === "view" && !page.deleted && !page.affine ? (
+            <Button
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setStructured(true);
+                enterEdit();
+              }}
+            >
+              Open in AFFiNE
             </Button>
           ) : null}
           {mode === "edit" ? (
@@ -334,6 +407,7 @@ export function DocPagePane({
           ) : null}
           {mode === "edit" ? (
             <DocPageEditor
+              structured={structured || !!page.affine}
               autoFocus
               key={`${page.id}:${editorSession}`}
               onAutosaveState={setSaveState}
@@ -378,8 +452,19 @@ export function DocPagePane({
                 {page.author.slice(0, 8)}
               </p>
               <div className="mt-6 text-base leading-7">
-                {page.body.trim() ? (
-                  <Markdown blockCode content={page.body} />
+                {viewBody === undefined ? (
+                  <p role={loadedBody?.error ? "alert" : "status"}>
+                    {loadedBody?.eventId === page.eventId && loadedBody.error
+                      ? loadedBody.error
+                      : "Loading complete document…"}
+                  </p>
+                ) : viewBody.trim() ? (
+                  <Markdown
+                    blockCode
+                    content={viewBody}
+                    docsDatabases
+                    renderDocDatabase={renderDocDatabase}
+                  />
                 ) : (
                   <p className="text-muted-foreground">
                     This page is empty.{" "}

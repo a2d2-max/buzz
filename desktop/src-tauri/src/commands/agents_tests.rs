@@ -213,9 +213,13 @@ fn production_delete_orchestration_restores_bestie_when_agent_save_fails() {
     record.pubkey.clone_from(&pubkey);
     let mut records = vec![record];
 
-    let result = run_managed_agent_deletion(dir.path(), &pubkey, &mut records, |_records| {
-        Err::<(), _>("injected managed-agent save failure".to_string())
-    });
+    let result = run_managed_agent_deletion(
+        dir.path(),
+        &pubkey,
+        &mut records,
+        || Ok(()),
+        |_records| Err::<(), _>("injected managed-agent save failure".to_string()),
+    );
 
     assert_eq!(
         result,
@@ -227,6 +231,51 @@ fn production_delete_orchestration_restores_bestie_when_agent_save_fails() {
         &pubkey,
     )
     .unwrap_or_else(|error| panic!("read restored assignment: {error}")));
+}
+
+#[test]
+fn production_delete_keeps_the_record_addressable_until_disk_cleanup_can_retry() {
+    use std::cell::Cell;
+
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let pubkey = "b".repeat(64);
+    let mut record = bare_agent_record(None, None, None);
+    record.pubkey.clone_from(&pubkey);
+    let mut records = vec![record];
+    let occupied = dir.path().join("homes").join(&pubkey);
+    std::fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+    std::fs::write(&occupied, "not a directory").unwrap();
+    let metadata_write_called = Cell::new(false);
+
+    let error = run_managed_agent_deletion(
+        dir.path(),
+        &pubkey,
+        &mut records,
+        || crate::managed_agents::agent_home::remove_agent_homes(dir.path(), &pubkey),
+        |records| {
+            metadata_write_called.set(true);
+            records.clear();
+            Ok(())
+        },
+    )
+    .expect_err("disk cleanup failure must stop before metadata removal");
+    assert!(error.contains("failed to remove the agent's data home"));
+    assert!(!metadata_write_called.get());
+    assert_eq!(records.len(), 1, "the same agent remains a retry target");
+
+    std::fs::remove_file(&occupied).unwrap();
+    run_managed_agent_deletion(
+        dir.path(),
+        &pubkey,
+        &mut records,
+        || crate::managed_agents::agent_home::remove_agent_homes(dir.path(), &pubkey),
+        |records| {
+            records.clear();
+            Ok(())
+        },
+    )
+    .expect("idempotent cleanup retry completes deletion");
+    assert!(records.is_empty());
 }
 
 /// Deploy resolver falls back to global when both definition and record have none.

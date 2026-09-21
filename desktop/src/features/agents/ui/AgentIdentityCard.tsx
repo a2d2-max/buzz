@@ -10,6 +10,7 @@ type AgentIdentityCardProps = {
   avatar?: ReactNode;
   avatarUrl?: string | null;
   footerAccessory?: ReactNode;
+  footerControl?: ReactNode;
   dataTestId: string;
   label: string;
   /**
@@ -30,6 +31,7 @@ export function AgentIdentityCard({
   avatarUrl,
   dataTestId,
   footerAccessory,
+  footerControl,
   label,
   subtitle,
   onClick,
@@ -85,6 +87,11 @@ export function AgentIdentityCard({
             <span className="line-clamp-2 min-w-0 text-xs font-normal text-muted-foreground">
               {subtitle}
             </span>
+          ) : null}
+          {footerControl ? (
+            <div className="pointer-events-auto mt-1 min-w-0">
+              {footerControl}
+            </div>
           ) : null}
           {/* pointer-events-auto: the overlay button above has pointer-events-none
               on this container, but the status badge itself (a sibling of the button

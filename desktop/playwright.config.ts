@@ -30,6 +30,7 @@ export default defineConfig({
         "**/exact-key-profile.spec.ts",
         "**/key-import-reveal.spec.ts",
         "**/navigation.spec.ts",
+        "**/legacy-upstream-routes.spec.ts",
         "**/channels.spec.ts",
         "**/channel-shared-header-backdrop.spec.ts",
         "**/auxiliary-pane-close-visibility.spec.ts",
@@ -175,6 +176,10 @@ export default defineConfig({
         "**/agent-numeric-tuning.spec.ts",
         "**/needs-restart-screenshots.spec.ts",
         "**/team-catalog-screenshots.spec.ts",
+        "**/databases.spec.ts",
+        "**/database-views.spec.ts",
+        "**/database-computed.spec.ts",
+        "**/database-inline-docs.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],

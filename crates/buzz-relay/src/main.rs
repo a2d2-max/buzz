@@ -526,6 +526,16 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    // Derived engine projections are driven from the durable DB outbox. With
+    // no enabled binding the bounded worker remains inert; provider API keys
+    // stay server-side and are resolved only when dispatching a claimed row.
+    tokio::spawn(
+        buzz_relay::engine_projection::plane::run_plane_projection_worker(
+            state.db.clone(),
+            Arc::clone(&state.shutting_down),
+        ),
+    );
+
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
     // relay behaves byte-identically to a build without the mesh. When

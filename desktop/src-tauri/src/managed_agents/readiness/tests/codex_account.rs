@@ -32,6 +32,7 @@ fn codex_agent_with_its_own_login_needs_no_cli_login() {
         config_file_path: None,
         effective_command: "codex-acp".to_string(),
         oauth_token_supplied: true,
+        selected_claude_account_unready: false,
     };
     let missing = collect_missing_requirements(&effective, known_acp_runtime("codex-acp"));
     assert!(
@@ -47,27 +48,34 @@ fn login_supplied_follows_the_account_or_either_env_var() {
     let codex = known_acp_runtime("codex-acp");
     let global = Default::default();
 
-    let with_account = resolve_effective_agent_env(&record(Some("acct"), &[]), &[], codex, &global);
+    let with_account =
+        resolve_effective_agent_env(&record(Some("acct"), &[]), &[], codex, &global, false);
     assert!(with_account.oauth_token_supplied);
 
     for key in ["OPENAI_API_KEY", "CODEX_HOME"] {
-        let with_env =
-            resolve_effective_agent_env(&record(None, &[(key, "value")]), &[], codex, &global);
+        let with_env = resolve_effective_agent_env(
+            &record(None, &[(key, "value")]),
+            &[],
+            codex,
+            &global,
+            false,
+        );
         assert!(
             with_env.oauth_token_supplied,
             "a hand-typed {key} counts as a supplied login"
         );
-        let blank = resolve_effective_agent_env(&record(None, &[(key, "  ")]), &[], codex, &global);
+        let blank =
+            resolve_effective_agent_env(&record(None, &[(key, "  ")]), &[], codex, &global, false);
         assert!(!blank.oauth_token_supplied, "a blank {key} is no login");
     }
 
-    let neither = resolve_effective_agent_env(&record(None, &[]), &[], codex, &global);
+    let neither = resolve_effective_agent_env(&record(None, &[]), &[], codex, &global, false);
     assert!(!neither.oauth_token_supplied);
 
     // A Codex account on a runtime that does not honor it supplies nothing.
     let goose = known_acp_runtime("goose");
     let mut on_goose = record(Some("acct"), &[]);
     on_goose.agent_command = "goose".to_string();
-    let resolved = resolve_effective_agent_env(&on_goose, &[], goose, &global);
+    let resolved = resolve_effective_agent_env(&on_goose, &[], goose, &global, false);
     assert!(!resolved.oauth_token_supplied);
 }

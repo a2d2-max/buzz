@@ -68,6 +68,8 @@ import {
   usePersonaModelDiscovery,
 } from "./usePersonaModelDiscovery";
 import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
+import { EditAgentAccountFields } from "./EditAgentAccountFields";
+import { useDefinitionInstanceAccounts } from "./useDefinitionInstanceAccounts";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentHarnessField } from "./AgentHarnessField";
@@ -381,6 +383,7 @@ export function AgentDefinitionDialog({
         {
           id: initialValues.id,
           ...baseInput,
+          ...(instanceAccounts.update ?? {}),
         },
         {
           publishCatalogUpdates: publishCatalogUpdatesOnSave && hasUserChanges,
@@ -519,6 +522,14 @@ export function AgentDefinitionDialog({
     () => ({ ...globalConfig.env_vars, ...envVars }),
     [globalConfig.env_vars, envVars],
   );
+  const editingPersonaId =
+    initialValues && "id" in initialValues ? initialValues.id : null;
+  const instanceAccounts = useDefinitionInstanceAccounts({
+    envVars: envVarsForDiscovery,
+    open,
+    personaId: editingPersonaId,
+    prospectiveRuntime: selectedRuntime,
+  });
   const {
     discoveredModelOptions,
     modelDiscoveryLoading,
@@ -913,6 +924,26 @@ export function AgentDefinitionDialog({
               triggerRef={aiDefaultsTriggerRef}
             />
           ) : null}
+        </div>
+
+        <div
+          className="space-y-5"
+          data-testid="agent-definition-account-section"
+        >
+          <EditAgentAccountFields
+            disabled={isPending || editingPersonaId === null}
+            selections={instanceAccounts.selections}
+          />
+          <p
+            className="text-xs text-muted-foreground"
+            data-testid="agent-definition-account-scope"
+          >
+            {editingPersonaId === null
+              ? "Pick an account after the agent is created — the choice is saved on each running copy of it."
+              : instanceAccounts.instanceCount === 0
+                ? "Applies once this agent runs somewhere (no running copy yet)."
+                : `Applies to every running copy of this agent (${instanceAccounts.instanceCount}, one per community). Copies restart to pick it up.`}
+          </p>
         </div>
 
         <AgentDefaultsDialog

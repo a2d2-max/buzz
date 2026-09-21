@@ -14,10 +14,13 @@ pub mod channel;
 pub mod channel_members;
 /// Community lifecycle and host-map persistence.
 pub mod community;
+mod community_task;
 /// Durable whole-community deletion lifecycle and PostgreSQL adapter.
 pub mod deletion;
 /// Direct message channel persistence.
 pub mod dm;
+/// Durable, fenced projections from canonical Buzz data into replaceable engines.
+pub mod engine_projection;
 /// Event storage and retrieval.
 pub mod event;
 /// Home feed queries.

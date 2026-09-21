@@ -118,6 +118,7 @@ export function AppSidebar({
   onCreateAgent,
   onSelectAgents,
   onSelectBoard,
+  onSelectDatabases,
   onSelectDocs,
   onSelectProjects,
   onSelectPulse,
@@ -571,6 +572,7 @@ export function AppSidebar({
                 homeBadgeCount={homeBadgeCount}
                 onSelectAgents={onSelectAgents}
                 onSelectBoard={onSelectBoard}
+                onSelectDatabases={onSelectDatabases}
                 onSelectDocs={onSelectDocs}
                 onSelectHome={onSelectHome}
                 onSelectProjects={onSelectProjects}

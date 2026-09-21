@@ -14,6 +14,8 @@ pub mod denial;
 pub mod discovery;
 pub mod jwks;
 pub mod startup;
+#[cfg(any(test, feature = "test-utils"))]
+mod test_support;
 pub mod verifier;
 
 pub use assertion::{
@@ -34,4 +36,6 @@ pub use jwks::{
     ProductionJwksSource,
 };
 pub use startup::{validate_nip_fi_config, NipFiMode, NipFiStartupError};
+#[cfg(any(test, feature = "test-utils"))]
+pub use test_support::{TestFederatedAssertion, TestFederatedIssuer};
 pub use verifier::{AssertionKeySet, FederatedAssertionVerifier, IssuerKeySource, VerifierError};

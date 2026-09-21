@@ -107,6 +107,7 @@ export function markdownPropsAreEqual(
 ): boolean {
   return (
     prev.content === next.content &&
+    prev.docsDatabases === next.docsDatabases &&
     prev.className === next.className &&
     prev.customEmoji === next.customEmoji &&
     prev.hardLineBreaks === next.hardLineBreaks &&
@@ -124,6 +125,7 @@ export function markdownPropsAreEqual(
     prev.configNudgeAuthorPubkey === next.configNudgeAuthorPubkey &&
     prev.searchQuery === next.searchQuery &&
     prev.snapshotSharedBy === next.snapshotSharedBy &&
+    prev.renderDocDatabase === next.renderDocDatabase &&
     prev.videoReviewContext === next.videoReviewContext
   );
 }

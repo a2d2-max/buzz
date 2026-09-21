@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Errors produced by database operations.
 #[derive(Debug, Error)]
 pub enum DbError {
+    /// A task write would violate current authority or discard protected extension data.
+    #[error("task write rejected: {0}")]
+    CommunityTaskRejected(String),
     /// A SQLx driver-level error.
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),

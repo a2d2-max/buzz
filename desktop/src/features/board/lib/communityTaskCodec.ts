@@ -1,3 +1,11 @@
+import {
+  type CommunityTaskCustomField,
+  parseCommunityTaskCustomFields,
+} from "./communityTaskCustomFields";
+import {
+  type CommunityTaskDocument,
+  parseCommunityTaskDocuments,
+} from "./communityTaskDocuments";
 import type { RelayEvent } from "@/shared/api/types";
 import {
   COMMUNITY_TASK_D_TAG_PREFIX,
@@ -30,6 +38,10 @@ export type CommunityTaskContent = {
   assignees: string[];
   /** Unix seconds (local midnight of the chosen day). */
   due?: number;
+  /** Docs references scoped to their originating community. */
+  documents?: CommunityTaskDocument[];
+  /** Task-local typed metadata. [] explicitly clears all fields. Older clients may drop this extension. */
+  customFields?: CommunityTaskCustomField[];
   /** Position inside a column; lower sorts first. */
   order: number;
   /** Unix seconds; set once, preserved by every revision. */
@@ -123,6 +135,14 @@ export function parseCommunityTaskContent(
   };
   const due = unixSeconds(candidate.due);
   if (due !== null) content.due = due;
+  const documents = parseCommunityTaskDocuments(candidate.documents);
+  if (
+    documents.length ||
+    (Array.isArray(candidate.documents) && candidate.documents.length === 0)
+  )
+    content.documents = documents;
+  const customFields = parseCommunityTaskCustomFields(candidate.customFields);
+  if (customFields !== undefined) content.customFields = customFields;
   if (candidate.deleted === true) content.deleted = true;
   return content;
 }
@@ -138,6 +158,16 @@ export function serializeCommunityTaskContent(
     assignees: content.assignees,
   };
   if (content.due !== undefined) wire.due = content.due;
+  const documents = parseCommunityTaskDocuments(content.documents);
+  if (
+    documents.length ||
+    (Array.isArray(content.documents) && content.documents.length === 0)
+  )
+    wire.documents = documents;
+  const customFields = parseCommunityTaskCustomFields(content.customFields);
+  if (content.customFields !== undefined && customFields === undefined)
+    throw new Error("Invalid task custom fields.");
+  if (customFields !== undefined) wire.customFields = customFields;
   wire.order = content.order;
   wire.createdAt = content.createdAt;
   wire.updatedAt = content.updatedAt;

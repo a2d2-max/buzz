@@ -205,7 +205,12 @@ pub(crate) fn process_has_buzz_marker(_pid: u32, _instance_id: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn signal_process_group_or_leader(pid: u32, signal: i32, action: &str) -> Result<(), String> {
+fn signal_process_group_or_leader(
+    pid: u32,
+    signal: i32,
+    action: &str,
+    require_group: bool,
+) -> Result<(), String> {
     let pgid = -(pid as i32);
 
     if unsafe { libc::kill(pgid, signal) } == 0 {
@@ -213,8 +218,13 @@ fn signal_process_group_or_leader(pid: u32, signal: i32, action: &str) -> Result
     }
 
     let group_err = std::io::Error::last_os_error();
-    if !process_is_running(pid) {
+    if group_err.raw_os_error() == Some(libc::ESRCH) && !process_is_running(pid) {
         return Ok(());
+    }
+    if require_group {
+        return Err(format!(
+            "failed to {action} process group {pid}: {group_err}"
+        ));
     }
 
     // Some local agent trees can no longer be signalled as a process group
@@ -241,10 +251,28 @@ fn signal_process_group_or_leader(pid: u32, signal: i32, action: &str) -> Result
     ))
 }
 
+/// Kill the exact process group created for a short-lived owned child even if
+/// its leader has already exited. Login sessions use this on every terminal
+/// path so a background descendant cannot outlive a successful CLI exit.
+#[cfg(unix)]
+pub(crate) fn kill_owned_process_group(pid: u32) -> Result<(), String> {
+    signal_process_group_or_leader(pid, libc::SIGKILL, "kill owned", true)
+}
+
+#[cfg(windows)]
+pub(crate) fn kill_owned_process_group(pid: u32) -> Result<(), String> {
+    super::super::process_lifecycle::taskkill_tree(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn kill_owned_process_group(_pid: u32) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) fn terminate_process(pid: u32) -> Result<(), String> {
     // Try graceful shutdown first (SIGTERM to the group).
-    signal_process_group_or_leader(pid, libc::SIGTERM, "terminate")?;
+    signal_process_group_or_leader(pid, libc::SIGTERM, "terminate", false)?;
 
     // Wait up to 1s for graceful exit.
     for _ in 0..10 {
@@ -255,7 +283,7 @@ pub(crate) fn terminate_process(pid: u32) -> Result<(), String> {
     }
 
     // Escalate to SIGKILL on the entire group.
-    signal_process_group_or_leader(pid, libc::SIGKILL, "kill")?;
+    signal_process_group_or_leader(pid, libc::SIGKILL, "kill", false)?;
 
     Ok(())
 }

@@ -52,10 +52,18 @@ async fn proxy_handler(AxumState(state): AxumState<ProxyState>, req: Request) ->
 
     let has_range = req.headers().contains_key("range");
 
-    let mut upstream = state
+    let upstream = state
         .client
         .get(&upstream_url)
         .timeout(std::time::Duration::from_secs(120));
+    let mut upstream = match crate::company_identity::attach_to_no_redirect_request(
+        &app_state,
+        &upstream_url,
+        upstream,
+    ) {
+        Ok(request) => request,
+        Err(_) => return (StatusCode::FORBIDDEN, "forbidden").into_response(),
+    };
 
     // `upstream_url` is always `{relay base}{path}`, so the token can't reach
     // a third-party origin (mint_media_get_auth safety contract).
@@ -180,10 +188,18 @@ pub async fn handle_buzz_media(
     let upstream_url = format!("{base}{path_and_query}");
 
     // Forward Range header if present — enables video seeking through the proxy.
-    let mut upstream = state
-        .http_client
+    let upstream = state
+        .media_fetch_client
         .get(&upstream_url)
         .timeout(std::time::Duration::from_secs(60));
+    let mut upstream = match crate::company_identity::attach_to_no_redirect_request(
+        &state,
+        &upstream_url,
+        upstream,
+    ) {
+        Ok(request) => request,
+        Err(_) => return error_response(403, "forbidden"),
+    };
 
     // `upstream_url` is always `{relay base}{path}`, so the token can't reach
     // a third-party origin (mint_media_get_auth safety contract).

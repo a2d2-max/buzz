@@ -29,6 +29,7 @@ pub(super) fn apply_setup_payload_env(
     record: &ManagedAgentRecord,
     descriptor: &EffectiveHarnessDescriptor,
     runtime_meta: Option<&'static KnownAcpRuntime>,
+    named_claude_account_ready: bool,
 ) -> bool {
     // Construct EffectiveAgentEnv from the descriptor the caller resolved — no
     // second resolver call; the descriptor's env is already the fully layered
@@ -41,11 +42,18 @@ pub(super) fn apply_setup_payload_env(
             record,
             runtime_meta,
             &descriptor.env,
+            named_claude_account_ready,
         ) || crate::managed_agents::codex_accounts::codex_auth_supplied(
             record,
             runtime_meta,
             &descriptor.env,
         ),
+        selected_claude_account_unready:
+            crate::managed_agents::claude_accounts::selected_claude_account_unready(
+                record,
+                runtime_meta,
+                named_claude_account_ready,
+            ),
     };
     // Compute the optional payload before touching the command.
     let setup_payload_json =

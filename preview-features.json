@@ -27,6 +27,13 @@
       "platforms": ["desktop"]
     },
     {
+      "id": "databases",
+      "name": "Databases",
+      "description": "Shared tables with typed properties and saved views",
+      "defaultEnabled": true,
+      "platforms": ["desktop"]
+    },
+    {
       "id": "pulse",
       "name": "Pulse",
       "description": "Activity feed with notes, social posts, and agent activity",

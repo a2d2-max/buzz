@@ -113,6 +113,24 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goDatabases = React.useCallback(
+    (
+      databaseId?: string | null,
+      behavior?: NavigationBehavior & { viewId?: string },
+    ) =>
+      commitNavigation(
+        databaseId
+          ? {
+              to: "/databases/$databaseId",
+              params: { databaseId },
+              search: { view: behavior?.viewId },
+            }
+          : { to: "/databases" },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProfile = React.useCallback(
     (pubkey: string, behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -481,6 +499,7 @@ export function useAppNavigation() {
     goAgents,
     goBoard,
     goChannel,
+    goDatabases,
     goDocs,
     goDuplicateWorkflow,
     goEditWorkflow,

@@ -120,3 +120,37 @@ test("no due date means the draft carries none", async () => {
 
   assert.deepEqual(created, [{ title: "Undated", body: "" }]);
 });
+
+test("new task includes a typed field draft and rejects blank field names", async () => {
+  const { act, fireEvent } = await import("@testing-library/react");
+  const { created, getByLabelText, getByRole } = await renderDialog();
+  fireEvent.change(field("community-task-dialog-title"), {
+    target: { value: "Typed task" },
+  });
+  fireEvent.change(getByLabelText("New field name"), {
+    target: { value: "Team" },
+  });
+  fireEvent.click(getByRole("button", { name: "Add field" }));
+  fireEvent.change(getByLabelText("Value: Team"), {
+    target: { value: "Core" },
+  });
+  fireEvent.change(getByLabelText("Field name: Team"), {
+    target: { value: " " },
+  });
+  await act(async () =>
+    fireEvent.submit(field("community-task-dialog").querySelector("form")),
+  );
+  assert.equal(created.length, 0);
+  assert.match(
+    field("community-task-dialog-error").textContent,
+    /every custom field a name/,
+  );
+  fireEvent.change(getByLabelText(/^Field name:/), {
+    target: { value: "Team" },
+  });
+  await act(async () =>
+    fireEvent.submit(field("community-task-dialog").querySelector("form")),
+  );
+  assert.equal(created[0].customFields[0].type, "text");
+  assert.equal(created[0].customFields[0].value, "Core");
+});

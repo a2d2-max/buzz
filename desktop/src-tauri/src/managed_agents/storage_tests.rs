@@ -9,11 +9,12 @@ use std::fs::File;
 use std::io::Write as _;
 use std::path::Path;
 
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 use super::{
     agent_keyring_name, hydrate_keys_with, migrate_inline_key, persist_agent_keys_with,
-    KeyMigration, KeyStore, KeyringProbe, ManagedAgentRecord,
+    save_agent_definitions_and_managed_agents_at_path, KeyMigration, KeyStore, KeyringProbe,
+    ManagedAgentRecord,
 };
 
 /// In-memory [`KeyStore`] for testing the migrate decision without the OS
@@ -141,6 +142,57 @@ fn record_with_pubkey_and_key(pubkey: &str, nsec: &str) -> ManagedAgentRecord {
         }}"#
     ))
     .expect("sample record")
+}
+
+#[test]
+fn unified_definition_and_instances_writer_round_trips_one_snapshot() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("managed-agents.json");
+
+    let mut definition = record_with_pubkey_and_key("definition-placeholder", "");
+    definition.pubkey.clear();
+    definition.name = "Definition".to_string();
+    definition.slug = Some("definition-1".to_string());
+
+    let mut linked = record_with_pubkey_and_key("linked", "");
+    linked.persona_id = Some("definition-1".to_string());
+    linked.claude_account_id = Some("claude-next".to_string());
+    linked.codex_account_id = Some("codex-next".to_string());
+
+    let mut unrelated = record_with_pubkey_and_key("unrelated", "");
+    unrelated.persona_id = Some("other-definition".to_string());
+    unrelated.claude_account_id = Some("claude-keep".to_string());
+
+    save_agent_definitions_and_managed_agents_at_path(
+        &path,
+        &[definition.clone()],
+        &[linked.clone(), unrelated.clone()],
+        false,
+    )
+    .expect("unified snapshot persists");
+
+    let saved: Vec<ManagedAgentRecord> =
+        serde_json::from_slice(&std::fs::read(&path).expect("unified snapshot can be read back"))
+            .expect("unified snapshot is valid JSON");
+    assert_eq!(saved.len(), 3);
+    assert_eq!(saved[0].slug.as_deref(), Some("definition-1"));
+    let linked_saved = saved
+        .iter()
+        .find(|record| record.pubkey == "linked")
+        .expect("linked instance preserved");
+    assert_eq!(
+        linked_saved.claude_account_id.as_deref(),
+        Some("claude-next")
+    );
+    assert_eq!(linked_saved.codex_account_id.as_deref(), Some("codex-next"));
+    let unrelated_saved = saved
+        .iter()
+        .find(|record| record.pubkey == "unrelated")
+        .expect("unrelated instance preserved");
+    assert_eq!(
+        unrelated_saved.claude_account_id.as_deref(),
+        Some("claude-keep")
+    );
 }
 
 #[test]

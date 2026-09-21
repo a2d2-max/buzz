@@ -1,0 +1,615 @@
+{
+  "providers": {
+    "affine": {
+      "accepted_archive_sha256": "9db31a65d9610885c4f6071eddd3e9bb7a15aea82d412ef7d803619d4bdd36cb",
+      "accepted_base_image": "node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5",
+      "accepted_image_id": "sha256:74853b5f5b7d6163f5e799c9e11af4b4903fe10244ae6c0314820f2034c5cad5",
+      "accepted_platform": "amd64/linux",
+      "accepted_scope": "build source excluding git/dependencies/dist/cache/test output/private env",
+      "accepted_source_manifest_sha256": "a8ccc4a4c812bb3fb850f693fde54ebc7f147fb8dbbbcdbc55c16fae4cc80221",
+      "files": [
+        {
+          "bytes": 513,
+          "mode": 420,
+          "path": "deploy/a2d2/.env.example",
+          "sha256": "f45f917311445f25a826dc6ca6950737da6d20b4f46f60a2b0096fcc1c5dddeb"
+        },
+        {
+          "bytes": 722,
+          "mode": 420,
+          "path": "deploy/a2d2/.env.remote.example",
+          "sha256": "5a5ee33c431067b6eb807642e92a8adf5c5e05ae78731fdd335dd84a7d606225"
+        },
+        {
+          "bytes": 45,
+          "mode": 420,
+          "path": "deploy/a2d2/.gitignore",
+          "sha256": "c7c00d81eaaad6450ee81fafd2130872e3e0325a6dab9505548ccc1fa78ed6a2"
+        },
+        {
+          "bytes": 1139,
+          "mode": 420,
+          "path": "deploy/a2d2/Dockerfile.managed",
+          "sha256": "b25c47c90c55ffc3c4c060d1af58e566456d460631bd21dda5bf8b9ab9815f4f"
+        },
+        {
+          "bytes": 648,
+          "mode": 420,
+          "path": "deploy/a2d2/IMAGE.json",
+          "sha256": "95569e7badb5b278d1b01b28ad3d2944cc83ffedb7e196001c442dc679d48c90"
+        },
+        {
+          "bytes": 2787,
+          "mode": 420,
+          "path": "deploy/a2d2/README.md",
+          "sha256": "b95771a70220dafdf3600e38bdb45dd1e0add6ff508151b8954cbf17e9d81d8c"
+        },
+        {
+          "bytes": 2931,
+          "mode": 420,
+          "path": "deploy/a2d2/REMOTE.md",
+          "sha256": "a950e7d99b7a4c0be2f636a1e7e21cb4acf9dd3de6de795fc6dc18a7baefd2f7"
+        },
+        {
+          "bytes": 385,
+          "mode": 420,
+          "path": "deploy/a2d2/REMOTE_IMAGES.json",
+          "sha256": "b8ca4a564231dcaba99aa6e00eb53ba5e8ad616395dd5b3e2dc913e2a19621ee"
+        },
+        {
+          "bytes": 4435,
+          "mode": 493,
+          "path": "deploy/a2d2/build-managed-image.sh",
+          "sha256": "f77702553378cd1331eaaea53a6369ac6942d25da4f1a3b31236c2d5e2c01f34"
+        },
+        {
+          "bytes": 2271,
+          "mode": 420,
+          "path": "deploy/a2d2/compose.yml",
+          "sha256": "57535c5eb0b1173585723d155a6510ea20394b6d0df96cf77db04b16b0309860"
+        },
+        {
+          "bytes": 936,
+          "mode": 493,
+          "path": "deploy/a2d2/start.sh",
+          "sha256": "941d404d85454a8236ad12486152a7eeba8838dd2b9bd1eefa5e1e28a6f36ad1"
+        },
+        {
+          "bytes": 3663,
+          "mode": 420,
+          "path": "deploy/a2d2/test_verify_runtime.py",
+          "sha256": "c8bb43b799f3b58d609a0bc2693c8864023bfd775ef1acafec15cc38d928b52a"
+        },
+        {
+          "bytes": 4750,
+          "mode": 420,
+          "path": "deploy/a2d2/verify_runtime.py",
+          "sha256": "2bf37c285943ac82d278c260425b9d686d67489458dd3b3e97b6bfdaf376d70d"
+        },
+        {
+          "bytes": 2214,
+          "mode": 420,
+          "path": "packages/backend/server/migrations/20260917000000_a2d2_managed_auth/migration.sql",
+          "sha256": "ef5659c890753ac1b9f48c9c7a39c59cf2cde3d17d28caa6cb6a04d3cd7462a7"
+        },
+        {
+          "bytes": 66546,
+          "mode": 420,
+          "path": "packages/backend/server/schema.prisma",
+          "sha256": "e28f08f76f298f63b8a18dc3723957136ab6e15534ceb55dcfb4181648de0605"
+        },
+        {
+          "bytes": 99,
+          "mode": 420,
+          "path": "packages/backend/server/src/base/config/config.ts",
+          "sha256": "904b0216aaaaae31988c3d506213c00ff96acd1c4d31122228cd2661dcc1c20f"
+        },
+        {
+          "bytes": 3168,
+          "mode": 420,
+          "path": "packages/backend/server/src/base/websocket/adapter.ts",
+          "sha256": "518e63e1dcf5cb6ef7c874a04901d844156fd2d358f52caab43cb852ce69fb9a"
+        },
+        {
+          "bytes": 4895,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/a2d2/__tests__/broker.spec.ts",
+          "sha256": "73df13653d44ebce1c4b499933ddf60e5c3787b7807152ba742d7d31657e2ab2"
+        },
+        {
+          "bytes": 16949,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/a2d2/__tests__/managed-auth.e2e.ts",
+          "sha256": "5d00dd77f3d4bf5ae7ab7ae86b07e42be65e56d7de2cc90446cd9a9b98660fed"
+        },
+        {
+          "bytes": 6317,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/a2d2/broker.ts",
+          "sha256": "8747db9563ddc400e3af8185261ca8c8e3bffb1b1a78f7342405af1fda005511"
+        },
+        {
+          "bytes": 1006,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/a2d2/config.ts",
+          "sha256": "963dd5790e3f6d56ed1128a4c5b0cff6587f0226fee8f827d23870f7cdf49ac5"
+        },
+        {
+          "bytes": 1738,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/a2d2/controller.ts",
+          "sha256": "45c386413952f481368a849b64f4aa4848c4e1003f6eb273175f437dedb1e745"
+        },
+        {
+          "bytes": 1203,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/a2d2/error.ts",
+          "sha256": "5a687294f7f766a55f616b674c100e7ad2e73b8859383906da9339a1d9f2047b"
+        },
+        {
+          "bytes": 212,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/a2d2/index.ts",
+          "sha256": "4a1585608fcbb6524b1566160776cb8a90deac82d0088d98acf08e2663a473f0"
+        },
+        {
+          "bytes": 15023,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/a2d2/service.ts",
+          "sha256": "643a789b5e96e2ea0c549ad8314c60b2878d08cb2f81f417691d06db4a83adcc"
+        },
+        {
+          "bytes": 11519,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/controller.ts",
+          "sha256": "ea285e5088540e7398ee38695daeda715e88b377b10c6271b2f59f7555278711"
+        },
+        {
+          "bytes": 11230,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/guard.ts",
+          "sha256": "137bd16e016c6710bd0416d9a4fff8aaa843eb144e3092162e836739f20540d3"
+        },
+        {
+          "bytes": 2768,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/index.ts",
+          "sha256": "d2fb56698a0520e741909dda40254de16d2f7682c6f71a6e3165f4f46781c15c"
+        },
+        {
+          "bytes": 9295,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/auth/resolver.ts",
+          "sha256": "05d680be973937ceb10c561163f01550c384ae492b75daf442b514d3e3360296"
+        },
+        {
+          "bytes": 31778,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/realtime/__tests__/registry.spec.ts",
+          "sha256": "61aad50a9b2637bd8fc0e722cbc58d399b793fde43c7718014a27f281f6e3038"
+        },
+        {
+          "bytes": 11113,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/user/resolver.ts",
+          "sha256": "070cf03aeadd5a6ef887e04e44cd2dcf94f876f2a8f0f1e1695ae6cfefd2ad68"
+        },
+        {
+          "bytes": 10940,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts",
+          "sha256": "ba1bb42f96ae90171fc0c957aef49bd9fb4cd29d2c2cb039c044d76eb0290cb9"
+        },
+        {
+          "bytes": 12235,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/workspaces/realtime.ts",
+          "sha256": "60af5ee1ca668230068f90115def0ace2e853fc224b49c6fe7cb03146829af87"
+        },
+        {
+          "bytes": 25675,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/workspaces/resolvers/member.ts",
+          "sha256": "dfde5f9b5404b04bfa5ae522ea849d5a18e1fa82d7b9e98c0b9e7b6a389e6f96"
+        },
+        {
+          "bytes": 1246,
+          "mode": 420,
+          "path": "packages/backend/server/src/global.d.ts",
+          "sha256": "d8225da4bd8940c1cd32bdfc9a91921e9cb2a9f36d02c954dce30f26511669fa"
+        },
+        {
+          "bytes": 777,
+          "mode": 420,
+          "path": "packages/frontend/apps/web/package.json",
+          "sha256": "7b2fddd049f3e4a046057229c1609fd81c89081aea916ddc0d0f029479504aa9"
+        },
+        {
+          "bytes": 874,
+          "mode": 420,
+          "path": "packages/frontend/apps/web/src/a2d2-managed-auth.spec.ts",
+          "sha256": "af60ba5b1e05fec69195ef31cecd726c99d6f85e72d4ea1a973a92b467fb5304"
+        },
+        {
+          "bytes": 2145,
+          "mode": 420,
+          "path": "packages/frontend/apps/web/src/a2d2-managed-auth.ts",
+          "sha256": "b8c7f6edd231a330b9c32fd92fa8a01e56ef644843b66d3723e4dc5864fca925"
+        },
+        {
+          "bytes": 4780,
+          "mode": 420,
+          "path": "packages/frontend/apps/web/src/app.tsx",
+          "sha256": "eb945a06e4e7d4d586a8c239f60cb817ebb2e750938289d95f6261f003104a08"
+        },
+        {
+          "bytes": 1233,
+          "mode": 420,
+          "path": "packages/frontend/apps/web/src/index.tsx",
+          "sha256": "1ce6e2a8db928950c402c82c11bbd86442d16424b7bafff2e4801b74f75b294e"
+        },
+        {
+          "bytes": 1141,
+          "mode": 420,
+          "path": "packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx",
+          "sha256": "e86e2c09cb6593abaaa040703386e56b82d3f267fc0bd22be399113d35f35292"
+        },
+        {
+          "bytes": 12447,
+          "mode": 420,
+          "path": "packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx",
+          "sha256": "11aa1fc31ff95ffa46fb6adef3d722811e589ba4f637571b73a862da3dc477c9"
+        },
+        {
+          "bytes": 1516,
+          "mode": 420,
+          "path": "packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx",
+          "sha256": "f293192ab3b84f0dea8de55d31fe766c15201b0b7cf2b57935a8cd171479cbf7"
+        },
+        {
+          "bytes": 3345,
+          "mode": 420,
+          "path": "packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx",
+          "sha256": "4edfe32d5eb7dd5160138b0573dd5ebc4b217137a5525b6e66c55eda1cf63198"
+        },
+        {
+          "bytes": 1402,
+          "mode": 420,
+          "path": "packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx",
+          "sha256": "bea8d23515c4259aedc83abb4f8aefd016db3e9d07852762b606083a2dc76410"
+        },
+        {
+          "bytes": 1315672,
+          "mode": 420,
+          "path": "yarn.lock",
+          "sha256": "c9d91ecf42511eee4ed40911eaf7fef978a2da0c866594bed39c5f2708f5c830"
+        }
+      ],
+      "patch": "patches/affine-a2d2.patch",
+      "patch_sha256": "7c56da3e36a8552f5abb6188bb2f21b2b85462f8f2945d50cd21e3a68ab794bb",
+      "source_delta_sha256": "d700a4608ce0b58d31d8ef680689ba026fc1fadf41c1742e4af23d0b5c736be7",
+      "upstream_commit": "b4c8548c09da21b2898443559a5b846f0ccf5dd8"
+    },
+    "plane": {
+      "accepted_archive_sha256": "b2b7db29f0e025d51a0ef40ab1d09939d37e347925f462a5b08523f47041f5cf",
+      "accepted_base_image": "python:3.12.12-alpine@sha256:2d91681153dd4b8cdb52d4fd34a17b9edbafa4dd3086143cfd4b6c3a84c1acb0",
+      "accepted_image_id": "sha256:b91e11aab99c577211f79df0e0becbb641ea6e543c24405f64cb5cfc0534df86",
+      "accepted_platform": "amd64/linux",
+      "accepted_scope": "apps/api Docker context excluding local env/venv/cache/log/generated static",
+      "accepted_source_manifest_sha256": "e0ea69e6c4f0245472c4b63537fe5473eb2df98147fbdddb22fb4bf12dd5a5e4",
+      "files": [
+        {
+          "bytes": 68,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/__init__.py",
+          "sha256": "be83040292c7ac9db9a0287ac012c67ef45524ffd906f641767960789921edfa"
+        },
+        {
+          "bytes": 8532,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/backfill.py",
+          "sha256": "12dcab144a78282057af59cf4e56d78a8759b041d8659a177212ef72ea3f5d41"
+        },
+        {
+          "bytes": 5821,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/broker.py",
+          "sha256": "bcab5c6dcb69b454dc16fc6401365c7af90d8b1a7f24f9ff86fb77d0e33e4289"
+        },
+        {
+          "bytes": 1788,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/config.py",
+          "sha256": "14ad84823d27fe8e38df96abe1a723f93fa68a402265c00e76c9b60a8e37bbe6"
+        },
+        {
+          "bytes": 4384,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/middleware.py",
+          "sha256": "c04e4c5062924596c46f1da2d068b960885c5ab67e7a90fa2652711081ab36c8"
+        },
+        {
+          "bytes": 7484,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/principals.py",
+          "sha256": "1a1a821602220f190c1c3098a4de95921595ba4fec59e366dc1e9637fccb1ec7"
+        },
+        {
+          "bytes": 8344,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/resolver.py",
+          "sha256": "72f5120e42cb33589bdfc09f6f557dfbfe1bcee5d834ac984c4858722c52cb1b"
+        },
+        {
+          "bytes": 3895,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/service_views.py",
+          "sha256": "8e8c93b20ece0436c4c6ba87b5302fb83686e8fd0f70b00cc4a83c7dd9a03310"
+        },
+        {
+          "bytes": 534,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/urls.py",
+          "sha256": "72094d5679a23ba87671f48520f3a5c2133dbccb5f6f1954726f4aebb1dd1e3f"
+        },
+        {
+          "bytes": 4342,
+          "mode": 420,
+          "path": "apps/api/plane/a2d2/views.py",
+          "sha256": "12d52dd479372d6b5612ded2f2a8fecfe7da9040f86344fedac8da41d180a90b"
+        },
+        {
+          "bytes": 2256,
+          "mode": 420,
+          "path": "apps/api/plane/api/middleware/api_authentication.py",
+          "sha256": "b167866c560b69fa9fb86a4756d8eac77944a3f6530e160562ab4a1c9481cf78"
+        },
+        {
+          "bytes": 1691,
+          "mode": 420,
+          "path": "apps/api/plane/db/management/commands/backfill_a2d2_managed_principals.py",
+          "sha256": "e26a935488fcddc8e827de9b9b9dd812789fb5ecc91b439d44122b438d88e002"
+        },
+        {
+          "bytes": 4708,
+          "mode": 420,
+          "path": "apps/api/plane/db/migrations/0123_a2d2_managed_identity.py",
+          "sha256": "84ea9cfbf71b50dab44efd8352cf8546ee702a7dfa067ccee61ce87ed7e03986"
+        },
+        {
+          "bytes": 1902,
+          "mode": 420,
+          "path": "apps/api/plane/db/migrations/0124_a2d2_managed_project.py",
+          "sha256": "bd1b4d8c890b0ceee3bd1344ace49c097334c7e1f1949249a0af00a38d3e63d3"
+        },
+        {
+          "bytes": 2436,
+          "mode": 420,
+          "path": "apps/api/plane/db/models/__init__.py",
+          "sha256": "f2565328f5496bad68b563cac29e76ef88042f50c32b123aa4b9c97045a9f3e7"
+        },
+        {
+          "bytes": 1513,
+          "mode": 420,
+          "path": "apps/api/plane/db/models/a2d2.py",
+          "sha256": "affd29832d7d64473b8e26bde6aef8ef6295869d589f63296046a3f7859c002d"
+        },
+        {
+          "bytes": 19537,
+          "mode": 420,
+          "path": "apps/api/plane/settings/common.py",
+          "sha256": "5a323723ba23ee370d01eea2c92912c319c36d159e6b3ad97ca74736fc9b9be3"
+        },
+        {
+          "bytes": 1,
+          "mode": 420,
+          "path": "apps/api/plane/tests/unit/a2d2/__init__.py",
+          "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+        },
+        {
+          "bytes": 926,
+          "mode": 420,
+          "path": "apps/api/plane/tests/unit/a2d2/test_broker.py",
+          "sha256": "25df30bf0533e880a4bc765013f5c551092b9e864b3f19ce7c1195fec10c923e"
+        },
+        {
+          "bytes": 18753,
+          "mode": 420,
+          "path": "apps/api/plane/tests/unit/a2d2/test_managed_session.py",
+          "sha256": "2826a1718b8048bcc9faa4f313b0305cbb841ec3ce836e44d4c760dd081e9667"
+        },
+        {
+          "bytes": 25433,
+          "mode": 420,
+          "path": "apps/api/plane/tests/unit/a2d2/test_principal_reconciliation.py",
+          "sha256": "339c0b2a3ac78669f753e1c5c93db2ee4d7f7ea684e7d5352e6e109fe734e39a"
+        },
+        {
+          "bytes": 1499,
+          "mode": 420,
+          "path": "apps/api/plane/urls.py",
+          "sha256": "1484eb7f4e1c4308e3f99727c7698c132057aac95c37778114f1fa1628b2e43f"
+        },
+        {
+          "bytes": 126,
+          "mode": 420,
+          "path": "apps/api/uv.lock",
+          "sha256": "91703aa9af85d0e32889b6c76427c1ad73b497660d95b11dca4c295c9c0dd961"
+        },
+        {
+          "bytes": 1749,
+          "mode": 420,
+          "path": "apps/live/src/hocuspocus.ts",
+          "sha256": "85e1db9fec7085e28e3c8d3e8c7ba0494748579a66f363f5ad5efc841216e330"
+        },
+        {
+          "bytes": 4201,
+          "mode": 420,
+          "path": "apps/live/src/lib/auth.ts",
+          "sha256": "79d18bb1b643d9605e5cbe5d0f66c841b67a1a621721ee124652c6ece79e84dd"
+        },
+        {
+          "bytes": 1924,
+          "mode": 420,
+          "path": "apps/live/tests/lib/auth.test.ts",
+          "sha256": "9e4057e4107fe4953f8f4d0ec438e0f6ddf4d3c31cab5478ccc05dcae56dcdbf"
+        },
+        {
+          "bytes": 6231,
+          "mode": 420,
+          "path": "apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/members/page.tsx",
+          "sha256": "c8599d7c403d79bd398cbd78f109b1fbe72c4e3f8527776cb2c38723c45a8c8a"
+        },
+        {
+          "bytes": 591,
+          "mode": 420,
+          "path": "apps/web/caddy/Caddyfile",
+          "sha256": "6768c705e90c7b0bfe7049a17a7fe9a5e4f30be570053b3fde4d845b0ea0f1ae"
+        },
+        {
+          "bytes": 7981,
+          "mode": 420,
+          "path": "apps/web/core/components/home/widgets/empty-states/no-projects.tsx",
+          "sha256": "3502ca7b23d1a0df891a2bdd751fd691c7876d4db3194dfca65fdecb44a606f5"
+        },
+        {
+          "bytes": 5083,
+          "mode": 420,
+          "path": "apps/web/core/components/project/member-list.tsx",
+          "sha256": "23611dea6358c141dbfbda87a549f8d104b803b33081b23fe1742913d1ea8dcc"
+        },
+        {
+          "bytes": 5291,
+          "mode": 420,
+          "path": "apps/web/core/components/workspace/sidebar/dropdown-item.tsx",
+          "sha256": "cc23a3c555bd5e0c7f5a9d3ffa5b34e791542c5a2bde286eda870a2fa2e93b88"
+        },
+        {
+          "bytes": 9900,
+          "mode": 420,
+          "path": "apps/web/core/components/workspace/sidebar/workspace-menu-root.tsx",
+          "sha256": "849744292c43f9535e2664c9fc4ccebacf80b93774f5ac742f899cf3d72c5226"
+        },
+        {
+          "bytes": 6478,
+          "mode": 420,
+          "path": "apps/web/core/lib/wrappers/authentication-wrapper.tsx",
+          "sha256": "0ee712bd665ae6c56c55e1a005623dbad29aa11631240f8a018b4598298799ea"
+        },
+        {
+          "bytes": 1826,
+          "mode": 420,
+          "path": "apps/web/core/lib/wrappers/instance-wrapper.tsx",
+          "sha256": "040115bd8c9334ff6b6aeee1db3446335709c984641b5a8fdb8201771ffee600"
+        },
+        {
+          "bytes": 2680,
+          "mode": 420,
+          "path": "apps/web/google.d.ts",
+          "sha256": "d30c1bedb7d7acfaca7023a048e73e07c221368cd38aa5b5b8d9b25411baf563"
+        },
+        {
+          "bytes": 114,
+          "mode": 420,
+          "path": "apps/web/helpers/a2d2-managed-mode.ts",
+          "sha256": "c2f6b8e96f7e38fa02b523fe2ad1d72ba4253ca165cbefcb39be7e39aa71ab69"
+        },
+        {
+          "bytes": 879,
+          "mode": 420,
+          "path": "deployments/a2d2/.env.example",
+          "sha256": "f23429e89f7137134820c722f96bbc7fc17531355b8e29d9fb82f8a9df83fe1e"
+        },
+        {
+          "bytes": 5257,
+          "mode": 420,
+          "path": "deployments/a2d2/README.md",
+          "sha256": "cfbd6d13f92aad8473120f1728d4b2566dbad3de996ddbd4d701fac2d9cfc540"
+        },
+        {
+          "bytes": 6271,
+          "mode": 420,
+          "path": "deployments/a2d2/REMOTE_AMD64.md",
+          "sha256": "508a7fabbb30b25598fbf64f59e558ce7e85c19f1eae6def2bf24b0db48832b1"
+        },
+        {
+          "bytes": 2550,
+          "mode": 420,
+          "path": "deployments/a2d2/RESUME_LOCAL.md",
+          "sha256": "25717cf5c6197485d1ccde2d7f65718b53a4cf9279bfcbe5ea7dd1f93a268be3"
+        },
+        {
+          "bytes": 547,
+          "mode": 420,
+          "path": "deployments/a2d2/compose.amd64.yml",
+          "sha256": "fc60b1ea1b96407442ae2a2e3d08e1939432245aa3764f72bee40a0f079631b4"
+        },
+        {
+          "bytes": 2043,
+          "mode": 420,
+          "path": "deployments/a2d2/compose.source.yml",
+          "sha256": "ce15c0ee3b13834cca8bc03fa8d1ddea118ea299dd9269123c576d02a35d6f5b"
+        },
+        {
+          "bytes": 959,
+          "mode": 420,
+          "path": "deployments/a2d2/lock-images.py",
+          "sha256": "1ddfcc2259d0002692d5c676c3d17ff01cb53227a060dc304b512bae92f5736f"
+        },
+        {
+          "bytes": 1916,
+          "mode": 420,
+          "path": "deployments/a2d2/verify-origin.py",
+          "sha256": "3ecc34bdeed6ca89237c38d397ad04b3358f3d2844bbd34a2a292ffe92e4c959"
+        }
+      ],
+      "patch": "patches/plane-a2d2.patch",
+      "patch_sha256": "10ccf653a8ffc73f540b5149dad453ace30d3593e287b45b624dc56a84c159f0",
+      "source_delta_sha256": "48aecafbb63839e3e4ef9a15bc6028af327273fe176761069cfff04a0e6d30a1",
+      "upstream_commit": "2f895b82dad839c730c36a5c0cbc046f1e5d6b56"
+    }
+  },
+  "runtime_contract": {
+    "affine": {
+      "relations": [
+        "AFFINE_A2D2_ENGINE_SECRET has the same secret bytes as BUZZ_ENGINE_AFFINE_BROKER_KEY",
+        "AFFINE_A2D2_ORIGIN exactly equals BUZZ_ENGINE_AFFINE_ORIGIN"
+      ],
+      "required_env_keys": [
+        "AFFINE_A2D2_AUTH_ENABLED",
+        "AFFINE_A2D2_BROKER_URL",
+        "AFFINE_A2D2_ORIGIN",
+        "AFFINE_A2D2_ENGINE_SECRET"
+      ]
+    },
+    "plane": {
+      "relations": [
+        "PLANE_A2D2_ENGINE_SECRET has the same secret bytes as BUZZ_ENGINE_PLANE_BROKER_KEY",
+        "PLANE_A2D2_SERVICE_API_TOKEN_SHA256 is lowercase SHA-256 of PLANE_ENGINE_API_KEY",
+        "PLANE_A2D2_ORIGIN exactly equals BUZZ_ENGINE_PLANE_ORIGIN"
+      ],
+      "required_env_keys": [
+        "PLANE_A2D2_AUTH_ENABLED",
+        "PLANE_A2D2_BROKER_URL",
+        "PLANE_A2D2_ORIGIN",
+        "PLANE_A2D2_ENGINE_SECRET",
+        "PLANE_A2D2_SERVICE_API_TOKEN_SHA256"
+      ]
+    },
+    "relay": {
+      "required_env_keys": [
+        "BUZZ_AUTO_MIGRATE",
+        "BUZZ_ENGINE_PLANE_ORIGIN",
+        "BUZZ_ENGINE_PLANE_BROKER_KEY",
+        "BUZZ_ENGINE_AFFINE_ORIGIN",
+        "BUZZ_ENGINE_AFFINE_BROKER_KEY",
+        "PLANE_ENGINE_API_KEY"
+      ],
+      "required_values": {
+        "BUZZ_AUTO_MIGRATE": "false"
+      }
+    },
+    "secret_handling": "Compare values only by one-way fingerprints; never print or commit them."
+  },
+  "schema_version": 1
+}

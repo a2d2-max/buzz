@@ -1,3 +1,11 @@
+import type { CommunityTaskFieldDefinition } from "../lib/communityTaskCustomFields";
+import { CommunityTaskCustomFields } from "./CommunityTaskCustomFields";
+import {
+  type CommunityTaskCustomField,
+  parseCommunityTaskCustomFields,
+} from "../lib/communityTaskCustomFields";
+import type { CommunityTaskDocument } from "@/features/board/lib/communityTaskDocuments";
+import { CommunityTaskDocuments } from "./CommunityTaskDocuments";
 import { Trash2 } from "lucide-react";
 import * as React from "react";
 
@@ -45,6 +53,8 @@ import {
 import { CommunityTaskDueChip } from "./CommunityTasksBoard";
 
 type Draft = {
+  customFields: CommunityTaskCustomField[];
+  documents: CommunityTaskDocument[];
   assignees: string[];
   body: string;
   dueInput: string;
@@ -54,6 +64,8 @@ type Draft = {
 
 function draftOf(task: CommunityTask): Draft {
   return {
+    customFields: task.customFields ?? [],
+    documents: task.documents ?? [],
     assignees: task.assignees,
     body: task.body,
     dueInput: dueToDateInputValue(task.due),
@@ -102,6 +114,7 @@ const ASSIGNEES_HEADING_ID = "community-task-sheet-assignees-heading";
  * so an edit in progress is never clobbered by someone else's revision.
  */
 export function CommunityTaskSheet({
+  definitions = [],
   canDelete,
   canEdit,
   isSaving,
@@ -112,7 +125,10 @@ export function CommunityTaskSheet({
   profiles,
   task,
   viewerPubkey,
+  relayUrl = "",
+  onOpenDocument,
 }: {
+  definitions?: CommunityTaskFieldDefinition[];
   canDelete: boolean;
   canEdit: boolean;
   isSaving: boolean;
@@ -123,6 +139,8 @@ export function CommunityTaskSheet({
   profiles?: UserProfileLookup;
   task: CommunityTask | null;
   viewerPubkey: string | null;
+  relayUrl?: string;
+  onOpenDocument?: (pageId: string) => void;
 }) {
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [confirmingDelete, setConfirmingDelete] = React.useState(false);
@@ -144,7 +162,7 @@ export function CommunityTaskSheet({
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!task || !draft || isSaving || inFlightRef.current) return;
+    if (!canEdit || !task || !draft || isSaving || inFlightRef.current) return;
     const title = draft.title.trim();
     if (!title) {
       setErrorMessage("Give the task a title.");
@@ -152,14 +170,22 @@ export function CommunityTaskSheet({
     }
     inFlightRef.current = true;
     try {
+      if (parseCommunityTaskCustomFields(draft.customFields) === undefined)
+        throw new Error("Give every custom field a name and a valid value.");
       const due = dateInputValueToDue(draft.dueInput);
       const content: CommunityTaskContent = {
         ...communityTaskContentOf(task),
+        ...(draft.customFields.length || task.customFields !== undefined
+          ? { customFields: draft.customFields }
+          : {}),
         assignees: draft.assignees,
         body: draft.body.trim(),
         status: draft.status,
         title,
       };
+      if (draft.documents.length || task.documents !== undefined)
+        content.documents = draft.documents;
+      else delete content.documents;
       if (due === undefined) delete content.due;
       else content.due = due;
       await onSave(content);
@@ -173,7 +199,7 @@ export function CommunityTaskSheet({
   }
 
   async function handleDelete() {
-    if (!task || isSaving || inFlightRef.current) return;
+    if (!canDelete || !task || isSaving || inFlightRef.current) return;
     inFlightRef.current = true;
     try {
       await onDelete();
@@ -329,13 +355,27 @@ export function CommunityTaskSheet({
                   </GroupHeading>
                   <CommunityTaskAssigneePicker
                     assignees={draft.assignees}
-                    disabled={busy}
+                    disabled={busy || task.author !== viewerPubkey}
                     labelledBy={ASSIGNEES_HEADING_ID}
                     onChange={(assignees) => patch({ assignees })}
                     profiles={profiles}
                     viewerPubkey={viewerPubkey}
                   />
                 </div>
+                <CommunityTaskCustomFields
+                  definitions={definitions}
+                  fields={draft.customFields}
+                  onChange={(customFields) => patch({ customFields })}
+                  disabled={busy}
+                />
+                <CommunityTaskDocuments
+                  documents={draft.documents}
+                  onChange={(documents) => patch({ documents })}
+                  relayUrl={relayUrl}
+                  readonly={false}
+                  disabled={busy}
+                  onOpenDocument={onOpenDocument}
+                />
                 {errorMessage ? (
                   <p
                     className="text-sm text-destructive"
@@ -432,6 +472,20 @@ export function CommunityTaskSheet({
                     viewerPubkey={viewerPubkey}
                   />
                 </div>
+                <CommunityTaskCustomFields
+                  definitions={definitions}
+                  fields={task.customFields ?? []}
+                  onChange={() => {}}
+                  readonly
+                />
+                <CommunityTaskDocuments
+                  documents={task.documents ?? []}
+                  onChange={() => {}}
+                  relayUrl={relayUrl}
+                  readonly
+                  disabled={false}
+                  onOpenDocument={onOpenDocument}
+                />
                 <p className="text-xs text-muted-foreground/60">
                   Only the author and assignees can change this task.
                 </p>

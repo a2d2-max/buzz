@@ -638,11 +638,15 @@ pub(crate) fn spawn_transcription_task(
     let spawned_gen = session_generation.load(Ordering::Acquire);
 
     let http_client = state.http_client.clone();
+    let company_identity_http_client = state.company_identity_http_client.clone();
+    let company_identity = Arc::clone(&state.company_identity);
     let keys = match state.keys.lock() {
         Ok(k) => k.clone(),
         Err(_) => return,
     };
     let relay_base_url = crate::relay::relay_api_base_url_with_override(state);
+    let relay_url = crate::relay::relay_ws_url_with_override(state);
+    let pubkey = keys.public_key().to_hex();
 
     tauri::async_runtime::spawn(async move {
         // recv().await yields (not blocks) until text arrives or sender is dropped.
@@ -709,14 +713,27 @@ pub(crate) fn spawn_transcription_task(
                 }
             };
 
-            let response = {
-                http_client
-                    .post(&url)
-                    .header("Authorization", auth_header)
-                    .header("Content-Type", "application/json")
-                    .body(body_bytes)
-                    .send()
-                    .await
+            let response = match crate::company_identity::relay_request_with_scope(
+                &http_client,
+                &company_identity_http_client,
+                &company_identity,
+                &relay_url,
+                &pubkey,
+                reqwest::Method::POST,
+                &url,
+            ) {
+                Ok(request) => {
+                    request
+                        .header("Authorization", auth_header)
+                        .header("Content-Type", "application/json")
+                        .body(body_bytes)
+                        .send()
+                        .await
+                }
+                Err(error) => {
+                    eprintln!("buzz-desktop: STT kind:9 post failed: {error}");
+                    continue;
+                }
             };
 
             match response {

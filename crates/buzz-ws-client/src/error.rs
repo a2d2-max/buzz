@@ -19,6 +19,10 @@ pub enum WsClientError {
     #[error("URL parse error: {0}")]
     Url(String),
 
+    /// A caller-supplied federated assertion cannot be attached safely.
+    #[error("Invalid federated identity assertion")]
+    InvalidFederatedAssertion,
+
     /// The relay did not respond within the expected time.
     #[error("Timeout waiting for relay message")]
     Timeout,

@@ -4,6 +4,8 @@
 
 mod admission;
 mod build_info;
+/// Provider-neutral company identity enforcement at relay ingress.
+pub mod company_identity;
 mod rejection;
 
 /// REST API route handlers.
@@ -19,6 +21,9 @@ pub mod config;
 pub mod conformance;
 /// WebSocket connection lifecycle and state.
 pub mod connection;
+/// Headless derived-engine projection workers.
+pub mod engine_projection;
+pub mod engine_sessions;
 /// Relay error types.
 pub mod error;
 /// WebSocket message handlers for NIP-01 client commands.

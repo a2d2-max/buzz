@@ -18,38 +18,18 @@
  * a `resetCommunityState()` hook.
  */
 
-const STORAGE_KEY_PREFIX = "docs:dedicated-kind-rejected:";
+import {
+  createDedicatedKindSupport,
+  DEDICATED_KIND_RECHECK_MS,
+  isUnknownKindRejection,
+} from "@/shared/lib/dedicatedKindSupport";
 
-/** How long a "relay rejected 30623" verdict is trusted before re-probing. */
-export const DEDICATED_KIND_RECHECK_MS = 24 * 60 * 60 * 1_000;
+export { DEDICATED_KIND_RECHECK_MS, isUnknownKindRejection };
 
-/**
- * True when `error` is the relay's "I do not know this kind" rejection —
- * the OK false message surfaces verbatim as the publish error. Matched
- * loosely so upstream wording drift ("restricted: unknown event kind" today)
- * does not silently break the fallback; anything else (auth, rate limit,
- * size, timeout) must NOT flip the relay to legacy writes.
- */
-export function isUnknownKindRejection(error: unknown): boolean {
-  return error instanceof Error && /unknown (event )?kind/i.test(error.message);
-}
-
-function storageKey(relayUrl: string): string {
-  return `${STORAGE_KEY_PREFIX}${relayUrl}`;
-}
-
-function readRejectedAtMs(relayUrl: string): number | null {
-  try {
-    const raw = window.localStorage.getItem(storageKey(relayUrl));
-    if (raw === null) return null;
-    const value = Number(raw);
-    return Number.isFinite(value) ? value : null;
-  } catch {
-    // Storage unavailable (private window, blocked): behave as if the relay
-    // was never marked — the write path re-probes and re-marks per session.
-    return null;
-  }
-}
+// Keep the exact legacy key so existing 30623 verdicts survive this refactor.
+const docKindSupport = createDedicatedKindSupport(
+  "docs:dedicated-kind-rejected:",
+);
 
 /**
  * True while a "rejected" verdict for this relay is still fresh: writes go
@@ -61,10 +41,7 @@ export function dedicatedDocKindMarkedUnsupported(
   relayUrl: string,
   nowMs: number,
 ): boolean {
-  const rejectedAtMs = readRejectedAtMs(relayUrl);
-  return (
-    rejectedAtMs !== null && nowMs - rejectedAtMs < DEDICATED_KIND_RECHECK_MS
-  );
+  return docKindSupport.markedUnsupported(relayUrl, nowMs);
 }
 
 /** Records that `relayUrl` rejected a kind-30623 publish just now. */
@@ -72,19 +49,10 @@ export function markDedicatedDocKindRejected(
   relayUrl: string,
   nowMs: number,
 ): void {
-  try {
-    window.localStorage.setItem(storageKey(relayUrl), String(nowMs));
-  } catch {
-    // Best-effort: without storage the verdict lasts only this write, and
-    // the next publish probes again.
-  }
+  docKindSupport.markRejected(relayUrl, nowMs);
 }
 
 /** Clears the verdict after `relayUrl` accepted a kind-30623 publish. */
 export function markDedicatedDocKindAccepted(relayUrl: string): void {
-  try {
-    window.localStorage.removeItem(storageKey(relayUrl));
-  } catch {
-    // Best-effort, same as above.
-  }
+  docKindSupport.markAccepted(relayUrl);
 }

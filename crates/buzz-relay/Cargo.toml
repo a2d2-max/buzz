@@ -58,6 +58,7 @@ redis = { workspace = true }
 # transitively, so rustls can't auto-select one — we install ring explicitly in
 # main(). Mirrors buzz-acp's rustls setup for wss://.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 sqlx = { workspace = true }
 reqwest = { workspace = true }
 base64 = "0.22"
@@ -68,6 +69,8 @@ s3 = { version = "0.37", package = "rust-s3", default-features = false, features
 tempfile = "3"
 bytes = "1"
 infer = "0.19"
+jsonwebtoken = { workspace = true }
+libc = "0.2"
 serde_yaml      = { workspace = true }
 sha2            = { workspace = true }
 hmac            = { workspace = true }
@@ -94,9 +97,11 @@ mesh-llm-host-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag 
 buzz-test-client = { path = "../buzz-test-client" }
 ed25519-dalek = "=3.0.0-rc.0"
 buzz-core = { workspace = true, features = ["test-utils"] }
-buzz-auth = { workspace = true, features = ["dev"] }
+buzz-auth = { workspace = true, features = ["dev", "test-utils"] }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = "0.3"
 flate2 = "1.1.9"
+rcgen = "0.14"
+tokio-rustls = "0.26"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

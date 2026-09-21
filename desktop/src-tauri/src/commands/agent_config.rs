@@ -303,20 +303,30 @@ pub async fn get_agent_config_surface(
     // Use resolve_effective_agent_env so the lookup covers all tiers (baked
     // floor → definition → global → persona → record) and cannot diverge from
     // what the spawned process actually sees.
-    let claude_config_dir: Option<std::path::PathBuf> = if runtime_meta
-        .is_some_and(|m| m.id == "claude")
-    {
-        let effective_env = resolve_effective_agent_env(&record, &personas, runtime_meta, &global);
-        // Treat empty or blank CLAUDE_CONFIG_DIR as unset, matching Claude's
-        // `CLAUDE_CONFIG_DIR || homedir()` resolver semantics.
-        effective_env
-            .env
-            .get("CLAUDE_CONFIG_DIR")
-            .filter(|v| !v.trim().is_empty())
-            .map(std::path::PathBuf::from)
-    } else {
-        None
-    };
+    let claude_config_dir: Option<std::path::PathBuf> =
+        if runtime_meta.is_some_and(|m| m.id == "claude") {
+            let named_claude_account_ready =
+                crate::managed_agents::claude_accounts::claude_account_readiness_supplied(
+                    &app,
+                    record.claude_account_id.as_deref(),
+                );
+            let effective_env = resolve_effective_agent_env(
+                &record,
+                &personas,
+                runtime_meta,
+                &global,
+                named_claude_account_ready,
+            );
+            // Treat empty or blank CLAUDE_CONFIG_DIR as unset, matching Claude's
+            // `CLAUDE_CONFIG_DIR || homedir()` resolver semantics.
+            effective_env
+                .env
+                .get("CLAUDE_CONFIG_DIR")
+                .filter(|v| !v.trim().is_empty())
+                .map(std::path::PathBuf::from)
+        } else {
+            None
+        };
 
     Ok(resolve_config_surface(
         record,

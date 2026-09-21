@@ -134,6 +134,159 @@ pub(crate) async fn flush_managed_agent_policy(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedAccountPatch {
+    pubkey: String,
+    claude_account_id: Option<Option<String>>,
+    codex_account_id: Option<Option<String>>,
+}
+
+/// Validate every target and account id against clones before mutating the
+/// registry. Applying the returned plan cannot fail, so the caller can write
+/// all selected rows in one atomic snapshot without a partially moved roster.
+fn prepare_account_batch(
+    records: &[ManagedAgentRecord],
+    input: UpdateManagedAgentAccountsBatchRequest,
+    claude_known: &dyn Fn(&str) -> bool,
+    codex_known: &dyn Fn(&str) -> bool,
+) -> Result<Vec<PreparedAccountPatch>, String> {
+    if input.updates.is_empty() {
+        return Err("account update batch is empty".to_string());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut prepared = Vec::with_capacity(input.updates.len());
+    for update in input.updates {
+        if !seen.insert(update.pubkey.clone()) {
+            return Err(format!(
+                "agent {} appears more than once in the account update batch",
+                update.pubkey
+            ));
+        }
+        if update.claude_account_id.is_none() && update.codex_account_id.is_none() {
+            return Err(format!(
+                "agent {} account update has no fields",
+                update.pubkey
+            ));
+        }
+        let record = records
+            .iter()
+            .find(|record| record.pubkey == update.pubkey)
+            .ok_or_else(|| format!("agent {} not found", update.pubkey))?;
+        let mut staged = record.clone();
+        crate::managed_agents::apply_claude_account_update(
+            &mut staged,
+            update.claude_account_id.clone(),
+            claude_known,
+        )?;
+        crate::managed_agents::apply_codex_account_update(
+            &mut staged,
+            update.codex_account_id.clone(),
+            codex_known,
+        )?;
+        prepared.push(PreparedAccountPatch {
+            pubkey: update.pubkey,
+            claude_account_id: update.claude_account_id.map(|_| staged.claude_account_id),
+            codex_account_id: update.codex_account_id.map(|_| staged.codex_account_id),
+        });
+    }
+    Ok(prepared)
+}
+
+fn apply_prepared_account_batch(
+    records: &mut [ManagedAgentRecord],
+    prepared: &[PreparedAccountPatch],
+    updated_at: &str,
+) -> Result<Vec<String>, String> {
+    let mut changed = Vec::new();
+    for update in prepared {
+        let Some(record) = records
+            .iter_mut()
+            .find(|record| record.pubkey == update.pubkey)
+        else {
+            return Err(format!(
+                "agent {} disappeared from the prepared account snapshot",
+                update.pubkey
+            ));
+        };
+        let mut record_changed = false;
+        if let Some(next) = update.claude_account_id.as_ref() {
+            if record.claude_account_id.as_ref() != next.as_ref() {
+                record.claude_account_id = next.clone();
+                record_changed = true;
+            }
+        }
+        if let Some(next) = update.codex_account_id.as_ref() {
+            if record.codex_account_id.as_ref() != next.as_ref() {
+                record.codex_account_id = next.clone();
+                record_changed = true;
+            }
+        }
+        if record_changed {
+            record.updated_at = updated_at.to_string();
+            changed.push(record.pubkey.clone());
+        }
+    }
+    Ok(changed)
+}
+
+/// Production persistence seam for one roster action. The command loads one
+/// registry snapshot under its store lock, then this function validates and
+/// applies the complete batch before invoking the preserving writer exactly
+/// once. Tests inject an on-disk writer so removing this save makes the
+/// round-trip assertion fail.
+fn apply_and_persist_account_batch(
+    mut records: Vec<ManagedAgentRecord>,
+    input: UpdateManagedAgentAccountsBatchRequest,
+    claude_accounts: &[crate::managed_agents::ProviderAccount],
+    codex_accounts: &[crate::managed_agents::ProviderAccount],
+    updated_at: &str,
+    save: impl FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
+) -> Result<Vec<String>, String> {
+    let prepared = prepare_account_batch(
+        &records,
+        input,
+        &|id| claude_accounts.iter().any(|account| account.id == id),
+        &|id| codex_accounts.iter().any(|account| account.id == id),
+    )?;
+    let changed = apply_prepared_account_batch(&mut records, &prepared, updated_at)?;
+    if !changed.is_empty() {
+        save(&records)?;
+    }
+    Ok(changed)
+}
+
+/// Move one or more managed agents between stored provider accounts in one
+/// atomic registry write. This is the roster's persistence seam.
+#[tauri::command]
+pub async fn update_managed_agent_accounts_batch(
+    input: UpdateManagedAgentAccountsBatchRequest,
+    app: AppHandle,
+    caller: tauri::Webview,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    super::super::upstream_apps::ensure_trusted_caller(&caller)?;
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let records = load_managed_agents(&app)?;
+    let claude_accounts = crate::managed_agents::with_claude_account_store(&app, |store| {
+        store.list(crate::managed_agents::AccountProvider::Claude)
+    })?;
+    let codex_accounts = crate::managed_agents::with_claude_account_store(&app, |store| {
+        store.list(crate::managed_agents::AccountProvider::Codex)
+    })?;
+    apply_and_persist_account_batch(
+        records,
+        input,
+        &claude_accounts,
+        &codex_accounts,
+        &crate::util::now_iso(),
+        |records| save_managed_agents(&app, records),
+    )
+}
+
 /// Update mutable fields on an existing managed agent record.
 ///
 /// Most runtime config changes take effect on the next agent spawn. Access
@@ -143,8 +296,10 @@ pub(crate) async fn flush_managed_agent_policy(
 pub async fn update_managed_agent(
     input: UpdateManagedAgentRequest,
     app: AppHandle,
+    caller: tauri::Webview,
     state: State<'_, AppState>,
 ) -> Result<UpdateManagedAgentResponse, String> {
+    super::super::upstream_apps::ensure_trusted_caller(&caller)?;
     // Phase 1: local save (synchronous, under lock)
     let (mut summary, sync_params, rollback, access_policy_changed, access_restart_relays) = {
         let _store_guard = state

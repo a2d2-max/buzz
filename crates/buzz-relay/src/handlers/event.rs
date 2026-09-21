@@ -1404,6 +1404,8 @@ mod tests {
                     agent_owner_pubkey: None,
                 },
             )),
+            federated_assertion: None,
+            connected_at: chrono::Utc::now(),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             send_tx,
             ctrl_tx,

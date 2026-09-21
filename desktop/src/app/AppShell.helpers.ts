@@ -11,7 +11,9 @@ export type AppView =
   | "pulse"
   | "projects"
   | "board"
-  | "docs";
+  | "docs"
+  | "databases"
+  | "upstream";
 
 const WINDOW_DRAG_HANDLE_HEIGHT = 44;
 const TAURI_DRAG_REGION_ATTR = "data-tauri-drag-region";
@@ -235,6 +237,10 @@ export function deriveShellRoute(pathname: string): {
     };
   }
 
+  if (pathname === "/apps/affine" || pathname === "/apps/plane") {
+    return { selectedChannelId: null, selectedView: "upstream" };
+  }
+
   if (pathname === "/agents") {
     return {
       selectedChannelId: null,
@@ -274,6 +280,13 @@ export function deriveShellRoute(pathname: string): {
     return {
       selectedChannelId: null,
       selectedView: "docs",
+    };
+  }
+
+  if (pathname === "/databases" || pathname.startsWith("/databases/")) {
+    return {
+      selectedChannelId: null,
+      selectedView: "databases",
     };
   }
 

@@ -202,3 +202,9 @@ fn script_src_stays_free_of_unsafe_inline_and_eval() {
     assert!(!allowed.contains(&"'unsafe-inline'".to_owned()));
     assert!(!allowed.contains(&"'unsafe-eval'".to_owned()));
 }
+
+#[test]
+fn embedded_docs_editor_is_restricted_to_the_app_origin() {
+    assert_eq!(sources("frame-src"), vec!["'self'".to_owned()]);
+    assert_eq!(sources("frame-ancestors"), vec!["'self'".to_owned()]);
+}

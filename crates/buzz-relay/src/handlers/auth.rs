@@ -92,6 +92,41 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         Ok(mut auth_ctx) => {
             let pubkey = auth_ctx.pubkey;
 
+            // A NIP-FI assertion proves the configured company issuer currently
+            // associates an account with this key. NIP-42 independently proves
+            // possession of the same key. Revalidate the sealed assertion at
+            // final admission so a rotated/expired JWKS snapshot cannot ride a
+            // connection prepared earlier during the WebSocket upgrade.
+            let company_identity_lease = match state
+                .company_identity
+                .finalize_websocket(
+                    conn.federated_assertion.as_ref(),
+                    &pubkey,
+                    conn.connected_at,
+                )
+                .await
+            {
+                Ok(lease) => lease,
+                Err(denial) => {
+                    warn!(
+                        conn_id = %conn_id,
+                        denial = ?denial,
+                        "company identity admission denied"
+                    );
+                    metrics::counter!(
+                        "buzz_auth_failures_total",
+                        "reason" => "company_identity_denied"
+                    )
+                    .increment(1);
+                    *conn.auth_state.write().await = AuthState::Failed;
+                    let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                        RelayMessage::ok(&event_id_hex, false, denial.nostr_text()).into(),
+                    ));
+                    conn.cancel.cancel();
+                    return;
+                }
+            };
+
             // Community ban gate (NIP-42 seam). Runs immediately after auth
             // verification succeeds and before the allowlist and relay-membership
             // gates, per COMMUNITY_MODERATION_PLAN.md §0 decision 4 and the
@@ -284,6 +319,29 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 .conn_manager
                 .set_authenticated_pubkey(conn_id, pubkey.to_bytes().to_vec());
             conn.send(RelayMessage::ok(&event_id_hex, true, ""));
+
+            // There is deliberately no in-band renewal. A fresh assertion and
+            // fresh NIP-42 proof require a new connection. The timer carries no
+            // issuer, subject, or token data and terminates when the connection
+            // closes, so one admitted connection owns at most one bounded task.
+            if let Some(lease) = company_identity_lease {
+                let cancel = conn.cancel.clone();
+                let ctrl_tx = conn.ctrl_tx.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {}
+                        _ = tokio::time::sleep(lease) => {
+                            let _ = ctrl_tx.try_send(WsMessage::Text(
+                                RelayMessage::notice(
+                                    buzz_auth::DenialClass::EvidenceRejected.nostr_text()
+                                )
+                                .into(),
+                            ));
+                            cancel.cancel();
+                        }
+                    }
+                });
+            }
         }
         Err(e) => {
             warn!(conn_id = %conn_id, error = %e, "NIP-42 auth failed");

@@ -200,10 +200,25 @@ fn collect_restart_candidates(
             }
             let effective_cmd = record_agent_command(record, &all_personas);
             let runtime_meta = known_acp_runtime(&effective_cmd);
-            let old_effective =
-                resolve_effective_agent_env(record, &all_personas, runtime_meta, old_global);
-            let new_effective =
-                resolve_effective_agent_env(record, &all_personas, runtime_meta, new_global);
+            let named_claude_account_ready =
+                crate::managed_agents::claude_accounts::claude_account_readiness_supplied(
+                    app,
+                    record.claude_account_id.as_deref(),
+                );
+            let old_effective = resolve_effective_agent_env(
+                record,
+                &all_personas,
+                runtime_meta,
+                old_global,
+                named_claude_account_ready,
+            );
+            let new_effective = resolve_effective_agent_env(
+                record,
+                &all_personas,
+                runtime_meta,
+                new_global,
+                named_claude_account_ready,
+            );
             let old_ready = matches!(agent_readiness(&old_effective), AgentReadiness::Ready);
             let new_ready = matches!(agent_readiness(&new_effective), AgentReadiness::Ready);
             // For a Ready+running agent: the process must be alive now and the
@@ -308,10 +323,25 @@ async fn restart_local_agent_on_config_change(
         // per agent when the save-command personas haven't changed.
         let effective_cmd = record_agent_command(record, &personas_owned);
         let runtime_meta = known_acp_runtime(&effective_cmd);
-        let old_effective =
-            resolve_effective_agent_env(record, &personas_owned, runtime_meta, &old_global_clone);
-        let new_effective =
-            resolve_effective_agent_env(record, &personas_owned, runtime_meta, &new_global_clone);
+        let named_claude_account_ready =
+            crate::managed_agents::claude_accounts::claude_account_readiness_supplied(
+                &app_for_stop,
+                record.claude_account_id.as_deref(),
+            );
+        let old_effective = resolve_effective_agent_env(
+            record,
+            &personas_owned,
+            runtime_meta,
+            &old_global_clone,
+            named_claude_account_ready,
+        );
+        let new_effective = resolve_effective_agent_env(
+            record,
+            &personas_owned,
+            runtime_meta,
+            &new_global_clone,
+            named_claude_account_ready,
+        );
         let old_ready = matches!(agent_readiness(&old_effective), AgentReadiness::Ready);
         let new_ready = matches!(agent_readiness(&new_effective), AgentReadiness::Ready);
         // Under lock, the alive check was already done above via process_is_running.

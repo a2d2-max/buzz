@@ -675,7 +675,12 @@ pub async fn mint_agent_card(
             let auth = is_same_origin(url, &relay_base)
                 .then(|| crate::commands::media::mint_media_get_auth(&state, &relay_base))
                 .flatten();
-            fetch_avatar(url, auth.as_deref()).await?
+            fetch_avatar(
+                url,
+                auth.as_deref(),
+                is_same_origin(url, &relay_base).then_some(state.inner()),
+            )
+            .await?
         }
         _ => {
             return Err(
@@ -915,7 +920,11 @@ fn is_same_origin(url: &str, relay_base: &str) -> bool {
 /// Content-Length header is checked before any body bytes are read, and the
 /// body is streamed with a running count so a missing or dishonest header
 /// still cannot exceed the cap (same contract as `media_download.rs`).
-async fn fetch_avatar(url: &str, auth: Option<&str>) -> Result<Vec<u8>, String> {
+async fn fetch_avatar(
+    url: &str,
+    auth: Option<&str>,
+    relay_state: Option<&AppState>,
+) -> Result<Vec<u8>, String> {
     use futures_util::StreamExt;
 
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
@@ -926,7 +935,17 @@ async fn fetch_avatar(url: &str, auth: Option<&str>) -> Result<Vec<u8>, String> 
     let client = builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-    let mut req = client.get(url);
+    let mut req = match relay_state {
+        Some(state) => crate::company_identity::attach_to_no_redirect_request(
+            state,
+            url,
+            state
+                .media_fetch_client
+                .get(url)
+                .timeout(std::time::Duration::from_secs(30)),
+        )?,
+        None => client.get(url),
+    };
     if let Some(auth) = auth {
         req = req.header("authorization", auth);
     }

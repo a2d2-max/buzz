@@ -64,6 +64,8 @@ fn test_runtime() -> &'static KnownAcpRuntime {
         auth_probe_args: None,
         oauth_token_env_var: None,
         supports_codex_accounts: false,
+        data_home: crate::managed_agents::agent_home::DataHomeKind::None,
+        account_unsupported_reason: None,
     };
     &RUNTIME
 }
@@ -664,6 +666,8 @@ fn buzz_agent_runtime() -> &'static KnownAcpRuntime {
         auth_probe_args: None,
         oauth_token_env_var: None,
         supports_codex_accounts: false,
+        data_home: crate::managed_agents::agent_home::DataHomeKind::None,
+        account_unsupported_reason: None,
     }
 }
 

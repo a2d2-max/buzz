@@ -10,6 +10,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addCodexAccount,
   getCodexLoginCommand,
+  importOrcaCodexAccounts,
+  listOrcaCodexAccounts,
   listCodexAccounts,
   removeCodexAccount,
   renameCodexAccount,
@@ -20,6 +22,7 @@ import type { CodexAccount, CodexAuthKind } from "@/shared/api/types";
 import { managedAgentsQueryKey } from "./hooks";
 
 export const codexAccountsQueryKey = ["codexAccounts"] as const;
+export const orcaCodexAccountsQueryKey = ["orcaCodexAccounts"] as const;
 
 export function useCodexAccountsQuery(options?: { enabled?: boolean }) {
   return useQuery({
@@ -28,6 +31,34 @@ export function useCodexAccountsQuery(options?: { enabled?: boolean }) {
     queryFn: listCodexAccounts,
     // Only this app mutates the list; a reread after each mutation is enough.
     staleTime: Number.POSITIVE_INFINITY,
+  });
+}
+
+export function useOrcaCodexAccountsQuery(options?: { enabled?: boolean }) {
+  return useQuery({
+    enabled: options?.enabled ?? true,
+    queryKey: orcaCodexAccountsQueryKey,
+    queryFn: listOrcaCodexAccounts,
+    staleTime: 0,
+  });
+}
+
+export function useImportOrcaCodexAccountsMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (accountIds: string[]) => importOrcaCodexAccounts(accountIds),
+    onSuccess: (result) => {
+      queryClient.setQueryData<CodexAccount[]>(
+        codexAccountsQueryKey,
+        (current) => [...(current ?? []), ...result.imported],
+      );
+    },
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: codexAccountsQueryKey }),
+        queryClient.invalidateQueries({ queryKey: orcaCodexAccountsQueryKey }),
+      ]);
+    },
   });
 }
 

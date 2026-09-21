@@ -212,6 +212,18 @@ pub async fn apply_workspace(
         assert_current_apply_generation(&state.workspace_apply_generation, apply_generation)?;
 
         // ── Apply all state changes (nothing below can fail) ──────────────────
+        let next_pubkey = match parsed_keys.as_ref() {
+            Some(keys) => keys.public_key().to_hex(),
+            None => state
+                .keys
+                .lock()
+                .map_err(|error| error.to_string())?
+                .public_key()
+                .to_hex(),
+        };
+        state
+            .company_identity
+            .clear_if_scope_changes(&relay_url, &next_pubkey);
         {
             let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
             *override_guard = Some(relay_url);

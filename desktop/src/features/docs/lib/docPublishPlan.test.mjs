@@ -114,3 +114,70 @@ test("a base is compared even when content happens to match", () => {
     "conflict",
   );
 });
+
+test("AFFiNE conversion cannot flatten an existing linked database", () => {
+  const newest = version("p", "v2", {
+    body: "# Linked data\n\n:::db 11111111-2222-4333-8444-555555555555 board",
+  });
+  assert.throws(
+    () =>
+      planDocPagePublish({
+        newest,
+        baseEventId: newest.eventId,
+        next: {
+          ...NEXT,
+          body: "Linked data",
+          affine: { version: 1, data: "AQID" },
+        },
+      }),
+    /linked databases/i,
+  );
+  assert.equal(
+    planDocPagePublish({
+      newest,
+      next: { ...NEXT, body: newest.body, order: 2 },
+    }).kind,
+    "publish",
+  );
+});
+
+test("linked DB capable editor converts only when every existing reference survives", () => {
+  const body = ":::db 11111111-2222-4333-8444-555555555555 board";
+  const newest = version("p", "base", { body });
+  assert.equal(
+    planDocPagePublish({
+      newest,
+      baseEventId: "base",
+      next: { ...NEXT, body, affine: { version: 2, data: "AQID" } },
+    }).kind,
+    "publish",
+  );
+  assert.throws(
+    () =>
+      planDocPagePublish({
+        newest,
+        next: { ...NEXT, body: "lost", affine: { version: 2, data: "AQID" } },
+      }),
+    /linked database/i,
+  );
+  assert.throws(
+    () =>
+      planDocPagePublish({
+        newest,
+        next: {
+          ...NEXT,
+          body: body.replace(" board", " table"),
+          affine: { version: 2, data: "AQID" },
+        },
+      }),
+    /linked database/i,
+  );
+  assert.throws(
+    () =>
+      planDocPagePublish({
+        newest,
+        next: { ...NEXT, body, affine: { version: 1, data: "AQID" } },
+      }),
+    /linked database/i,
+  );
+});

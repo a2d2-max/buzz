@@ -2,6 +2,7 @@ import {
   Activity,
   BookOpen,
   Bot,
+  Database,
   Folders,
   Inbox,
   KanbanSquare,
@@ -11,6 +12,7 @@ import {
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
 import { FeatureGate } from "@/shared/features";
+import { UpstreamSidebarEntries } from "@/features/upstream-apps/UpstreamSidebarEntries";
 import type { Channel, SearchHit } from "@/shared/api/types";
 import {
   SidebarHeader,
@@ -31,7 +33,9 @@ type SidebarSelectedView =
   | "pulse"
   | "projects"
   | "board"
-  | "docs";
+  | "docs"
+  | "databases"
+  | "upstream";
 
 type AppSidebarPinnedHeaderProps = {
   channelLabels: Record<string, string>;
@@ -53,6 +57,7 @@ type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
   onSelectBoard: () => void;
+  onSelectDatabases: () => void;
   onSelectDocs: () => void;
   onSelectHome: () => void;
   onSelectProjects: () => void;
@@ -105,6 +110,7 @@ export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
   onSelectBoard,
+  onSelectDatabases,
   onSelectDocs,
   onSelectHome,
   onSelectProjects,
@@ -197,33 +203,49 @@ export function AppSidebarPrimaryMenu({
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>
+          <UpstreamSidebarEntries />
+          <FeatureGate feature="databases">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                data-testid="open-databases-view"
+                isActive={selectedView === "databases"}
+                onClick={onSelectDatabases}
+                tooltip="Databases"
+                type="button"
+              >
+                <Database className="h-4 w-4" />
+                <SidebarMenuLabel>Databases</SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
+          {/* Legacy native surfaces retain their routes for saved links and existing data. */}
+          <FeatureGate feature="docs">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                data-testid="open-legacy-docs-view"
+                isActive={selectedView === "docs"}
+                onClick={onSelectDocs}
+                tooltip="Legacy Docs"
+                type="button"
+              >
+                <BookOpen className="h-4 w-4" />
+                <SidebarMenuLabel>Legacy Docs</SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
           {/* Writes project task statuses, so it follows the Projects gate. */}
           <FeatureGate feature="projects">
             <SidebarMenuItem>
               <SidebarMenuButton
                 className="data-[active=true]:font-normal"
-                data-testid="open-board-view"
+                data-testid="open-legacy-board-view"
                 isActive={selectedView === "board"}
                 onClick={onSelectBoard}
-                tooltip="Board"
+                tooltip="Legacy Board"
                 type="button"
               >
                 <KanbanSquare className="h-4 w-4" />
-                <SidebarMenuLabel>Board</SidebarMenuLabel>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </FeatureGate>
-          <FeatureGate feature="docs">
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                data-testid="open-docs-view"
-                isActive={selectedView === "docs"}
-                onClick={onSelectDocs}
-                tooltip="Docs"
-                type="button"
-              >
-                <BookOpen className="h-4 w-4" />
-                <SidebarMenuLabel>Docs</SidebarMenuLabel>
+                <SidebarMenuLabel>Legacy Board</SidebarMenuLabel>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>

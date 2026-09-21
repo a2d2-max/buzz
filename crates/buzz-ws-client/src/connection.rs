@@ -5,7 +5,15 @@ use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, Keys, Tag};
 use serde_json::{json, Value};
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{HeaderName, HeaderValue},
+        Message,
+    },
+    MaybeTlsStream, WebSocketStream,
+};
 use tracing::debug;
 
 use crate::error::WsClientError;
@@ -46,11 +54,46 @@ impl NostrWsConnection {
 
     /// Connects to the relay at `url` without performing authentication.
     pub async fn connect(url: &str) -> Result<Self, WsClientError> {
+        Self::connect_with_optional_federated_assertion(url, None).await
+    }
+
+    /// Connect without authenticating and attach one NIP-FI company identity
+    /// assertion to the WebSocket upgrade. The assertion is held only by the
+    /// handshake request and is never logged or stored on the connection.
+    pub async fn connect_with_federated_assertion(
+        url: &str,
+        compact_jws: &str,
+    ) -> Result<Self, WsClientError> {
+        Self::connect_with_optional_federated_assertion(url, Some(compact_jws)).await
+    }
+
+    async fn connect_with_optional_federated_assertion(
+        url: &str,
+        compact_jws: Option<&str>,
+    ) -> Result<Self, WsClientError> {
         let parsed = url
             .parse::<url::Url>()
             .map_err(|e| WsClientError::Url(e.to_string()))?;
 
-        let (ws, _response) = connect_async(parsed.as_str())
+        let mut request = parsed
+            .as_str()
+            .into_client_request()
+            .map_err(WsClientError::WebSocket)?;
+        if let Some(compact_jws) = compact_jws {
+            if compact_jws.is_empty()
+                || compact_jws.contains(',')
+                || compact_jws.bytes().any(|byte| byte.is_ascii_whitespace())
+            {
+                return Err(WsClientError::InvalidFederatedAssertion);
+            }
+            let value = HeaderValue::from_str(&format!("Bearer {compact_jws}"))
+                .map_err(|_| WsClientError::InvalidFederatedAssertion)?;
+            request
+                .headers_mut()
+                .insert(HeaderName::from_static("nostr-federated-identity"), value);
+        }
+
+        let (ws, _response) = connect_async(request)
             .await
             .map_err(WsClientError::WebSocket)?;
 
@@ -281,8 +324,53 @@ pub async fn publish_event(
     auth_tag: Option<&Tag>,
     timeout_secs: u64,
 ) -> Result<OkResponse, WsClientError> {
+    publish_event_with_optional_federated_assertion(
+        relay_url,
+        event,
+        keys,
+        auth_tag,
+        None,
+        timeout_secs,
+    )
+    .await
+}
+
+/// One-shot publish using NIP-FI on the WebSocket upgrade and NIP-42 for key
+/// possession. The compact assertion is never logged or persisted.
+pub async fn publish_event_with_federated_assertion(
+    relay_url: &str,
+    event: Event,
+    keys: &Keys,
+    auth_tag: Option<&Tag>,
+    compact_jws: &str,
+    timeout_secs: u64,
+) -> Result<OkResponse, WsClientError> {
+    publish_event_with_optional_federated_assertion(
+        relay_url,
+        event,
+        keys,
+        auth_tag,
+        Some(compact_jws),
+        timeout_secs,
+    )
+    .await
+}
+
+async fn publish_event_with_optional_federated_assertion(
+    relay_url: &str,
+    event: Event,
+    keys: &Keys,
+    auth_tag: Option<&Tag>,
+    compact_jws: Option<&str>,
+    timeout_secs: u64,
+) -> Result<OkResponse, WsClientError> {
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-        let mut conn = NostrWsConnection::connect(relay_url).await?;
+        let mut conn = match compact_jws {
+            Some(assertion) => {
+                NostrWsConnection::connect_with_federated_assertion(relay_url, assertion).await?
+            }
+            None => NostrWsConnection::connect(relay_url).await?,
+        };
         conn.authenticate(keys, auth_tag).await?;
         let ok = conn.send_event(event).await?;
         let _ = conn.disconnect().await;

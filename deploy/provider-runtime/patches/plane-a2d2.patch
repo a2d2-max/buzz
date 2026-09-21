@@ -1,0 +1,3992 @@
+diff --git a/apps/api/plane/api/middleware/api_authentication.py b/apps/api/plane/api/middleware/api_authentication.py
+index ed03bbb8d4..c8a9d722e5 100644
+--- a/apps/api/plane/api/middleware/api_authentication.py
++++ b/apps/api/plane/api/middleware/api_authentication.py
+@@ -2,6 +2,10 @@
+ # SPDX-License-Identifier: AGPL-3.0-only
+ # See the LICENSE file for details.
+ 
++# Python imports
++import hashlib
++import hmac
++
+ # Django imports
+ from django.utils import timezone
+ from django.db.models import Q
+@@ -11,6 +15,7 @@ from rest_framework import authentication
+ from rest_framework.exceptions import AuthenticationFailed
+ 
+ # Module imports
++from plane.a2d2.config import load_config
+ from plane.db.models import APIToken
+ 
+ 
+@@ -37,6 +42,21 @@ class APIKeyAuthentication(authentication.BaseAuthentication):
+         except APIToken.DoesNotExist:
+             raise AuthenticationFailed("Given API token is not valid")
+ 
++        try:
++            config = load_config()
++        except ValueError as error:
++            raise AuthenticationFailed(
++                "A2D2 managed API authentication is unavailable"
++            ) from error
++        if config.enabled:
++            token_sha256 = hashlib.sha256(token.encode()).hexdigest()
++            if not api_token.is_service or not hmac.compare_digest(
++                token_sha256, config.service_api_token_sha256
++            ):
++                raise AuthenticationFailed(
++                    "A2D2 managed mode only accepts the configured service credential"
++                )
++
+         # save api token last used
+         api_token.last_used = timezone.now()
+         api_token.save(update_fields=["last_used"])
+diff --git a/apps/api/plane/db/models/__init__.py b/apps/api/plane/db/models/__init__.py
+index 5cf9dec2a3..09a49ca52e 100644
+--- a/apps/api/plane/db/models/__init__.py
++++ b/apps/api/plane/db/models/__init__.py
+@@ -3,6 +3,7 @@
+ # See the LICENSE file for details.
+ 
+ from .analytic import AnalyticView
++from .a2d2 import A2D2ManagedPrincipal, A2D2ManagedWorkspace
+ from .api import APIActivityLog, APIToken
+ from .asset import FileAsset
+ from .base import BaseModel
+diff --git a/apps/api/plane/settings/common.py b/apps/api/plane/settings/common.py
+index 7f942a1bdc..3f06ae5cf0 100644
+--- a/apps/api/plane/settings/common.py
++++ b/apps/api/plane/settings/common.py
+@@ -126,6 +126,7 @@ MIDDLEWARE = [
+     "django.middleware.common.CommonMiddleware",
+     "django.middleware.csrf.CsrfViewMiddleware",
+     "django.contrib.auth.middleware.AuthenticationMiddleware",
++    "plane.a2d2.middleware.A2D2ManagedSessionMiddleware",
+     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+     "crum.CurrentRequestUserMiddleware",
+     "django.middleware.gzip.GZipMiddleware",
+diff --git a/apps/api/plane/urls.py b/apps/api/plane/urls.py
+index 44761bd6b5..81e0a23786 100644
+--- a/apps/api/plane/urls.py
++++ b/apps/api/plane/urls.py
+@@ -16,6 +16,7 @@ from drf_spectacular.views import (
+ handler404 = "plane.app.views.error_404.custom_404_view"
+ 
+ urlpatterns = [
++    path("api/a2d2/", include("plane.a2d2.urls")),
+     path("api/", include("plane.app.urls")),
+     path("api/public/", include("plane.space.urls")),
+     path("api/instances/", include("plane.license.urls")),
+diff --git a/apps/live/src/hocuspocus.ts b/apps/live/src/hocuspocus.ts
+index 93ebf725ee..8af80c9e4a 100644
+--- a/apps/live/src/hocuspocus.ts
++++ b/apps/live/src/hocuspocus.ts
+@@ -11,7 +11,7 @@ import { env } from "@/env";
+ // extensions
+ import { getExtensions } from "@/extensions";
+ // lib
+-import { onAuthenticate } from "@/lib/auth";
++import { beforeHandleMessage, onAuthenticate } from "@/lib/auth";
+ import { onStateless } from "@/lib/stateless";
+ 
+ export class HocusPocusServerManager {
+@@ -45,6 +45,7 @@ export class HocusPocusServerManager {
+     this.server = new Hocuspocus({
+       name: this.serverName,
+       onAuthenticate,
++      beforeHandleMessage,
+       onStateless,
+       extensions: getExtensions(),
+       debounce: 10000,
+diff --git a/apps/live/src/lib/auth.ts b/apps/live/src/lib/auth.ts
+index 02aa69ca4c..9642a40585 100644
+--- a/apps/live/src/lib/auth.ts
++++ b/apps/live/src/lib/auth.ts
+@@ -6,6 +6,8 @@
+ 
+ // plane imports
+ import type { IncomingHttpHeaders } from "http";
++import { createHash } from "node:crypto";
++import type { beforeHandleMessagePayload } from "@hocuspocus/server";
+ import type { TUserDetails } from "@plane/editor";
+ import { logger } from "@plane/logger";
+ import { AppError } from "@/lib/errors";
+@@ -95,3 +97,25 @@ export const handleAuthentication = async ({ cookie, userId }: { cookie: string;
+     throw new AppError("Authentication unsuccessful", { code: appError.code });
+   }
+ };
++
++const MAX_CONCURRENT_SESSION_CHECKS = 128;
++const inFlightSessionChecks = new Map<string, ReturnType<typeof handleAuthentication>>();
++
++/** Revalidate the managed A2D2 session before every live protocol message. */
++export const beforeHandleMessage = async ({ context }: beforeHandleMessagePayload) => {
++  const managed = context as HocusPocusServerContext;
++  const key = createHash("sha256").update(managed.userId).update("\0").update(managed.cookie).digest("hex");
++  const current = inFlightSessionChecks.get(key);
++  if (current) return await current;
++  if (inFlightSessionChecks.size >= MAX_CONCURRENT_SESSION_CHECKS) {
++    throw new AppError("Authentication capacity exhausted", { code: "AUTH_CHECK_CAPACITY" });
++  }
++
++  const pending = handleAuthentication({ cookie: managed.cookie, userId: managed.userId });
++  inFlightSessionChecks.set(key, pending);
++  try {
++    return await pending;
++  } finally {
++    if (inFlightSessionChecks.get(key) === pending) inFlightSessionChecks.delete(key);
++  }
++};
+diff --git a/apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/members/page.tsx b/apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/members/page.tsx
+index 142f7b31c0..ffbc1d5169 100644
+--- a/apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/members/page.tsx
++++ b/apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/members/page.tsx
+@@ -26,6 +26,7 @@ import { SendWorkspaceInvitationModal } from "@/components/workspace/members";
+ import { useMember } from "@/hooks/store/use-member";
+ import { useWorkspace } from "@/hooks/store/use-workspace";
+ import { useUserPermissions } from "@/hooks/store/user";
++import { isA2D2ManagedMode } from "@/helpers/a2d2-managed-mode";
+ // local imports
+ import type { Route } from "./+types/page";
+ import { MembersWorkspaceSettingsHeader } from "./header";
+@@ -43,6 +44,7 @@ const WorkspaceMembersSettingsPage = observer(function WorkspaceMembersSettingsP
+   } = useMember();
+   const { currentWorkspace } = useWorkspace();
+   const { t } = useTranslation();
++  const isManagedMode = isA2D2ManagedMode();
+ 
+   // derived values
+   const canPerformWorkspaceAdminActions = allowPermissions([EUserPermissions.ADMIN], EUserPermissionsLevel.WORKSPACE);
+@@ -101,11 +103,13 @@ const WorkspaceMembersSettingsPage = observer(function WorkspaceMembersSettingsP
+   return (
+     <SettingsContentWrapper header={<MembersWorkspaceSettingsHeader />} hugging>
+       <PageHead title={pageTitle} />
+-      <SendWorkspaceInvitationModal
+-        isOpen={inviteModal}
+-        onClose={() => setInviteModal(false)}
+-        onSubmit={handleWorkspaceInvite}
+-      />
++      {!isManagedMode && (
++        <SendWorkspaceInvitationModal
++          isOpen={inviteModal}
++          onClose={() => setInviteModal(false)}
++          onSubmit={handleWorkspaceInvite}
++        />
++      )}
+       <section
+         className={cn("size-full", {
+           "opacity-60": !canPerformWorkspaceMemberActions,
+@@ -135,7 +139,7 @@ const WorkspaceMembersSettingsPage = observer(function WorkspaceMembersSettingsP
+               handleUpdate={handleRoleFilterUpdate}
+               memberType="workspace"
+             />
+-            {canPerformWorkspaceAdminActions && (
++            {canPerformWorkspaceAdminActions && !isManagedMode && (
+               <Button variant="primary" size="lg" onClick={() => setInviteModal(true)}>
+                 {t("workspace_settings.settings.members.add_member")}
+               </Button>
+diff --git a/apps/web/caddy/Caddyfile b/apps/web/caddy/Caddyfile
+index fced343528..72f5e91728 100644
+--- a/apps/web/caddy/Caddyfile
++++ b/apps/web/caddy/Caddyfile
+@@ -13,7 +13,7 @@
+ 	rate_limit {
+ 		zone static {
+ 			key {client_ip}
+-			events 300
++			events 600
+ 			window 1m
+ 		}
+ 	}
+diff --git a/apps/web/core/components/home/widgets/empty-states/no-projects.tsx b/apps/web/core/components/home/widgets/empty-states/no-projects.tsx
+index 24b3a0ae01..edaeb3fa9c 100644
+--- a/apps/web/core/components/home/widgets/empty-states/no-projects.tsx
++++ b/apps/web/core/components/home/widgets/empty-states/no-projects.tsx
+@@ -20,6 +20,7 @@ import { useCommandPalette } from "@/hooks/store/use-command-palette";
+ import { useProject } from "@/hooks/store/use-project";
+ import { useWorkspace } from "@/hooks/store/use-workspace";
+ import { useUser, useUserPermissions } from "@/hooks/store/user";
++import { isA2D2ManagedMode } from "@/helpers/a2d2-managed-mode";
+ // plane web constants
+ 
+ export const NoProjectsEmptyState = observer(function NoProjectsEmptyState() {
+@@ -45,6 +46,7 @@ export const NoProjectsEmptyState = observer(function NoProjectsEmptyState() {
+     EUserPermissionsLevel.WORKSPACE
+   );
+   const isWorkspaceAdmin = allowPermissions([EUserPermissions.ADMIN], EUserPermissionsLevel.WORKSPACE);
++  const isManagedMode = isA2D2ManagedMode();
+ 
+   const EMPTY_STATE_DATA = [
+     {
+@@ -64,18 +66,22 @@ export const NoProjectsEmptyState = observer(function NoProjectsEmptyState() {
+         disabled: !canCreateProject,
+       },
+     },
+-    {
+-      id: "invite-team",
+-      title: "home.empty.invite_team.title",
+-      description: "home.empty.invite_team.description",
+-      icon: <MembersOutline className="size-4" />,
+-      flag: "visited_members",
+-      cta: {
+-        text: "home.empty.invite_team.cta",
+-        link: `/${workspaceSlug}/settings/members`,
+-        disabled: !isWorkspaceAdmin,
+-      },
+-    },
++    ...(!isManagedMode
++      ? [
++          {
++            id: "invite-team",
++            title: "home.empty.invite_team.title",
++            description: "home.empty.invite_team.description",
++            icon: <MembersOutline className="size-4" />,
++            flag: "visited_members",
++            cta: {
++              text: "home.empty.invite_team.cta",
++              link: `/${workspaceSlug}/settings/members`,
++              disabled: !isWorkspaceAdmin,
++            },
++          },
++        ]
++      : []),
+     {
+       id: "configure-workspace",
+       title: "home.empty.configure_workspace.title",
+diff --git a/apps/web/core/components/project/member-list.tsx b/apps/web/core/components/project/member-list.tsx
+index d6c04a1a0d..b582466bf9 100644
+--- a/apps/web/core/components/project/member-list.tsx
++++ b/apps/web/core/components/project/member-list.tsx
+@@ -16,6 +16,7 @@ import { MembersSettingsLoader } from "@/components/ui/loader/settings/members";
+ // hooks
+ import { useMember } from "@/hooks/store/use-member";
+ import { useUserPermissions } from "@/hooks/store/user";
++import { isA2D2ManagedMode } from "@/helpers/a2d2-managed-mode";
+ // local imports
+ import { MemberListFiltersDropdown } from "./dropdowns/filters/member-list";
+ import { ProjectMemberListItem } from "./member-list-item";
+@@ -37,6 +38,7 @@ export const ProjectMemberList = observer(function ProjectMemberList(props: TPro
+   const { allowPermissions } = useUserPermissions();
+ 
+   const { t } = useTranslation();
++  const isManagedMode = isA2D2ManagedMode();
+ 
+   const searchedProjectMembers = (projectMemberIds ?? []).filter((userId) => {
+     const memberDetails = projectId ? getFilteredProjectMemberDetails(userId, projectId.toString()) : null;
+@@ -75,12 +77,14 @@ export const ProjectMemberList = observer(function ProjectMemberList(props: TPro
+ 
+   return (
+     <>
+-      <SendProjectInvitationModal
+-        isOpen={inviteModal}
+-        onClose={() => setInviteModal(false)}
+-        projectId={projectId}
+-        workspaceSlug={workspaceSlug}
+-      />
++      {!isManagedMode && (
++        <SendProjectInvitationModal
++          isOpen={inviteModal}
++          onClose={() => setInviteModal(false)}
++          projectId={projectId}
++          workspaceSlug={workspaceSlug}
++        />
++      )}
+       <div className="flex items-center justify-between gap-4 overflow-x-hidden border-b border-subtle py-2">
+         <div className="text-14 font-semibold">{t("common.members")}</div>
+         <div className="flex items-center gap-2">
+@@ -99,7 +103,7 @@ export const ProjectMemberList = observer(function ProjectMemberList(props: TPro
+             handleUpdate={handleRoleFilterUpdate}
+             memberType="project"
+           />
+-          {isAdmin && (
++          {isAdmin && !isManagedMode && (
+             <Button
+               variant="primary"
+               onClick={() => {
+diff --git a/apps/web/core/components/workspace/sidebar/dropdown-item.tsx b/apps/web/core/components/workspace/sidebar/dropdown-item.tsx
+index b4c7f04f5c..f6e65fa50e 100644
+--- a/apps/web/core/components/workspace/sidebar/dropdown-item.tsx
++++ b/apps/web/core/components/workspace/sidebar/dropdown-item.tsx
+@@ -14,6 +14,7 @@ import { EUserPermissions } from "@plane/constants";
+ import { useTranslation } from "@plane/i18n";
+ import type { IWorkspace } from "@plane/types";
+ import { cn, getFileURL, getUserRole } from "@plane/utils";
++import { isA2D2ManagedMode } from "@/helpers/a2d2-managed-mode";
+ 
+ type TProps = {
+   workspace: IWorkspace;
+@@ -28,6 +29,7 @@ const SidebarDropdownItem = observer(function SidebarDropdownItem(props: TProps)
+   const { workspaceSlug } = useParams();
+   // hooks
+   const { t } = useTranslation();
++  const isManagedMode = isA2D2ManagedMode();
+ 
+   return (
+     <Link
+@@ -99,7 +101,7 @@ const SidebarDropdownItem = observer(function SidebarDropdownItem(props: TProps)
+                   <span className="my-auto text-13 font-medium whitespace-nowrap">{t("settings")}</span>
+                 </Link>
+               )}
+-              {[EUserPermissions.ADMIN].includes(workspace?.role) && (
++              {!isManagedMode && [EUserPermissions.ADMIN].includes(workspace?.role) && (
+                 <Link
+                   href={`/${workspace.slug}/settings/members`}
+                   onClick={(e) => {
+diff --git a/apps/web/core/components/workspace/sidebar/workspace-menu-root.tsx b/apps/web/core/components/workspace/sidebar/workspace-menu-root.tsx
+index be082f40c5..36043ee0ac 100644
+--- a/apps/web/core/components/workspace/sidebar/workspace-menu-root.tsx
++++ b/apps/web/core/components/workspace/sidebar/workspace-menu-root.tsx
+@@ -24,6 +24,7 @@ import { useAppTheme } from "@/hooks/store/use-app-theme";
+ import { useWorkspace } from "@/hooks/store/use-workspace";
+ import { useUser, useUserProfile } from "@/hooks/store/user";
+ import { useInstance } from "@/hooks/store/use-instance";
++import { isA2D2ManagedMode } from "@/helpers/a2d2-managed-mode";
+ // components
+ import { WorkspaceLogo } from "../logo";
+ import SidebarDropdownItem from "./dropdown-item";
+@@ -43,6 +44,7 @@ export const WorkspaceMenuRoot = observer(function WorkspaceMenuRoot(props: Work
+   const { currentWorkspace: activeWorkspace, workspaces } = useWorkspace();
+   // derived values
+   const isWorkspaceCreationDisabled = config?.is_workspace_creation_disabled ?? false;
++  const isManagedMode = isA2D2ManagedMode();
+   // translation
+   const { t } = useTranslation();
+   // local state
+@@ -186,7 +188,7 @@ export const WorkspaceMenuRoot = observer(function WorkspaceMenuRoot(props: Work
+                     )}
+                   </div>
+                   <div className="flex w-full flex-col items-start justify-start gap-2 px-4 py-2 text-13">
+-                    {!isWorkspaceCreationDisabled && (
++                    {!isWorkspaceCreationDisabled && !isManagedMode && (
+                       <Link href="/create-workspace" className="w-full">
+                         <Menu.Item
+                           as="div"
+@@ -198,15 +200,17 @@ export const WorkspaceMenuRoot = observer(function WorkspaceMenuRoot(props: Work
+                       </Link>
+                     )}
+ 
+-                    <Link href="/invitations" className="w-full" onClick={handleItemClick}>
+-                      <Menu.Item
+-                        as="div"
+-                        className="flex items-center gap-2 rounded-sm px-2 py-1 text-13 font-medium text-secondary hover:bg-layer-transparent-hover"
+-                      >
+-                        <MailOutline className="h-4 w-4 flex-shrink-0" />
+-                        {t("workspace_invites")}
+-                      </Menu.Item>
+-                    </Link>
++                    {!isManagedMode && (
++                      <Link href="/invitations" className="w-full" onClick={handleItemClick}>
++                        <Menu.Item
++                          as="div"
++                          className="flex items-center gap-2 rounded-sm px-2 py-1 text-13 font-medium text-secondary hover:bg-layer-transparent-hover"
++                        >
++                          <MailOutline className="h-4 w-4 flex-shrink-0" />
++                          {t("workspace_invites")}
++                        </Menu.Item>
++                      </Link>
++                    )}
+ 
+                     <div className="w-full">
+                       <Menu.Item
+diff --git a/apps/web/core/lib/wrappers/authentication-wrapper.tsx b/apps/web/core/lib/wrappers/authentication-wrapper.tsx
+index fc142c3002..f240f9c0da 100644
+--- a/apps/web/core/lib/wrappers/authentication-wrapper.tsx
++++ b/apps/web/core/lib/wrappers/authentication-wrapper.tsx
+@@ -4,7 +4,7 @@
+  * See the LICENSE file for details.
+  */
+ 
+-import type { ReactNode } from "react";
++import { type ReactNode, useEffect, useRef, useState } from "react";
+ import { observer } from "mobx-react";
+ import { useSearchParams, usePathname } from "next/navigation";
+ import useSWR from "swr";
+@@ -41,12 +41,41 @@ export const AuthenticationWrapper = observer(function AuthenticationWrapper(pro
+   const { data: currentUserProfile } = useUserProfile();
+   const { data: currentUserSettings } = useUserSettings();
+   const { loader: workspacesLoader, workspaces } = useWorkspace();
++  const hasA2D2Bridge = typeof window !== "undefined" && window.a2d2Engine !== undefined;
++  const launchStarted = useRef(false);
++  const [a2d2Launch, setA2D2Launch] = useState<"pending" | "failed" | "unavailable">(() =>
++    hasA2D2Bridge ? "pending" : "unavailable"
++  );
+ 
+   const { isLoading: isUserSWRLoading } = useSWR("USER_INFORMATION", async () => await fetchCurrentUser(), {
+     revalidateOnFocus: false,
+     shouldRetryOnError: false,
+   });
+ 
++  useEffect(() => {
++    // Let the existing session probe finish before minting a launch.  The
++    // managed exchange reloads into the workspace route with a fresh secure
++    // cookie; launching while that probe is still pending would exchange and
++    // reload again on every mount.
++    if (
++      isUserLoading ||
++      isUserSWRLoading ||
++      pageType === EPageTypes.PUBLIC ||
++      currentUser?.id ||
++      !hasA2D2Bridge ||
++      launchStarted.current
++    )
++      return;
++    launchStarted.current = true;
++    void window.a2d2Engine
++      ?.launch()
++      .then((session) => {
++        if (!session.workspace_slug) throw new Error("A2D2 managed workspace missing");
++        window.location.replace(`/${session.workspace_slug}`);
++      })
++      .catch(() => setA2D2Launch("failed"));
++  }, [currentUser?.id, hasA2D2Bridge, isUserLoading, isUserSWRLoading, pageType]);
++
+   const isUserOnboard =
+     currentUserProfile?.is_onboarded ||
+     (currentUserProfile?.onboarding_step?.profile_complete &&
+@@ -87,6 +116,20 @@ export const AuthenticationWrapper = observer(function AuthenticationWrapper(pro
+ 
+   if (pageType === EPageTypes.PUBLIC) return <>{children}</>;
+ 
++  if (!currentUser?.id && hasA2D2Bridge) {
++    if (a2d2Launch === "failed")
++      return (
++        <div className="relative flex h-screen w-full items-center justify-center">
++          <p role="alert">A2D2 session unavailable. Reopen Plane from A2D2 to try again.</p>
++        </div>
++      );
++    return (
++      <div className="relative flex h-screen w-full items-center justify-center">
++        <LogoSpinner />
++      </div>
++    );
++  }
++
+   if (pageType === EPageTypes.NON_AUTHENTICATED) {
+     if (!currentUser?.id) return <>{children}</>;
+     else {
+diff --git a/apps/web/core/lib/wrappers/instance-wrapper.tsx b/apps/web/core/lib/wrappers/instance-wrapper.tsx
+index c5beae4d0f..1c5838aa34 100644
+--- a/apps/web/core/lib/wrappers/instance-wrapper.tsx
++++ b/apps/web/core/lib/wrappers/instance-wrapper.tsx
+@@ -21,6 +21,7 @@ const InstanceWrapper = observer(function InstanceWrapper(props: TInstanceWrappe
+   const { children } = props;
+   // store
+   const { isLoading, instance, error, fetchInstanceInfo } = useInstance();
++  const hasA2D2Bridge = typeof window !== "undefined" && window.a2d2Engine !== undefined;
+ 
+   const { isLoading: isInstanceSWRLoading, error: instanceSWRError } = useSWR(
+     "INSTANCE_INFORMATION",
+@@ -42,7 +43,10 @@ const InstanceWrapper = observer(function InstanceWrapper(props: TInstanceWrappe
+   if (error && error?.status === "error") return <>{children}</>;
+ 
+   // instance is not ready and setup is not done
+-  if (instance?.is_setup_done === false) return <InstanceNotReady />;
++  // A2D2 managed auth provisions the first workspace owner through the
++  // authenticated bridge.  Let that flow reach AuthenticationWrapper instead
++  // of exposing Plane's standalone admin bootstrap UI in the child webview.
++  if (instance?.is_setup_done === false && !hasA2D2Bridge) return <InstanceNotReady />;
+ 
+   return <>{children}</>;
+ });
+diff --git a/apps/web/google.d.ts b/apps/web/google.d.ts
+index 0a8bf46979..e29aa00789 100644
+--- a/apps/web/google.d.ts
++++ b/apps/web/google.d.ts
+@@ -87,5 +87,13 @@ interface Google {
+ }
+ 
+ interface Window {
++  a2d2Engine?: {
++    launch: () => Promise<{
++      authenticated: true;
++      expires_at: number;
++      workspace_slug?: string;
++      workspace_id?: string;
++    }>;
++  };
+   google?: Google;
+ }
+diff --git a/apps/api/plane/a2d2/__init__.py b/apps/api/plane/a2d2/__init__.py
+new file mode 100644
+index 0000000000..e3088bbe6d
+--- /dev/null
++++ b/apps/api/plane/a2d2/__init__.py
+@@ -0,0 +1 @@
++"""A2D2-managed identity adapter for the embedded Plane product."""
+diff --git a/apps/api/plane/a2d2/backfill.py b/apps/api/plane/a2d2/backfill.py
+new file mode 100644
+index 0000000000..9bfa2abdb2
+--- /dev/null
++++ b/apps/api/plane/a2d2/backfill.py
+@@ -0,0 +1,249 @@
++import re
++from dataclasses import dataclass
++from uuid import UUID
++
++from django.db import transaction
++
++from plane.db.models import (
++    A2D2ManagedPrincipal,
++    A2D2ManagedWorkspace,
++    APIToken,
++    Profile,
++    Project,
++    ProjectMember,
++    User,
++    Workspace,
++    WorkspaceMember,
++)
++
++from .principals import (
++    _community_lock,
++    _workspace_role,
++    ensure_managed_profile,
++    expected_principal_key,
++)
++from .resolver import PUBKEY_RE
++
++
++MAX_BACKFILL_PRINCIPALS = 1000
++
++
++class BackfillError(Exception):
++    pass
++
++
++@dataclass(frozen=True)
++class BackfillPrincipal:
++    pubkey: str
++    user_id: UUID
++    role: str
++
++
++@dataclass(frozen=True)
++class BackfillManifest:
++    community_id: UUID
++    workspace_id: UUID
++    workspace_slug: str
++    project_id: UUID
++    principals: tuple[BackfillPrincipal, ...]
++
++
++def parse_backfill_manifest(data) -> BackfillManifest:
++    if not isinstance(data, dict) or set(data) != {
++        "community_id",
++        "workspace_id",
++        "workspace_slug",
++        "project_id",
++        "principals",
++    }:
++        raise BackfillError("invalid_manifest")
++    workspace_slug = data["workspace_slug"]
++    principals = data["principals"]
++    if (
++        not isinstance(workspace_slug, str)
++        or re.fullmatch(r"[A-Za-z0-9_-]{1,48}", workspace_slug) is None
++        or not isinstance(principals, list)
++        or not 1 <= len(principals) <= MAX_BACKFILL_PRINCIPALS
++    ):
++        raise BackfillError("invalid_manifest")
++    try:
++        community_id = UUID(str(data["community_id"]))
++        workspace_id = UUID(str(data["workspace_id"]))
++        project_id = UUID(str(data["project_id"]))
++    except (TypeError, ValueError):
++        raise BackfillError("invalid_manifest") from None
++
++    parsed: list[BackfillPrincipal] = []
++    for principal in principals:
++        if (
++            not isinstance(principal, dict)
++            or set(principal) != {"pubkey", "user_id", "role"}
++            or not isinstance(principal["pubkey"], str)
++            or PUBKEY_RE.fullmatch(principal["pubkey"]) is None
++            or principal["role"] not in {"owner", "admin", "member"}
++        ):
++            raise BackfillError("invalid_manifest")
++        try:
++            user_id = UUID(str(principal["user_id"]))
++        except (TypeError, ValueError):
++            raise BackfillError("invalid_manifest") from None
++        parsed.append(
++            BackfillPrincipal(
++                pubkey=principal["pubkey"],
++                user_id=user_id,
++                role=principal["role"],
++            )
++        )
++    if (
++        len({principal.pubkey for principal in parsed}) != len(parsed)
++        or len({principal.user_id for principal in parsed}) != len(parsed)
++        or sum(principal.role == "owner" for principal in parsed) != 1
++    ):
++        raise BackfillError("invalid_manifest")
++    return BackfillManifest(
++        community_id=community_id,
++        workspace_id=workspace_id,
++        workspace_slug=workspace_slug,
++        project_id=project_id,
++        principals=tuple(parsed),
++    )
++
++
++@transaction.atomic
++def backfill_existing_principals(manifest: BackfillManifest) -> int:
++    _community_lock(manifest.community_id)
++    workspace = (
++        Workspace.objects.select_for_update().filter(id=manifest.workspace_id, slug=manifest.workspace_slug).first()
++    )
++    project = (
++        Project.objects.select_for_update()
++        .filter(
++            id=manifest.project_id,
++            workspace_id=manifest.workspace_id,
++            network=0,
++            archived_at__isnull=True,
++        )
++        .first()
++    )
++    if workspace is None or project is None:
++        raise BackfillError("provider_scope_conflict")
++
++    users = {
++        user.id: user
++        for user in User.objects.select_for_update().filter(
++            id__in=[principal.user_id for principal in manifest.principals]
++        )
++    }
++    if len(users) != len(manifest.principals):
++        raise BackfillError("provider_user_missing")
++    owner = next(principal for principal in manifest.principals if principal.role == "owner")
++    if workspace.owner_id != owner.user_id:
++        raise BackfillError("workspace_owner_conflict")
++
++    conflicting_bindings = (
++        A2D2ManagedWorkspace.objects.select_for_update()
++        .filter(workspace_id=workspace.id)
++        .exclude(community_id=manifest.community_id)
++    )
++    if conflicting_bindings.exists():
++        raise BackfillError("provider_scope_conflict")
++    binding = A2D2ManagedWorkspace.objects.select_for_update().filter(community_id=manifest.community_id).first()
++    if binding is None:
++        binding = A2D2ManagedWorkspace.objects.create(
++            community_id=manifest.community_id,
++            workspace=workspace,
++            project=project,
++        )
++    elif binding.workspace_id != workspace.id or binding.project_id not in {
++        None,
++        project.id,
++    }:
++        raise BackfillError("provider_scope_conflict")
++    elif binding.project_id is None:
++        binding.project = project
++        binding.save(update_fields=["project", "updated_at"])
++
++    manifest_by_pubkey = {item.pubkey: item for item in manifest.principals}
++    for existing in A2D2ManagedPrincipal.objects.select_for_update().filter(community_id=manifest.community_id):
++        declared = manifest_by_pubkey.get(existing.nostr_pubkey)
++        if (
++            declared is None
++            or existing.user_id != declared.user_id
++            or existing.principal_key != expected_principal_key(manifest.community_id, existing.nostr_pubkey)
++        ):
++            raise BackfillError("principal_mapping_conflict")
++
++    for item in manifest.principals:
++        user = users[item.user_id]
++        if (
++            not user.is_active
++            or user.has_usable_password()
++            or user.is_bot
++            or APIToken.objects.filter(user=user, is_service=True).exists()
++        ):
++            raise BackfillError("provider_user_conflict")
++        expected_key = expected_principal_key(manifest.community_id, item.pubkey)
++        conflicts = (
++            A2D2ManagedPrincipal.objects.select_for_update()
++            .filter(user_id=user.id)
++            .exclude(community_id=manifest.community_id, nostr_pubkey=item.pubkey)
++        )
++        if conflicts.exists():
++            raise BackfillError("principal_mapping_conflict")
++        principal = (
++            A2D2ManagedPrincipal.objects.select_for_update()
++            .filter(community_id=manifest.community_id, nostr_pubkey=item.pubkey)
++            .first()
++        )
++        if principal is not None and (principal.user_id != user.id or principal.principal_key != expected_key):
++            raise BackfillError("principal_mapping_conflict")
++        if (
++            A2D2ManagedPrincipal.objects.select_for_update()
++            .filter(principal_key=expected_key)
++            .exclude(community_id=manifest.community_id, nostr_pubkey=item.pubkey)
++            .exists()
++        ):
++            raise BackfillError("principal_mapping_conflict")
++
++        if not user.is_managed or not user.is_email_verified or user.is_password_autoset:
++            user.is_managed = True
++            user.is_email_verified = True
++            user.is_password_autoset = False
++            user.save(
++                update_fields=[
++                    "is_managed",
++                    "is_email_verified",
++                    "is_password_autoset",
++                    "updated_at",
++                ]
++            )
++        if principal is None:
++            principal = A2D2ManagedPrincipal.objects.create(
++                community_id=manifest.community_id,
++                nostr_pubkey=item.pubkey,
++                principal_key=expected_key,
++                user=user,
++                role=item.role,
++                is_active=True,
++            )
++        elif principal.role != item.role or not principal.is_active:
++            principal.role = item.role
++            principal.is_active = True
++            principal.save(update_fields=["role", "is_active", "updated_at"])
++
++        WorkspaceMember.objects.update_or_create(
++            workspace=workspace,
++            member=user,
++            defaults={"role": _workspace_role(item.role), "is_active": True},
++        )
++        ProjectMember.objects.update_or_create(
++            project=project,
++            member=user,
++            defaults={
++                "workspace": workspace,
++                "role": _workspace_role(item.role),
++                "is_active": True,
++            },
++        )
++        ensure_managed_profile(user, workspace)
++    return len(manifest.principals)
+diff --git a/apps/api/plane/a2d2/broker.py b/apps/api/plane/a2d2/broker.py
+new file mode 100644
+index 0000000000..81491b3792
+--- /dev/null
++++ b/apps/api/plane/a2d2/broker.py
+@@ -0,0 +1,171 @@
++import hashlib
++import hmac
++import json
++import time
++from dataclasses import dataclass
++from typing import Any
++from uuid import UUID
++
++import requests
++
++from .config import A2D2EngineConfig
++
++
++class BrokerError(Exception):
++    def __init__(self, status_code: int, code: str):
++        super().__init__(code)
++        self.status_code = status_code
++        self.code = code
++
++
++@dataclass(frozen=True)
++class BrokerSession:
++    session_token: str
++    community_id: UUID
++    pubkey: str
++    role: str
++    principal_key: str
++    expires_at: int
++
++
++def _session(value: Any) -> BrokerSession:
++    if not isinstance(value, dict) or set(value) != {
++        "session_token",
++        "community_id",
++        "pubkey",
++        "role",
++        "principal_key",
++        "expires_at",
++    }:
++        raise BrokerError(502, "broker_response_invalid")
++    try:
++        result = BrokerSession(
++            session_token=value["session_token"],
++            community_id=UUID(value["community_id"]),
++            pubkey=value["pubkey"],
++            role=value["role"],
++            principal_key=value["principal_key"],
++            expires_at=value["expires_at"],
++        )
++    except (TypeError, ValueError, AttributeError) as error:
++        raise BrokerError(502, "broker_response_invalid") from error
++    if (
++        not isinstance(result.session_token, str)
++        or not 32 <= len(result.session_token) <= 256
++        or not isinstance(result.expires_at, int)
++        or result.expires_at <= int(time.time())
++        or result.role not in {"owner", "admin", "member"}
++        or len(result.pubkey) != 64
++        or len(result.principal_key) != 64
++    ):
++        raise BrokerError(502, "broker_response_invalid")
++    try:
++        bytes.fromhex(result.pubkey)
++        bytes.fromhex(result.principal_key)
++    except ValueError as error:
++        raise BrokerError(502, "broker_response_invalid") from error
++    return result
++
++
++class BrokerClient:
++    def __init__(self, config: A2D2EngineConfig):
++        self.config = config
++
++    def _post(self, path: str, body: dict[str, Any], *, expect_session: bool) -> BrokerSession | None:
++        encoded = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
++        timestamp = str(int(time.time()))
++        body_hash = hashlib.sha256(encoded).hexdigest()
++        signature = hmac.new(
++            self.config.secret,
++            f"{timestamp}\n{body_hash}".encode(),
++            hashlib.sha256,
++        ).hexdigest()
++        try:
++            response = requests.post(
++                f"{self.config.broker_url}{path}",
++                data=encoded,
++                headers={
++                    "content-type": "application/json",
++                    "x-a2d2-engine-timestamp": timestamp,
++                    "x-a2d2-engine-signature": signature,
++                },
++                timeout=(2, 5),
++                allow_redirects=False,
++                stream=True,
++            )
++        except requests.RequestException as error:
++            raise BrokerError(503, "broker_unavailable") from error
++        try:
++            payload = bytearray()
++            for chunk in response.iter_content(chunk_size=4096):
++                payload.extend(chunk)
++                if len(payload) > 16 * 1024:
++                    break
++        except requests.RequestException as error:
++            response.close()
++            raise BrokerError(503, "broker_unavailable") from error
++        payload_bytes = bytes(payload)
++        if len(payload_bytes) > 16 * 1024:
++            response.close()
++            raise BrokerError(502, "broker_response_invalid")
++        status_code = response.status_code
++        is_redirect = response.is_redirect
++        response.close()
++        if is_redirect:
++            raise BrokerError(502, "broker_response_invalid")
++        if not 200 <= status_code < 300:
++            try:
++                payload = json.loads(payload_bytes)
++                code = payload.get("error", "broker_denied") if isinstance(payload, dict) else "broker_denied"
++            except (ValueError, UnicodeDecodeError):
++                code = "broker_denied"
++            raise BrokerError(status_code, code)
++        if not expect_session:
++            if status_code != 204 or payload_bytes:
++                raise BrokerError(502, "broker_response_invalid")
++            return None
++        try:
++            return _session(json.loads(payload_bytes))
++        except (ValueError, UnicodeDecodeError) as error:
++            raise BrokerError(502, "broker_response_invalid") from error
++
++    def exchange(self, *, code: str, mount_session: str, callback_state: str) -> BrokerSession:
++        result = self._post(
++            "/api/engine/v1/exchange",
++            {
++                "code": code,
++                "product": "plane",
++                "origin": self.config.origin,
++                "mount_session": mount_session,
++                "callback_state": callback_state,
++            },
++            expect_session=True,
++        )
++        if result is None:
++            raise BrokerError(502, "broker_response_invalid")
++        return result
++
++    def check(self, session_token: str) -> BrokerSession:
++        result = self._post(
++            "/api/engine/v1/session/check",
++            {
++                "session_token": session_token,
++                "product": "plane",
++                "origin": self.config.origin,
++            },
++            expect_session=True,
++        )
++        if result is None:
++            raise BrokerError(502, "broker_response_invalid")
++        return result
++
++    def revoke(self, session_token: str) -> None:
++        self._post(
++            "/api/engine/v1/session/revoke",
++            {
++                "session_token": session_token,
++                "product": "plane",
++                "origin": self.config.origin,
++            },
++            expect_session=False,
++        )
+diff --git a/apps/api/plane/a2d2/config.py b/apps/api/plane/a2d2/config.py
+new file mode 100644
+index 0000000000..de38ff6fb4
+--- /dev/null
++++ b/apps/api/plane/a2d2/config.py
+@@ -0,0 +1,58 @@
++import os
++import re
++from dataclasses import dataclass
++from urllib.parse import urlparse
++
++
++@dataclass(frozen=True)
++class A2D2EngineConfig:
++    enabled: bool
++    broker_url: str
++    origin: str
++    secret: bytes
++    service_api_token_sha256: str = ""
++
++
++def _is_enabled(value: str | None) -> bool:
++    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
++
++
++def _root_url(value: str, *, loopback_http: bool) -> str | None:
++    parsed = urlparse(value)
++    host = parsed.hostname
++    loopback = host in {"localhost", "127.0.0.1", "::1"}
++    if (
++        not host
++        or parsed.username
++        or parsed.password
++        or parsed.query
++        or parsed.fragment
++        or parsed.path not in {"", "/"}
++        or parsed.scheme not in ({"https", "http"} if loopback_http and loopback else {"https"})
++    ):
++        return None
++    return value.rstrip("/")
++
++
++def load_config() -> A2D2EngineConfig:
++    enabled = _is_enabled(os.environ.get("PLANE_A2D2_AUTH_ENABLED"))
++    broker = _root_url(os.environ.get("PLANE_A2D2_BROKER_URL", ""), loopback_http=True)
++    origin = _root_url(os.environ.get("PLANE_A2D2_ORIGIN", ""), loopback_http=True)
++    secret = os.environ.get("PLANE_A2D2_ENGINE_SECRET", "").encode()
++    service_api_token_sha256 = os.environ.get(
++        "PLANE_A2D2_SERVICE_API_TOKEN_SHA256", ""
++    )
++    if enabled and (
++        broker is None
++        or origin is None
++        or len(secret) < 32
++        or re.fullmatch(r"[0-9a-f]{64}", service_api_token_sha256) is None
++    ):
++        raise ValueError("A2D2 Plane authentication is enabled but incomplete")
++    return A2D2EngineConfig(
++        enabled=enabled,
++        broker_url=broker or "",
++        origin=origin or "",
++        secret=secret,
++        service_api_token_sha256=service_api_token_sha256,
++    )
+diff --git a/apps/api/plane/a2d2/middleware.py b/apps/api/plane/a2d2/middleware.py
+new file mode 100644
+index 0000000000..50fb5e3c5b
+--- /dev/null
++++ b/apps/api/plane/a2d2/middleware.py
+@@ -0,0 +1,99 @@
++from django.contrib.auth import logout
++from django.http import JsonResponse
++
++from plane.db.models import A2D2ManagedPrincipal
++
++from .broker import BrokerClient, BrokerError
++from .config import load_config
++from .principals import ProvisioningError, deactivate, provision
++
++
++def is_vendor_membership_mutation(method: str, path: str) -> bool:
++    """Return whether managed mode must reject a vendor-owned membership write."""
++    if method not in {"POST", "PUT", "PATCH"}:
++        return False
++    if path == "/api/workspaces/":
++        return True
++    if path.startswith("/api/users/me/workspaces/") and "/invitations/" in path:
++        return True
++    segments = [segment for segment in path.split("/") if segment]
++    if len(segments) < 4 or segments[:2] != ["api", "workspaces"]:
++        return False
++    if segments[3] == "invitations":
++        return True
++    return len(segments) >= 6 and segments[3] == "projects" and segments[5] == "invitations"
++
++
++class A2D2ManagedSessionMiddleware:
++    """Revalidate every managed Plane API request against A2D2 membership."""
++
++    def __init__(self, get_response):
++        self.get_response = get_response
++
++    def __call__(self, request):
++        try:
++            config = load_config()
++        except ValueError:
++            if request.path.startswith("/api/"):
++                return JsonResponse({"error": "a2d2_auth_unavailable"}, status=503)
++            return self.get_response(request)
++        managed_sign_out = request.method == "POST" and request.path == "/auth/sign-out/"
++        if (
++            config.enabled
++            and request.path.startswith("/auth/")
++            and request.path != "/auth/get-csrf-token/"
++            and not managed_sign_out
++        ):
++            return JsonResponse({"error": "a2d2_managed_auth_required"}, status=403)
++        if config.enabled and request.path.startswith("/api/users/api-tokens/"):
++            return JsonResponse({"error": "a2d2_managed_auth_required"}, status=403)
++        if (
++            not config.enabled
++            or request.path.startswith("/api/a2d2/session/")
++            or (not request.path.startswith("/api/") and not managed_sign_out)
++            or not getattr(request.user, "is_authenticated", False)
++        ):
++            return self.get_response(request)
++
++        principal = A2D2ManagedPrincipal.objects.select_related("user").filter(user_id=request.user.id).first()
++        if principal is None:
++            logout(request)
++            return JsonResponse({"error": "a2d2_managed_auth_required"}, status=401)
++
++        token = request.session.get("a2d2_engine_session_token")
++        if not isinstance(token, str):
++            return self._deny(request, principal)
++        try:
++            checked = BrokerClient(config).check(token)
++            if (
++                checked.community_id != principal.community_id
++                or checked.pubkey != principal.nostr_pubkey
++                or checked.principal_key != principal.principal_key
++                or request.session.get("a2d2_engine_community_id") != str(checked.community_id)
++                or request.session.get("a2d2_engine_pubkey") != checked.pubkey
++                or request.session.get("a2d2_engine_principal_key") != checked.principal_key
++            ):
++                return self._deny(request, principal)
++            provision(checked)
++            if managed_sign_out:
++                BrokerClient(config).revoke(token)
++        except BrokerError as error:
++            if error.status_code == 403 and error.code == "scope_or_membership_denied":
++                return self._deny(request, principal)
++            if error.status_code in {401, 403, 410}:
++                logout(request)
++                return JsonResponse({"error": "a2d2_session_expired"}, status=401)
++            return JsonResponse({"error": "a2d2_auth_unavailable"}, status=503)
++        except ProvisioningError:
++            return self._deny(request, principal)
++        if managed_sign_out:
++            return self.get_response(request)
++        if is_vendor_membership_mutation(request.method, request.path):
++            return JsonResponse({"error": "a2d2_membership_managed"}, status=403)
++        return self.get_response(request)
++
++    @staticmethod
++    def _deny(request, principal):
++        deactivate(principal)
++        logout(request)
++        return JsonResponse({"error": "a2d2_session_revoked"}, status=401)
+diff --git a/apps/api/plane/a2d2/principals.py b/apps/api/plane/a2d2/principals.py
+new file mode 100644
+index 0000000000..ec8e4930ec
+--- /dev/null
++++ b/apps/api/plane/a2d2/principals.py
+@@ -0,0 +1,210 @@
++import hashlib
++from dataclasses import dataclass
++from uuid import UUID
++
++from django.db import connection, transaction
++
++from plane.db.models import (
++    A2D2ManagedPrincipal,
++    A2D2ManagedWorkspace,
++    Profile,
++    ProjectMember,
++    User,
++    Workspace,
++    WorkspaceMember,
++)
++from plane.license.models import Instance
++
++from .broker import BrokerSession
++
++
++class ProvisioningError(Exception):
++    pass
++
++
++@dataclass(frozen=True)
++class ManagedIdentity:
++    user: User
++    workspace: Workspace
++    principal: A2D2ManagedPrincipal
++
++
++@dataclass(frozen=True)
++class ManagedPrincipalAuthority:
++    community_id: UUID
++    pubkey: str
++    role: str
++    principal_key: str
++
++
++MANAGED_ONBOARDING_STEP = {
++    "profile_complete": True,
++    "workspace_create": True,
++    "workspace_invite": True,
++    "workspace_join": True,
++}
++
++
++def _workspace_role(role: str) -> int:
++    return 20 if role in {"owner", "admin"} else 15
++
++
++def expected_principal_key(community_id, pubkey: str) -> str:
++    return hashlib.sha256(f"a2d2-engine-principal:v1:{community_id}:plane:{pubkey}".encode()).hexdigest()
++
++
++def ensure_managed_profile(user: User, workspace: Workspace) -> Profile:
++    """Keep a broker-managed principal out of Plane's separate signup flow."""
++    profile, _ = Profile.objects.get_or_create(user=user)
++    changed: list[str] = []
++    desired = {
++        "is_onboarded": True,
++        "is_tour_completed": True,
++        "onboarding_step": MANAGED_ONBOARDING_STEP,
++        "last_workspace_id": workspace.id,
++    }
++    for field, value in desired.items():
++        if getattr(profile, field) != value:
++            setattr(profile, field, value)
++            changed.append(field)
++    if changed:
++        profile.save(update_fields=[*changed, "updated_at"])
++    return profile
++
++
++def _ensure_project_membership(binding: A2D2ManagedWorkspace, user: User, role: str) -> None:
++    project = binding.project
++    if project is None:
++        return
++    if project.workspace_id != binding.workspace_id or project.network != 0 or project.archived_at is not None:
++        raise ProvisioningError("project_binding_conflict")
++    ProjectMember.objects.update_or_create(
++        project=project,
++        member=user,
++        defaults={
++            "workspace": binding.workspace,
++            "role": _workspace_role(role),
++            "is_active": True,
++        },
++    )
++
++
++def _community_lock(community_id) -> None:
++    digest = hashlib.sha256(f"a2d2-plane:{community_id}".encode()).digest()
++    key = int.from_bytes(digest[:8], "big", signed=True)
++    with connection.cursor() as cursor:
++        cursor.execute("SELECT pg_advisory_xact_lock(%s)", [key])
++
++
++@transaction.atomic
++def provision(session: BrokerSession | ManagedPrincipalAuthority) -> ManagedIdentity:
++    _community_lock(session.community_id)
++    if session.principal_key != expected_principal_key(session.community_id, session.pubkey):
++        raise ProvisioningError("principal_mapping_conflict")
++    binding = (
++        A2D2ManagedWorkspace.objects.select_for_update(of=("self",))
++        .select_related("workspace", "project")
++        .filter(community_id=session.community_id)
++        .first()
++    )
++    principal = (
++        A2D2ManagedPrincipal.objects.select_for_update()
++        .select_related("user")
++        .filter(community_id=session.community_id, nostr_pubkey=session.pubkey)
++        .first()
++    )
++
++    if principal is None:
++        user = User(
++            username=f"a2d2-{session.principal_key}",
++            email=f"a2d2+{session.principal_key}@internal.invalid",
++            display_name=f"A2D2 {session.pubkey[:8]}",
++            is_active=True,
++            is_managed=True,
++            is_email_verified=True,
++            is_password_autoset=False,
++        )
++        user.set_unusable_password()
++        user.save()
++        Profile.objects.create(
++            user=user,
++            is_onboarded=True,
++            is_tour_completed=True,
++            onboarding_step=MANAGED_ONBOARDING_STEP,
++        )
++        principal = A2D2ManagedPrincipal.objects.create(
++            community_id=session.community_id,
++            nostr_pubkey=session.pubkey,
++            principal_key=session.principal_key,
++            user=user,
++            role=session.role,
++            is_active=True,
++        )
++    else:
++        user = principal.user
++        if principal.principal_key != session.principal_key or not user.is_managed:
++            raise ProvisioningError("principal_mapping_conflict")
++        if not user.is_active:
++            user.is_active = True
++            user.save(update_fields=["is_active"])
++        if principal.role != session.role or not principal.is_active:
++            principal.role = session.role
++            principal.is_active = True
++            principal.save(update_fields=["role", "is_active", "updated_at"])
++
++    if binding is None:
++        if session.role != "owner":
++            raise ProvisioningError("community_not_provisioned")
++        workspace = Workspace.objects.create(
++            name="A2D2",
++            slug=f"a2d2-{str(session.community_id)}",
++            owner=user,
++        )
++        binding = A2D2ManagedWorkspace.objects.create(
++            community_id=session.community_id,
++            workspace=workspace,
++        )
++        # Managed mode has no separate Plane admin signup.  The verified relay
++        # owner is the bootstrap authority, so make the singleton instance
++        # ready in the same transaction as its first managed workspace.
++        Instance.objects.filter(is_setup_done=False).update(
++            is_setup_done=True,
++            instance_name="A2D2",
++        )
++    else:
++        workspace = binding.workspace
++
++    # A relay owner demotion is authoritative immediately.  Until the newly
++    # authoritative owner has signed in and claimed the provider workspace,
++    # fail closed instead of leaving the demoted principal able to exercise
++    # Plane's separate Workspace.owner shortcut with a lower member role.
++    if session.role != "owner" and workspace.owner_id == user.id:
++        raise ProvisioningError("owner_transfer_required")
++
++    if session.role == "owner" and workspace.owner_id != user.id:
++        WorkspaceMember.objects.filter(workspace=workspace, member=workspace.owner).update(role=15)
++        if binding.project_id is not None:
++            ProjectMember.objects.filter(project_id=binding.project_id, member=workspace.owner).update(role=15)
++        workspace.owner = user
++        workspace.save(update_fields=["owner", "updated_at"])
++
++    WorkspaceMember.objects.update_or_create(
++        workspace=workspace,
++        member=user,
++        defaults={"role": _workspace_role(session.role), "is_active": True},
++    )
++    _ensure_project_membership(binding, user, session.role)
++    ensure_managed_profile(user, workspace)
++    return ManagedIdentity(user=user, workspace=workspace, principal=principal)
++
++
++@transaction.atomic
++def deactivate(principal: A2D2ManagedPrincipal) -> None:
++    principal = A2D2ManagedPrincipal.objects.select_for_update().get(pk=principal.pk)
++    principal.is_active = False
++    principal.save(update_fields=["is_active", "updated_at"])
++    binding = A2D2ManagedWorkspace.objects.filter(community_id=principal.community_id).first()
++    if binding is not None:
++        WorkspaceMember.objects.filter(workspace=binding.workspace, member=principal.user).update(is_active=False)
++        if binding.project_id is not None:
++            ProjectMember.objects.filter(project_id=binding.project_id, member=principal.user).update(is_active=False)
+diff --git a/apps/api/plane/a2d2/resolver.py b/apps/api/plane/a2d2/resolver.py
+new file mode 100644
+index 0000000000..2976ec1b7d
+--- /dev/null
++++ b/apps/api/plane/a2d2/resolver.py
+@@ -0,0 +1,250 @@
++import re
++from dataclasses import dataclass
++from uuid import UUID
++
++from django.db import transaction
++
++from plane.db.models import (
++    A2D2ManagedPrincipal,
++    A2D2ManagedWorkspace,
++    ProjectMember,
++    WorkspaceMember,
++)
++from plane.db.models.project import ROLE
++
++from .principals import (
++    ManagedPrincipalAuthority,
++    ProvisioningError,
++    _workspace_role,
++    expected_principal_key,
++    provision,
++)
++
++
++PUBKEY_RE = re.compile(r"[0-9a-f]{64}")
++MAX_RESOLVE_PUBKEYS = 100
++
++
++class PrincipalResolutionError(Exception):
++    pass
++
++
++class PrincipalAuthorizationError(Exception):
++    pass
++
++
++@dataclass(frozen=True)
++class PrincipalResolution:
++    principals: tuple[tuple[str, UUID], ...]
++    missing: tuple[str, ...]
++
++
++@dataclass(frozen=True)
++class PrincipalEnsure:
++    pubkey: str
++    principal_key: str
++    role: str
++
++
++def _parse_scope(data, *, member_key: str):
++    if not isinstance(data, dict) or set(data) != {
++        "community_id",
++        "workspace_slug",
++        "project_id",
++        member_key,
++    }:
++        raise ValueError("invalid_request")
++    workspace_slug = data["workspace_slug"]
++    if not isinstance(workspace_slug, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,48}", workspace_slug) is None:
++        raise ValueError("invalid_request")
++    try:
++        community_id = UUID(str(data["community_id"]))
++        project_id = UUID(str(data["project_id"]))
++    except (TypeError, ValueError):
++        raise ValueError("invalid_request") from None
++    return community_id, workspace_slug, project_id, data[member_key]
++
++
++def parse_resolve_request(data) -> tuple[UUID, str, UUID, tuple[str, ...]]:
++    community_id, workspace_slug, project_id, pubkeys = _parse_scope(data, member_key="pubkeys")
++    if (
++        not isinstance(pubkeys, list)
++        or not 1 <= len(pubkeys) <= MAX_RESOLVE_PUBKEYS
++        or any(not isinstance(pubkey, str) or PUBKEY_RE.fullmatch(pubkey) is None for pubkey in pubkeys)
++        or len(set(pubkeys)) != len(pubkeys)
++    ):
++        raise ValueError("invalid_request")
++    return community_id, workspace_slug, project_id, tuple(pubkeys)
++
++
++def parse_ensure_request(
++    data,
++) -> tuple[UUID, str, UUID, tuple[PrincipalEnsure, ...]]:
++    community_id, workspace_slug, project_id, principals = _parse_scope(data, member_key="principals")
++    if not isinstance(principals, list) or not 1 <= len(principals) <= MAX_RESOLVE_PUBKEYS:
++        raise ValueError("invalid_request")
++    parsed: list[PrincipalEnsure] = []
++    for principal in principals:
++        if (
++            not isinstance(principal, dict)
++            or set(principal) != {"pubkey", "principal_key", "role"}
++            or not isinstance(principal["pubkey"], str)
++            or PUBKEY_RE.fullmatch(principal["pubkey"]) is None
++            or not isinstance(principal["principal_key"], str)
++            or PUBKEY_RE.fullmatch(principal["principal_key"]) is None
++            or principal["role"] not in {"owner", "admin", "member"}
++        ):
++            raise ValueError("invalid_request")
++        parsed.append(
++            PrincipalEnsure(
++                pubkey=principal["pubkey"],
++                principal_key=principal["principal_key"],
++                role=principal["role"],
++            )
++        )
++    if len({principal.pubkey for principal in parsed}) != len(parsed):
++        raise ValueError("invalid_request")
++    return community_id, workspace_slug, project_id, tuple(parsed)
++
++
++def _bound_scope(
++    *,
++    community_id: UUID,
++    workspace_slug: str,
++    project_id: UUID,
++    lock: bool = False,
++) -> A2D2ManagedWorkspace:
++    query = A2D2ManagedWorkspace.objects.select_related("workspace", "project")
++    if lock:
++        query = query.select_for_update(of=("self",))
++    binding = query.filter(community_id=community_id).first()
++    if (
++        binding is None
++        or binding.workspace.slug != workspace_slug
++        or binding.project_id != project_id
++        or binding.project is None
++        or binding.project.workspace_id != binding.workspace_id
++        or binding.project.network != 0
++        or binding.project.archived_at is not None
++    ):
++        raise PrincipalResolutionError("principal_binding_conflict")
++    return binding
++
++
++def _assert_service_scope(binding: A2D2ManagedWorkspace, service_user_id: UUID) -> None:
++    workspace_member = WorkspaceMember.objects.filter(
++        workspace=binding.workspace,
++        member_id=service_user_id,
++        is_active=True,
++        role=ROLE.ADMIN.value,
++    ).exists()
++    project_member = ProjectMember.objects.filter(
++        workspace=binding.workspace,
++        project=binding.project,
++        member_id=service_user_id,
++        is_active=True,
++        role=ROLE.ADMIN.value,
++    ).exists()
++    if not workspace_member or not project_member:
++        raise PrincipalAuthorizationError("service_scope_denied")
++
++
++def resolve_principals(
++    *,
++    community_id: UUID,
++    workspace_slug: str,
++    project_id: UUID,
++    pubkeys: tuple[str, ...],
++    service_user_id: UUID,
++) -> PrincipalResolution:
++    binding = _bound_scope(
++        community_id=community_id,
++        workspace_slug=workspace_slug,
++        project_id=project_id,
++    )
++    _assert_service_scope(binding, service_user_id)
++    principal_by_pubkey = {
++        principal.nostr_pubkey: principal
++        for principal in A2D2ManagedPrincipal.objects.select_related("user").filter(
++            community_id=community_id,
++            nostr_pubkey__in=pubkeys,
++        )
++    }
++    user_ids = [principal.user_id for principal in principal_by_pubkey.values()]
++    workspace_members = dict(
++        WorkspaceMember.objects.filter(
++            workspace=binding.workspace,
++            member_id__in=user_ids,
++            is_active=True,
++        ).values_list("member_id", "role")
++    )
++    project_members = dict(
++        ProjectMember.objects.filter(
++            workspace=binding.workspace,
++            project=binding.project,
++            member_id__in=user_ids,
++            is_active=True,
++        ).values_list("member_id", "role")
++    )
++
++    resolved: list[tuple[str, UUID]] = []
++    missing: list[str] = []
++    for pubkey in pubkeys:
++        principal = principal_by_pubkey.get(pubkey)
++        if principal is None:
++            missing.append(pubkey)
++            continue
++        if (
++            not principal.is_active
++            or not principal.user.is_active
++            or not principal.user.is_managed
++            or principal.principal_key != expected_principal_key(community_id, pubkey)
++            or workspace_members.get(principal.user_id) != _workspace_role(principal.role)
++            or project_members.get(principal.user_id) != _workspace_role(principal.role)
++            or (principal.role == "owner") != (binding.workspace.owner_id == principal.user_id)
++        ):
++            raise PrincipalResolutionError("principal_mapping_conflict")
++        resolved.append((pubkey, principal.user_id))
++    return PrincipalResolution(tuple(resolved), tuple(missing))
++
++
++@transaction.atomic
++def ensure_principals(
++    *,
++    community_id: UUID,
++    workspace_slug: str,
++    project_id: UUID,
++    principals: tuple[PrincipalEnsure, ...],
++    service_user_id: UUID,
++) -> PrincipalResolution:
++    binding = _bound_scope(
++        community_id=community_id,
++        workspace_slug=workspace_slug,
++        project_id=project_id,
++        lock=True,
++    )
++    _assert_service_scope(binding, service_user_id)
++    for principal in principals:
++        if principal.principal_key != expected_principal_key(community_id, principal.pubkey):
++            raise PrincipalResolutionError("principal_mapping_conflict")
++        try:
++            provision(
++                ManagedPrincipalAuthority(
++                    community_id=community_id,
++                    pubkey=principal.pubkey,
++                    role=principal.role,
++                    principal_key=principal.principal_key,
++                )
++            )
++        except ProvisioningError as error:
++            raise PrincipalResolutionError(str(error)) from error
++    resolution = resolve_principals(
++        community_id=community_id,
++        workspace_slug=workspace_slug,
++        project_id=project_id,
++        pubkeys=tuple(principal.pubkey for principal in principals),
++        service_user_id=service_user_id,
++    )
++    if resolution.missing:
++        raise PrincipalResolutionError("principal_mapping_conflict")
++    return resolution
+diff --git a/apps/api/plane/a2d2/service_views.py b/apps/api/plane/a2d2/service_views.py
+new file mode 100644
+index 0000000000..425205c356
+--- /dev/null
++++ b/apps/api/plane/a2d2/service_views.py
+@@ -0,0 +1,102 @@
++from rest_framework import status
++from rest_framework.exceptions import PermissionDenied
++from rest_framework.response import Response
++
++from plane.api.middleware.api_authentication import APIKeyAuthentication
++from plane.api.views.base import BaseAPIView
++
++from .config import load_config
++from .resolver import (
++    PrincipalAuthorizationError,
++    PrincipalResolutionError,
++    ensure_principals,
++    parse_ensure_request,
++    parse_resolve_request,
++    resolve_principals,
++)
++
++
++class A2D2ServiceAPIKeyAuthentication(APIKeyAuthentication):
++    """Require the configured service credential on provider-only routes."""
++
++    def authenticate(self, request):
++        if not self.get_api_token(request):
++            raise PermissionDenied("A2D2 service credential required")
++        return super().authenticate(request)
++
++
++class PrincipalResolveView(BaseAPIView):
++    authentication_classes = [A2D2ServiceAPIKeyAuthentication]
++
++    def post(self, request):
++        try:
++            config = load_config()
++        except ValueError:
++            return Response(
++                {"error": "a2d2_auth_unavailable"},
++                status=status.HTTP_503_SERVICE_UNAVAILABLE,
++            )
++        if not config.enabled:
++            return Response(
++                {"error": "a2d2_managed_auth_required"},
++                status=status.HTTP_403_FORBIDDEN,
++            )
++        try:
++            community_id, workspace_slug, project_id, pubkeys = parse_resolve_request(request.data)
++            resolution = resolve_principals(
++                community_id=community_id,
++                workspace_slug=workspace_slug,
++                project_id=project_id,
++                pubkeys=pubkeys,
++                service_user_id=request.user.id,
++            )
++        except ValueError:
++            return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
++        except PrincipalAuthorizationError as error:
++            return Response({"error": str(error)}, status=status.HTTP_403_FORBIDDEN)
++        except PrincipalResolutionError as error:
++            return Response({"error": str(error)}, status=status.HTTP_409_CONFLICT)
++        return Response(
++            {
++                "principals": [
++                    {"pubkey": pubkey, "user_id": str(user_id)} for pubkey, user_id in resolution.principals
++                ],
++                "missing": list(resolution.missing),
++            }
++        )
++
++
++class PrincipalEnsureView(BaseAPIView):
++    authentication_classes = [A2D2ServiceAPIKeyAuthentication]
++
++    def post(self, request):
++        try:
++            config = load_config()
++        except ValueError:
++            return Response(
++                {"error": "a2d2_auth_unavailable"},
++                status=status.HTTP_503_SERVICE_UNAVAILABLE,
++            )
++        if not config.enabled:
++            return Response(
++                {"error": "a2d2_managed_auth_required"},
++                status=status.HTTP_403_FORBIDDEN,
++            )
++        try:
++            community_id, workspace_slug, project_id, principals = parse_ensure_request(request.data)
++            resolution = ensure_principals(
++                community_id=community_id,
++                workspace_slug=workspace_slug,
++                project_id=project_id,
++                principals=principals,
++                service_user_id=request.user.id,
++            )
++        except ValueError:
++            return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
++        except PrincipalAuthorizationError as error:
++            return Response({"error": str(error)}, status=status.HTTP_403_FORBIDDEN)
++        except PrincipalResolutionError as error:
++            return Response({"error": str(error)}, status=status.HTTP_409_CONFLICT)
++        return Response(
++            {"principals": [{"pubkey": pubkey, "user_id": str(user_id)} for pubkey, user_id in resolution.principals]}
++        )
+diff --git a/apps/api/plane/a2d2/urls.py b/apps/api/plane/a2d2/urls.py
+new file mode 100644
+index 0000000000..2c5a1a46f6
+--- /dev/null
++++ b/apps/api/plane/a2d2/urls.py
+@@ -0,0 +1,20 @@
++from django.urls import path
++
++from .service_views import PrincipalEnsureView, PrincipalResolveView
++from .views import begin, exchange
++
++
++urlpatterns = [
++    path("session/begin", begin, name="a2d2-session-begin"),
++    path("session/exchange", exchange, name="a2d2-session-exchange"),
++    path(
++        "principals/resolve",
++        PrincipalResolveView.as_view(),
++        name="a2d2-principal-resolve",
++    ),
++    path(
++        "principals/ensure",
++        PrincipalEnsureView.as_view(),
++        name="a2d2-principal-ensure",
++    ),
++]
+diff --git a/apps/api/plane/a2d2/views.py b/apps/api/plane/a2d2/views.py
+new file mode 100644
+index 0000000000..e62f3e2caf
+--- /dev/null
++++ b/apps/api/plane/a2d2/views.py
+@@ -0,0 +1,124 @@
++import base64
++import hashlib
++import hmac
++import json
++import secrets
++import time
++from uuid import UUID
++
++from django.core import signing
++from django.http import JsonResponse
++from django.views.decorators.csrf import csrf_exempt
++from django.views.decorators.http import require_POST
++
++from plane.authentication.utils.login import user_login
++
++from .broker import BrokerClient, BrokerError
++from .config import load_config
++from .principals import ProvisioningError, provision
++
++
++STATE_COOKIE = "__Host-a2d2-plane-state"
++STATE_SALT = "plane.a2d2.callback-state.v1"
++STATE_TTL_SECONDS = 60
++MAX_EXCHANGE_BYTES = 4 * 1024
++
++
++def _error(code: str, status: int) -> JsonResponse:
++    return JsonResponse({"error": code}, status=status)
++
++
++def _same_origin(request, origin: str) -> bool:
++    return request.headers.get("Origin") == origin
++
++
++@csrf_exempt
++@require_POST
++def begin(request):
++    try:
++        config = load_config()
++    except ValueError:
++        return _error("a2d2_auth_unavailable", 503)
++    if not config.enabled or not _same_origin(request, config.origin):
++        return _error("a2d2_auth_unavailable", 403)
++    state = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
++    value = signing.dumps(
++        {"digest": hashlib.sha256(state.encode()).hexdigest()},
++        salt=STATE_SALT,
++    )
++    response = JsonResponse({"state": state})
++    response.set_cookie(
++        STATE_COOKIE,
++        value,
++        max_age=STATE_TTL_SECONDS,
++        path="/",
++        secure=True,
++        httponly=True,
++        samesite="Strict",
++    )
++    return response
++
++
++@csrf_exempt
++@require_POST
++def exchange(request):
++    try:
++        config = load_config()
++    except ValueError:
++        return _error("a2d2_auth_unavailable", 503)
++    if not config.enabled or not _same_origin(request, config.origin) or len(request.body) > MAX_EXCHANGE_BYTES:
++        return _error("a2d2_auth_unavailable", 403)
++    try:
++        body = json.loads(request.body)
++        if not isinstance(body, dict) or set(body) != {"code", "mount_session", "state"}:
++            raise ValueError
++        code = body["code"]
++        mount_session = str(UUID(body["mount_session"]))
++        state = body["state"]
++        if not isinstance(code, str) or not isinstance(state, str) or len(code) > 256 or len(state) > 128:
++            raise ValueError
++        cookie = signing.loads(
++            request.COOKIES.get(STATE_COOKIE, ""),
++            salt=STATE_SALT,
++            max_age=STATE_TTL_SECONDS,
++        )
++        expected = cookie.get("digest", "") if isinstance(cookie, dict) else ""
++        actual = hashlib.sha256(state.encode()).hexdigest()
++        if not hmac.compare_digest(expected, actual):
++            raise ValueError
++    except (ValueError, TypeError, signing.BadSignature, signing.SignatureExpired):
++        response = _error("callback_state_invalid", 403)
++        response.delete_cookie(STATE_COOKIE, path="/", samesite="Strict")
++        return response
++
++    try:
++        broker_session = BrokerClient(config).exchange(
++            code=code,
++            mount_session=mount_session,
++            callback_state=state,
++        )
++        identity = provision(broker_session)
++    except BrokerError as error:
++        response = _error(error.code, error.status_code if error.status_code in {403, 410, 503} else 502)
++        response.delete_cookie(STATE_COOKIE, path="/", samesite="Strict")
++        return response
++    except ProvisioningError as error:
++        response = _error(str(error), 409)
++        response.delete_cookie(STATE_COOKIE, path="/", samesite="Strict")
++        return response
++
++    user_login(request=request, user=identity.user, is_app=True)
++    request.session["a2d2_engine_session_token"] = broker_session.session_token
++    request.session["a2d2_engine_community_id"] = str(broker_session.community_id)
++    request.session["a2d2_engine_pubkey"] = broker_session.pubkey
++    request.session["a2d2_engine_principal_key"] = broker_session.principal_key
++    request.session.set_expiry(max(1, min(15 * 60, broker_session.expires_at - int(time.time()))))
++    response = JsonResponse(
++        {
++            "authenticated": True,
++            "workspace_slug": identity.workspace.slug,
++            "expires_at": broker_session.expires_at,
++        }
++    )
++    response.delete_cookie(STATE_COOKIE, path="/", samesite="Strict")
++    return response
+diff --git a/apps/api/plane/db/management/commands/backfill_a2d2_managed_principals.py b/apps/api/plane/db/management/commands/backfill_a2d2_managed_principals.py
+new file mode 100644
+index 0000000000..6ff686eaa7
+--- /dev/null
++++ b/apps/api/plane/db/management/commands/backfill_a2d2_managed_principals.py
+@@ -0,0 +1,48 @@
++import json
++import os
++import stat
++
++from django.core.management.base import BaseCommand, CommandError
++
++from plane.a2d2.backfill import (
++    BackfillError,
++    backfill_existing_principals,
++    parse_backfill_manifest,
++)
++
++
++MAX_MANIFEST_BYTES = 256 * 1024
++
++
++def _read_manifest(path: str):
++    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
++    descriptor = os.open(path, flags)
++    try:
++        metadata = os.fstat(descriptor)
++        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_MANIFEST_BYTES:
++            raise CommandError("manifest must be a bounded regular file")
++        with os.fdopen(descriptor, "rb", closefd=False) as manifest_file:
++            payload = manifest_file.read(MAX_MANIFEST_BYTES + 1)
++        if len(payload) > MAX_MANIFEST_BYTES:
++            raise CommandError("manifest is too large")
++    finally:
++        os.close(descriptor)
++    try:
++        return json.loads(payload)
++    except (UnicodeDecodeError, json.JSONDecodeError) as error:
++        raise CommandError("manifest is not valid JSON") from error
++
++
++class Command(BaseCommand):
++    help = "Bind verified existing Plane users to A2D2 principals without email matching."
++
++    def add_arguments(self, parser):
++        parser.add_argument("--manifest", required=True)
++
++    def handle(self, *args, **options):
++        try:
++            manifest = parse_backfill_manifest(_read_manifest(options["manifest"]))
++            count = backfill_existing_principals(manifest)
++        except (BackfillError, OSError) as error:
++            raise CommandError(str(error)) from error
++        self.stdout.write(self.style.SUCCESS(f"Reconciled {count} A2D2 Plane principal(s)."))
+diff --git a/apps/api/plane/db/migrations/0123_a2d2_managed_identity.py b/apps/api/plane/db/migrations/0123_a2d2_managed_identity.py
+new file mode 100644
+index 0000000000..7207615e16
+--- /dev/null
++++ b/apps/api/plane/db/migrations/0123_a2d2_managed_identity.py
+@@ -0,0 +1,122 @@
++# Generated for the A2D2 managed full-product session adapter.
++
++import uuid
++
++import django.db.models.deletion
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [("db", "0122_alter_draftissue_assignees_alter_issue_assignees_and_more")]
++
++    operations = [
++        migrations.CreateModel(
++            name="A2D2ManagedWorkspace",
++            fields=[
++                (
++                    "created_at",
++                    models.DateTimeField(auto_now_add=True),
++                ),
++                ("updated_at", models.DateTimeField(auto_now=True)),
++                ("deleted_at", models.DateTimeField(blank=True, null=True)),
++                (
++                    "created_by",
++                    models.ForeignKey(
++                        null=True,
++                        on_delete=django.db.models.deletion.SET_NULL,
++                        related_name="%(class)s_created_by",
++                        to="db.user",
++                        verbose_name="Created By",
++                    ),
++                ),
++                (
++                    "updated_by",
++                    models.ForeignKey(
++                        null=True,
++                        on_delete=django.db.models.deletion.SET_NULL,
++                        related_name="%(class)s_updated_by",
++                        to="db.user",
++                        verbose_name="Last Modified By",
++                    ),
++                ),
++                (
++                    "id",
++                    models.UUIDField(
++                        db_index=True,
++                        default=uuid.uuid4,
++                        editable=False,
++                        primary_key=True,
++                        serialize=False,
++                        unique=True,
++                    ),
++                ),
++                ("community_id", models.UUIDField(db_index=True, unique=True)),
++                (
++                    "workspace",
++                    models.OneToOneField(
++                        on_delete=django.db.models.deletion.PROTECT,
++                        related_name="a2d2_managed_workspace",
++                        to="db.workspace",
++                    ),
++                ),
++            ],
++            options={"db_table": "a2d2_managed_workspaces"},
++        ),
++        migrations.CreateModel(
++            name="A2D2ManagedPrincipal",
++            fields=[
++                ("created_at", models.DateTimeField(auto_now_add=True)),
++                ("updated_at", models.DateTimeField(auto_now=True)),
++                ("deleted_at", models.DateTimeField(blank=True, null=True)),
++                (
++                    "created_by",
++                    models.ForeignKey(
++                        null=True,
++                        on_delete=django.db.models.deletion.SET_NULL,
++                        related_name="%(class)s_created_by",
++                        to="db.user",
++                        verbose_name="Created By",
++                    ),
++                ),
++                (
++                    "updated_by",
++                    models.ForeignKey(
++                        null=True,
++                        on_delete=django.db.models.deletion.SET_NULL,
++                        related_name="%(class)s_updated_by",
++                        to="db.user",
++                        verbose_name="Last Modified By",
++                    ),
++                ),
++                (
++                    "id",
++                    models.UUIDField(
++                        db_index=True,
++                        default=uuid.uuid4,
++                        editable=False,
++                        primary_key=True,
++                        serialize=False,
++                        unique=True,
++                    ),
++                ),
++                ("community_id", models.UUIDField(db_index=True)),
++                ("nostr_pubkey", models.CharField(max_length=64)),
++                ("principal_key", models.CharField(max_length=64, unique=True)),
++                ("role", models.CharField(max_length=16)),
++                ("is_active", models.BooleanField(default=True)),
++                (
++                    "user",
++                    models.OneToOneField(
++                        on_delete=django.db.models.deletion.PROTECT, related_name="a2d2_managed_principal", to="db.user"
++                    ),
++                ),
++            ],
++            options={"db_table": "a2d2_managed_principals"},
++        ),
++        migrations.AddConstraint(
++            model_name="a2d2managedprincipal",
++            constraint=models.UniqueConstraint(
++                fields=("community_id", "nostr_pubkey"), name="a2d2_principal_unique_community_pubkey"
++            ),
++        ),
++    ]
+diff --git a/apps/api/plane/db/migrations/0124_a2d2_managed_project.py b/apps/api/plane/db/migrations/0124_a2d2_managed_project.py
+new file mode 100644
+index 0000000000..b333113987
+--- /dev/null
++++ b/apps/api/plane/db/migrations/0124_a2d2_managed_project.py
+@@ -0,0 +1,52 @@
++# Generated for A2D2 principal reconciliation with the canonical Plane project.
++
++import django.db.models.deletion
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [("db", "0123_a2d2_managed_identity")]
++
++    operations = [
++        migrations.AlterField(
++            model_name="a2d2managedprincipal",
++            name="created_at",
++            field=models.DateTimeField(auto_now_add=True, verbose_name="Created At"),
++        ),
++        migrations.AlterField(
++            model_name="a2d2managedprincipal",
++            name="deleted_at",
++            field=models.DateTimeField(blank=True, null=True, verbose_name="Deleted At"),
++        ),
++        migrations.AlterField(
++            model_name="a2d2managedprincipal",
++            name="updated_at",
++            field=models.DateTimeField(auto_now=True, verbose_name="Last Modified At"),
++        ),
++        migrations.AlterField(
++            model_name="a2d2managedworkspace",
++            name="created_at",
++            field=models.DateTimeField(auto_now_add=True, verbose_name="Created At"),
++        ),
++        migrations.AlterField(
++            model_name="a2d2managedworkspace",
++            name="deleted_at",
++            field=models.DateTimeField(blank=True, null=True, verbose_name="Deleted At"),
++        ),
++        migrations.AlterField(
++            model_name="a2d2managedworkspace",
++            name="updated_at",
++            field=models.DateTimeField(auto_now=True, verbose_name="Last Modified At"),
++        ),
++        migrations.AddField(
++            model_name="a2d2managedworkspace",
++            name="project",
++            field=models.OneToOneField(
++                blank=True,
++                null=True,
++                on_delete=django.db.models.deletion.PROTECT,
++                related_name="a2d2_managed_workspace",
++                to="db.project",
++            ),
++        ),
++    ]
+diff --git a/apps/api/plane/db/models/a2d2.py b/apps/api/plane/db/models/a2d2.py
+new file mode 100644
+index 0000000000..fb10f7e72d
+--- /dev/null
++++ b/apps/api/plane/db/models/a2d2.py
+@@ -0,0 +1,51 @@
++# Copyright (c) 2023-present Plane Software, Inc. and contributors
++# SPDX-License-Identifier: AGPL-3.0-only
++
++from django.db import models
++
++from .base import BaseModel
++
++
++class A2D2ManagedWorkspace(BaseModel):
++    """One Plane workspace durably bound to one A2D2 community."""
++
++    community_id = models.UUIDField(unique=True, db_index=True)
++    workspace = models.OneToOneField(
++        "db.Workspace",
++        on_delete=models.PROTECT,
++        related_name="a2d2_managed_workspace",
++    )
++    project = models.OneToOneField(
++        "db.Project",
++        null=True,
++        blank=True,
++        on_delete=models.PROTECT,
++        related_name="a2d2_managed_workspace",
++    )
++
++    class Meta:
++        db_table = "a2d2_managed_workspaces"
++
++
++class A2D2ManagedPrincipal(BaseModel):
++    """One internal Plane user bound to one A2D2 community member."""
++
++    community_id = models.UUIDField(db_index=True)
++    nostr_pubkey = models.CharField(max_length=64)
++    principal_key = models.CharField(max_length=64, unique=True)
++    user = models.OneToOneField(
++        "db.User",
++        on_delete=models.PROTECT,
++        related_name="a2d2_managed_principal",
++    )
++    role = models.CharField(max_length=16)
++    is_active = models.BooleanField(default=True)
++
++    class Meta:
++        db_table = "a2d2_managed_principals"
++        constraints = [
++            models.UniqueConstraint(
++                fields=["community_id", "nostr_pubkey"],
++                name="a2d2_principal_unique_community_pubkey",
++            )
++        ]
+diff --git a/apps/api/plane/tests/unit/a2d2/__init__.py b/apps/api/plane/tests/unit/a2d2/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b137891791fe96927ad78e64b0aad7bded08bdc
+GIT binary patch
+literal 1
+Icmd-A000XB3jhEB
+
+literal 0
+HcmV?d00001
+
+diff --git a/apps/api/plane/tests/unit/a2d2/test_broker.py b/apps/api/plane/tests/unit/a2d2/test_broker.py
+new file mode 100644
+index 0000000000..95063fd9ff
+--- /dev/null
++++ b/apps/api/plane/tests/unit/a2d2/test_broker.py
+@@ -0,0 +1,24 @@
++from unittest.mock import patch
++
++import requests
++from django.test import SimpleTestCase
++
++from plane.a2d2.broker import BrokerClient, BrokerError
++from plane.a2d2.config import A2D2EngineConfig
++
++
++class BrokerClientTest(SimpleTestCase):
++    def test_timeout_becomes_transient_unavailable_without_exposing_request_data(self):
++        client = BrokerClient(
++            A2D2EngineConfig(
++                enabled=True,
++                broker_url="https://relay.example.test",
++                origin="https://plane.example.test",
++                secret=b"s" * 32,
++            )
++        )
++        with patch("plane.a2d2.broker.requests.post", side_effect=requests.Timeout):
++            with self.assertRaises(BrokerError) as raised:
++                client.check("opaque-session-token-with-enough-bytes")
++        self.assertEqual(raised.exception.status_code, 503)
++        self.assertEqual(raised.exception.code, "broker_unavailable")
+diff --git a/apps/api/plane/tests/unit/a2d2/test_managed_session.py b/apps/api/plane/tests/unit/a2d2/test_managed_session.py
+new file mode 100644
+index 0000000000..e2a4c3a492
+--- /dev/null
++++ b/apps/api/plane/tests/unit/a2d2/test_managed_session.py
+@@ -0,0 +1,497 @@
++import hashlib
++import json
++import os
++import time
++from unittest.mock import patch
++from uuid import UUID, uuid4
++
++from django.test import Client, TestCase
++from django.utils import timezone
++
++from plane.a2d2.broker import BrokerError, BrokerSession
++from plane.a2d2.principals import expected_principal_key
++from plane.a2d2.views import STATE_COOKIE
++from plane.db.models import (
++    A2D2ManagedPrincipal,
++    A2D2ManagedWorkspace,
++    APIToken,
++    ProjectMemberInvite,
++    User,
++    WorkspaceMember,
++    WorkspaceMemberInvite,
++)
++from plane.license.models import Instance
++
++
++ORIGIN = "https://plane.example.test"
++AUTH_ENV = {
++    "PLANE_A2D2_AUTH_ENABLED": "true",
++    "PLANE_A2D2_BROKER_URL": "https://relay.example.test",
++    "PLANE_A2D2_ORIGIN": ORIGIN,
++    "PLANE_A2D2_ENGINE_SECRET": "s" * 32,
++    "PLANE_A2D2_SERVICE_API_TOKEN_SHA256": "0" * 64,
++}
++
++
++def broker_session(
++    *,
++    community_id: UUID,
++    pubkey: str,
++    principal_key: str,
++    role: str,
++) -> BrokerSession:
++    return BrokerSession(
++        session_token=f"session-{principal_key}",
++        community_id=community_id,
++        pubkey=pubkey,
++        role=role,
++        principal_key=expected_principal_key(community_id, pubkey),
++        expires_at=int(time.time()) + 600,
++    )
++
++
++class ManagedSessionTest(TestCase):
++    def setUp(self):
++        self.env = patch.dict(os.environ, AUTH_ENV, clear=False)
++        self.env.start()
++        self.addCleanup(self.env.stop)
++
++    def exchange(self, client: Client, session: BrokerSession):
++        begin = client.post(
++            "/api/a2d2/session/begin",
++            data="{}",
++            content_type="application/json",
++            HTTP_ORIGIN=ORIGIN,
++        )
++        self.assertEqual(begin.status_code, 200)
++        self.assertIn(STATE_COOKIE, begin.cookies)
++        state = begin.json()["state"]
++        with patch("plane.a2d2.views.BrokerClient.exchange", return_value=session) as exchange:
++            response = client.post(
++                "/api/a2d2/session/exchange",
++                data=json.dumps(
++                    {
++                        "code": "c" * 43,
++                        "mount_session": str(uuid4()),
++                        "state": state,
++                    }
++                ),
++                content_type="application/json",
++                HTTP_ORIGIN=ORIGIN,
++            )
++        self.assertEqual(response.status_code, 200)
++        exchange.assert_called_once()
++        return response
++
++    def test_two_members_get_distinct_users_in_one_managed_workspace(self):
++        instance = Instance.objects.first()
++        if instance is None:
++            instance = Instance.objects.create(
++                instance_name="Plane Community Edition",
++                instance_id=uuid4().hex,
++                current_version="test",
++                last_checked_at=timezone.now(),
++            )
++        instance.is_setup_done = False
++        instance.save(update_fields=["is_setup_done", "updated_at"])
++        community_id = uuid4()
++        owner = broker_session(
++            community_id=community_id,
++            pubkey="11" * 32,
++            principal_key="aa" * 32,
++            role="owner",
++        )
++        member = broker_session(
++            community_id=community_id,
++            pubkey="22" * 32,
++            principal_key="bb" * 32,
++            role="member",
++        )
++
++        owner_response = self.exchange(Client(), owner)
++        instance.refresh_from_db()
++        self.assertTrue(instance.is_setup_done)
++        self.assertEqual(instance.instance_name, "A2D2")
++        member_response = self.exchange(Client(), member)
++
++        self.assertNotIn("session_token", owner_response.json())
++        self.assertEqual(owner_response.json()["workspace_slug"], member_response.json()["workspace_slug"])
++        self.assertEqual(A2D2ManagedWorkspace.objects.count(), 1)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 2)
++        self.assertEqual(User.objects.filter(is_managed=True).count(), 2)
++        roles = sorted(WorkspaceMember.objects.values_list("role", flat=True))
++        self.assertEqual(roles, [15, 20])
++
++    def test_original_sign_out_revokes_managed_broker_session_before_logout(self):
++        community_id = uuid4()
++        session = broker_session(
++            community_id=community_id,
++            pubkey="91" * 32,
++            principal_key="a1" * 32,
++            role="owner",
++        )
++        client = Client()
++        self.exchange(client, session)
++
++        with (
++            patch("plane.a2d2.middleware.BrokerClient.check", return_value=session),
++            patch("plane.a2d2.middleware.BrokerClient.revoke") as revoke,
++        ):
++            response = client.post("/auth/sign-out/")
++
++        self.assertEqual(response.status_code, 302)
++        revoke.assert_called_once_with(session.session_token)
++        self.assertNotIn("a2d2_engine_session_token", client.session)
++
++    def test_original_sign_out_does_not_report_success_when_broker_revoke_fails(self):
++        community_id = uuid4()
++        session = broker_session(
++            community_id=community_id,
++            pubkey="92" * 32,
++            principal_key="a2" * 32,
++            role="owner",
++        )
++        client = Client()
++        self.exchange(client, session)
++
++        with (
++            patch("plane.a2d2.middleware.BrokerClient.check", return_value=session),
++            patch(
++                "plane.a2d2.middleware.BrokerClient.revoke",
++                side_effect=BrokerError(503, "broker_unavailable"),
++            ),
++        ):
++            response = client.post("/auth/sign-out/")
++
++        self.assertEqual(response.status_code, 503)
++        self.assertIn("a2d2_engine_session_token", client.session)
++
++    def test_managed_mode_blocks_vendor_password_auth_without_creating_users(self):
++        before = User.objects.count()
++        response = Client().post(
++            "/auth/sign-up/",
++            data={
++                "email": "vendor-signup@example.invalid",
++                "password": "not-a-real-password",
++            },
++            HTTP_ORIGIN=ORIGIN,
++        )
++
++        self.assertEqual(response.status_code, 403)
++        self.assertEqual(response.json(), {"error": "a2d2_managed_auth_required"})
++        self.assertEqual(User.objects.count(), before)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 0)
++
++    def test_managed_mode_rejects_a_preexisting_legacy_user_session(self):
++        user = User.objects.create_user(
++            email="legacy-user@example.invalid",
++            username="legacy-user",
++            password="not-a-real-password",
++        )
++        client = Client()
++        client.force_login(user)
++
++        response = client.get("/api/users/me/")
++
++        self.assertEqual(response.status_code, 401)
++        self.assertEqual(response.json(), {"error": "a2d2_managed_auth_required"})
++        self.assertNotIn("_auth_user_id", client.session)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 0)
++
++    def test_managed_mode_blocks_personal_api_token_creation(self):
++        session = broker_session(
++            community_id=uuid4(),
++            pubkey="aa" * 32,
++            principal_key="44" * 32,
++            role="owner",
++        )
++        client = Client()
++        self.exchange(client, session)
++
++        response = client.post(
++            "/api/users/api-tokens/",
++            data=json.dumps({"label": "personal-bypass"}),
++            content_type="application/json",
++        )
++
++        self.assertEqual(response.status_code, 403)
++        self.assertEqual(response.json(), {"error": "a2d2_managed_auth_required"})
++        self.assertEqual(APIToken.objects.count(), 0)
++
++    def test_managed_mode_blocks_vendor_workspace_and_membership_mutations(self):
++        session = broker_session(
++            community_id=uuid4(),
++            pubkey="ab" * 32,
++            principal_key="45" * 32,
++            role="owner",
++        )
++        client = Client()
++        exchange = self.exchange(client, session)
++        workspace_slug = exchange.json()["workspace_slug"]
++        before_users = User.objects.count()
++        project_id = uuid4()
++
++        with patch("plane.a2d2.middleware.BrokerClient.check", return_value=session) as check:
++            paths = (
++                "/api/workspaces/",
++                f"/api/workspaces/{workspace_slug}/invitations/",
++                f"/api/workspaces/{workspace_slug}/invitations/{uuid4()}/join/",
++                f"/api/workspaces/{workspace_slug}/projects/{project_id}/invitations/",
++                "/api/users/me/workspaces/invitations/",
++                f"/api/users/me/workspaces/{workspace_slug}/projects/invitations/",
++            )
++            for path in paths:
++                with self.subTest(path=path):
++                    response = client.post(
++                        path,
++                        data=json.dumps({"emails": [{"email": "bypass@example.invalid"}]}),
++                        content_type="application/json",
++                    )
++                    self.assertEqual(response.status_code, 403)
++                    self.assertEqual(response.json(), {"error": "a2d2_membership_managed"})
++
++        self.assertEqual(check.call_count, len(paths))
++        self.assertEqual(ProjectMemberInvite.objects.count(), 0)
++        self.assertEqual(WorkspaceMemberInvite.objects.count(), 0)
++        self.assertEqual(User.objects.count(), before_users)
++
++    def test_managed_mode_rejects_personal_api_tokens_even_when_hash_matches(self):
++        token_value = "plane_api_personal_bypass"
++        user = User.objects.create_user(
++            email="personal-token@example.invalid",
++            username="personal-token",
++            password="not-a-real-password",
++        )
++        APIToken.objects.create(user=user, token=token_value, is_service=False)
++
++        with patch.dict(
++            os.environ,
++            {"PLANE_A2D2_SERVICE_API_TOKEN_SHA256": hashlib.sha256(token_value.encode()).hexdigest()},
++        ):
++            response = Client().get("/api/v1/users/me/", HTTP_X_API_KEY=token_value)
++
++        self.assertIn(response.status_code, {401, 403})
++
++    def test_managed_mode_allows_only_the_configured_service_api_token(self):
++        token_value = "plane_api_projection_service"
++        user = User.objects.create_user(
++            email="projection-service@example.invalid",
++            username="projection-service",
++            password=None,
++        )
++        token = APIToken.objects.create(
++            user=user,
++            token=token_value,
++            is_service=True,
++        )
++
++        with patch.dict(
++            os.environ,
++            {"PLANE_A2D2_SERVICE_API_TOKEN_SHA256": hashlib.sha256(token_value.encode()).hexdigest()},
++        ):
++            response = Client().get("/api/v1/users/me/", HTTP_X_API_KEY=token_value)
++
++        self.assertEqual(response.status_code, 200)
++        token.refresh_from_db()
++        self.assertIsNotNone(token.last_used)
++
++    def test_member_cannot_provision_a_community_before_an_owner(self):
++        session = broker_session(
++            community_id=uuid4(),
++            pubkey="33" * 32,
++            principal_key="cc" * 32,
++            role="member",
++        )
++        client = Client()
++        begin = client.post(
++            "/api/a2d2/session/begin",
++            data="{}",
++            content_type="application/json",
++            HTTP_ORIGIN=ORIGIN,
++        )
++        state = begin.json()["state"]
++        with patch("plane.a2d2.views.BrokerClient.exchange", return_value=session):
++            response = client.post(
++                "/api/a2d2/session/exchange",
++                data=json.dumps(
++                    {
++                        "code": "c" * 43,
++                        "mount_session": str(uuid4()),
++                        "state": state,
++                    }
++                ),
++                content_type="application/json",
++                HTTP_ORIGIN=ORIGIN,
++            )
++        self.assertEqual(response.status_code, 409)
++        self.assertEqual(response.json(), {"error": "community_not_provisioned"})
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 0)
++        self.assertEqual(User.objects.filter(is_managed=True).count(), 0)
++
++    def test_tampered_callback_state_is_rejected_before_broker_exchange(self):
++        client = Client()
++        begin = client.post(
++            "/api/a2d2/session/begin",
++            data="{}",
++            content_type="application/json",
++            HTTP_ORIGIN=ORIGIN,
++        )
++        self.assertEqual(begin.status_code, 200)
++        with patch("plane.a2d2.views.BrokerClient.exchange") as exchange:
++            response = client.post(
++                "/api/a2d2/session/exchange",
++                data=json.dumps(
++                    {
++                        "code": "c" * 43,
++                        "mount_session": str(uuid4()),
++                        "state": "different-state",
++                    }
++                ),
++                content_type="application/json",
++                HTTP_ORIGIN=ORIGIN,
++            )
++        self.assertEqual(response.status_code, 403)
++        self.assertEqual(response.json(), {"error": "callback_state_invalid"})
++        exchange.assert_not_called()
++
++    def test_membership_denial_deactivates_mapping_and_plane_access(self):
++        session = broker_session(
++            community_id=uuid4(),
++            pubkey="44" * 32,
++            principal_key="dd" * 32,
++            role="owner",
++        )
++        client = Client()
++        self.exchange(client, session)
++        principal = A2D2ManagedPrincipal.objects.get(principal_key=session.principal_key)
++        membership = WorkspaceMember.objects.get(member=principal.user)
++
++        with patch(
++            "plane.a2d2.middleware.BrokerClient.check",
++            side_effect=BrokerError(403, "scope_or_membership_denied"),
++        ):
++            response = client.get("/api/users/me/")
++
++        self.assertEqual(response.status_code, 401)
++        principal.refresh_from_db()
++        membership.refresh_from_db()
++        self.assertFalse(principal.is_active)
++        self.assertFalse(membership.is_active)
++        self.assertNotIn("a2d2_engine_session_token", client.session)
++
++    def test_expired_broker_session_requires_reauthentication_without_revoking_membership(self):
++        session = broker_session(
++            community_id=uuid4(),
++            pubkey="55" * 32,
++            principal_key="ee" * 32,
++            role="owner",
++        )
++        client = Client()
++        self.exchange(client, session)
++        principal = A2D2ManagedPrincipal.objects.get(principal_key=session.principal_key)
++        membership = WorkspaceMember.objects.get(member=principal.user)
++
++        with patch(
++            "plane.a2d2.middleware.BrokerClient.check",
++            side_effect=BrokerError(401, "session_invalid_or_expired"),
++        ):
++            response = client.get("/api/users/me/")
++
++        self.assertEqual(response.status_code, 401)
++        principal.refresh_from_db()
++        membership.refresh_from_db()
++        self.assertTrue(principal.is_active)
++        self.assertTrue(membership.is_active)
++        self.assertNotIn("a2d2_engine_session_token", client.session)
++
++    def test_transient_broker_failures_fail_closed_without_mutating_access(self):
++        session = broker_session(
++            community_id=uuid4(),
++            pubkey="66" * 32,
++            principal_key="ff" * 32,
++            role="owner",
++        )
++        client = Client()
++        self.exchange(client, session)
++        principal = A2D2ManagedPrincipal.objects.get(principal_key=session.principal_key)
++        membership = WorkspaceMember.objects.get(member=principal.user)
++
++        for failure in (
++            BrokerError(503, "broker_unavailable"),
++            BrokerError(500, "broker_denied"),
++        ):
++            with self.subTest(status=failure.status_code):
++                with patch("plane.a2d2.middleware.BrokerClient.check", side_effect=failure):
++                    response = client.get("/api/users/me/")
++                self.assertEqual(response.status_code, 503)
++                principal.refresh_from_db()
++                membership.refresh_from_db()
++                self.assertTrue(principal.is_active)
++                self.assertTrue(membership.is_active)
++                self.assertIn("a2d2_engine_session_token", client.session)
++
++    def test_admin_demotion_updates_provider_role_on_the_next_request(self):
++        community_id = uuid4()
++        owner = broker_session(
++            community_id=community_id,
++            pubkey="77" * 32,
++            principal_key="11" * 32,
++            role="owner",
++        )
++        admin = broker_session(
++            community_id=community_id,
++            pubkey="88" * 32,
++            principal_key="22" * 32,
++            role="admin",
++        )
++        client = Client()
++        self.exchange(Client(), owner)
++        self.exchange(client, admin)
++        principal = A2D2ManagedPrincipal.objects.get(principal_key=admin.principal_key)
++        membership = WorkspaceMember.objects.get(member=principal.user)
++        self.assertEqual(membership.role, 20)
++
++        demoted = broker_session(
++            community_id=community_id,
++            pubkey=admin.pubkey,
++            principal_key=admin.principal_key,
++            role="member",
++        )
++        with patch("plane.a2d2.middleware.BrokerClient.check", return_value=demoted):
++            response = client.get("/api/users/me/")
++
++        self.assertEqual(response.status_code, 200)
++        principal.refresh_from_db()
++        membership.refresh_from_db()
++        self.assertEqual(principal.role, "member")
++        self.assertEqual(membership.role, 15)
++        self.assertTrue(membership.is_active)
++
++    def test_owner_demotion_fails_closed_until_the_new_owner_claims_workspace(self):
++        community_id = uuid4()
++        owner = broker_session(
++            community_id=community_id,
++            pubkey="99" * 32,
++            principal_key="33" * 32,
++            role="owner",
++        )
++        client = Client()
++        self.exchange(client, owner)
++        principal = A2D2ManagedPrincipal.objects.get(principal_key=owner.principal_key)
++        membership = WorkspaceMember.objects.get(member=principal.user)
++
++        demoted = broker_session(
++            community_id=community_id,
++            pubkey=owner.pubkey,
++            principal_key=owner.principal_key,
++            role="member",
++        )
++        with patch("plane.a2d2.middleware.BrokerClient.check", return_value=demoted):
++            response = client.get("/api/users/me/")
++
++        self.assertEqual(response.status_code, 401)
++        principal.refresh_from_db()
++        membership.refresh_from_db()
++        self.assertFalse(principal.is_active)
++        self.assertFalse(membership.is_active)
++        self.assertNotIn("a2d2_engine_session_token", client.session)
+diff --git a/apps/api/plane/tests/unit/a2d2/test_principal_reconciliation.py b/apps/api/plane/tests/unit/a2d2/test_principal_reconciliation.py
+new file mode 100644
+index 0000000000..3f867a6930
+--- /dev/null
++++ b/apps/api/plane/tests/unit/a2d2/test_principal_reconciliation.py
+@@ -0,0 +1,729 @@
++import hashlib
++import json
++import os
++import tempfile
++from unittest.mock import patch
++from uuid import uuid4
++
++from django.core.management import call_command
++from django.core.management.base import CommandError
++from django.test import Client, TestCase
++
++from plane.a2d2.broker import BrokerSession
++from plane.a2d2.principals import expected_principal_key, provision
++from plane.db.models import (
++    A2D2ManagedPrincipal,
++    A2D2ManagedWorkspace,
++    APIToken,
++    Project,
++    ProjectMember,
++    Profile,
++    User,
++    Workspace,
++    WorkspaceMember,
++)
++
++
++ORIGIN = "https://plane.example.test"
++SERVICE_TOKEN = "plane_api_projection_service"
++AUTH_ENV = {
++    "PLANE_A2D2_AUTH_ENABLED": "true",
++    "PLANE_A2D2_BROKER_URL": "https://relay.example.test",
++    "PLANE_A2D2_ORIGIN": ORIGIN,
++    "PLANE_A2D2_ENGINE_SECRET": "s" * 32,
++    "PLANE_A2D2_SERVICE_API_TOKEN_SHA256": hashlib.sha256(SERVICE_TOKEN.encode()).hexdigest(),
++}
++
++
++class PrincipalReconciliationTest(TestCase):
++    def setUp(self):
++        self.env = patch.dict(os.environ, AUTH_ENV, clear=False)
++        self.env.start()
++        self.addCleanup(self.env.stop)
++        self.service_user = self.create_disabled_user("projection-service")
++        APIToken.objects.create(
++            user=self.service_user,
++            token=SERVICE_TOKEN,
++            is_service=True,
++        )
++
++    @staticmethod
++    def create_disabled_user(name: str) -> User:
++        return User.objects.create_user(
++            email=f"{name}@internal.invalid",
++            username=name,
++            password=None,
++        )
++
++    def create_scope(self):
++        owner = self.create_disabled_user("existing-owner")
++        member = self.create_disabled_user("existing-member")
++        workspace = Workspace.objects.create(
++            name="A2D2 Engine",
++            slug="a2d2-engine",
++            owner=owner,
++        )
++        project = Project.objects.create(
++            name="A2D2 Tasks",
++            identifier="A2D2",
++            workspace=workspace,
++            network=0,
++        )
++        WorkspaceMember.objects.create(
++            workspace=workspace,
++            member=self.service_user,
++            role=20,
++        )
++        ProjectMember.objects.create(
++            workspace=workspace,
++            project=project,
++            member=self.service_user,
++            role=20,
++        )
++        return owner, member, workspace, project
++
++    @staticmethod
++    def write_manifest(manifest: dict) -> str:
++        descriptor, path = tempfile.mkstemp(suffix=".json")
++        with os.fdopen(descriptor, "w") as manifest_file:
++            json.dump(manifest, manifest_file)
++        return path
++
++    @staticmethod
++    def manifest(community_id, workspace, project, principals):
++        return {
++            "community_id": str(community_id),
++            "workspace_id": str(workspace.id),
++            "workspace_slug": workspace.slug,
++            "project_id": str(project.id),
++            "principals": principals,
++        }
++
++    def run_backfill(self, manifest):
++        path = self.write_manifest(manifest)
++        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
++        call_command("backfill_a2d2_managed_principals", manifest=path)
++
++    def resolve(self, *, community_id, workspace, project, pubkeys, token=SERVICE_TOKEN):
++        return Client().post(
++            "/api/a2d2/principals/resolve",
++            data=json.dumps(
++                {
++                    "community_id": str(community_id),
++                    "workspace_slug": workspace.slug,
++                    "project_id": str(project.id),
++                    "pubkeys": pubkeys,
++                }
++            ),
++            content_type="application/json",
++            HTTP_X_API_KEY=token,
++        )
++
++    def ensure(self, *, community_id, workspace, project, principals, token=SERVICE_TOKEN):
++        return Client().post(
++            "/api/a2d2/principals/ensure",
++            data=json.dumps(
++                {
++                    "community_id": str(community_id),
++                    "workspace_slug": workspace.slug,
++                    "project_id": str(project.id),
++                    "principals": principals,
++                }
++            ),
++            content_type="application/json",
++            HTTP_X_API_KEY=token,
++        )
++
++    def test_backfill_reuses_exact_users_and_is_idempotent(self):
++        community_id = uuid4()
++        owner, member, workspace, project = self.create_scope()
++        owner_pubkey = "11" * 32
++        member_pubkey = "22" * 32
++        manifest = self.manifest(
++            community_id,
++            workspace,
++            project,
++            [
++                {
++                    "pubkey": owner_pubkey,
++                    "user_id": str(owner.id),
++                    "role": "owner",
++                },
++                {
++                    "pubkey": member_pubkey,
++                    "user_id": str(member.id),
++                    "role": "member",
++                },
++            ],
++        )
++        user_count = User.objects.count()
++
++        self.run_backfill(manifest)
++        self.run_backfill(manifest)
++
++        binding = A2D2ManagedWorkspace.objects.get(community_id=community_id)
++        self.assertEqual(binding.workspace_id, workspace.id)
++        self.assertEqual(binding.project_id, project.id)
++        self.assertEqual(User.objects.count(), user_count)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 2)
++        self.assertEqual(WorkspaceMember.objects.filter(workspace=workspace).count(), 3)
++        self.assertEqual(ProjectMember.objects.filter(project=project).count(), 3)
++        self.assertEqual(
++            A2D2ManagedPrincipal.objects.get(nostr_pubkey=owner_pubkey).user_id,
++            owner.id,
++        )
++        self.assertEqual(
++            A2D2ManagedPrincipal.objects.get(nostr_pubkey=member_pubkey).user_id,
++            member.id,
++        )
++        owner.refresh_from_db()
++        member.refresh_from_db()
++        self.assertTrue(owner.is_managed)
++        self.assertTrue(member.is_managed)
++        for user in (owner, member):
++            profile = Profile.objects.get(user=user)
++            self.assertTrue(profile.is_onboarded)
++            self.assertTrue(profile.is_tour_completed)
++            self.assertEqual(
++                profile.onboarding_step,
++                {
++                    "profile_complete": True,
++                    "workspace_create": True,
++                    "workspace_invite": True,
++                    "workspace_join": True,
++                },
++            )
++            self.assertEqual(profile.last_workspace_id, workspace.id)
++
++    def test_existing_managed_login_repairs_only_the_profile_onboarding_gate(self):
++        community_id = uuid4()
++        owner, _, workspace, project = self.create_scope()
++        pubkey = "2a" * 32
++        self.run_backfill(
++            self.manifest(
++                community_id,
++                workspace,
++                project,
++                [{"pubkey": pubkey, "user_id": str(owner.id), "role": "owner"}],
++            )
++        )
++        profile = Profile.objects.get(user=owner)
++        profile.is_onboarded = False
++        profile.is_tour_completed = False
++        profile.onboarding_step = {
++            "profile_complete": False,
++            "workspace_create": False,
++            "workspace_invite": False,
++            "workspace_join": False,
++        }
++        profile.theme = {"theme": "dark"}
++        profile.save()
++
++        identity = provision(
++            BrokerSession(
++                session_token="session-existing-owner",
++                community_id=community_id,
++                pubkey=pubkey,
++                role="owner",
++                principal_key=expected_principal_key(community_id, pubkey),
++                expires_at=2_000_000_000,
++            )
++        )
++
++        self.assertEqual(identity.user.id, owner.id)
++        profile.refresh_from_db()
++        self.assertTrue(profile.is_onboarded)
++        self.assertTrue(profile.is_tour_completed)
++        self.assertTrue(all(profile.onboarding_step.values()))
++        self.assertEqual(profile.last_workspace_id, workspace.id)
++        self.assertEqual(profile.theme, {"theme": "dark"})
++
++    def test_backfill_then_login_and_resolver_reuse_the_same_user(self):
++        community_id = uuid4()
++        owner, _, workspace, project = self.create_scope()
++        pubkey = "33" * 32
++        self.run_backfill(
++            self.manifest(
++                community_id,
++                workspace,
++                project,
++                [
++                    {
++                        "pubkey": pubkey,
++                        "user_id": str(owner.id),
++                        "role": "owner",
++                    }
++                ],
++            )
++        )
++        before = User.objects.count()
++        identity = provision(
++            BrokerSession(
++                session_token="session-owner",
++                community_id=community_id,
++                pubkey=pubkey,
++                role="owner",
++                principal_key=expected_principal_key(community_id, pubkey),
++                expires_at=2_000_000_000,
++            )
++        )
++
++        response = self.resolve(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            pubkeys=[pubkey, "44" * 32],
++        )
++
++        self.assertEqual(identity.user.id, owner.id)
++        self.assertEqual(User.objects.count(), before)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(
++            response.json(),
++            {
++                "principals": [{"pubkey": pubkey, "user_id": str(owner.id)}],
++                "missing": ["44" * 32],
++            },
++        )
++
++    def test_projection_first_then_login_reuses_the_ensured_user(self):
++        community_id = uuid4()
++        prior_owner, _, workspace, project = self.create_scope()
++        A2D2ManagedWorkspace.objects.create(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++        )
++        pubkey = "55" * 32
++        principal_key = expected_principal_key(community_id, pubkey)
++        before = User.objects.count()
++        ensured = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[
++                {
++                    "pubkey": pubkey,
++                    "principal_key": principal_key,
++                    "role": "member",
++                }
++            ],
++        )
++        self.assertEqual(ensured.status_code, 200)
++        ensured_user_id = ensured.json()["principals"][0]["user_id"]
++        identity = provision(
++            BrokerSession(
++                session_token="session-new-member",
++                community_id=community_id,
++                pubkey=pubkey,
++                role="member",
++                principal_key=principal_key,
++                expires_at=2_000_000_000,
++            )
++        )
++
++        self.assertEqual(str(identity.user.id), ensured_user_id)
++        self.assertEqual(User.objects.count(), before + 1)
++        self.assertEqual(workspace.owner_id, prior_owner.id)
++        self.assertTrue(ProjectMember.objects.filter(project=project, member=identity.user, is_active=True).exists())
++
++    def test_login_first_then_projection_ensure_reuses_the_same_user(self):
++        community_id = uuid4()
++        prior_owner, _, workspace, project = self.create_scope()
++        A2D2ManagedWorkspace.objects.create(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++        )
++        pubkey = "5a" * 32
++        principal_key = expected_principal_key(community_id, pubkey)
++        identity = provision(
++            BrokerSession(
++                session_token="session-login-first",
++                community_id=community_id,
++                pubkey=pubkey,
++                role="member",
++                principal_key=principal_key,
++                expires_at=2_000_000_000,
++            )
++        )
++        before = User.objects.count()
++
++        response = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[
++                {
++                    "pubkey": pubkey,
++                    "principal_key": principal_key,
++                    "role": "member",
++                }
++            ],
++        )
++
++        self.assertNotEqual(identity.user.id, prior_owner.id)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(
++            response.json()["principals"],
++            [{"pubkey": pubkey, "user_id": str(identity.user.id)}],
++        )
++        self.assertEqual(User.objects.count(), before)
++        self.assertTrue(ProjectMember.objects.filter(project=project, member=identity.user, is_active=True).exists())
++
++    def test_ensure_repairs_roles_without_changing_the_user(self):
++        community_id = uuid4()
++        _, _, workspace, project = self.create_scope()
++        A2D2ManagedWorkspace.objects.create(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++        )
++        pubkey = "5e" * 32
++        principal_key = expected_principal_key(community_id, pubkey)
++
++        member = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[
++                {
++                    "pubkey": pubkey,
++                    "principal_key": principal_key,
++                    "role": "member",
++                }
++            ],
++        )
++        user_id = member.json()["principals"][0]["user_id"]
++        promoted = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[
++                {
++                    "pubkey": pubkey,
++                    "principal_key": principal_key,
++                    "role": "admin",
++                }
++            ],
++        )
++
++        self.assertEqual(promoted.status_code, 200)
++        self.assertEqual(promoted.json()["principals"][0]["user_id"], user_id)
++        self.assertEqual(
++            WorkspaceMember.objects.get(workspace=workspace, member_id=user_id).role,
++            20,
++        )
++        self.assertEqual(
++            ProjectMember.objects.get(project=project, member_id=user_id).role,
++            20,
++        )
++        self.assertEqual(A2D2ManagedPrincipal.objects.get(user_id=user_id).role, "admin")
++
++        demoted = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[
++                {
++                    "pubkey": pubkey,
++                    "principal_key": principal_key,
++                    "role": "member",
++                }
++            ],
++        )
++        self.assertEqual(demoted.status_code, 200)
++        self.assertEqual(demoted.json()["principals"][0]["user_id"], user_id)
++        self.assertEqual(
++            WorkspaceMember.objects.get(workspace=workspace, member_id=user_id).role,
++            15,
++        )
++        self.assertEqual(
++            ProjectMember.objects.get(project=project, member_id=user_id).role,
++            15,
++        )
++        self.assertEqual(A2D2ManagedPrincipal.objects.get(user_id=user_id).role, "member")
++
++    def test_ensure_rejects_wrong_principal_key_without_creating_a_user(self):
++        community_id = uuid4()
++        _, _, workspace, project = self.create_scope()
++        A2D2ManagedWorkspace.objects.create(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++        )
++        before = User.objects.count()
++        response = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[
++                {
++                    "pubkey": "5b" * 32,
++                    "principal_key": "ff" * 32,
++                    "role": "owner",
++                }
++            ],
++        )
++
++        self.assertEqual(response.status_code, 409)
++        self.assertEqual(response.json(), {"error": "principal_mapping_conflict"})
++        self.assertEqual(User.objects.count(), before)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 0)
++
++    def test_ensure_requires_the_exact_service_credential_and_is_atomic(self):
++        community_id = uuid4()
++        _, _, workspace, project = self.create_scope()
++        A2D2ManagedWorkspace.objects.create(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++        )
++        first_pubkey = "5c" * 32
++        second_pubkey = "5d" * 32
++        before = User.objects.count()
++        without_token = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[
++                {
++                    "pubkey": first_pubkey,
++                    "principal_key": expected_principal_key(community_id, first_pubkey),
++                    "role": "member",
++                }
++            ],
++            token="",
++        )
++        self.assertEqual(without_token.status_code, 403)
++
++        partial_conflict = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[
++                {
++                    "pubkey": first_pubkey,
++                    "principal_key": expected_principal_key(community_id, first_pubkey),
++                    "role": "member",
++                },
++                {
++                    "pubkey": second_pubkey,
++                    "principal_key": "ff" * 32,
++                    "role": "member",
++                },
++            ],
++        )
++        self.assertEqual(partial_conflict.status_code, 409)
++        self.assertEqual(User.objects.count(), before)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 0)
++        self.assertEqual(ProjectMember.objects.filter(project=project).count(), 1)
++
++    def test_service_credential_requires_active_admin_scope_on_exact_binding(self):
++        community_id = uuid4()
++        _, _, workspace, project = self.create_scope()
++        A2D2ManagedWorkspace.objects.create(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++        )
++        pubkey = "5f" * 32
++        principal = {
++            "pubkey": pubkey,
++            "principal_key": expected_principal_key(community_id, pubkey),
++            "role": "member",
++        }
++
++        project_membership = ProjectMember.objects.get(
++            project=project,
++            member=self.service_user,
++        )
++        project_membership.is_active = False
++        project_membership.save(update_fields=["is_active", "updated_at"])
++
++        denied_resolve = self.resolve(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            pubkeys=[pubkey],
++        )
++        denied_ensure = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[principal],
++        )
++        self.assertEqual(denied_resolve.status_code, 403)
++        self.assertEqual(denied_resolve.json(), {"error": "service_scope_denied"})
++        self.assertEqual(denied_ensure.status_code, 403)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 0)
++
++        other_project = Project.objects.create(
++            name="Other Tasks",
++            identifier="OTHER",
++            workspace=workspace,
++            network=0,
++        )
++        ProjectMember.objects.create(
++            workspace=workspace,
++            project=other_project,
++            member=self.service_user,
++            role=20,
++        )
++        still_denied = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[principal],
++        )
++        self.assertEqual(still_denied.status_code, 403)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 0)
++
++        project_membership.is_active = True
++        project_membership.role = 15
++        project_membership.save(update_fields=["is_active", "role", "updated_at"])
++        role_denied = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[principal],
++        )
++        self.assertEqual(role_denied.status_code, 403)
++
++        project_membership.role = 20
++        project_membership.save(update_fields=["role", "updated_at"])
++        allowed = self.ensure(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            principals=[principal],
++        )
++        self.assertEqual(allowed.status_code, 200)
++
++    def test_resolver_fails_closed_for_scope_membership_and_token_mismatches(self):
++        community_id = uuid4()
++        owner, _, workspace, project = self.create_scope()
++        pubkey = "66" * 32
++        self.run_backfill(
++            self.manifest(
++                community_id,
++                workspace,
++                project,
++                [
++                    {
++                        "pubkey": pubkey,
++                        "user_id": str(owner.id),
++                        "role": "owner",
++                    }
++                ],
++            )
++        )
++
++        wrong_token = self.resolve(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            pubkeys=[pubkey],
++            token="not-the-service-token",
++        )
++        self.assertEqual(wrong_token.status_code, 403)
++
++        project_member = ProjectMember.objects.get(project=project, member=owner)
++        project_member.is_active = False
++        project_member.save(update_fields=["is_active", "updated_at"])
++        inactive = self.resolve(
++            community_id=community_id,
++            workspace=workspace,
++            project=project,
++            pubkeys=[pubkey],
++        )
++        self.assertEqual(inactive.status_code, 409)
++        self.assertEqual(inactive.json(), {"error": "principal_mapping_conflict"})
++
++        project_member.is_active = True
++        project_member.save(update_fields=["is_active", "updated_at"])
++        other_workspace = Workspace.objects.create(
++            name="Other",
++            slug="other",
++            owner=owner,
++        )
++        scope_conflict = self.resolve(
++            community_id=community_id,
++            workspace=other_workspace,
++            project=project,
++            pubkeys=[pubkey],
++        )
++        self.assertEqual(scope_conflict.status_code, 409)
++        self.assertEqual(scope_conflict.json(), {"error": "principal_binding_conflict"})
++
++    def test_backfill_conflict_rolls_back_every_mapping_and_membership(self):
++        community_id = uuid4()
++        owner, conflicting, workspace, project = self.create_scope()
++        conflicting.set_password("usable-password-must-fail")
++        conflicting.save(update_fields=["password", "updated_at"])
++        manifest = self.manifest(
++            community_id,
++            workspace,
++            project,
++            [
++                {
++                    "pubkey": "77" * 32,
++                    "user_id": str(owner.id),
++                    "role": "owner",
++                },
++                {
++                    "pubkey": "88" * 32,
++                    "user_id": str(conflicting.id),
++                    "role": "member",
++                },
++            ],
++        )
++        path = self.write_manifest(manifest)
++        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
++
++        with self.assertRaises(CommandError):
++            call_command("backfill_a2d2_managed_principals", manifest=path)
++
++        self.assertEqual(A2D2ManagedWorkspace.objects.count(), 0)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 0)
++        self.assertEqual(WorkspaceMember.objects.filter(workspace=workspace).count(), 1)
++        self.assertEqual(ProjectMember.objects.filter(project=project).count(), 1)
++        owner.refresh_from_db()
++        self.assertFalse(owner.is_managed)
++
++    def test_backfill_rejects_an_undeclared_existing_principal(self):
++        community_id = uuid4()
++        owner, undeclared, workspace, project = self.create_scope()
++        undeclared_pubkey = "99" * 32
++        A2D2ManagedPrincipal.objects.create(
++            community_id=community_id,
++            nostr_pubkey=undeclared_pubkey,
++            principal_key=expected_principal_key(community_id, undeclared_pubkey),
++            user=undeclared,
++            role="member",
++            is_active=True,
++        )
++        manifest = self.manifest(
++            community_id,
++            workspace,
++            project,
++            [
++                {
++                    "pubkey": "aa" * 32,
++                    "user_id": str(owner.id),
++                    "role": "owner",
++                }
++            ],
++        )
++        path = self.write_manifest(manifest)
++        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
++
++        with self.assertRaises(CommandError):
++            call_command("backfill_a2d2_managed_principals", manifest=path)
++
++        self.assertEqual(A2D2ManagedWorkspace.objects.count(), 0)
++        self.assertEqual(A2D2ManagedPrincipal.objects.count(), 1)
++        self.assertEqual(
++            A2D2ManagedPrincipal.objects.get().nostr_pubkey,
++            undeclared_pubkey,
++        )
+diff --git a/apps/api/uv.lock b/apps/api/uv.lock
+new file mode 100644
+index 0000000000..a84a44e748
+--- /dev/null
++++ b/apps/api/uv.lock
+@@ -0,0 +1,8 @@
++version = 1
++revision = 1
++requires-python = ">=3.12"
++
++[[package]]
++name = "plane"
++version = "0.24.0"
++source = { virtual = "." }
+diff --git a/apps/live/tests/lib/auth.test.ts b/apps/live/tests/lib/auth.test.ts
+new file mode 100644
+index 0000000000..654eb57372
+--- /dev/null
++++ b/apps/live/tests/lib/auth.test.ts
+@@ -0,0 +1,54 @@
++import { afterEach, describe, expect, test, vi } from "vitest";
++
++const mocks = vi.hoisted(() => ({ currentUser: vi.fn() }));
++
++vi.mock("@/services/user.service", () => ({
++  UserService: class {
++    currentUser = mocks.currentUser;
++  },
++}));
++
++import { beforeHandleMessage } from "@/lib/auth";
++
++const payload = (userId: string, cookie: string) =>
++  ({ context: { userId, cookie } }) as Parameters<typeof beforeHandleMessage>[0];
++
++afterEach(() => {
++  mocks.currentUser.mockReset();
++});
++
++describe("managed live session revalidation", () => {
++  test("coalesces simultaneous checks for the same managed session", async () => {
++    let resolve!: (value: { id: string; display_name: string }) => void;
++    mocks.currentUser.mockReturnValue(
++      new Promise((done) => {
++        resolve = done;
++      })
++    );
++
++    const first = beforeHandleMessage(payload("user-1", "session=one"));
++    const second = beforeHandleMessage(payload("user-1", "session=one"));
++    expect(mocks.currentUser).toHaveBeenCalledTimes(1);
++    resolve({ id: "user-1", display_name: "One" });
++    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
++  });
++
++  test("fails closed once distinct in-flight checks reach the bounded capacity", async () => {
++    let resolve!: (value: { id: string; display_name: string }) => void;
++    const blocked = new Promise<{ id: string; display_name: string }>((done) => {
++      resolve = done;
++    });
++    mocks.currentUser.mockReturnValue(blocked);
++
++    const inFlight = Array.from({ length: 128 }, (_, index) =>
++      beforeHandleMessage(payload(`user-${index}`, `session=${index}`))
++    );
++    await expect(beforeHandleMessage(payload("user-overflow", "session=overflow"))).rejects.toMatchObject({
++      code: "AUTH_CHECK_CAPACITY",
++    });
++    expect(mocks.currentUser).toHaveBeenCalledTimes(128);
++
++    resolve({ id: "unused", display_name: "Unused" });
++    await Promise.allSettled(inFlight);
++  });
++});
+diff --git a/apps/web/helpers/a2d2-managed-mode.ts b/apps/web/helpers/a2d2-managed-mode.ts
+new file mode 100644
+index 0000000000..f5702ce63a
+--- /dev/null
++++ b/apps/web/helpers/a2d2-managed-mode.ts
+@@ -0,0 +1 @@
++export const isA2D2ManagedMode = (): boolean => typeof window !== "undefined" && window.a2d2Engine !== undefined;
+diff --git a/deployments/a2d2/.env.example b/deployments/a2d2/.env.example
+new file mode 100644
+index 0000000000..7fd938a259
+--- /dev/null
++++ b/deployments/a2d2/.env.example
+@@ -0,0 +1,28 @@
++# Copy to .env; replace every CHANGE_ME before starting.
++WEB_URL=http://127.0.0.1:3020
++CORS_ALLOWED_ORIGINS=http://127.0.0.1:3020
++APP_DOMAIN=127.0.0.1
++SITE_ADDRESS=:80
++LISTEN_HTTP_PORT=3020
++LISTEN_HTTPS_PORT=3443
++POSTGRES_USER=plane
++POSTGRES_DB=plane
++POSTGRES_PASSWORD=CHANGE_ME_DATABASE
++DATABASE_URL=postgresql://plane:${POSTGRES_PASSWORD}@plane-db:5432/plane
++RABBITMQ_USER=plane
++RABBITMQ_PASSWORD=CHANGE_ME_QUEUE
++RABBITMQ_VHOST=plane
++AMQP_URL=amqp://plane:${RABBITMQ_PASSWORD}@plane-mq:5672/plane
++AWS_ACCESS_KEY_ID=plane-local
++AWS_SECRET_ACCESS_KEY=CHANGE_ME_STORAGE
++AWS_S3_ENDPOINT_URL=http://plane-minio:9000
++AWS_S3_BUCKET_NAME=uploads
++USE_MINIO=1
++MINIO_ENDPOINT_SSL=0
++SECRET_KEY=CHANGE_ME_DJANGO
++LIVE_SERVER_SECRET_KEY=CHANGE_ME_LIVE
++API_BASE_URL=http://api:8000
++FILE_SIZE_LIMIT=5242880
++CERT_EMAIL=
++CERT_ACME_CA=https://acme-v02.api.letsencrypt.org/directory
++CERT_ACME_DNS=
+diff --git a/deployments/a2d2/README.md b/deployments/a2d2/README.md
+new file mode 100644
+index 0000000000..63aca3ccf3
+--- /dev/null
++++ b/deployments/a2d2/README.md
+@@ -0,0 +1,94 @@
++# A2D2 original Plane runtime
++
++Source baseline: `2f895b82dad839c730c36a5c0cbc046f1e5d6b56` (makeplane/plane).
++This layers local source builds over the upstream Community deployment. The UI,
++API, authentication, permissions, and persistence remain Plane's implementations.
++It does not migrate or modify existing A2D2 Board data.
++
++Run all commands from the repository root. Requires Docker Compose supporting
++`!override` (validated with v5.0.2) and a running Docker Desktop daemon.
++
++## Configuration
++
++Copy `deployments/a2d2/.env.example` to `deployments/a2d2/.env` only if absent.
++Replace all five `CHANGE_ME_*` values with independent random hex secrets and
++restrict `.env` to mode 0600. The DB and AMQP URLs interpolate those passwords.
++Do not print, commit, or share the resulting env file. The session has already
++created this file; preserve it to retain access to persistent volumes.
++
++The local entry URL is `http://127.0.0.1:3020`. The proxy binds only loopback.
++The project name below also isolates named volumes from existing services.
++
++```sh
++docker compose --project-directory . --env-file deployments/a2d2/.env \
++  -p a2d2-plane-full -f deployments/cli/community/docker-compose.yml \
++  -f deployments/a2d2/compose.source.yml config --quiet
++
++docker compose --project-directory . --env-file deployments/a2d2/.env \
++  -p a2d2-plane-full -f deployments/cli/community/docker-compose.yml \
++  -f deployments/a2d2/compose.source.yml up -d --build
++```
++
++The source override builds web, admin, space, live, backend, and proxy from this
++checkout. Worker, beat, and migrator use the same backend build. Upstream infrastructure
++images remain as declared upstream; this is not a fully digest-pinned release.
++The image suffix records the source baseline, not a verified successful build.
++
++## Native host contract
++
++The main window's native child WebView navigates to `/` as its own top-level page.
++It must have no A2D2 IPC capabilities. Host code owns persistent session isolation
++by A2D2 account, relay, and service. Plane's session and CSRF cookies stay in that
++WebView store; do not inject Buzz credentials or copy cookies across accounts.
++
++Caddy routes `/god-mode/` to admin, `/spaces/` to public space, `/live/` to live
++collaboration, `/api/` and `/auth/` to Django, and `/uploads/` to MinIO. Keep these
++routes and same-origin cookies intact. TLS/remote deployment is owned by the host
++and deployment integrator; this loopback configuration is not a remote deployment.
++
++Initialize the instance through `/god-mode/`, then exercise the original
++email/password login. API routes include `/auth/get-csrf-token/`, `/auth/sign-in/`,
++`/auth/sign-up/`, and `/auth/sign-out/`. SMTP-dependent magic links/password resets
++need instance email settings. OAuth provider routes exist but provider configuration,
++external navigation, popup handling, and native callback behavior require separate
++verification; none are claimed tested by this configuration.
++
++## Readiness and acceptance
++
++- `GET /` checks web delivery, not Django health.
++- `GET /api/instances/` checks the public instance API. HTTP 200 is insufficient:
++  inspect `is_activated` and `is_setup_done`; an empty instance also returns 200.
++- Django's health endpoint is internal `http://api:8000/` (the public root is web).
++- Verify migrator success and API, worker, beat, live logs.
++- In the native app, create a user/workspace/project/work item and upload a file;
++  close and reopen the child WebView and verify session/data persistence.
++- Restart this Compose project's services without deleting volumes, then verify
++  the saved work item and attachment again. Verify another account cannot access
++  private workspace data, and verify logout/account-switch store isolation.
++
++Compose validation is not login, persistence, or native integration verification.
++No volume deletion command is part of this workflow.
++
++Sources: `deployments/cli/community/docker-compose.yml`, `apps/proxy/Caddyfile.ce`,
++`apps/api/plane/urls.py`, `apps/api/plane/license/api/views/instance.py`,
++`apps/api/plane/authentication/urls.py`, `apps/api/plane/settings/common.py`.
++
++## Local backend architecture workaround
++
++On this Docker Desktop, upstream `python:3.12.12-alpine` ARM64 fails even
++`uname -m` with `exec format error`; plain Alpine ARM64 and Python AMD64 run.
++The override therefore selects `linux/amd64` for the four backend services only.
++This requires emulation on ARM hosts and may increase build/runtime cost. The
++Python base tag and original application Dockerfile remain unchanged.
++
++## Verification status (2026-09-16)
++
++Compose configuration passes. Backend is built once by `api` and shared by worker,
++beat, and migrator (six unique image builds total), avoiding concurrent exports to
++the same image name. The live TypeScript/build step passed, but image export failed
++with Docker containerd storage `input/output error`. Docker image listing and a
++previously working Alpine container then failed with the same storage read error.
++Host storage reported 15 GiB available and 100% capacity. The exact storage failure
++cause is not yet established. No application login/save/restart validation passed;
++restore Docker storage health or use another Docker host before resuming. No prune,
++reset, or volume deletion was performed.
+diff --git a/deployments/a2d2/REMOTE_AMD64.md b/deployments/a2d2/REMOTE_AMD64.md
+new file mode 100644
+index 0000000000..9d2117b97a
+--- /dev/null
++++ b/deployments/a2d2/REMOTE_AMD64.md
+@@ -0,0 +1,103 @@
++# Plane remote Linux amd64 handoff
++
++Source: makeplane/plane commit `2f895b82dad839c730c36a5c0cbc046f1e5d6b56`.
++Existing worktree: `REPOS/plane-native-runtime`, branch `a2d2/plane-native-runtime`.
++The deployment additions are uncommitted; transfer `deployments/a2d2/` explicitly,
++excluding `.env` and any generated lock/temp files. Do not transfer local Docker data.
++Local Docker is stopped for this task: no build, pull, restart, prune, or volume changes.
++
++## Destination and secrets
++
++Integrator supplies the Linux amd64 host and HTTPS origin. Install git, Python 3,
++Docker Engine, and Compose with `!override` / `!reset` support. Verify disk and
++memory headroom before building; this session has no measured minimum capacity.
++Check out the exact source commit and copy these deployment additions.
++Use a new `a2d2-plane-full` project only after checking that name is unused on the
++remote host. Keep source and `.env` access restricted to deployment operators.
++
++Copy `.env.example` to `.env` only if absent; chmod 0600. Set five independent
++random hex secrets: POSTGRES_PASSWORD, RABBITMQ_PASSWORD, AWS_SECRET_ACCESS_KEY,
++SECRET_KEY, LIVE_SERVER_SECRET_KEY. Never replace credentials for existing volumes.
++Other variable names are exhaustively listed in `.env.example`; DATABASE_URL and
++AMQP_URL reference their passwords through Compose interpolation. AWS_ACCESS_KEY_ID
++is the MinIO username. Keep internal API_BASE_URL and AWS_S3_ENDPOINT_URL unchanged.
++
++Set WEB_URL and CORS_ALLOWED_ORIGINS to the final HTTPS origin; APP_DOMAIN to its
++hostname. Keep SITE_ADDRESS=:80. The supplied proxy remains 127.0.0.1:3020:80 on
++that remote machine. The integrator terminates TLS in a host reverse proxy and
++forwards the complete origin, including WebSockets, to that loopback port. The
++host proxy must overwrite forwarded headers. A containerized ingress needs a
++separate explicitly designed network route; its own loopback is not the host.
++Do not expose database, queue, Redis, or MinIO ports. The remote host loopback URL
++cannot be used directly by a WebView running on the user's machine.
++
++## Remote-only build and image freeze
++
++Run from repository root on the selected remote host, using Bash. These commands
++are preparation instructions, not evidence that deployment has succeeded.
++
++```bash
++set -euo pipefail
++umask 077
++test "$(uname -s)" = Linux
++test "$(uname -m)" = x86_64
++test "$(git rev-parse HEAD)" = 2f895b82dad839c730c36a5c0cbc046f1e5d6b56
++# Before running: ensure no tracked source edits and no CHANGE_ME values in .env.
++git diff --exit-code HEAD -- . ':!deployments/a2d2'
++if grep -q CHANGE_ME deployments/a2d2/.env; then exit 1; fi
++plane_compose=(docker compose --project-directory . --env-file deployments/a2d2/.env
++  -p a2d2-plane-full -f deployments/cli/community/docker-compose.yml
++  -f deployments/a2d2/compose.source.yml -f deployments/a2d2/compose.amd64.yml)
++"${plane_compose[@]}" config --quiet
++"${plane_compose[@]}" pull plane-db plane-redis plane-mq plane-minio
++"${plane_compose[@]}" build web admin space live api proxy
++# Never persist config JSON: it contains interpolated secrets.
++test ! -e deployments/a2d2/compose.images.lock.yml
++"${plane_compose[@]}" config --format json |
++  python3 deployments/a2d2/lock-images.py > deployments/a2d2/compose.images.lock.yml.tmp
++mv deployments/a2d2/compose.images.lock.yml.tmp deployments/a2d2/compose.images.lock.yml
++plane_locked=("${plane_compose[@]}" -f deployments/a2d2/compose.images.lock.yml)
++"${plane_locked[@]}" config --quiet
++# Migrations must succeed before API/workers are launched.
++"${plane_locked[@]}" up -d plane-db plane-redis plane-mq plane-minio
++"${plane_locked[@]}" run --rm migrator
++"${plane_locked[@]}" up -d --no-build --pull never
++"${plane_locked[@]}" ps -a
++python3 deployments/a2d2/verify-origin.py https://REPLACE_WITH_PLANE_HOST
++```
++
++There is currently NO successful app image/digest to hand off. Source tags
++`a2d2-plane-{web,admin,space,live,backend,proxy}:2f895b82da` are build labels,
++not content locks. Infrastructure currently comes from upstream postgres:15.7-alpine,
++valkey/valkey:7.2.11-alpine, rabbitmq:3.13.6-management-alpine, minio/minio:latest.
++The first successful remote build/pull resolves these moving inputs; lock-images.py
++then checks every image is Linux amd64 and freezes all 13 services to local SHA256
++image IDs, removes build configuration and prevents pulls. This pins deployment
++artifacts on that host, not reproducible future source builds. Keep these images;
++a new host requires docker save/load or registry publication with repo digests.
++Do not claim registry digest pinning from a local image ID.
++
++## Acceptance and preservation
++
++1. Verify all expected services and migrator exit status; inspect private logs for
++   API/worker/beat/live/proxy failures. Internal Django health: use api container
++   Python urllib to GET http://127.0.0.1:8000/. Public `/` is the web UI.
++2. Run verify-origin.py before/after `/god-mode/` initialization. It exits 2 if setup
++   remains incomplete, 0 only for the origin smoke. Source instance.py returns flat
++   flags when no instance exists, but `{config, instance}` after creation; inspect
++   nested `instance.is_setup_done`, not a presumed top-level `is_activated`.
++3. In the real A2D2 child WebView, email/password login, create a private workspace,
++   project and unique work item, and upload a file. Record IDs and file checksum
++   privately. Close/reopen and verify login/session and contents.
++4. Restart ONLY this project with `"${plane_locked[@]}" restart`. Log in again and
++   verify the same item and attachment checksum. A successful smoke is insufficient.
++5. Verify a second account cannot read the private item; verify logout/account
++   switch isolates cookies. OAuth and email flows require separate provider setup.
++
++Do not run down -v, prune, reset, or delete existing files/volumes. Remote first
++startup creates new data; existing local volumes remain preserved and are NOT
++migrated by these commands. Data migration, if needed, requires a separate verified
++backup/restore plan. No local login/save/restart acceptance has passed yet.
++
++Sources: compose.source.yml, .env.example, deployments/cli/community/docker-compose.yml,
++apps/proxy/Caddyfile.ce, apps/api/plane/license/api/views/instance.py at the above commit.
+diff --git a/deployments/a2d2/RESUME_LOCAL.md b/deployments/a2d2/RESUME_LOCAL.md
+new file mode 100644
+index 0000000000..47c621ec40
+--- /dev/null
++++ b/deployments/a2d2/RESUME_LOCAL.md
+@@ -0,0 +1,51 @@
++# Resume local Plane without rebuilding
++
++Paused at coordinator request, 2026-09-16 05:26 UTC. Do not start Docker Desktop
++or execute these commands until the coordinator resumes runtime verification.
++Six application images were built; migrator has not run successfully yet.
++Existing Plane volumes must be preserved. No remote/GCP deployment is involved.
++
++Run in Bash from REPOS/plane-native-runtime after Docker is available:
++
++```bash
++set -euo pipefail
++plane_compose=(docker compose --project-directory .
++  --env-file deployments/a2d2/.env -p a2d2-plane-full
++  -f deployments/cli/community/docker-compose.yml
++  -f deployments/a2d2/compose.source.yml)
++# Read-only image availability check; no pull or build.
++docker image inspect a2d2-plane-web:2f895b82da a2d2-plane-admin:2f895b82da \
++  a2d2-plane-space:2f895b82da a2d2-plane-live:2f895b82da \
++  a2d2-plane-backend:2f895b82da a2d2-plane-proxy:2f895b82da \
++  --format '{{.RepoTags}} {{.Id}}'
++"${plane_compose[@]}" up -d --no-build --pull never plane-db plane-redis plane-mq plane-minio
++"${plane_compose[@]}" run --rm --no-deps --pull never migrator
++"${plane_compose[@]}" up -d --no-build --pull never
++"${plane_compose[@]}" ps -a
++python3 deployments/a2d2/verify-origin.py http://127.0.0.1:3020
++```
++
++The final smoke script exits 2 if initial instance setup remains incomplete.
++Open http://127.0.0.1:3020/god-mode/ to initialize using a dedicated QA account,
++then verify the original UI inside A2D2. HTTP 200 alone does not prove login,
++work-item storage, attachment upload, restart restoration, or account isolation.
++No global Docker restart, prune, volume deletion, or credential change is included.
++Do not apply the remote amd64 overlay to these mixed-platform local images.
++
++Evidence: OUTBOX/PLANE_ORIGINAL_RUNTIME_20260916/LIVE_BUILD_SUCCESS_0523.log,
++MIGRATION_DAEMON_DISCONNECT_0524.log. The commands above are not yet successfully
++executed end-to-end. Keep the existing private .env unchanged.
++
++## Subsequent infrastructure finding
++
++After resumption, DB/Redis/MQ containers failed their entrypoint with exec format
++error. compose.source.yml now selects linux/amd64 for these three services, but
++the new platform images have not been pulled because Docker went offline again.
++Before the infrastructure up command above, run the following when Docker is stable:
++
++```bash
++"${plane_compose[@]}" pull plane-db plane-redis plane-mq
++```
++
++This fetches infrastructure images only; the six completed app images are reused.
++The platform workaround remains unverified until the containers start successfully.
+diff --git a/deployments/a2d2/compose.amd64.yml b/deployments/a2d2/compose.amd64.yml
+new file mode 100644
+index 0000000000..35726798bd
+--- /dev/null
++++ b/deployments/a2d2/compose.amd64.yml
+@@ -0,0 +1,28 @@
++# Apply after compose.source.yml on the remote Linux host.
++services:
++  web:
++    platform: linux/amd64
++  admin:
++    platform: linux/amd64
++  space:
++    platform: linux/amd64
++  live:
++    platform: linux/amd64
++  api:
++    platform: linux/amd64
++  worker:
++    platform: linux/amd64
++  beat-worker:
++    platform: linux/amd64
++  migrator:
++    platform: linux/amd64
++  proxy:
++    platform: linux/amd64
++  plane-db:
++    platform: linux/amd64
++  plane-redis:
++    platform: linux/amd64
++  plane-mq:
++    platform: linux/amd64
++  plane-minio:
++    platform: linux/amd64
+diff --git a/deployments/a2d2/compose.source.yml b/deployments/a2d2/compose.source.yml
+new file mode 100644
+index 0000000000..f038f73151
+--- /dev/null
++++ b/deployments/a2d2/compose.source.yml
+@@ -0,0 +1,70 @@
++# Layer over deployments/cli/community/docker-compose.yml with --project-directory .
++# Build the checked-out source, never the moving upstream stable app images.
++services:
++  web:
++    image: a2d2-plane-web:2f895b82da
++    pull_policy: build
++    build:
++      context: .
++      dockerfile: apps/web/Dockerfile.web
++  admin:
++    image: a2d2-plane-admin:2f895b82da
++    pull_policy: build
++    build:
++      context: .
++      dockerfile: apps/admin/Dockerfile.admin
++  space:
++    image: a2d2-plane-space:2f895b82da
++    pull_policy: build
++    build:
++      context: .
++      dockerfile: apps/space/Dockerfile.space
++  live:
++    image: a2d2-plane-live:2f895b82da
++    pull_policy: build
++    build:
++      context: .
++      dockerfile: apps/live/Dockerfile.live
++    environment:
++      CORS_ALLOWED_ORIGINS: ${WEB_URL:?Set WEB_URL}
++      LIVE_BASE_PATH: /live
++      PORT: "3000"
++  api:
++    # Upstream Python ARM image fails exec on this Docker Desktop; amd64 verified.
++    platform: linux/amd64
++    image: a2d2-plane-backend:2f895b82da
++    pull_policy: build
++    build:
++      context: ./apps/api
++      dockerfile: Dockerfile.api
++  worker:
++    # Upstream Python ARM image fails exec on this Docker Desktop; amd64 verified.
++    platform: linux/amd64
++    image: a2d2-plane-backend:2f895b82da
++    pull_policy: never
++  beat-worker:
++    # Upstream Python ARM image fails exec on this Docker Desktop; amd64 verified.
++    platform: linux/amd64
++    image: a2d2-plane-backend:2f895b82da
++    pull_policy: never
++  migrator:
++    # Upstream Python ARM image fails exec on this Docker Desktop; amd64 verified.
++    platform: linux/amd64
++    image: a2d2-plane-backend:2f895b82da
++    pull_policy: never
++  proxy:
++    image: a2d2-plane-proxy:2f895b82da
++    pull_policy: build
++    build:
++      context: ./apps/proxy
++      dockerfile: Dockerfile.ce
++    ports: !override
++      - "127.0.0.1:3020:80"
++
++  # Local ARM infrastructure entrypoints failed with exec format error.
++  plane-db:
++    platform: linux/amd64
++  plane-redis:
++    platform: linux/amd64
++  plane-mq:
++    platform: linux/amd64
+diff --git a/deployments/a2d2/lock-images.py b/deployments/a2d2/lock-images.py
+new file mode 100644
+index 0000000000..c71e86a3af
+--- /dev/null
++++ b/deployments/a2d2/lock-images.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++"""Remote host only: read compose JSON on stdin; emit immutable local image IDs.
++Does not pull, build, or start containers. Do not save the input (contains secrets).
++"""
++import json
++import re
++import subprocess
++import sys
++
++config = json.load(sys.stdin)
++lines = ["# Host-local image lock; transfer images with docker save/load if moving hosts.", "services:"]
++for name, service in config["services"].items():
++    image = json.loads(subprocess.check_output(
++        ["docker", "image", "inspect", service["image"]], text=True
++    ))[0]
++    if image.get("Architecture") != "amd64" or image.get("Os") != "linux":
++        raise SystemExit(f"Wrong platform: {name}")
++    ident = image["Id"]
++    if not re.fullmatch(r"sha256:[0-9a-f]{64}", ident):
++        raise SystemExit(f"Invalid image ID: {name}")
++    lines += [f"  {name}:", f'    image: "{ident}"',
++              "    pull_policy: never", "    build: !reset null"]
++print("\n".join(lines))
+diff --git a/deployments/a2d2/verify-origin.py b/deployments/a2d2/verify-origin.py
+new file mode 100644
+index 0000000000..44319e681f
+--- /dev/null
++++ b/deployments/a2d2/verify-origin.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""Read-only origin smoke check. Exit 2 means instance setup remains incomplete.
++Does not establish authentication, persistence, uploads, or native WebView acceptance.
++"""
++import json
++import sys
++import urllib.request
++import urllib.parse
++
++if len(sys.argv) != 2:
++    raise SystemExit("Usage: python3 verify-origin.py https://plane.example.com")
++origin = sys.argv[1].rstrip("/")
++url = urllib.parse.urlsplit(origin)
++if url.scheme not in ("http", "https") or not url.netloc or url.path or url.query or url.fragment or url.username:
++    raise SystemExit("Expected an HTTP(S) origin without path, credentials, query, or fragment")
++for path in ("/", "/god-mode/", "/spaces/", "/auth/get-csrf-token/", "/api/instances/"):
++    request = urllib.request.Request(origin + path, headers={"Accept": "application/json" if path.startswith(("/api/", "/auth/")) else "text/html"})
++    with urllib.request.urlopen(request, timeout=30) as response:
++        if urllib.parse.urlsplit(response.url).netloc != url.netloc:
++            raise SystemExit(f"Unexpected cross-origin redirect: {path}")
++        body = response.read()
++        mime = response.headers.get_content_type()
++        if response.status != 200:
++            raise SystemExit(f"Unexpected status: {path} {response.status}")
++    if path.startswith(("/api/", "/auth/")):
++        if mime != "application/json":
++            raise SystemExit(f"Expected JSON: {path}")
++        payload = json.loads(body)
++    elif mime != "text/html" or not body:
++        raise SystemExit(f"Expected nonempty HTML: {path}")
++    print(f"PASS {path}")
++    if path == "/api/instances/":
++        instance = payload.get("instance", payload)
++        if instance.get("is_setup_done") is not True:
++            print("SETUP REQUIRED: complete /god-mode/ then rerun")
++            raise SystemExit(2)
++print("Origin smoke passed; login/save/upload/restart/native checks still required.")

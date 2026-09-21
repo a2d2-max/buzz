@@ -32,7 +32,7 @@ const TEST_QUERY_DEFAULTS = {
   },
 };
 
-async function renderSheet(overrides = {}) {
+async function renderSheet(overrides = {}, docsPages = []) {
   const { createElement } = await import("react");
   const { render } = await import("@testing-library/react");
   const { QueryClient, QueryClientProvider } = await import(
@@ -41,6 +41,12 @@ async function renderSheet(overrides = {}) {
   const { ThemeProvider } = await import("@/shared/theme/ThemeProvider.tsx");
   const { CommunityTaskSheet } = await import("./CommunityTaskSheet.tsx");
   const queryClient = new QueryClient({ defaultOptions: TEST_QUERY_DEFAULTS });
+  queryClient.setQueryData(["docs", "pages"], {
+    pages: new Map(docsPages.map((page) => [page.id, page])),
+    truncated: false,
+    scanned: docsPages.length,
+    watermark: undefined,
+  });
   const saved = [];
   const deletes = [];
   const openChanges = [];
@@ -204,4 +210,158 @@ test("a rejected save surfaces the reason and keeps the sheet open", async (t) =
     "Relay is away.",
   );
   assert.deepEqual(openChanges, []);
+});
+
+test("saved document links open only in their community and readonly users cannot remove them", async (t) => {
+  const { screen } = await import("@testing-library/react");
+  const { queryClient } = await renderSheet({
+    canEdit: false,
+    canDelete: false,
+    relayUrl: "wss://example.com",
+    task: makeTask({
+      documents: [
+        {
+          pageId: "local-doc",
+          relayUrl: "wss://example.com",
+          title: "Local specification",
+        },
+        {
+          pageId: "other-doc",
+          relayUrl: "wss://other.example.com",
+          title: "Other specification",
+        },
+      ],
+    }),
+  });
+  t.after(() => queryClient.clear());
+  assert.equal(
+    screen
+      .getByRole("link", { name: "Local specification" })
+      .getAttribute("href"),
+    "/#/docs/local-doc",
+  );
+  assert.equal(
+    screen.queryByRole("link", { name: "Other specification" }),
+    null,
+  );
+  assert.ok(screen.getByText("Other specification"));
+  assert.equal(screen.queryByRole("button", { name: /Remove document/ }), null);
+});
+
+test("selecting a document stays in the draft until Save and removal is saved", async (t) => {
+  const { fireEvent, screen, act } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  t.mock.method(relayClient, "subscribeLive", (_filter, _event, ready) => {
+    ready?.("eose");
+    return Promise.resolve(() => Promise.resolve());
+  });
+  t.mock.method(relayClient, "subscribeToReconnects", () => () => {});
+  const opened = [];
+  const { queryClient, saved } = await renderSheet(
+    { relayUrl: "wss://example.com", onOpenDocument: (id) => opened.push(id) },
+    [
+      {
+        id: "spec",
+        title: "Release specification",
+        body: "",
+        parentId: null,
+        order: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        eventCreatedAt: 1,
+        eventId: "e".repeat(64),
+        author: AUTHOR,
+        eventKind: 30623,
+        deleted: false,
+      },
+      { id: "deleted", title: "Deleted specification", deleted: true },
+    ],
+  );
+  t.after(() => queryClient.clear());
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Link a document" }));
+  });
+  assert.equal(
+    screen.queryByRole("button", { name: "Deleted specification" }),
+    null,
+  );
+  fireEvent.change(screen.getByRole("textbox", { name: "Search documents" }), {
+    target: { value: "release" },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Release specification" }),
+  );
+  assert.equal(saved.length, 0);
+  fireEvent.click(screen.getByRole("link", { name: "Release specification" }));
+  assert.deepEqual(opened, ["spec"]);
+  await act(async () => {
+    fireEvent.click(field("community-task-sheet-save"));
+  });
+  assert.deepEqual(saved[0].documents, [
+    {
+      pageId: "spec",
+      relayUrl: "wss://example.com",
+      title: "Release specification",
+    },
+  ]);
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: "Remove document Release specification",
+    }),
+  );
+  await act(async () => {
+    fireEvent.click(field("community-task-sheet-save"));
+  });
+  assert.equal(saved[1].documents, undefined);
+});
+
+test("custom fields can be added, edited, cleared and removed with the task", async (t) => {
+  const { act, fireEvent } = await import("@testing-library/react");
+  const { queryClient, saved, getByRole, getByLabelText } = await renderSheet({
+    task: makeTask({
+      customFields: [
+        { id: "estimate", name: "Estimate", type: "number", value: 3 },
+      ],
+    }),
+  });
+  t.after(() => queryClient.clear());
+  fireEvent.change(getByLabelText("Value: Estimate"), {
+    target: { value: "0" },
+  });
+  fireEvent.change(getByLabelText("New field name"), {
+    target: { value: "Reviewed" },
+  });
+  fireEvent.change(getByLabelText("New field type"), {
+    target: { value: "checkbox" },
+  });
+  fireEvent.click(getByRole("button", { name: "Add field" }));
+  fireEvent.click(getByLabelText("Value: Reviewed"));
+  await act(async () => fireEvent.submit(field("community-task-form")));
+  assert.equal(saved[0].customFields[0].value, 0);
+  assert.equal(saved[0].customFields[1].value, true);
+  fireEvent.click(getByRole("button", { name: "Clear value: Estimate" }));
+  await act(async () => fireEvent.submit(field("community-task-form")));
+  assert.equal(saved[1].customFields[0].value, null);
+  fireEvent.click(getByRole("button", { name: "Remove field: Estimate" }));
+  fireEvent.click(getByRole("button", { name: "Remove field: Reviewed" }));
+  await act(async () => fireEvent.submit(field("community-task-form")));
+  assert.deepEqual(saved[2].customFields, []);
+});
+
+test("read-only viewers see field values without custom-field controls", async (t) => {
+  const { queryClient, getByText, queryByRole, queryByLabelText, saved } =
+    await renderSheet({
+      canEdit: false,
+      canDelete: false,
+      task: makeTask({
+        customFields: [
+          { id: "review", name: "Reviewed", type: "checkbox", value: false },
+        ],
+      }),
+    });
+  t.after(() => queryClient.clear());
+  assert.ok(getByText("Reviewed: Unchecked"));
+  assert.equal(queryByRole("button", { name: "Add field" }), null);
+  assert.equal(queryByLabelText("New field name"), null);
+  assert.deepEqual(saved, []);
 });

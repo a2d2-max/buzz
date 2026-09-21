@@ -1,0 +1,37 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  font-family: var(--affine-font-family);
+}
+#editor,
+.affine-edgeless-viewport,
+.edgeless-editor-container {
+  height: 100%;
+}
+.affine-page-viewport {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  min-height: 100%;
+  container-name: viewport;
+  container-type: inline-size;
+}
+.affine-page-viewport *,
+.affine-edgeless-viewport * {
+  box-sizing: border-box;
+}
+.affine-edgeless-viewport {
+  position: relative;
+  overflow: clip;
+  container-name: viewport;
+  container-type: inline-size;
+}
+.edgeless-editor-container {
+  position: relative;
+  overflow: clip;
+}
+#status {
+  font-size: 1rem;
+}

@@ -1,6 +1,8 @@
 pub(crate) mod access_policy;
+pub(crate) mod account_quota;
 mod agent_env;
 pub(crate) mod agent_events;
+pub(crate) mod agent_home;
 pub(crate) mod agent_snapshot;
 pub(crate) mod agent_snapshot_envelope;
 pub(crate) mod team_snapshot;
@@ -18,6 +20,7 @@ pub(crate) use claude_accounts::{
     CodexAuthKind, ProviderAccount,
 };
 pub(crate) mod codex_accounts;
+pub(crate) mod codex_login;
 pub(crate) use codex_accounts::{apply_codex_account_update, detach_codex_account};
 pub(crate) mod claude_config;
 pub(crate) mod config_bridge;

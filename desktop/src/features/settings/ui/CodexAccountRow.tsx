@@ -2,6 +2,7 @@ import * as React from "react";
 import { EllipsisVertical } from "lucide-react";
 import { toast } from "sonner";
 
+import { useAccountQuotaQuery } from "@/features/agents/useAccountQuota";
 import {
   useCodexLoginCommandMutation,
   useRemoveCodexAccountMutation,
@@ -19,6 +20,11 @@ import {
 import { Input } from "@/shared/ui/input";
 import { Spinner } from "@/shared/ui/spinner";
 
+import { AccountAgentRoster } from "./AccountAgentRoster";
+import { AccountQuotaMeter } from "./AccountQuotaMeter";
+import { CodexLoginStatus } from "./CodexLoginStatus";
+import { useCodexAccountLogin } from "./useCodexAccountLogin";
+
 function errorText(error: unknown, fallback: string) {
   if (error instanceof Error && error.message.trim().length > 0) {
     return error.message;
@@ -34,9 +40,10 @@ function detachedAccountsMessage(label: string, detachedCount: number) {
 /**
  * One stored Codex account in Settings → Agents → Codex accounts. Mirrors
  * `ClaudeAccountRow` (inline rename/remove, per-row mutations, spelled-out
- * remove blast radius); the Codex-only addition is the "Copy login command"
- * action on ChatGPT-login accounts, whose one-time `codex login` step lives
- * in a terminal.
+ * remove blast radius); the Codex-only additions are for ChatGPT-login
+ * accounts: "Log in" runs `codex login` for the account's own directory in
+ * the app (the browser sign-in stays with the user) and re-tests the account
+ * when it finishes; "Copy login command" is the terminal fallback.
  */
 export function CodexAccountRow({ account }: { account: CodexAccount }) {
   const [editing, setEditing] = React.useState(false);
@@ -51,7 +58,15 @@ export function CodexAccountRow({ account }: { account: CodexAccount }) {
   const rename = useRenameCodexAccountMutation();
   const remove = useRemoveCodexAccountMutation();
   const test = useTestCodexAccountMutation();
+  // Reads when the settings panel mounts this row; a removed account unmounts
+  // it, so a late reading can never land on a row that is gone.
+  const quota = useAccountQuotaQuery(account.id);
   const loginCommand = useCodexLoginCommandMutation();
+  const testMutate = test.mutate;
+  const login = useCodexAccountLogin(account.id, {
+    // A finished login proves nothing until the spawn env is exercised.
+    onSucceeded: () => testMutate(account.id),
+  });
 
   React.useEffect(() => {
     if (!editing) {
@@ -138,7 +153,7 @@ export function CodexAccountRow({ account }: { account: CodexAccount }) {
       .mutateAsync(account.id)
       .then(async (command) => {
         await navigator.clipboard.writeText(command);
-        toast("Login command copied — run it once in a terminal.");
+        toast("Login command copied — paste it as is into a terminal.");
       })
       .catch((err: unknown) => {
         toast.error(errorText(err, "Couldn't fetch the login command."));
@@ -218,6 +233,11 @@ export function CodexAccountRow({ account }: { account: CodexAccount }) {
             >
               {account.authKind === "api_key" ? "API key" : "ChatGPT"}
             </span>
+            {account.source === "orca" ? (
+              <span className="rounded-full bg-muted px-2 py-0.5 text-2xs text-muted-foreground">
+                Orca
+              </span>
+            ) : null}
             {account.tokenHint ? (
               <span
                 className="font-mono text-xs text-muted-foreground"
@@ -228,6 +248,23 @@ export function CodexAccountRow({ account }: { account: CodexAccount }) {
             ) : null}
           </div>
           <div className="ml-auto flex shrink-0 items-center justify-end gap-1">
+            {account.authKind === "chatgpt" ? (
+              <Button
+                aria-label={`Log in ${account.label}`}
+                className="h-7 px-3 text-xs"
+                data-testid={`codex-account-login-${account.id}`}
+                disabled={login.startPending || (login.view?.running ?? false)}
+                onClick={login.start}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                {login.startPending ? (
+                  <Spinner aria-hidden className="h-3.5 w-3.5" />
+                ) : null}
+                Log in
+              </Button>
+            ) : null}
             <Button
               aria-label={`Test ${account.label}`}
               className="h-7 px-3 text-xs"
@@ -258,7 +295,7 @@ export function CodexAccountRow({ account }: { account: CodexAccount }) {
                 align="end"
                 onCloseAutoFocus={(event) => event.preventDefault()}
               >
-                {account.authKind === "chatgpt" ? (
+                {account.authKind === "chatgpt" && account.source === "app" ? (
                   <DropdownMenuItem
                     data-testid={`codex-account-login-command-${account.id}`}
                     onSelect={copyLoginCommand}
@@ -289,6 +326,21 @@ export function CodexAccountRow({ account }: { account: CodexAccount }) {
         </div>
       )}
 
+      {editing || confirmingRemove ? null : (
+        <>
+          <AccountQuotaMeter
+            label={account.label}
+            pending={quota.isPending}
+            quota={quota.data}
+          />
+          <AccountAgentRoster
+            accountId={account.id}
+            accountLabel={account.label}
+            provider="codex"
+          />
+        </>
+      )}
+
       {testResult ? (
         <p
           className={
@@ -312,6 +364,25 @@ export function CodexAccountRow({ account }: { account: CodexAccount }) {
         </p>
       ) : null}
 
+      {login.startError ? (
+        <p
+          className="mt-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-sm text-destructive"
+          data-testid={`codex-account-login-error-${account.id}`}
+          role="alert"
+        >
+          Couldn't start the login — {login.startError}
+        </p>
+      ) : null}
+      {login.view ? (
+        <CodexLoginStatus
+          accountId={account.id}
+          authUrl={login.session?.authUrl ?? null}
+          cancelPending={login.cancelPending}
+          onCancel={login.cancel}
+          view={login.view}
+        />
+      ) : null}
+
       {confirmingRemove ? (
         <div
           aria-describedby={removeWarningId}
@@ -327,7 +398,9 @@ export function CodexAccountRow({ account }: { account: CodexAccount }) {
             Remove “{account.label}”? Agents using this account switch back to
             the app's own Codex login and will need a restart.
             {account.authKind === "chatgpt"
-              ? " Its login directory is deleted too."
+              ? account.source === "app"
+                ? " Its app-owned login directory is deleted too."
+                : " The original Orca home is left unchanged."
               : ""}
           </p>
           <div className="flex justify-end gap-2">

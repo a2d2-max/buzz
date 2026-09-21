@@ -405,11 +405,63 @@ pub(crate) fn save_agent_definitions<R: tauri::Runtime>(
     write_agent_store(app, definitions, instances)
 }
 
+/// Save both halves of the unified agent store in one atomic replacement.
+///
+/// Callers that edit a definition and its linked instances as one user action
+/// must use this seam instead of the two preserving writers above. Otherwise
+/// the first whole-file write can become durable while the second fails,
+/// leaving the definition and instance account selections out of sync.
+pub(crate) fn save_agent_definitions_and_managed_agents<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    definitions: &[ManagedAgentRecord],
+    records: &[ManagedAgentRecord],
+) -> Result<(), String> {
+    let path = managed_agents_store_path(app)?;
+    save_agent_definitions_and_managed_agents_at_path(&path, definitions, records, true)
+}
+
+/// Shared implementation for the production unified writer and its on-disk
+/// regression test. `persist_keys` is disabled only by the test: it exercises
+/// the exact filter/sort/serialize/atomic-replace path without touching the OS
+/// keyring.
+fn save_agent_definitions_and_managed_agents_at_path(
+    path: &Path,
+    definitions: &[ManagedAgentRecord],
+    records: &[ManagedAgentRecord],
+    persist_keys: bool,
+) -> Result<(), String> {
+    let mut definitions = definitions.to_vec();
+    definitions.retain(|record| record.pubkey.is_empty());
+
+    let mut instances = records.to_vec();
+    instances.retain(|record| !record.pubkey.is_empty());
+    instances.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.pubkey.cmp(&right.pubkey))
+    });
+    if persist_keys {
+        persist_agent_keys(&mut instances);
+    }
+
+    write_agent_store_at_path(path, definitions, instances)
+}
+
 /// Serialize definitions + instances into the single unified store file.
 /// Definitions sort first (by slug) for stable diffs; instances keep the
 /// name/pubkey order their save path established.
 fn write_agent_store<R: tauri::Runtime>(
     app: &AppHandle<R>,
+    definitions: Vec<ManagedAgentRecord>,
+    instances: Vec<ManagedAgentRecord>,
+) -> Result<(), String> {
+    let path = managed_agents_store_path(app)?;
+    write_agent_store_at_path(&path, definitions, instances)
+}
+
+fn write_agent_store_at_path(
+    path: &Path,
     mut definitions: Vec<ManagedAgentRecord>,
     instances: Vec<ManagedAgentRecord>,
 ) -> Result<(), String> {
@@ -417,7 +469,6 @@ fn write_agent_store<R: tauri::Runtime>(
     let mut all = definitions;
     all.extend(instances);
 
-    let path = managed_agents_store_path(app)?;
     let payload = serde_json::to_vec_pretty(&all)
         .map_err(|error| format!("failed to serialize agent store: {error}"))?;
 
@@ -425,7 +476,7 @@ fn write_agent_store<R: tauri::Runtime>(
     // fallback. Write it owner-only (`0o600`) unconditionally — harmless for the
     // keyring-backed case (it is the user's own agent store) and closes the
     // umask window a post-write `chmod` would leave open.
-    atomic_write_json_restricted(&path, &payload)
+    atomic_write_json_restricted(path, &payload)
 }
 
 /// Write each record's in-memory key to the keyring and blank the inline copy

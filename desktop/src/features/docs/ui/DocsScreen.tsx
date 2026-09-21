@@ -137,7 +137,15 @@ export function DocsScreen({ pageId }: DocsScreenProps) {
 
   const handleSave = React.useCallback(
     (id: string, draft: DocDraft, baseEventId: string) =>
-      updatePage(id, { body: draft.body, title: draft.title }, { baseEventId }),
+      updatePage(
+        id,
+        {
+          body: draft.body,
+          title: draft.title,
+          ...(draft.affine ? { affine: draft.affine } : {}),
+        },
+        { baseEventId },
+      ),
     [updatePage],
   );
 

@@ -95,4 +95,8 @@ export type UpdatePersonaInput = {
   namePool?: string[];
   envVars?: Record<string, string>;
   behavior?: PersonaBehaviorInput;
+  /** Omit to preserve every linked instance; null returns them to the app login. */
+  claudeAccountId?: string | null;
+  /** Omit to preserve every linked instance; null returns them to the app login. */
+  codexAccountId?: string | null;
 };
