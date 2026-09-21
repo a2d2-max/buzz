@@ -75,7 +75,9 @@ export function DocPagePane({
   const [mode, setMode] = React.useState<"view" | "edit">(() =>
     !page.deleted && page.body.trim() === "" ? "edit" : "view",
   );
-  const [structured, setStructured] = React.useState(!!page.affine);
+  const [structured, setStructured] = React.useState(
+    !!page.affine || (!page.deleted && page.body.trim() === ""),
+  );
   const [loadedBody, setLoadedBody] = React.useState<{
     eventId: string;
     body?: string;

@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
-# Pre-push guard: CI checks the PR merged with main, so local runs on a
-# skewed branch can pass while CI fails. Block the push only when
-# origin/main has changed files this branch also touches.
+# Pre-push guard: local runs on a skewed feature branch can pass while its
+# configured integration build fails. Block the push only when the integration
+# base has changed files this branch also touches.
 set -euo pipefail
 
-branch=$(git rev-parse --abbrev-ref HEAD)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+branch=$(git symbolic-ref --quiet --short HEAD || printf 'HEAD')
 if [ "$branch" = "main" ] || [ "$branch" = "HEAD" ]; then
   exit 0
 fi
 
-git fetch --quiet origin main || true
-git rev-parse --verify --quiet origin/main >/dev/null || exit 0
+base_ref=$("$script_dir/resolve-pre-push-base.sh" --fetch)
+base=$(git merge-base HEAD "$base_ref")
+base_tip=$(git rev-parse "${base_ref}^{commit}")
 
-base=$(git merge-base HEAD origin/main)
-if [ "$base" = "$(git rev-parse origin/main)" ]; then
+if [ "$base" = "$base_tip" ]; then
   exit 0
 fi
 
 overlap=$(comm -12 \
-  <(git diff --name-only "$base" origin/main -- | sort) \
+  <(git diff --name-only "$base" "$base_ref" -- | sort) \
   <(git diff --name-only "$base" HEAD -- | sort))
 
 if [ -z "$overlap" ]; then
@@ -26,9 +27,9 @@ if [ -z "$overlap" ]; then
 fi
 
 {
-  echo "Branch is behind origin/main, and main changed files this branch also touches:"
-  echo "$overlap" | sed 's/^/  /'
-  echo "Local checks ran on a tree CI will never test. Run 'git merge origin/main',"
-  echo "resolve, re-run checks, then push."
+  echo "Branch is behind $base_ref, and that base changed files this branch also touches:"
+  printf '%s\n' "$overlap" | awk '{ print "  " $0 }'
+  echo "Local checks ran on a tree the integration build will never test. Integrate"
+  echo "$base_ref, resolve, re-run checks, then push."
 } >&2
 exit 1
