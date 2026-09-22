@@ -3536,6 +3536,129 @@ async fn post_mention_claim(
     (status, response.json().await.expect("claim response JSON"))
 }
 
+/// One runtime's claim on one mention, through the exact pair of functions
+/// `buzz-acp`'s `claim_mention` uses: `buzz_sdk::build_mention_claim` to build
+/// the kind:24250 event and `buzz_sdk::classify_mention_claim_response` to read
+/// the `POST /events` body back.
+async fn claim_as_runtime(
+    keys: &Keys,
+    nonce: &str,
+    target_id: &str,
+) -> buzz_sdk::MentionClaimAnswer {
+    let target = nostr::EventId::from_hex(target_id).expect("target id");
+    let event = buzz_sdk::build_mention_claim(target, nonce)
+        .expect("build claim")
+        .sign_with_keys(keys)
+        .expect("sign claim");
+    let response = reqwest::Client::new()
+        .post(format!("{}/events", relay_http_url()))
+        .header("X-Pubkey", keys.public_key().to_hex())
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&event).expect("serialize claim"))
+        .send()
+        .await
+        .expect("POST /events");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "a lost claim is an answer, never an HTTP error"
+    );
+    let body: serde_json::Value = response.json().await.expect("claim response JSON");
+    buzz_sdk::classify_mention_claim_response(&body)
+}
+
+/// A fresh per-runtime nonce, built the way `buzz-acp` builds its own: 32 hex
+/// characters of process-unique randomness, never a name or a constant.
+fn runtime_nonce() -> String {
+    Keys::generate()
+        .public_key()
+        .to_hex()
+        .chars()
+        .take(32)
+        .collect()
+}
+
+/// **Duplicate-answer gate, relay half.** Three claimers share one agent key
+/// and race on ten mentions. What this measures is the arbitration, not the
+/// answering: every mention must be won by exactly one claimer, and no claim
+/// may come back undecided — an undecided claim fails open in `buzz-acp`, so
+/// it would surface as a duplicate answer. That a won claim actually turns
+/// into an answer, and a lost one into silence, is pinned by
+/// `claim_then_push`'s tests in `buzz-acp`.
+///
+/// Named under the `test_mention_claim` prefix because CI selects this suite's
+/// claim tests by that filter (`.github/workflows/_ci-relay.yml`).
+///
+/// Requires a live relay (`RELAY_URL`, default `ws://localhost:3000`) with
+/// Redis, so it is `#[ignore]` like the rest of this suite.
+#[tokio::test]
+#[ignore]
+async fn test_mention_claim_three_claimers_win_exactly_one_claim_per_mention() {
+    const RUNTIMES: usize = 3;
+    const MENTIONS: usize = 10;
+
+    ensure_test_community(&relay_authority()).await;
+    let keys = Keys::generate();
+    let nonces: Vec<String> = (0..RUNTIMES).map(|_| runtime_nonce()).collect();
+    assert_eq!(
+        nonces
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        RUNTIMES,
+        "the nonce contract: two runtimes sharing one both win"
+    );
+    let targets: Vec<String> = (0..MENTIONS).map(|_| fresh_target_id()).collect();
+
+    let mut winners_per_target = Vec::with_capacity(MENTIONS);
+    let mut won = 0usize;
+    let mut lost = 0usize;
+    let mut undecided = 0usize;
+
+    for target in &targets {
+        // All three runtimes claim the same mention concurrently — the race the
+        // relay has to arbitrate, not a polite sequence.
+        let answers = futures_util::future::join_all(
+            nonces
+                .iter()
+                .map(|nonce| claim_as_runtime(&keys, nonce, target)),
+        )
+        .await;
+        let target_wins = answers
+            .iter()
+            .filter(|answer| **answer == buzz_sdk::MentionClaimAnswer::Won)
+            .count();
+        winners_per_target.push(target_wins);
+        for answer in answers {
+            match answer {
+                buzz_sdk::MentionClaimAnswer::Won => won += 1,
+                buzz_sdk::MentionClaimAnswer::Lost => lost += 1,
+                buzz_sdk::MentionClaimAnswer::Undecided => undecided += 1,
+            }
+        }
+    }
+
+    println!(
+        "3 claimers x {MENTIONS} mentions -> won={won} lost={lost} undecided={undecided} \
+         winners_per_mention={winners_per_target:?}"
+    );
+    assert_eq!(
+        undecided, 0,
+        "an undecided claim is handled anyway, so it would show up as a \
+         duplicate answer in production"
+    );
+    assert_eq!(
+        winners_per_target,
+        vec![1; MENTIONS],
+        "every mention must have exactly one winner"
+    );
+    assert_eq!(
+        won, MENTIONS,
+        "ten mentions must grant ten claims — one answer each"
+    );
+    assert_eq!(lost, MENTIONS * (RUNTIMES - 1));
+}
+
 /// The agent runtime claims over the HTTP bridge, not the WebSocket — that is
 /// its only correlated request/response path. A lost claim must still be HTTP
 /// 200 with `accepted: false`, so the runtime can tell it apart from a

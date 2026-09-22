@@ -34,7 +34,7 @@ use buzz_core::observer::{
 };
 use clap::Parser;
 use config::{
-    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
+    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, ClaimMode, Config, DedupMode, ModelsArgs,
     MultipleEventHandling, RespondTo, SubscribeMode,
 };
 use filter::SubscriptionRule;
@@ -694,6 +694,330 @@ impl NormalListenerIngress {
             prompt_tag_for_steer,
         }
     }
+}
+
+/// How long one relay round-trip on the claim path may take, start to finish.
+///
+/// Bounds two calls, each separately: reading the NIP-11 capability (once per
+/// connection generation) and submitting one claim. `RestClient::bridge_post`
+/// retries transient failures with backoff and `fetch_nip11` tries two paths,
+/// so both are bounded here rather than per attempt — that is what keeps a
+/// wedged relay from stalling the harness's event loop. The first admitted
+/// mention after a reconnect can therefore wait up to twice this; every later
+/// one waits at most once.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a *failed* capability read waits before an admitted mention
+/// retries it.
+///
+/// A relay whose HTTP side is still warming up at connect time must not leave
+/// the runtime claim-less for the whole connection — that is the duplicate
+/// this feature exists to prevent. But an HTTP side that stays dead must not
+/// cost one GET per mention either, so a failed generation retries on the next
+/// admitted mention after this interval and not before.
+const CLAIM_CAPABILITY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Whether this runtime may answer one mention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimOutcome {
+    /// The relay granted this runtime the mention.
+    Won,
+    /// Another runtime holds the mention. The **only** outcome that drops it.
+    Lost,
+    /// The relay does not arbitrate claims, or the operator set
+    /// `--claim=off`. Handle the mention exactly as a pre-claim build would.
+    Unsupported,
+    /// The claim could not be decided — transport failure, timeout, a
+    /// relay-side Redis failure, or a malformed claim. Fails open: the mention
+    /// is handled. A relay blip must not mute the agent, and the cost of
+    /// being wrong here is a duplicate answer rather than silence.
+    Errored,
+}
+
+/// Ask the relay for the exclusive right to answer `event_id_hex`.
+///
+/// Sends a kind:24250 claim signed with the agent's own keys over the NIP-98
+/// HTTP bridge — the harness's only correlated request/response path — and
+/// classifies the 200 body with
+/// [`buzz_sdk::classify_mention_claim_response`], the same parse the live
+/// relay gate test uses. Every failure mode collapses to
+/// [`ClaimOutcome::Errored`], never to [`ClaimOutcome::Lost`]: only the relay
+/// saying `duplicate` is a loss.
+///
+/// `supported` is the cached NIP-11 capability (see [`ClaimCapability`]);
+/// when it is false nothing is sent at all. `timeout` bounds the whole
+/// round-trip including `bridge_post`'s internal retries.
+async fn claim_mention(
+    rest: &relay::RestClient,
+    supported: bool,
+    nonce: &str,
+    event_id_hex: &str,
+    timeout: Duration,
+) -> ClaimOutcome {
+    if !supported {
+        return ClaimOutcome::Unsupported;
+    }
+    let target = match nostr::EventId::from_hex(event_id_hex) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(event_id = %event_id_hex, %error, "claim: invalid event id");
+            return ClaimOutcome::Errored;
+        }
+    };
+    let signed = match buzz_sdk::build_mention_claim(target, nonce)
+        .map_err(|error| error.to_string())
+        .and_then(|builder| {
+            builder
+                .sign_with_keys(&rest.keys)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!(event_id = %event_id_hex, %error, "claim: could not build claim event");
+            return ClaimOutcome::Errored;
+        }
+    };
+    let body = match tokio::time::timeout(timeout, rest.submit_event(&signed)).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                event_id = %event_id_hex,
+                %error,
+                "claim: relay submission failed — handling the mention anyway"
+            );
+            return ClaimOutcome::Errored;
+        }
+        Err(_) => {
+            tracing::warn!(
+                event_id = %event_id_hex,
+                timeout_secs = timeout.as_secs_f64(),
+                "claim: relay did not answer in time — handling the mention anyway"
+            );
+            return ClaimOutcome::Errored;
+        }
+    };
+    match buzz_sdk::classify_mention_claim_response(&body) {
+        buzz_sdk::MentionClaimAnswer::Won => ClaimOutcome::Won,
+        buzz_sdk::MentionClaimAnswer::Lost => ClaimOutcome::Lost,
+        buzz_sdk::MentionClaimAnswer::Undecided => {
+            tracing::warn!(
+                event_id = %event_id_hex,
+                answer = %body,
+                "claim: relay gave no decision — handling the mention anyway"
+            );
+            ClaimOutcome::Errored
+        }
+    }
+}
+
+/// Resolve the per-process token this runtime puts in its mention claims.
+///
+/// The relay stores this value as the claim's owner token, which is what lets
+/// *this* runtime re-claim a mention it already took after a reconnect. It
+/// therefore **must be unique to this process**: two runtimes sharing an agent
+/// key and a nonce are indistinguishable to the relay, so both are told the
+/// mention is theirs and both answer it — the exact duplicate claiming exists
+/// to prevent. Never derive it from a hostname, an agent name, or any other
+/// value two processes could both produce.
+///
+/// `managed` is `BUZZ_MANAGED_AGENT_START_NONCE`, which the desktop launcher
+/// already mints fresh per managed runtime. An over-long value is **rejected**
+/// rather than truncated — truncation could map two distinct launcher nonces
+/// onto one token — and a fresh random one is used instead.
+fn resolve_claim_nonce(managed: Option<String>) -> String {
+    let managed = managed.unwrap_or_default();
+    let managed = managed.trim();
+    if managed.is_empty() {
+        return random_claim_nonce();
+    }
+    if managed.chars().count() > buzz_sdk::MENTION_CLAIM_MAX_NONCE_CHARS {
+        tracing::warn!(
+            chars = managed.chars().count(),
+            max = buzz_sdk::MENTION_CLAIM_MAX_NONCE_CHARS,
+            "BUZZ_MANAGED_AGENT_START_NONCE is too long for a claim nonce — \
+             using a fresh random one instead of truncating it"
+        );
+        return random_claim_nonce();
+    }
+    managed.to_string()
+}
+
+/// 32 hex characters (128 bits) of fresh randomness, generated once per
+/// process.
+///
+/// `nostr::Keys::generate()` is the only CSPRNG this crate already depends on.
+/// The *public* half is used: it is derived from the same random secret, so it
+/// is just as unpredictable, and unlike the secret half it is safe to put on
+/// the wire.
+fn random_claim_nonce() -> String {
+    nostr::Keys::generate()
+        .public_key()
+        .to_hex()
+        .chars()
+        .take(32)
+        .collect()
+}
+
+/// Caches whether the connected relay arbitrates mention claims.
+///
+/// The NIP-11 document is read once per relay *connection generation*, never
+/// per mention: a reconnect may land on a different relay build, so the answer
+/// is re-evaluated on the same boundary the inbound author gate uses to
+/// re-read the relay identity ([`inbound_author_gate::refresh_needed`]).
+///
+/// Only an **authoritative** read resolves a generation, matching
+/// `refresh_relay_self`: a relay whose HTTP side is still warming up when the
+/// WebSocket connects would otherwise leave this runtime claim-less for the
+/// whole connection, which is precisely the duplicate answer claiming exists
+/// to prevent. The retry is bounded by
+/// [`CLAIM_CAPABILITY_RETRY_INTERVAL`] rather than by "once per generation",
+/// so an HTTP side that stays dead costs one GET per interval, never one per
+/// mention. Until a read succeeds the capability reads as unsupported, which
+/// is fail-open — the agent keeps answering.
+struct ClaimCapability {
+    mode: ClaimMode,
+    supported: bool,
+    /// `None` until an authoritative read has completed, exactly like
+    /// `InboundAuthorGate::refreshed_generation`.
+    resolved_generation: Option<u64>,
+    /// Generation and moment of the most recent read *attempt*, successful or
+    /// not. A failed read leaves `resolved_generation` behind, so this is what
+    /// paces the retry; it is keyed by generation so a reconnect retries
+    /// immediately instead of waiting out the previous connection's interval.
+    last_attempt: Option<(u64, tokio::time::Instant)>,
+}
+
+impl ClaimCapability {
+    /// Read the capability for the initial connection (generation 0).
+    ///
+    /// `ClaimMode::Off` performs no request at all.
+    async fn connect(mode: ClaimMode, rest: &relay::RestClient) -> Self {
+        let mut capability = Self {
+            mode,
+            supported: false,
+            resolved_generation: None,
+            last_attempt: None,
+        };
+        capability.resolve(rest, 0, "startup").await;
+        capability
+    }
+
+    /// Whether a mention arriving on `generation` should be claimed,
+    /// re-reading the capability when that generation is unresolved and the
+    /// retry interval has passed.
+    async fn supported_for(&mut self, rest: &relay::RestClient, generation: u64) -> bool {
+        if self.read_due(generation) {
+            self.resolve(rest, generation, "listener").await;
+        }
+        self.supported
+    }
+
+    /// Whether an admitted mention on `generation` should trigger a read.
+    ///
+    /// Kept separate from [`Self::resolve`] so the pacing rule is one pure
+    /// decision: unresolved generations retry, but at most once per
+    /// [`CLAIM_CAPABILITY_RETRY_INTERVAL`].
+    fn read_due(&self, generation: u64) -> bool {
+        if !inbound_author_gate::refresh_needed(self.resolved_generation, generation) {
+            return false;
+        }
+        match self.last_attempt {
+            Some((attempted, at)) if attempted == generation => {
+                at.elapsed() >= CLAIM_CAPABILITY_RETRY_INTERVAL
+            }
+            _ => true,
+        }
+    }
+
+    async fn resolve(&mut self, rest: &relay::RestClient, generation: u64, context: &str) {
+        if matches!(self.mode, ClaimMode::Off) {
+            self.supported = false;
+            self.resolved_generation = Some(generation);
+            return;
+        }
+        self.last_attempt = Some((generation, tokio::time::Instant::now()));
+        // Bounded like the claim itself: two NIP-11 paths at reqwest's own
+        // 10s each would otherwise stall the first mention after a reconnect
+        // for up to 20s.
+        let read = tokio::time::timeout(CLAIM_TIMEOUT, rest.relay_supports_mention_claim()).await;
+        let outcome = match read {
+            Ok(Ok(supported)) => Ok(supported),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err(format!(
+                "NIP-11 read exceeded {:.0}s",
+                CLAIM_TIMEOUT.as_secs_f64()
+            )),
+        };
+        match outcome {
+            Ok(supported) => {
+                self.supported = supported;
+                self.resolved_generation = Some(generation);
+                // Debug, and only once per connection generation: an operator
+                // running against a relay without the extension must not get a
+                // line per mention.
+                tracing::debug!(
+                    %context,
+                    generation,
+                    supported,
+                    "resolved relay mention-claim capability"
+                );
+            }
+            Err(error) => {
+                self.supported = false;
+                tracing::warn!(
+                    %context,
+                    generation,
+                    %error,
+                    retry_secs = CLAIM_CAPABILITY_RETRY_INTERVAL.as_secs(),
+                    "failed to read relay claim capability — not claiming mentions until a \
+                     later read succeeds; every runtime sharing this agent key may answer"
+                );
+            }
+        }
+    }
+}
+
+/// Claim an admitted mention, then admit it into the queue.
+///
+/// The whole drop decision for one mention lives here, between the author
+/// gate and the queue: [`ClaimOutcome::Lost`] returns `None` and the mention
+/// is dropped *silently* — no queue entry, no 👀 reaction, and (because the
+/// caller has nothing to steer with) no steer/interrupt and no lazy-pool wake.
+/// Every other outcome pushes exactly as a pre-claim build did.
+///
+/// The drop is logged at `info`, not `debug`: it produces no reply and no
+/// reaction, so this line is the only way an operator can tell a claimed-away
+/// mention from an agent that went quiet for a worse reason.
+async fn claim_then_push<F, Fut>(
+    ingress: NormalListenerIngress,
+    session_scope: scope::SessionScope,
+    queue: &mut EventQueue,
+    rest_client: &relay::RestClient,
+    claim: F,
+) -> Option<QueuedNormalListenerEvent>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = ClaimOutcome>,
+{
+    let channel_id = ingress.buzz_event.channel_id;
+    let event_id_hex = ingress.buzz_event.event.id.to_hex();
+    let author_hex = ingress.buzz_event.event.pubkey.to_hex();
+    if claim(event_id_hex.clone()).await == ClaimOutcome::Lost {
+        tracing::info!(
+            channel_id = %channel_id,
+            event_id = %event_id_hex,
+            author = %author_hex,
+            "claim lost — another runtime holds this mention; dropping it"
+        );
+        return None;
+    }
+    let queued = ingress.push(queue, session_scope);
+    // 👀 — immediate "seen" reaction, only if the event was actually queued
+    // (not dropped by DedupMode::Drop). Fire-and-forget: on rare fast-failure
+    // paths the guard's cleanup may race with this add, leaving a cosmetic
+    // stale 👀. Acceptable — see ReactionGuard docs.
+    queued.mark_seen(rest_client);
+    Some(queued)
 }
 
 /// Apply the complete normal-listener author boundary for one relay event.
@@ -2630,6 +2954,10 @@ async fn tokio_main() -> Result<()> {
     let relay_rest_client = relay.rest_client();
     let mut author_gate_ctx =
         InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
+    // Read once per connection generation, on the same boundary as the relay
+    // identity above — never per mention.
+    let mut claim_capability =
+        ClaimCapability::connect(config.claim_mode, &relay_rest_client).await;
 
     relay
         .subscribe_membership_notifications()
@@ -2777,6 +3105,9 @@ async fn tokio_main() -> Result<()> {
     }
 
     let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
+    // Generated once, here, for the life of the process. See
+    // `resolve_claim_nonce`: reusing one across runtimes defeats claiming.
+    let claim_nonce = resolve_claim_nonce(Some(runtime_start_nonce.clone()));
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
@@ -3558,13 +3889,38 @@ async fn tokio_main() -> Result<()> {
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let queued = ingress.push(&mut queue, session_scope);
-                            // 👀 — immediate "seen" reaction, only if the event
-                            // was actually queued (not dropped by DedupMode::Drop).
-                            // Fire-and-forget: on rare fast-failure paths the
-                            // guard's cleanup may race with this add, leaving a
-                            // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
-                            queued.mark_seen(&ctx.rest_client);
+                            // Claim the mention on the relay before touching
+                            // it. A lost claim means another runtime sharing
+                            // this agent key already took it: drop silently —
+                            // no queue entry, no 👀, no steer, no pool wake.
+                            let claim_supported = claim_capability
+                                .supported_for(
+                                    &ctx.rest_client,
+                                    ingress.buzz_event.connection_generation,
+                                )
+                                .await;
+                            let claim_rest: &relay::RestClient = &ctx.rest_client;
+                            let claim_nonce: &str = &claim_nonce;
+                            let Some(queued) = claim_then_push(
+                                ingress,
+                                session_scope,
+                                &mut queue,
+                                claim_rest,
+                                |event_id| async move {
+                                    claim_mention(
+                                        claim_rest,
+                                        claim_supported,
+                                        claim_nonce,
+                                        &event_id,
+                                        CLAIM_TIMEOUT,
+                                    )
+                                    .await
+                                },
+                            )
+                            .await
+                            else {
+                                continue;
+                            };
                             // Event is already queued. The authorized ingress
                             // retains its verified author, resolved scope, and
                             // event data through the optional steer/interrupt
@@ -9072,6 +9428,7 @@ mod build_mcp_servers_tests {
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
+            claim_mode: config::ClaimMode::Auto,
             session_policy: scope::SessionPolicy::Channel,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
@@ -9298,6 +9655,7 @@ mod error_outcome_emission_tests {
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
+            claim_mode: config::ClaimMode::Auto,
             session_policy: scope::SessionPolicy::Channel,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
@@ -11246,5 +11604,510 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A short timeout so the "relay never answers" case does not cost the
+    /// suite three real seconds. Production uses [`CLAIM_TIMEOUT`].
+    const TEST_TIMEOUT: Duration = Duration::from_millis(250);
+
+    /// What the fake relay bridge does with each request it receives.
+    #[derive(Clone)]
+    enum BridgeReply {
+        /// HTTP 200 carrying this JSON body.
+        Body(serde_json::Value),
+        /// This HTTP status, empty body.
+        Status(u16),
+        /// Accept the connection and never answer — the timeout case.
+        Silent,
+        /// `first` for the first `first_count` requests, then `rest` — a relay
+        /// whose HTTP side comes up after the runtime has already connected.
+        ScriptedThen {
+            first: Box<BridgeReply>,
+            rest: Box<BridgeReply>,
+            first_count: usize,
+        },
+    }
+
+    impl BridgeReply {
+        /// The reply for request number `seen` (1-based).
+        fn for_request(&self, seen: usize) -> BridgeReply {
+            match self {
+                BridgeReply::ScriptedThen {
+                    first,
+                    rest,
+                    first_count,
+                } => {
+                    if seen <= *first_count {
+                        first.as_ref().clone()
+                    } else {
+                        rest.as_ref().clone()
+                    }
+                }
+                other => other.clone(),
+            }
+        }
+    }
+
+    /// A loopback HTTP server that counts every request it receives.
+    ///
+    /// The counter is the falsifiable half of these tests: a build that
+    /// skipped the claim, or issued one when it must not, moves it.
+    async fn fake_bridge(
+        reply: BridgeReply,
+    ) -> (
+        relay::RestClient,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind claim test bridge");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = server_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                let reply = reply.for_request(seen);
+                tokio::spawn(async move {
+                    let mut request = vec![0; 16384];
+                    let _ = socket.read(&mut request).await;
+                    let response = match reply {
+                        BridgeReply::Body(body) => {
+                            let body = body.to_string();
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                        }
+                        BridgeReply::Status(status) => format!(
+                            "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        ),
+                        BridgeReply::Silent => {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            return;
+                        }
+                        // `for_request` has already collapsed the script.
+                        BridgeReply::ScriptedThen { .. } => return,
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        (rest, requests, server)
+    }
+
+    fn target_id() -> String {
+        EventBuilder::new(Kind::TextNote, "target")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign target")
+            .id
+            .to_hex()
+    }
+
+    /// A NIP-11 document advertising the extension and the claim descriptor.
+    fn nip11_document(extensions: &[&str], claim_kind: Option<u32>) -> serde_json::Value {
+        let mut document = serde_json::json!({
+            "name": "Buzz Relay",
+            "supported_extensions": extensions,
+        });
+        if let Some(kind) = claim_kind {
+            document["claim"] = serde_json::json!({ "kind": kind, "ttl_secs": 600 });
+        }
+        document
+    }
+
+    // ── NIP-11 capability parse ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn capability_is_read_from_the_advertised_extension_and_kind() {
+        let (rest, server) = crate::author_gate_tests::nip11_server(nip11_document(
+            &["nip-er", "buzz-claim"],
+            Some(buzz_core::kind::KIND_AGENT_MENTION_CLAIM),
+        ))
+        .await;
+        assert!(rest
+            .relay_supports_mention_claim()
+            .await
+            .expect("document served"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn capability_is_absent_without_the_extension() {
+        let (rest, server) = crate::author_gate_tests::nip11_server(nip11_document(
+            &["nip-er"],
+            Some(buzz_core::kind::KIND_AGENT_MENTION_CLAIM),
+        ))
+        .await;
+        assert!(
+            !rest
+                .relay_supports_mention_claim()
+                .await
+                .expect("document served"),
+            "the claim descriptor alone must not be read as support — the \
+             relay has to list the extension"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn capability_is_absent_for_a_different_claim_kind() {
+        let (rest, server) = crate::author_gate_tests::nip11_server(nip11_document(
+            &["buzz-claim"],
+            Some(buzz_core::kind::KIND_AGENT_MENTION_CLAIM + 1),
+        ))
+        .await;
+        assert!(
+            !rest
+                .relay_supports_mention_claim()
+                .await
+                .expect("document served"),
+            "claiming at a kind the relay does not arbitrate would look like a \
+             win the relay never decided"
+        );
+        server.abort();
+
+        let (rest, server) =
+            crate::author_gate_tests::nip11_server(nip11_document(&["buzz-claim"], None)).await;
+        assert!(
+            !rest
+                .relay_supports_mention_claim()
+                .await
+                .expect("document served"),
+            "no descriptor means no confirmed kind"
+        );
+        server.abort();
+    }
+
+    // ── claim_mention outcome mapping ─────────────────────────────────────
+
+    async fn claim_against(reply: BridgeReply, timeout: Duration) -> (ClaimOutcome, usize) {
+        let (rest, requests, server) = fake_bridge(reply).await;
+        let outcome = claim_mention(&rest, true, "test-runtime-nonce", &target_id(), timeout).await;
+        let count = requests.load(Ordering::SeqCst);
+        server.abort();
+        (outcome, count)
+    }
+
+    #[tokio::test]
+    async fn accepted_claim_is_won() {
+        let (outcome, requests) = claim_against(
+            BridgeReply::Body(serde_json::json!({
+                "event_id": "00", "accepted": true, "message": ""
+            })),
+            TEST_TIMEOUT,
+        )
+        .await;
+        assert_eq!(outcome, ClaimOutcome::Won);
+        assert_eq!(requests, 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_claim_is_lost() {
+        let (outcome, _) = claim_against(
+            BridgeReply::Body(serde_json::json!({
+                "event_id": "00", "accepted": false, "message": "duplicate: already claimed"
+            })),
+            TEST_TIMEOUT,
+        )
+        .await;
+        assert_eq!(outcome, ClaimOutcome::Lost);
+    }
+
+    #[tokio::test]
+    async fn relay_side_claim_failure_is_errored_not_lost() {
+        for message in ["error: claim unavailable", "invalid: claim needs one e tag"] {
+            let (outcome, _) = claim_against(
+                BridgeReply::Body(serde_json::json!({
+                    "event_id": "00", "accepted": false, "message": message
+                })),
+                TEST_TIMEOUT,
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                ClaimOutcome::Errored,
+                "{message} must fail open — reading it as a loss would mute the \
+                 agent whenever the relay's Redis blips"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_failure_is_errored() {
+        let (outcome, _) = claim_against(BridgeReply::Status(500), TEST_TIMEOUT).await;
+        assert_eq!(outcome, ClaimOutcome::Errored);
+    }
+
+    #[tokio::test]
+    async fn no_answer_within_the_timeout_is_errored() {
+        let started = std::time::Instant::now();
+        let (outcome, _) = claim_against(BridgeReply::Silent, TEST_TIMEOUT).await;
+        assert_eq!(outcome, ClaimOutcome::Errored);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the claim must be bounded by its own timeout, not by the \
+             bridge's retry ladder — took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // ── capability cache ──────────────────────────────────────────────────
+
+    fn supporting_document() -> serde_json::Value {
+        nip11_document(
+            &["buzz-claim"],
+            Some(buzz_core::kind::KIND_AGENT_MENTION_CLAIM),
+        )
+    }
+
+    #[tokio::test]
+    async fn claim_mode_off_never_touches_the_relay() {
+        let (rest, requests, server) = fake_bridge(BridgeReply::Body(supporting_document())).await;
+        let mut capability = ClaimCapability::connect(ClaimMode::Off, &rest).await;
+        assert!(!capability.supported_for(&rest, 0).await);
+        assert!(!capability.supported_for(&rest, 7).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "--claim=off must not read the capability, let alone send a claim"
+        );
+        assert_eq!(
+            claim_mention(&rest, false, "nonce", &target_id(), TEST_TIMEOUT).await,
+            ClaimOutcome::Unsupported
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "an unsupported claim must send nothing"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn capability_is_cached_per_connection_generation() {
+        let (rest, requests, server) = fake_bridge(BridgeReply::Body(supporting_document())).await;
+        let mut capability = ClaimCapability::connect(ClaimMode::Auto, &rest).await;
+        assert!(capability.supported_for(&rest, 0).await);
+        assert!(capability.supported_for(&rest, 0).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the capability must be read once per connection, not per mention"
+        );
+        assert!(capability.supported_for(&rest, 1).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "a reconnect may land on a different relay build — re-evaluate"
+        );
+        server.abort();
+    }
+
+    /// Pretend [`CLAIM_CAPABILITY_RETRY_INTERVAL`] has passed since the last
+    /// read attempt, without sleeping through it.
+    fn rewind_retry_clock(capability: &mut ClaimCapability) {
+        capability.last_attempt = capability
+            .last_attempt
+            .map(|(generation, at)| (generation, at - CLAIM_CAPABILITY_RETRY_INTERVAL));
+    }
+
+    #[tokio::test]
+    async fn unreadable_capability_is_unsupported_and_paced_not_abandoned() {
+        let (rest, requests, server) = fake_bridge(BridgeReply::Status(500)).await;
+        let mut capability = ClaimCapability::connect(ClaimMode::Auto, &rest).await;
+        // Two NIP-11 paths tried by the read inside `connect`.
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+        assert!(
+            !capability.supported_for(&rest, 0).await,
+            "an unread capability must fail open — handle the mention, do not drop it"
+        );
+        assert!(!capability.supported_for(&rest, 0).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "a dead HTTP side must not cost a GET per mention"
+        );
+
+        rewind_retry_clock(&mut capability);
+        assert!(!capability.supported_for(&rest, 0).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            4,
+            "a failed read must be retried once the interval passes — a relay \
+             still warming up must not leave this runtime claim-less for the \
+             whole connection"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_later_successful_read_flips_to_supported_in_the_same_generation() {
+        // The relay's HTTP side is down when the WebSocket connects, then
+        // comes up: the same connection must start claiming.
+        let (rest, requests, server) = fake_bridge(BridgeReply::ScriptedThen {
+            first: Box::new(BridgeReply::Status(500)),
+            rest: Box::new(BridgeReply::Body(supporting_document())),
+            first_count: 2,
+        })
+        .await;
+        let mut capability = ClaimCapability::connect(ClaimMode::Auto, &rest).await;
+        assert!(!capability.supported_for(&rest, 0).await);
+
+        rewind_retry_clock(&mut capability);
+        assert!(
+            capability.supported_for(&rest, 0).await,
+            "the generation was never resolved, so a later read must be allowed \
+             to resolve it"
+        );
+        let after_success = requests.load(Ordering::SeqCst);
+        assert!(capability.supported_for(&rest, 0).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            after_success,
+            "once resolved, the generation is cached again"
+        );
+        server.abort();
+    }
+
+    // ── the drop itself ───────────────────────────────────────────────────
+
+    fn ingress_for(channel_id: Uuid) -> (NormalListenerIngress, scope::SessionScope) {
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "@agent hello")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign mention");
+        let scope = scope::SessionScope::derive(
+            crate::scope::SessionPolicy::Channel,
+            channel_id,
+            false,
+            &event,
+        );
+        let ingress = NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            },
+            effective_author: "00".repeat(32),
+            prompt_tag: String::new(),
+        };
+        (ingress, scope)
+    }
+
+    /// Runs the production claim-then-push seam with a scripted outcome and
+    /// reports what reached the queue and the relay.
+    async fn push_with(outcome: ClaimOutcome) -> (usize, usize) {
+        let (rest, requests, server) = fake_bridge(BridgeReply::Body(serde_json::json!({
+            "event_id": "00", "accepted": true, "message": ""
+        })))
+        .await;
+        let channel_id = Uuid::new_v4();
+        let (ingress, scope) = ingress_for(channel_id);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let queued = claim_then_push(ingress, scope.clone(), &mut queue, &rest, |_| async move {
+            outcome
+        })
+        .await;
+        // The 👀 reaction is fire-and-forget on a spawned task; give it a real
+        // chance to reach the bridge before counting, so "no reaction" is a
+        // measured zero rather than a race we won.
+        for _ in 0..40 {
+            if requests.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let reactions = requests.load(Ordering::SeqCst);
+        assert_eq!(queued.is_some(), outcome != ClaimOutcome::Lost);
+        let depth = queue.queued_event_count(scope);
+        server.abort();
+        (depth, reactions)
+    }
+
+    #[tokio::test]
+    async fn a_lost_claim_drops_the_mention_silently() {
+        let (depth, reactions) = push_with(ClaimOutcome::Lost).await;
+        assert_eq!(depth, 0, "a lost mention must never reach the queue");
+        assert_eq!(
+            reactions, 0,
+            "a lost mention must leave no trace at all — a 👀 from a runtime \
+             that will never answer is exactly the duplicate users see"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_other_outcome_handles_the_mention_as_before() {
+        for outcome in [
+            ClaimOutcome::Won,
+            ClaimOutcome::Errored,
+            ClaimOutcome::Unsupported,
+        ] {
+            let (depth, reactions) = push_with(outcome).await;
+            assert_eq!(depth, 1, "{outcome:?} must queue the mention");
+            assert_eq!(reactions, 1, "{outcome:?} must still mark the mention seen");
+        }
+    }
+
+    // ── nonce ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_random_nonce_is_fresh_per_process() {
+        let first = random_claim_nonce();
+        assert_eq!(first.len(), 32, "128 bits of hex");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            first,
+            random_claim_nonce(),
+            "two runtimes sharing a nonce both win and both answer"
+        );
+    }
+
+    #[test]
+    fn the_managed_start_nonce_is_used_when_it_fits() {
+        let managed = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        assert_eq!(resolve_claim_nonce(Some(managed.into())), managed);
+        assert_eq!(resolve_claim_nonce(Some(format!("  {managed}  "))), managed);
+    }
+
+    #[test]
+    fn an_unusable_managed_nonce_falls_back_to_a_random_one() {
+        for unusable in [
+            String::new(),
+            "   ".to_string(),
+            "z".repeat(buzz_sdk::MENTION_CLAIM_MAX_NONCE_CHARS + 1),
+        ] {
+            let resolved = resolve_claim_nonce(Some(unusable.clone()));
+            assert_eq!(
+                resolved.len(),
+                32,
+                "an over-long or empty launcher nonce must be replaced, never \
+                 truncated: {unusable:?}"
+            );
+            assert!(resolved.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert_eq!(resolve_claim_nonce(None).len(), 32);
     }
 }

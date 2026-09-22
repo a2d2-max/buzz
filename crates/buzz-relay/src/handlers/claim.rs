@@ -31,6 +31,7 @@
 
 use std::sync::Arc;
 
+use buzz_core::kind::{MENTION_CLAIM_LOST_MESSAGE, MENTION_CLAIM_MAX_NONCE_CHARS};
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
 use buzz_pubsub::mention_claim::ClaimAttempt;
@@ -40,9 +41,6 @@ use tracing::warn;
 use crate::connection::ConnectionState;
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
-
-/// Longest accepted `nonce` tag value, in characters.
-const MAX_NONCE_CHARS: usize = 64;
 
 /// The relay's answer to one claim, in transport-neutral form.
 ///
@@ -81,7 +79,7 @@ impl ClaimDecision {
     };
     const LOST: Self = Self {
         accepted: false,
-        message: "duplicate: already claimed",
+        message: MENTION_CLAIM_LOST_MESSAGE,
         reject_reason: None,
         outcome: "lost",
     };
@@ -138,7 +136,7 @@ pub(crate) struct ClaimRequest {
 ///    check happens (the WebSocket door checks it again for every kind).
 /// 2. **Scope** — see [`scopes_allow_claim`].
 /// 3. **Tags** — exactly one `e` tag holding a 64-char lowercase hex event id,
-///    and at most one `nonce` tag of 1..=[`MAX_NONCE_CHARS`] characters.
+///    and at most one `nonce` tag of 1..=[`MENTION_CLAIM_MAX_NONCE_CHARS`] characters.
 ///
 /// Signature verification is deliberately *not* here: it is the expensive
 /// check and belongs after the cheap ones, in [`decide_mention_claim`].
@@ -176,7 +174,9 @@ pub(crate) fn precheck_claim(
 
     let token = match (nonces.next(), nonces.next()) {
         (None, _) => event.id.to_hex(),
-        (Some(value), None) if !value.is_empty() && value.chars().count() <= MAX_NONCE_CHARS => {
+        (Some(value), None)
+            if !value.is_empty() && value.chars().count() <= MENTION_CLAIM_MAX_NONCE_CHARS =>
+        {
             value.to_owned()
         }
         _ => return Err(ClaimDecision::invalid("invalid: bad nonce tag")),
@@ -467,7 +467,7 @@ mod tests {
     fn nonce_of_exactly_sixty_four_chars_is_accepted() {
         let signer = Keys::generate();
         let target = event_id_hex();
-        let nonce = "n".repeat(MAX_NONCE_CHARS);
+        let nonce = "n".repeat(MENTION_CLAIM_MAX_NONCE_CHARS);
         let event = claim_event_signed_by(&signer, vec![e_tag(&target), nonce_tag(&nonce)]);
         let request = precheck_claim(&event, &signer.public_key(), &[]).expect("64-char nonce");
         assert_eq!(request.token, nonce);

@@ -219,6 +219,10 @@ buzz-acp --agents 2 --heartbeat-interval 300 \
 
 All N agents authenticate as the **same Nostr bot identity** — users see one bot regardless of how many agents are running. The same channel is never processed by two agents simultaneously (the queue enforces this). Cross-channel message ordering is not guaranteed when N>1.
 
+### Mention Claims
+
+`--claim` / `BUZZ_ACP_CLAIM` (`auto` by default, `off` to disable) controls what happens when the *same agent key* is running in more than one place — a laptop, a server, a phone. All of them see the same @mention, so without arbitration all of them answer it. On `auto` the harness sends a kind:24250 claim for the mention to the relay (over `POST /events`) and only handles the mention if the relay says it won; a mention it lost is dropped completely — no reply, no 👀, no steer or interrupt, no lazy-pool wake. Claiming happens only when the relay advertises the `buzz-claim` extension in its NIP-11 document, which is read once per connection (and re-read on reconnect), never per mention; against a relay that does not advertise it, the harness behaves exactly as it did before. A claim that cannot be decided — transport failure, a 3-second timeout, or a relay-side error — **fails open**: the mention is handled, because a relay blip must not mute the agent. Each process identifies itself to the relay with a per-process nonce taken from `BUZZ_MANAGED_AGENT_START_NONCE`, or 32 random hex characters generated at startup when that is unset or too long. Never set it to a hostname, an agent name, or any other value two processes could share: two runtimes with the same key *and* the same nonce are indistinguishable to the relay, so both are told the mention is theirs and both answer.
+
 ### Heartbeat Semantics
 
 When `--heartbeat-interval` is set, the harness fires a prompt on an idle agent at the configured interval. Heartbeat rules:
