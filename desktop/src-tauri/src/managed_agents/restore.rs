@@ -27,6 +27,71 @@ enum SpawnOutcome {
 }
 type AgentSpawnResult = (String, SpawnOutcome);
 
+/// Claim one slot from launch restore's shared Phase B budget.
+///
+/// Phase B spawns in parallel and does NOT insert into the runtimes map until
+/// Phase C, so `enforce_runtime_cap` — which reads that map — returns the same
+/// answer to every thread in the batch. Without this atomic claim, N threads
+/// each see "one slot free" and N children start. `fetch_update` returning
+/// `None` at zero is what makes the claim saturate instead of wrapping.
+///
+/// Returns `true` when a slot was taken.
+pub(super) fn claim_spawn_slot(budget: &std::sync::atomic::AtomicUsize) -> bool {
+    budget
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok()
+}
+
+/// Hand a claimed slot back after a spawn that never started a process, so one
+/// failed agent does not refuse a later one that would have fit.
+pub(super) fn release_spawn_slot(budget: &std::sync::atomic::AtomicUsize) {
+    budget.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Pick the auto-start agents launch restore should respawn, bounded by the
+/// live-runtime cap.
+///
+/// An agent is a candidate when it is a local auto-start agent whose pair is
+/// neither tracked-and-alive in this process (`live_pubkeys`) nor still
+/// running under its recorded `runtime_pid` from a previous launch
+/// (`pid_is_running`) — both of those are already serving and must not be
+/// terminate-and-respawned.
+///
+/// The cap then truncates the list to `cap - live_count` agents. Restore runs
+/// before any user interaction, so an over-budget launch would otherwise fill
+/// the whole ceiling with whatever order the store happened to be in and leave
+/// nothing for the pairs the user actually asks for. Order is the store order,
+/// so the choice is stable across relaunches rather than random.
+///
+/// Pure (no `AppHandle`, no locks) so the cap arithmetic is unit-testable;
+/// liveness is injected by the caller.
+fn plan_restore_candidates(
+    records: &[super::ManagedAgentRecord],
+    live_pubkeys: &std::collections::HashSet<String>,
+    pid_is_running: &dyn Fn(u32) -> bool,
+    live_count: usize,
+    cap: usize,
+) -> Vec<super::ManagedAgentRecord> {
+    // `saturating_sub`: a cap already met (or exceeded) restores nothing
+    // instead of underflowing into an unbounded budget.
+    let budget = cap.saturating_sub(live_count);
+    if budget == 0 {
+        return Vec::new();
+    }
+    records
+        .iter()
+        .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
+        .filter(|record| !live_pubkeys.contains(&record.pubkey))
+        .filter(|record| !record.runtime_pid.is_some_and(pid_is_running))
+        .take(budget)
+        .cloned()
+        .collect()
+}
+
 /// Backfill the pinned persona snapshot for pre-existing agents created before
 /// the record became the spawn source of truth. Runs once at launch, before
 /// `restore_managed_agents_on_launch` spawns anything, so no agent boots from an
@@ -171,33 +236,23 @@ pub async fn restore_managed_agents_on_launch(
         // replacing the three separate kernel enumerations.
         super::sweep_untracked_bundle_harnesses(&tracked_pids);
 
-        let candidates: Vec<String> = records
-            .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
-            .map(|record| record.pubkey.clone())
-            .collect();
-
-        let mut to_start = Vec::new();
-        for pubkey in &candidates {
-            if let Some(runtime) = runtimes
-                .iter_mut()
-                .find(|(key, _)| key.pubkey == *pubkey)
-                .map(|(_, runtime)| runtime)
-            {
-                if runtime.child.try_wait().ok().flatten().is_none() {
-                    continue;
-                }
-            }
-            if let Some(record) = records.iter().find(|r| r.pubkey == *pubkey) {
-                if let Some(pid) = record.runtime_pid {
-                    if super::process_is_running(pid) {
-                        continue;
-                    }
-                }
-                to_start.push(record.clone());
-            }
-        }
-        agents_to_start = to_start;
+        // Pairs already alive in this process' runtime map. They keep running
+        // and are not restored again, but they DO occupy cap slots — counted
+        // as PAIRS (one agent can hold several), while the skip test is per
+        // agent, matching the one-pair-per-agent shape restore spawns.
+        let live_keys = super::runtime_commands::live_runtime_keys(&mut runtimes);
+        let live_pubkeys: std::collections::HashSet<String> =
+            live_keys.iter().map(|key| key.pubkey.clone()).collect();
+        let cap = super::load_global_agent_config(app)
+            .unwrap_or_default()
+            .effective_max_live_runtimes();
+        agents_to_start = plan_restore_candidates(
+            &records,
+            &live_pubkeys,
+            &|pid| super::process_is_running(pid),
+            live_keys.len(),
+            cap,
+        );
 
         // Re-snapshot persona config for agents about to be restored, matching
         // the interactive spawn path so auto-start agents also pick up the
@@ -295,6 +350,25 @@ pub async fn restore_managed_agents_on_launch(
     }
 
     // ── Phase B (transition lock held): resolve commands and spawn in parallel ──
+    //
+    // Phase A already budgeted `agents_to_start` against the cap, but Phase B
+    // bypasses `start_pair` and its cap check, and a concurrent startup
+    // reconcile can have filled slots during the Phase A → B window. Re-read
+    // the cap and the live count now (under the transition lock) and hand the
+    // spawn threads a shared budget: each thread claims a slot before spawning
+    // or reports the refusal, so N parallel threads cannot each believe they
+    // hold the last slot.
+    let cap = super::runtime_commands::configured_runtime_cap(app);
+    let (live_now, remaining) = {
+        let mut runtimes = state
+            .managed_agent_processes
+            .lock()
+            .map_err(|error| error.to_string())?;
+        super::runtime_commands::remaining_runtime_slots(&mut runtimes, cap)
+    };
+    let spawn_budget = std::sync::atomic::AtomicUsize::new(remaining);
+    let budget = &spawn_budget;
+
     let spawn_results: Vec<AgentSpawnResult> = std::thread::scope(|scope| {
         let owner_hex_ref = owner_hex.as_deref();
         let handles: Vec<_> = agents_to_start
@@ -316,41 +390,86 @@ pub async fn restore_managed_agents_on_launch(
                                 // tracked a live child for this exact pair during
                                 // the Phase A window, leave it alone. Mirrors the
                                 // live-child guard in `start_pair`.
-                                let already_live = app
+                                // One lock acquisition answers both questions:
+                                // is this exact pair already live (leave it
+                                // alone), and does the cap still admit a new
+                                // one? The cap re-check matters because a
+                                // concurrent startup reconcile can fill slots
+                                // during the Phase A → B window.
+                                let (already_live, cap_refusal) = match app
                                     .state::<AppState>()
                                     .managed_agent_processes
                                     .lock()
-                                    .ok()
-                                    .and_then(|mut runtimes| {
-                                        runtimes.get_mut(&key).map(|runtime| {
-                                            runtime.child.try_wait().ok().flatten().is_none()
-                                        })
-                                    })
-                                    .unwrap_or(false);
+                                {
+                                    Ok(mut runtimes) => {
+                                        let already_live = runtimes
+                                            .get_mut(&key)
+                                            .map(|runtime| {
+                                                runtime.child.try_wait().ok().flatten().is_none()
+                                            })
+                                            .unwrap_or(false);
+                                        let refusal = super::runtime_commands::enforce_runtime_cap(
+                                            &mut runtimes,
+                                            &key,
+                                            cap,
+                                        );
+                                        (already_live, refusal)
+                                    }
+                                    Err(error) => (false, Err(error.to_string())),
+                                };
                                 if already_live {
                                     SpawnOutcome::Skipped
                                 } else {
-                                    match super::terminate_untracked_pair_runtime(app, &key)
-                                        .and_then(|()| {
-                                            // F1: restore spawns lazy, matching
-                                            // reconcile and manual start. Eager on
-                                            // restore buys nothing — a crashed
-                                            // mid-turn session is not resumed by an
-                                            // eager child — and silently reintroduces
-                                            // N idle brains on every launch.
-                                            spawn_agent_child(
-                                                app,
-                                                record,
-                                                &key.relay_url,
-                                                true,
-                                                owner_hex_ref,
-                                                None,
-                                            )
-                                        }) {
-                                        Ok(process) => {
-                                            SpawnOutcome::Spawned(key, Box::new(process))
+                                    match cap_refusal.and_then(|cap_checked| {
+                                        // `enforce_runtime_cap` reads the live
+                                        // map, which does not grow until Phase
+                                        // C — so WITHIN this batch the shared
+                                        // atomic is what stops N parallel
+                                        // threads from each believing they
+                                        // hold the last slot. Both are needed.
+                                        claim_spawn_slot(budget).then_some(cap_checked).ok_or_else(
+                                            || {
+                                                super::runtime_commands::runtime_cap_error(
+                                                    live_now, cap,
+                                                )
+                                            },
+                                        )
+                                    }) {
+                                        // Refusal (either gate) is persisted to
+                                        // `last_error` by Phase C.
+                                        Err(refusal) => SpawnOutcome::Failed(refusal),
+                                        Ok(cap_checked) => {
+                                            match super::terminate_untracked_pair_runtime(app, &key)
+                                                .and_then(|()| {
+                                                    // F1: restore spawns lazy, matching
+                                                    // reconcile and manual start. Eager on
+                                                    // restore buys nothing — a crashed
+                                                    // mid-turn session is not resumed by an
+                                                    // eager child — and silently reintroduces
+                                                    // N idle brains on every launch.
+                                                    spawn_agent_child(
+                                                        app,
+                                                        record,
+                                                        &key.relay_url,
+                                                        true,
+                                                        owner_hex_ref,
+                                                        None,
+                                                        cap_checked,
+                                                    )
+                                                }) {
+                                                Ok(process) => {
+                                                    SpawnOutcome::Spawned(key, Box::new(process))
+                                                }
+                                                Err(error) => {
+                                                    // The slot claimed above was never
+                                                    // filled — hand it back so one
+                                                    // failed spawn does not refuse a
+                                                    // later agent that would fit.
+                                                    release_spawn_slot(budget);
+                                                    SpawnOutcome::Failed(error)
+                                                }
+                                            }
                                         }
-                                        Err(error) => SpawnOutcome::Failed(error),
                                     }
                                 }
                             }
@@ -542,6 +661,91 @@ pub(crate) fn spawn_pending_profile_reconciliations(app: &tauri::AppHandle, work
                 ),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod restore_candidate_tests {
+    use super::plan_restore_candidates;
+    use std::collections::HashSet;
+
+    fn record(index: usize, autostart: bool) -> super::super::ManagedAgentRecord {
+        let mut record: super::super::ManagedAgentRecord = serde_json::from_str(&format!(
+            r#"{{
+                "pubkey": "{:064x}",
+                "name": "agent-{index}",
+                "relay_url": "",
+                "acp_command": "buzz-acp",
+                "agent_command": "goose",
+                "agent_args": [],
+                "mcp_command": "",
+                "turn_timeout_seconds": 320,
+                "system_prompt": "",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            }}"#,
+            index + 1
+        ))
+        .unwrap();
+        record.start_on_app_launch = autostart;
+        record
+    }
+
+    fn never_running(_pid: u32) -> bool {
+        false
+    }
+
+    #[test]
+    fn restore_never_exceeds_the_remaining_cap_budget() {
+        // Launch restore runs before the user can ask for anything, so an
+        // unbounded restore would fill the whole ceiling with store order.
+        let records: Vec<_> = (0..26).map(|i| record(i, true)).collect();
+
+        let picked = plan_restore_candidates(&records, &HashSet::new(), &never_running, 0, 8);
+        assert_eq!(picked.len(), 8);
+        // Stable, not random: the first 8 in store order.
+        assert_eq!(picked[0].pubkey, records[0].pubkey);
+        assert_eq!(picked[7].pubkey, records[7].pubkey);
+    }
+
+    #[test]
+    fn live_pairs_spend_the_budget_and_are_not_restored_again() {
+        let records: Vec<_> = (0..26).map(|i| record(i, true)).collect();
+        let live: HashSet<String> = records[..3]
+            .iter()
+            .map(|record| record.pubkey.clone())
+            .collect();
+
+        let picked = plan_restore_candidates(&records, &live, &never_running, live.len(), 8);
+
+        assert_eq!(picked.len(), 5, "cap 8 minus the 3 already live");
+        assert!(
+            picked.iter().all(|record| !live.contains(&record.pubkey)),
+            "a live pair is never terminate-and-respawned"
+        );
+    }
+
+    #[test]
+    fn a_met_or_exceeded_cap_restores_nothing() {
+        let records: Vec<_> = (0..26).map(|i| record(i, true)).collect();
+        assert!(
+            plan_restore_candidates(&records, &HashSet::new(), &never_running, 8, 8).is_empty()
+        );
+        // cap < live_count: saturating, never a panic or an unbounded budget.
+        assert!(
+            plan_restore_candidates(&records, &HashSet::new(), &never_running, 9, 8).is_empty()
+        );
+    }
+
+    #[test]
+    fn manual_start_agents_and_still_running_pids_are_left_alone() {
+        let mut records = vec![record(0, false), record(1, true), record(2, true)];
+        records[2].runtime_pid = Some(4242);
+
+        let picked = plan_restore_candidates(&records, &HashSet::new(), &|pid| pid == 4242, 0, 8);
+
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].pubkey, records[1].pubkey);
     }
 }
 

@@ -19,6 +19,8 @@ const EMPTY_CONFIG: GlobalAgentConfig = {
   provider: null,
   model: null,
   preferred_runtime: null,
+  // Mirrors the Rust `DEFAULT_MAX_LIVE_RUNTIMES`.
+  max_live_runtimes: 8,
 };
 
 export const globalAgentConfigQueryKey = ["globalAgentConfig"] as const;

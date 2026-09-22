@@ -46,6 +46,9 @@ mod repos;
 mod restore;
 pub mod retention;
 mod runtime;
+#[cfg(all(test, unix))]
+#[path = "runtime_cap_tests.rs"]
+mod runtime_cap_tests;
 mod runtime_commands;
 mod runtime_types;
 mod session_policy;
@@ -55,6 +58,8 @@ pub(crate) mod storage;
 pub(crate) mod team_catalog;
 pub(crate) mod team_events;
 mod team_repair;
+#[cfg(test)]
+pub(crate) mod test_env;
 pub(crate) use team_repair::team_persona_key;
 mod teams;
 mod types;

@@ -69,6 +69,9 @@ export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
   provider: null,
   model: null,
   preferred_runtime: null,
+  // Mirrors the Rust `DEFAULT_MAX_LIVE_RUNTIMES`. No field edits it here; it
+  // is carried so a save round-trips the stored value instead of clearing it.
+  max_live_runtimes: 8,
 };
 
 const BAKED_STRUCTURED_KEYS = new Set([

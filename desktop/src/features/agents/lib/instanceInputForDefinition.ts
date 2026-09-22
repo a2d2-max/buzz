@@ -155,7 +155,10 @@ export async function buildInstanceInputForDefinition(
     model: persona.model ?? undefined,
     provider: persona.provider ?? undefined,
     spawnAfterCreate: true,
-    startOnAppLaunch: true,
+    // Auto-start fans one live buzz-acp pair out per (agent x community), so a
+    // newly minted agent does NOT opt into it. Mirrors the Rust
+    // `default_start_on_app_launch` = false; the user turns it on per agent.
+    startOnAppLaunch: false,
     backend: { type: "local" },
   };
 }

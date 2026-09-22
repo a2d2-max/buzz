@@ -296,6 +296,12 @@ export type ManagedAgentRuntimeStatus = {
   lifecycle: ManagedAgentRuntimeLifecycle;
   pid: number | null;
   error: string | null;
+  /**
+   * Machine-readable discriminator for `error`, present only where a caller
+   * must treat a `failed` row differently from a relay/spawn fault. Currently
+   * only `RUNTIME_CAP_ERROR_CODE` (see managedAgentReconciliationPlan.ts).
+   */
+  errorCode?: string;
   logPath: string | null;
 };
 
@@ -1071,6 +1077,14 @@ export type GlobalAgentConfig = {
   model: string | null;
   /** Preferred ACP runtime for agents without a persona-specific runtime. */
   preferred_runtime: string | null;
+  /**
+   * Ceiling on simultaneously live buzz-acp pair runtimes, across all agents
+   * and all communities. Declared here so the defaults editor's
+   * `{ ...config }` save round-trips the stored value instead of dropping it
+   * back to the Rust default. No UI field edits it yet — it is set in
+   * `agents/global-agent-config.json`.
+   */
+  max_live_runtimes: number;
 };
 
 /**

@@ -91,8 +91,22 @@ pub struct ManagedAgentRuntimeStatus {
     pub lifecycle: ManagedAgentRuntimeLifecycle,
     pub pid: Option<u32>,
     pub error: Option<String>,
+    /// Machine-readable discriminator for `error`, set only where a caller must
+    /// treat a `Failed` row differently from a relay or spawn failure.
+    ///
+    /// Currently only [`RUNTIME_CAP_ERROR_CODE`]. The frontend's reconcile
+    /// retry ladder keys off this: a cap refusal is a steady state, not a
+    /// transient relay fault, so retrying it just re-emits the same rows
+    /// forever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'static str>,
     pub log_path: Option<String>,
 }
+
+/// `ManagedAgentRuntimeStatus.error_code` for a pair the live-runtime cap
+/// refused. Mirrored in TypeScript by `RUNTIME_CAP_ERROR_CODE` in
+/// `desktop/src/features/agents/managedAgentReconciliationPlan.ts`.
+pub const RUNTIME_CAP_ERROR_CODE: &str = "runtime_cap";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,4 +131,30 @@ pub struct ManagedAgentRuntimeReceipt {
     pub pid: u32,
     pub desktop_instance_id: String,
     pub started_at: String,
+}
+
+/// Test-only fixture: a `ManagedAgentPairRuntime` wrapping a real, genuinely
+/// running child process.
+///
+/// The cap counts LIVE pairs, and "live" is decided by polling the child
+/// (`try_wait`), so a fixture holding an already-exited or fake process would
+/// let every cap test pass vacuously. The child is a long `sleep`; callers
+/// should `kill()` it when the assertion is done.
+#[cfg(all(test, unix))]
+pub(crate) fn live_pair_runtime_fixture() -> ManagedAgentPairRuntime {
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the fixture needs a real live child to count as a live pair");
+    ManagedAgentPairRuntime::starting(ManagedAgentProcess {
+        child,
+        log_path: std::path::PathBuf::from("/dev/null"),
+        spawn_config: Default::default(),
+        setup_mode: false,
+        adapter_availability: None,
+        start_nonce: "test-generation".to_string(),
+    })
 }
