@@ -333,9 +333,9 @@
       "upstream_commit": "b4c8548c09da21b2898443559a5b846f0ccf5dd8"
     },
     "plane": {
-      "accepted_archive_sha256": "b2b7db29f0e025d51a0ef40ab1d09939d37e347925f462a5b08523f47041f5cf",
+      "accepted_archive_sha256": "bfb0dd02049472d0c22aa719b692cb67516ce3d2cf217c472b9fe5c4710c1ef1",
       "accepted_base_image": "python:3.12.12-alpine@sha256:2d91681153dd4b8cdb52d4fd34a17b9edbafa4dd3086143cfd4b6c3a84c1acb0",
-      "accepted_image_id": "sha256:b91e11aab99c577211f79df0e0becbb641ea6e543c24405f64cb5cfc0534df86",
+      "accepted_image_id": "sha256:686a7d24e385aebbc3161f1f487fd6a3f915431de18b588e5c0bf7c6a19719f2",
       "accepted_platform": "amd64/linux",
       "accepted_scope": "apps/api Docker context excluding local env/venv/cache/log/generated static",
       "accepted_source_manifest_sha256": "e0ea69e6c4f0245472c4b63537fe5473eb2df98147fbdddb22fb4bf12dd5a5e4",
