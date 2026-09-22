@@ -1,973 +1,3 @@
-diff --git a/packages/backend/server/schema.prisma b/packages/backend/server/schema.prisma
-index 54c72e0..17dd3cd 100644
---- a/packages/backend/server/schema.prisma
-+++ b/packages/backend/server/schema.prisma
-@@ -53,6 +53,7 @@ model User {
-   workspaceMemberLastAccesses WorkspaceMemberLastAccess[]
-   quotaState                  EffectiveUserQuotaState?
-   ownedQuotaStates            EffectiveWorkspaceQuotaState[]
-+  a2d2PrincipalBinding        A2d2PrincipalBinding?
- 
-   @@index([email])
-   @@map("users")
-@@ -209,12 +210,45 @@ model Workspace {
-   docGrants                  DocGrant[]
-   mcpCredentials             McpCredential[]
-   artifacts                  WorkspaceArtifact[]
-+  a2d2CommunityBinding       A2d2CommunityBinding?
- 
-   @@index([lastCheckEmbeddings])
-   @@index([createdAt])
-   @@map("workspaces")
- }
- 
-+model A2d2CommunityBinding {
-+  communityId String   @id @map("community_id") @db.VarChar
-+  workspaceId String   @unique @map("workspace_id") @db.VarChar
-+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
-+
-+  workspace  Workspace              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-+  principals A2d2PrincipalBinding[]
-+
-+  @@unique([communityId, workspaceId])
-+  @@map("a2d2_community_bindings")
-+}
-+
-+model A2d2PrincipalBinding {
-+  communityId  String   @map("community_id") @db.VarChar
-+  workspaceId  String   @map("workspace_id") @db.VarChar
-+  pubkey       String   @db.Char(64)
-+  principalKey String   @unique @map("principal_key") @db.VarChar
-+  userId       String   @unique @map("user_id") @db.VarChar
-+  role         String   @db.Text
-+  active       Boolean  @default(true)
-+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
-+
-+  community A2d2CommunityBinding @relation(fields: [communityId, workspaceId], references: [communityId, workspaceId], onDelete: Cascade)
-+  user      User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
-+
-+  @@id([communityId, pubkey])
-+  @@index([communityId, workspaceId, active])
-+  @@map("a2d2_principal_bindings")
-+}
-+
- model Entitlement {
-   id            String    @id @default(uuid()) @db.VarChar
-   targetType    String    @map("target_type") @db.Text
-diff --git a/packages/backend/server/src/base/config/config.ts b/packages/backend/server/src/base/config/config.ts
-index 1f5e1bc..d6f1228 100644
---- a/packages/backend/server/src/base/config/config.ts
-+++ b/packages/backend/server/src/base/config/config.ts
-@@ -1,3 +1,3 @@
--import { ApplyType } from '../utils';
-+import { ApplyType } from '../utils/types';
- 
- export class Config extends ApplyType<AppConfig>() {}
-diff --git a/packages/backend/server/src/base/websocket/adapter.ts b/packages/backend/server/src/base/websocket/adapter.ts
-index fed2369..ef8fa25 100644
---- a/packages/backend/server/src/base/websocket/adapter.ts
-+++ b/packages/backend/server/src/base/websocket/adapter.ts
-@@ -25,6 +25,7 @@ export class SocketIoAdapter extends IoAdapter {
-     const logger = this.app.get(AFFiNELogger);
-     const config = this.app.get(WEBSOCKET_OPTIONS) as Config['websocket'] & {
-       canActivate: (socket: Socket) => Promise<boolean>;
-+      canActivatePacket?: (socket: Socket) => Promise<boolean>;
-     };
-     const url = this.app.get(URLHelper);
-     const allowedOrigins = buildCorsAllowedOrigins(url);
-@@ -70,6 +71,27 @@ export class SocketIoAdapter extends IoAdapter {
-       });
-     }
- 
-+    if (config.canActivatePacket) {
-+      server.on('connection', socket => {
-+        socket.use((_event, next) => {
-+          config
-+            .canActivatePacket?.(socket)
-+            .then(pass => {
-+              if (pass) {
-+                next();
-+                return;
-+              }
-+              socket.disconnect(true);
-+              next(new AuthenticationRequired());
-+            })
-+            .catch(error => {
-+              socket.disconnect(true);
-+              next(error);
-+            });
-+        });
-+      });
-+    }
-+
-     const pubClient = this.app.get(SocketIoRedis);
-     const subClient = pubClient.duplicate();
- 
-diff --git a/packages/backend/server/src/core/auth/controller.ts b/packages/backend/server/src/core/auth/controller.ts
-index 4c9aac4..39521ce 100644
---- a/packages/backend/server/src/core/auth/controller.ts
-+++ b/packages/backend/server/src/core/auth/controller.ts
-@@ -30,6 +30,7 @@ import {
- import { Models } from '../../models';
- import { validators } from '../utils/validators';
- import { getAbuseRequestSource } from '../workspaces/abuse';
-+import { A2d2ManagedAuthService } from './a2d2/service';
- import { AuthSessionService } from './auth-session';
- import { Public } from './guard';
- import {
-@@ -76,7 +77,8 @@ export class AuthController {
-     private readonly sessionExchange: SessionExchangeService,
-     private readonly authSessions: AuthSessionService,
-     private readonly models: Models,
--    private readonly config: Config
-+    private readonly config: Config,
-+    private readonly a2d2: A2d2ManagedAuthService
-   ) {
-     if (env.dev) {
-       // set DNS servers in dev mode
-@@ -199,6 +201,17 @@ export class AuthController {
-       return;
-     }
- 
-+    if (req.authType === 'a2d2') {
-+      const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
-+      const csrfHeader = req.get('x-affine-csrf-token');
-+      if (!csrfHeader || !csrfCookie || csrfCookie !== csrfHeader) {
-+        throw new ActionForbidden();
-+      }
-+      await this.a2d2.signOut(req, res);
-+      res.status(HttpStatus.OK).send({});
-+      return;
-+    }
-+
-     const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
-     const csrfHeader = req.get('x-affine-csrf-token');
-     if (!csrfHeader || !csrfCookie || csrfCookie !== csrfHeader) {
-@@ -361,7 +374,7 @@ export class AuthController {
-     if (req.authType === 'jwt') {
-       const principal = session as Partial<AuthSessionPrincipal> | undefined;
-       if (principal?.authSessionId) return;
--    } else if (req.authType === 'session') {
-+    } else if (req.authType === 'session' || req.authType === 'a2d2') {
-       const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
-       const csrfHeader = req.get('x-affine-csrf-token');
-       if (csrfHeader && csrfCookie && csrfCookie === csrfHeader) return;
-diff --git a/packages/backend/server/src/core/auth/guard.ts b/packages/backend/server/src/core/auth/guard.ts
-index 47095c5..d7e87d7 100644
---- a/packages/backend/server/src/core/auth/guard.ts
-+++ b/packages/backend/server/src/core/auth/guard.ts
-@@ -23,6 +23,7 @@ import {
-   UnsupportedClientVersion,
- } from '../../base';
- import { WEBSOCKET_OPTIONS } from '../../base/websocket';
-+import { A2d2ManagedAuthService } from './a2d2/service';
- import { AccessTokenService, SessionAccessTokenError } from './access-token';
- import { AuthSessionService } from './auth-session';
- import { extractTokenFromHeader } from './input';
-@@ -45,6 +46,7 @@ export class AuthGuard implements CanActivate, OnModuleInit {
-   private auth!: AuthService;
-   private accessTokens!: AccessTokenService;
-   private authSessions!: AuthSessionService;
-+  private a2d2!: A2d2ManagedAuthService;
-   private readonly cachedVersionRange = new Map<string, semver.Range | null>();
-   private static readonly HARD_REQUIRED_VERSION = '>=0.25.0';
-   private static readonly CANARY_REQUIRED_VERSION = 'canary (within 2 months)';
-@@ -61,6 +63,15 @@ export class AuthGuard implements CanActivate, OnModuleInit {
-     this.auth = this.ref.get(AuthService, { strict: false });
-     this.accessTokens = this.ref.get(AccessTokenService, { strict: false });
-     this.authSessions = this.ref.get(AuthSessionService, { strict: false });
-+    this.a2d2 = this.ref.get(A2d2ManagedAuthService, { strict: false });
-+  }
-+
-+  get managedAuthEnabled() {
-+    return this.a2d2.enabled;
-+  }
-+
-+  async revalidateManagedSocket(req: Request) {
-+    return await this.a2d2.authenticate(req);
-   }
- 
-   async canActivate(context: ExecutionContext) {
-@@ -99,6 +110,8 @@ export class AuthGuard implements CanActivate, OnModuleInit {
-       throw new AccessDenied('Invalid internal request');
-     }
- 
-+    this.a2d2.assertRequestAllowed(req);
-+
-     // api is public
-     const isPublic = this.reflector.getAllAndOverride<boolean>(
-       PUBLIC_ENTRYPOINT_SYMBOL,
-@@ -132,6 +145,11 @@ export class AuthGuard implements CanActivate, OnModuleInit {
-     res?: Response,
-     isPublic = false
-   ): Promise<AuthenticatedRequestSession | null> {
-+    if (this.a2d2.enabled) {
-+      if (req.path?.startsWith('/api/a2d2/session/')) return null;
-+      const session = await this.a2d2.authenticate(req, res);
-+      return session ? { type: 'cookie_session', session } : null;
-+    }
-     const bearer = req.headers.authorization
-       ? extractTokenFromHeader(req.headers.authorization)
-       : undefined;
-@@ -358,6 +376,15 @@ export const AuthWebsocketOptionsProvider: FactoryProvider = {
- 
-         return !!session;
-       },
-+      canActivatePacket: async (socket: Socket) => {
-+        if (!guard.managedAuthEnabled) return true;
-+        const upgradeReq = socket.client.request as Request;
-+        try {
-+          return !!(await guard.revalidateManagedSocket(upgradeReq));
-+        } catch {
-+          return false;
-+        }
-+      },
-     };
-   },
-   inject: [Config, AuthGuard],
-diff --git a/packages/backend/server/src/core/auth/index.ts b/packages/backend/server/src/core/auth/index.ts
-index f367229..d6d1f82 100644
---- a/packages/backend/server/src/core/auth/index.ts
-+++ b/packages/backend/server/src/core/auth/index.ts
-@@ -9,6 +9,11 @@ import { MailModule } from '../mail';
- import { QuotaModule } from '../quota';
- import { UserModule } from '../user';
- import { AccessTokenService } from './access-token';
-+import {
-+  A2d2BrokerClient,
-+  A2d2ManagedAuthService,
-+  A2d2SessionController,
-+} from './a2d2';
- import { AuthSessionService } from './auth-session';
- import { AuthChallengeStore } from './challenge-store';
- import { AuthController } from './controller';
-@@ -49,6 +54,8 @@ import { AuthSigningKeyResolver } from './signing-key-resolver';
-     AuthSigningKeyResolver,
-     AuthCronJob,
-     AuthWebsocketOptionsProvider,
-+    A2d2BrokerClient,
-+    A2d2ManagedAuthService,
-   ],
-   exports: [
-     AuthService,
-@@ -63,8 +70,9 @@ import { AuthSigningKeyResolver } from './signing-key-resolver';
-     AuthSessionService,
-     AuthSigningKeyRing,
-     AuthWebsocketOptionsProvider,
-+    A2d2ManagedAuthService,
-   ],
--  controllers: [AuthController],
-+  controllers: [AuthController, A2d2SessionController],
- })
- export class AuthModule {}
- 
-@@ -79,5 +87,6 @@ export { AuthSessionService } from './auth-session';
- export { OpenAppAuthService } from './open-app';
- export { ClientTokenType } from './resolver';
- export { AccessTokenService, AuthService, SessionIssuer };
-+export { A2d2ManagedAuthService } from './a2d2';
- export * from './session';
- export { AuthSigningKeyRing } from './signing-key';
-diff --git a/packages/backend/server/src/core/auth/resolver.ts b/packages/backend/server/src/core/auth/resolver.ts
-index c5bfe84..85fe9d8 100644
---- a/packages/backend/server/src/core/auth/resolver.ts
-+++ b/packages/backend/server/src/core/auth/resolver.ts
-@@ -30,6 +30,7 @@ import type { MailDeliveryMetadata } from '../mail/types';
- import { UserType } from '../user/types';
- import { validators } from '../utils/validators';
- import { getAbuseRequestSource } from '../workspaces/abuse';
-+import { A2d2AuthError } from './a2d2/error';
- import { Public } from './guard';
- import { AuthService } from './service';
- import { CurrentUser } from './session';
-@@ -56,6 +57,12 @@ export class AuthResolver {
-     private readonly config: Config
-   ) {}
- 
-+  private assertVendorAccountMutationAllowed() {
-+    if (this.config.a2d2Auth.enabled) {
-+      throw new A2d2AuthError('scope_or_membership_denied');
-+    }
-+  }
-+
-   private mailMetadata(
-     context: GraphqlContext,
-     expiresAt?: Date
-@@ -85,6 +92,7 @@ export class AuthResolver {
-     @CurrentUser() currentUser: CurrentUser,
-     @Parent() user: UserType
-   ): Promise<ClientTokenType> {
-+    this.assertVendorAccountMutationAllowed();
-     if (user.id !== currentUser.id) {
-       throw new ActionForbidden();
-     }
-@@ -105,6 +113,7 @@ export class AuthResolver {
-     @Args('newPassword') newPassword: string,
-     @Args('userId', { type: () => String, nullable: true }) userId?: string
-   ) {
-+    this.assertVendorAccountMutationAllowed();
-     if (!userId) {
-       throw new LinkExpired();
-     }
-@@ -133,6 +142,7 @@ export class AuthResolver {
-     @Args('token') token: string,
-     @Args('email') email: string
-   ) {
-+    this.assertVendorAccountMutationAllowed();
-     // @see [sendChangeEmail]
-     const valid = await this.models.verificationToken.verify(
-       TokenType.VerifyEmail,
-@@ -166,6 +176,7 @@ export class AuthResolver {
-     _email: string | undefined,
-     @Context() context: GraphqlContext
-   ) {
-+    this.assertVendorAccountMutationAllowed();
-     if (!user.emailVerified) {
-       throw new EmailVerificationRequired();
-     }
-@@ -197,6 +208,7 @@ export class AuthResolver {
-     _email: string | undefined,
-     @Context() context: GraphqlContext
-   ) {
-+    this.assertVendorAccountMutationAllowed();
-     const { token, expiresAt } =
-       await this.models.verificationToken.createWithExpiresAt(
-         TokenType.ChangePassword,
-@@ -225,6 +237,7 @@ export class AuthResolver {
-     @Args('callbackUrl') callbackUrl: string,
-     @Context() context: GraphqlContext
-   ) {
-+    this.assertVendorAccountMutationAllowed();
-     if (!user.emailVerified) {
-       throw new EmailVerificationRequired();
-     }
-@@ -252,6 +265,7 @@ export class AuthResolver {
-     @Args('callbackUrl') callbackUrl: string,
-     @Context() context: GraphqlContext
-   ) {
-+    this.assertVendorAccountMutationAllowed();
-     if (!token) {
-       throw new EmailTokenNotFound();
-     }
-@@ -302,6 +316,7 @@ export class AuthResolver {
-     @Args('callbackUrl') callbackUrl: string,
-     @Context() context: GraphqlContext
-   ) {
-+    this.assertVendorAccountMutationAllowed();
-     const { token, expiresAt } =
-       await this.models.verificationToken.createWithExpiresAt(
-         TokenType.VerifyEmail,
-@@ -322,6 +337,7 @@ export class AuthResolver {
-     @CurrentUser() user: CurrentUser,
-     @Args('token') token: string
-   ) {
-+    this.assertVendorAccountMutationAllowed();
-     if (!token) {
-       throw new EmailTokenNotFound();
-     }
-@@ -351,6 +367,7 @@ export class AuthResolver {
-     @Args('userId') userId: string,
-     @Args('callbackUrl') callbackUrl: string
-   ): Promise<string> {
-+    this.assertVendorAccountMutationAllowed();
-     const token = await this.models.verificationToken.create(
-       TokenType.ChangePassword,
-       userId
-diff --git a/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts b/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
-index 1b7ee0a..57989ad 100644
---- a/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
-+++ b/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
-@@ -880,6 +880,34 @@ test('new realtime providers publish changed events from domain events', t => {
-   );
- });
- 
-+test('managed mode realtime membership snapshot omits vendor invite link', async t => {
-+  const registry = new RealtimeRegistry();
-+  const provider = new WorkspaceMembersRealtimeProvider(
-+    {
-+      get: async () => ({ inviteId: 'vendor-link' }),
-+      ttl: async () => 60,
-+    } as never,
-+    { link: (path: string) => `https://app.affine.pro${path}` } as never,
-+    {
-+      user: () => ({
-+        workspace: () => ({ assert: async () => {} }),
-+      }),
-+    } as never,
-+    {} as never,
-+    registry,
-+    undefined,
-+    { a2d2Auth: { enabled: true } } as never
-+  );
-+  provider.onModuleInit();
-+
-+  t.deepEqual(
-+    await registry
-+      .getRequest('workspace.invite-link.get')
-+      .handle({ id: 'managed-user' } as never, { workspaceId: 'space' }),
-+    { inviteLink: null }
-+  );
-+});
-+
- test('quota realtime provider exposes effective quota state snapshots', async t => {
-   const registry = new RealtimeRegistry();
-   const provider = new QuotaStateRealtimeProvider(
-diff --git a/packages/backend/server/src/core/user/resolver.ts b/packages/backend/server/src/core/user/resolver.ts
-index 7e8c36a..236c565 100644
---- a/packages/backend/server/src/core/user/resolver.ts
-+++ b/packages/backend/server/src/core/user/resolver.ts
-@@ -16,6 +16,7 @@ import { isNil, omitBy } from 'lodash-es';
- 
- import {
-   CannotDeleteOwnAccount,
-+  Config,
-   EventBus,
-   type FileUpload,
-   ImageFormatNotSupported,
-@@ -32,6 +33,7 @@ import {
-   UserSettingsSchema,
- } from '../../models';
- import { processImage } from '../../native';
-+import { A2d2AuthError } from '../auth/a2d2/error';
- import { Public } from '../auth/guard';
- import { sessionUser } from '../auth/service';
- import { CurrentUser } from '../auth/session';
-@@ -50,11 +52,18 @@ import {
-   UserType,
- } from './types';
- 
-+function assertVendorAccountMutationAllowed(config: Config) {
-+  if (config.a2d2Auth.enabled) {
-+    throw new A2d2AuthError('scope_or_membership_denied');
-+  }
-+}
-+
- @Resolver(() => UserType)
- export class UserResolver {
-   constructor(
-     private readonly storage: AvatarStorage,
--    private readonly models: Models
-+    private readonly models: Models,
-+    private readonly config: Config
-   ) {}
- 
-   @Throttle('strict')
-@@ -115,6 +124,7 @@ export class UserResolver {
-     @Args({ name: 'avatar', type: () => GraphQLUpload })
-     avatar: FileUpload
-   ) {
-+    assertVendorAccountMutationAllowed(this.config);
-     if (!user) {
-       throw new UserNotFound();
-     }
-@@ -155,6 +165,7 @@ export class UserResolver {
-     @CurrentUser() user: CurrentUser,
-     @Args('input', { type: () => UpdateUserInput }) input: UpdateUserInput
-   ): Promise<UserType> {
-+    assertVendorAccountMutationAllowed(this.config);
-     input = omitBy(input, isNil);
- 
-     if (Object.keys(input).length === 0) {
-@@ -169,6 +180,7 @@ export class UserResolver {
-     description: 'Remove user avatar',
-   })
-   async removeAvatar(@CurrentUser() user: CurrentUser) {
-+    assertVendorAccountMutationAllowed(this.config);
-     if (!user) {
-       throw new UserNotFound();
-     }
-@@ -180,6 +192,7 @@ export class UserResolver {
-   async deleteAccount(
-     @CurrentUser() user: CurrentUser
-   ): Promise<DeleteAccount> {
-+    assertVendorAccountMutationAllowed(this.config);
-     await this.models.user.delete(user.id);
-     return { success: true };
-   }
-@@ -271,7 +284,8 @@ const UserImportResultType = createUnionType({
- export class UserManagementResolver {
-   constructor(
-     private readonly db: PrismaClient,
--    private readonly models: Models
-+    private readonly models: Models,
-+    private readonly config: Config
-   ) {}
- 
-   @Query(() => Int, {
-@@ -340,8 +354,10 @@ export class UserManagementResolver {
-     description: 'Create a new user',
-   })
-   async createUser(
--    @Args({ name: 'input', type: () => CreateUserInput }) input: CreateUserInput
-+    @Args({ name: 'input', type: () => CreateUserInput })
-+    input: CreateUserInput
-   ) {
-+    assertVendorAccountMutationAllowed(this.config);
-     const { id } = await this.models.user.create({
-       ...input,
-       registered: true,
-@@ -358,6 +374,7 @@ export class UserManagementResolver {
-     @Args({ name: 'input', type: () => ImportUsersInput })
-     input: ImportUsersInput
-   ): Promise<(typeof UserImportResultType)[]> {
-+    assertVendorAccountMutationAllowed(this.config);
-     const results = await this.models.user.importUsers(input.users);
- 
-     return results.map((result, i) => {
-@@ -379,6 +396,7 @@ export class UserManagementResolver {
-     @CurrentUser() user: CurrentUser,
-     @Args('id') id: string
-   ): Promise<DeleteAccount> {
-+    assertVendorAccountMutationAllowed(this.config);
-     if (user.id === id) {
-       throw new CannotDeleteOwnAccount();
-     }
-@@ -393,6 +411,7 @@ export class UserManagementResolver {
-     @Args('id') id: string,
-     @Args('input') input: ManageUserInput
-   ): Promise<UserType> {
-+    assertVendorAccountMutationAllowed(this.config);
-     const user = await this.db.user.findUnique({
-       where: { id },
-     });
-@@ -418,6 +437,7 @@ export class UserManagementResolver {
-     description: 'Ban an user',
-   })
-   async banUser(@Args('id') id: string): Promise<UserType> {
-+    assertVendorAccountMutationAllowed(this.config);
-     return sessionUser(await this.models.user.ban(id));
-   }
- 
-@@ -425,6 +445,7 @@ export class UserManagementResolver {
-     description: 'Reenable an banned user',
-   })
-   async enableUser(@Args('id') id: string): Promise<UserType> {
-+    assertVendorAccountMutationAllowed(this.config);
-     return sessionUser(await this.models.user.enable(id));
-   }
- }
-diff --git a/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts b/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
-index fd90008..7eea477 100644
---- a/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
-+++ b/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
-@@ -3,7 +3,6 @@ import { createHash } from 'node:crypto';
- import {
-   createInviteLinkMutation,
-   inviteByEmailsMutation,
--  WorkspaceInviteLinkExpireTime,
- } from '@affine/graphql';
- import { PrismaClient, WorkspaceMemberStatus } from '@prisma/client';
- import test from 'ava';
-@@ -13,8 +12,8 @@ import Sinon from 'sinon';
- import { createApp, type TestingApp } from '../../../__tests__/e2e/test';
- import { Mockers } from '../../../__tests__/mocks';
- import { Config } from '../../../base';
--import { ActionForbidden, TooManyRequest } from '../../../base/error';
--import { Models, WorkspaceRole } from '../../../models';
-+import { TooManyRequest } from '../../../base/error';
-+import { Models } from '../../../models';
- import {
-   getAbuseRequestSource,
-   InviteAbuseDispositionService,
-diff --git a/packages/backend/server/src/core/workspaces/realtime.ts b/packages/backend/server/src/core/workspaces/realtime.ts
-index 21b57ce..f37c081 100644
---- a/packages/backend/server/src/core/workspaces/realtime.ts
-+++ b/packages/backend/server/src/core/workspaces/realtime.ts
-@@ -10,6 +10,7 @@ import { z } from 'zod';
- 
- import {
-   Cache,
-+  Config,
-   isValidCacheTtl,
-   OnEvent,
-   QueryTooLong,
-@@ -216,7 +217,8 @@ export class WorkspaceMembersRealtimeProvider implements OnModuleInit {
-     private readonly ac: PermissionAccess,
-     private readonly models: Models,
-     @Optional() private readonly registry?: RealtimeRegistry,
--    @Optional() private readonly publisher?: RealtimePublisher
-+    @Optional() private readonly publisher?: RealtimePublisher,
-+    @Optional() private readonly config?: Config
-   ) {}
- 
-   onModuleInit() {
-@@ -356,6 +358,10 @@ export class WorkspaceMembersRealtimeProvider implements OnModuleInit {
-   ): Promise<WorkspaceInviteLinkSnapshot | null> {
-     await this.assertInviteManage(user.id, workspaceId);
- 
-+    if (this.config?.a2d2Auth.enabled) {
-+      return null;
-+    }
-+
-     const cacheId = `workspace:inviteLink:${workspaceId}`;
-     const id = await this.cache.get<{ inviteId: string }>(cacheId);
-     if (!id) {
-diff --git a/packages/backend/server/src/core/workspaces/resolvers/member.ts b/packages/backend/server/src/core/workspaces/resolvers/member.ts
-index 3ab1afb..b04a9ff 100644
---- a/packages/backend/server/src/core/workspaces/resolvers/member.ts
-+++ b/packages/backend/server/src/core/workspaces/resolvers/member.ts
-@@ -109,6 +109,12 @@ export class WorkspaceMemberResolver {
-     private readonly runtime: BackendRuntimeProvider
-   ) {}
- 
-+  private assertVendorMembershipMutationAllowed() {
-+    if (this.config.a2d2Auth.enabled) {
-+      throw new ActionForbidden('Workspace membership is managed by A2D2.');
-+    }
-+  }
-+
-   private async assertCanInviteOrShare(
-     userId: string,
-     context: {
-@@ -235,6 +241,7 @@ export class WorkspaceMemberResolver {
-     @Args('workspaceId') workspaceId: string,
-     @Args({ name: 'emails', type: () => [String] }) emails: string[]
-   ): Promise<InviteResult[]> {
-+    this.assertVendorMembershipMutationAllowed();
-     await this.ac
-       .user(me.id)
-       .workspace(workspaceId)
-@@ -427,6 +434,10 @@ export class WorkspaceMemberResolver {
-       .workspace(workspace.id)
-       .assert('Workspace.Users.Manage');
- 
-+    if (this.config.a2d2Auth.enabled) {
-+      return null;
-+    }
-+
-     const cacheId = `workspace:inviteLink:${workspace.id}`;
-     const id = await this.cache.get<{ inviteId: string }>(cacheId);
-     if (id) {
-@@ -448,6 +459,7 @@ export class WorkspaceMemberResolver {
-     @Args('expireTime', { type: () => WorkspaceInviteLinkExpireTime })
-     expireTime: WorkspaceInviteLinkExpireTime
-   ): Promise<InviteLink> {
-+    this.assertVendorMembershipMutationAllowed();
-     await this.ac
-       .user(user.id)
-       .workspace(workspaceId)
-@@ -511,6 +523,7 @@ export class WorkspaceMemberResolver {
-     @Args('workspaceId') workspaceId: string,
-     @Args('userId') userId: string
-   ) {
-+    this.assertVendorMembershipMutationAllowed();
-     await this.ac
-       .user(me.id)
-       .workspace(workspaceId)
-@@ -567,6 +580,7 @@ export class WorkspaceMemberResolver {
-     @Args('userId') userId: string,
-     @Args('permission', { type: () => WorkspaceRole }) newRole: WorkspaceRole
-   ) {
-+    this.assertVendorMembershipMutationAllowed();
-     await this.ac
-       .user(user.id)
-       .workspace(workspaceId)
-@@ -642,6 +656,7 @@ export class WorkspaceMemberResolver {
-     @Args('workspaceId') workspaceId: string,
-     @Args('userId') userId: string
-   ) {
-+    this.assertVendorMembershipMutationAllowed();
-     if (userId === me.id) {
-       throw new CanNotRevokeYourself();
-     }
-@@ -697,6 +712,7 @@ export class WorkspaceMemberResolver {
-     })
-     _sendAcceptMail: boolean
-   ) {
-+    this.assertVendorMembershipMutationAllowed();
-     const role = await this.models.workspaceUser.getById(inviteId);
-     // invitation by email
-     if (role) {
-@@ -759,6 +775,7 @@ export class WorkspaceMemberResolver {
-     })
-     _workspaceName?: string
-   ) {
-+    this.assertVendorMembershipMutationAllowed();
-     const role = await this.models.workspaceUser.getActive(
-       workspaceId,
-       user.id
-diff --git a/packages/backend/server/src/global.d.ts b/packages/backend/server/src/global.d.ts
-index 8a90ad7..7fc6aef 100644
---- a/packages/backend/server/src/global.d.ts
-+++ b/packages/backend/server/src/global.d.ts
-@@ -1,7 +1,7 @@
- declare namespace Express {
-   interface Request {
-     session?: import('./core/auth/session').Session;
--    authType?: 'jwt' | 'session';
-+    authType?: 'jwt' | 'session' | 'a2d2';
-   }
- }
- 
-diff --git a/packages/frontend/apps/web/package.json b/packages/frontend/apps/web/package.json
-index 4ae07de..2cf14f4 100644
---- a/packages/frontend/apps/web/package.json
-+++ b/packages/frontend/apps/web/package.json
-@@ -23,6 +23,7 @@
-   "devDependencies": {
-     "@types/react": "^19.0.1",
-     "@types/react-dom": "^19.0.2",
--    "typescript": "npm:@typescript/typescript6@6.0.2"
-+    "typescript": "npm:@typescript/typescript6@6.0.2",
-+    "vitest": "^4.1.10"
-   }
- }
-diff --git a/packages/frontend/apps/web/src/app.tsx b/packages/frontend/apps/web/src/app.tsx
-index 6b91cb6..7a7b91a 100644
---- a/packages/frontend/apps/web/src/app.tsx
-+++ b/packages/frontend/apps/web/src/app.tsx
-@@ -2,6 +2,7 @@ import { AffineContext } from '@affine/core/components/context';
- import { AppContainer } from '@affine/core/desktop/components/app-container';
- import { router } from '@affine/core/desktop/router';
- import { configureCommonModules } from '@affine/core/modules';
-+import { AuthService, DefaultServerService } from '@affine/core/modules/cloud';
- import { I18nProvider } from '@affine/core/modules/i18n';
- import { LifecycleService } from '@affine/core/modules/lifecycle';
- import {
-@@ -10,6 +11,7 @@ import {
- } from '@affine/core/modules/storage';
- import { PopupWindowProvider } from '@affine/core/modules/url';
- import { configureBrowserWorkbenchModule } from '@affine/core/modules/workbench';
-+import { WorkspacesService } from '@affine/core/modules/workspace';
- import { configureBrowserWorkspaceFlavours } from '@affine/core/modules/workspace-engine';
- import createEmotionCache from '@affine/core/utils/create-emotion-cache';
- import { getWorkerUrl } from '@affine/env/worker';
-@@ -95,6 +97,27 @@ window.addEventListener('focus', () => {
- });
- frameworkProvider.get(LifecycleService).applicationStart();
- 
-+export async function prepareA2d2ManagedWorkspace(workspaceId: string) {
-+  const server = frameworkProvider.get(DefaultServerService).server;
-+  await server.waitForConfigRevalidation();
-+  const session = await server.scope.framework
-+    .get(AuthService)
-+    .session.revalidateOnce();
-+  if (!session?.account) {
-+    throw new Error('A2D2 managed session was not accepted');
-+  }
-+
-+  const workspaces = frameworkProvider.get(WorkspacesService);
-+  await workspaces.list.waitForRevalidation();
-+  const managedWorkspace = workspaces.list.workspaces$.value.find(
-+    workspace =>
-+      workspace.id === workspaceId && workspace.flavour === 'affine-cloud'
-+  );
-+  if (!managedWorkspace) {
-+    throw new Error('A2D2 managed workspace is unavailable');
-+  }
-+}
-+
- export function App() {
-   return (
-     <Suspense>
-diff --git a/packages/frontend/apps/web/src/index.tsx b/packages/frontend/apps/web/src/index.tsx
-index 01a9436..7fa42a1 100644
---- a/packages/frontend/apps/web/src/index.tsx
-+++ b/packages/frontend/apps/web/src/index.tsx
-@@ -4,9 +4,23 @@ import { Telemetry } from '@affine/core/components/telemetry';
- import { StrictMode } from 'react';
- import { createRoot } from 'react-dom/client';
- 
--import { App } from './app';
-+import {
-+  isManagedWorkspacePath,
-+  managedWorkspacePath,
-+  prepareA2d2ManagedLaunch,
-+} from './a2d2-managed-auth';
- 
--function mountApp() {
-+async function mountApp() {
-+  const workspaceId = await prepareA2d2ManagedLaunch();
-+  const { App, prepareA2d2ManagedWorkspace } = await import('./app');
-+  if (workspaceId) {
-+    await prepareA2d2ManagedWorkspace(workspaceId);
-+    const workspacePath = managedWorkspacePath(workspaceId);
-+    if (!isManagedWorkspacePath(workspaceId, location.pathname)) {
-+      location.replace(workspacePath);
-+      return;
-+    }
-+  }
-   // oxlint-disable-next-line typescript/no-non-null-assertion
-   const root = document.getElementById('app')!;
-   createRoot(root).render(
-@@ -17,8 +31,13 @@ function mountApp() {
-   );
- }
- 
--try {
--  mountApp();
--} catch (err) {
-+void mountApp().catch(err => {
-   console.error('Failed to bootstrap app', err);
--}
-+  const root = document.getElementById('app');
-+  if (
-+    root &&
-+    (window.a2d2Engine || localStorage.getItem('a2d2-managed-workspace-id'))
-+  ) {
-+    root.textContent = 'A2D2 sign-in is unavailable. Please retry from A2D2.';
-+  }
-+});
-diff --git a/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx b/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
-index a3efb76..a9b90f0 100644
---- a/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
-+++ b/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
-@@ -10,6 +10,7 @@ export const InviteMembersButton = () => {
-   const workspace = useService(WorkspaceService).workspace;
- 
-   const isLocal = workspace.flavour === 'local';
-+  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
- 
-   const dialogService = useService(WorkspaceDialogService);
-   const onOpenInviteMembersModal = useCallback(() => {
-@@ -20,7 +21,7 @@ export const InviteMembersButton = () => {
- 
-   const t = useI18n();
- 
--  if (isLocal) {
-+  if (isLocal || managedByA2d2) {
-     return null;
-   }
- 
-diff --git a/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx b/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
-index e501388..7ff5d9a 100644
---- a/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
-+++ b/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
-@@ -56,6 +56,7 @@ export const CloudWorkspaceMembersPanel = ({
-   onChangeSettingState: (settingState: SettingState) => void;
-   isTeam?: boolean;
- }) => {
-+  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
-   const workspaceShareSettingService = useService(WorkspaceShareSettingService);
-   const subscription = useService(WorkspaceSubscriptionService).subscription;
-   const workspaceSubscription = useLiveData(subscription.subscription$);
-@@ -86,10 +87,14 @@ export const CloudWorkspaceMembersPanel = ({
-   }, [membersService]);
- 
-   useEffect(() => {
--    if (isOwnerOrAdmin) {
-+    if (isOwnerOrAdmin && !managedByA2d2) {
-       workspaceShareSettingService.sharePreview.revalidateInviteLink();
-     }
--  }, [isOwnerOrAdmin, workspaceShareSettingService.sharePreview]);
-+  }, [
-+    isOwnerOrAdmin,
-+    managedByA2d2,
-+    workspaceShareSettingService.sharePreview,
-+  ]);
- 
-   const workspaceQuotaService = useService(WorkspaceQuotaService);
-   useEffect(() => {
-@@ -296,8 +301,12 @@ export const CloudWorkspaceMembersPanel = ({
- 
-   return (
-     <>
--      <SettingRow name={title} desc={desc} spreadCol={!!isOwnerOrAdmin}>
--        {isOwnerOrAdmin ? (
-+      <SettingRow
-+        name={title}
-+        desc={managedByA2d2 ? 'Workspace membership is managed by A2D2.' : desc}
-+        spreadCol={!!isOwnerOrAdmin && !managedByA2d2}
-+      >
-+        {isOwnerOrAdmin && !managedByA2d2 ? (
-           <>
-             <Button onClick={openInviteModal}>{t['Invite Members']()}</Button>
-             {!isTeam ? (
-@@ -327,8 +336,8 @@ export const CloudWorkspaceMembersPanel = ({
- 
-       <div className={styles.membersPanel}>
-         <MemberList
--          isOwner={!!isOwner}
--          isAdmin={!!isAdmin}
-+          isOwner={!managedByA2d2 && !!isOwner}
-+          isAdmin={!managedByA2d2 && !!isAdmin}
-           goToTeamBilling={goToTeamBilling}
-         />
-       </div>
-diff --git a/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx b/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
-index 6f39e9c..97fe4bd 100644
---- a/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
-+++ b/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
-@@ -14,6 +14,7 @@ export function AppDownloadButton({
-   style?: React.CSSProperties;
- }) {
-   const [show, setShow] = useState(true);
-+  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
- 
-   const handleClose = useCatchEventCallback(() => {
-     setShow(false);
-@@ -26,7 +27,7 @@ export function AppDownloadButton({
-     open(url, '_blank');
-   }, []);
- 
--  if (!show) {
-+  if (managedByA2d2 || !show) {
-     return null;
-   }
-   return (
-diff --git a/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx b/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
-index 91c5bbb..f14a825 100644
---- a/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
-+++ b/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
-@@ -36,6 +36,9 @@ export const OpenInAppCard = () => {
-   }, []);
- 
-   const appIcon = appIconMap[BUILD_CONFIG.appBuildType];
-+  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
-+
-+  if (managedByA2d2) return null;
- 
-   return (
-     <div
-diff --git a/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx b/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
-index 8116a48..a7f1402 100644
---- a/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
-+++ b/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
-@@ -13,10 +13,15 @@ const WebOpenInAppGuard = ({ children }: { children: React.ReactNode }) => {
-   }
-   const service = useService(OpenInAppService);
-   const shouldOpenInApp = useLiveData(service.showOpenInAppPage$);
-+  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
- 
-   useEffect(() => {
--    service?.bootstrap();
--  }, [service]);
-+    if (managedByA2d2) {
-+      service.hideOpenInAppPage();
-+    } else {
-+      service.bootstrap();
-+    }
-+  }, [managedByA2d2, service]);
- 
-   const onOpenHere = useCallback(
-     (e: React.MouseEvent) => {
-@@ -27,9 +32,11 @@ const WebOpenInAppGuard = ({ children }: { children: React.ReactNode }) => {
-   );
- 
-   if (shouldOpenInApp === undefined) {
--    return null;
-+    return managedByA2d2 ? children : null;
-   }
- 
-+  if (managedByA2d2) return children;
-+
-   return shouldOpenInApp && !environment.isMobile ? (
-     <OpenInAppPage openHereClicked={onOpenHere} mode="open-doc" />
-   ) : (
-diff --git a/yarn.lock b/yarn.lock
-index fbf69c4..9490dac 100644
---- a/yarn.lock
-+++ b/yarn.lock
-@@ -1086,6 +1086,7 @@ __metadata:
-     react-dom: "npm:^19.2.1"
-     react-router-dom: "npm:^6.30.4"
-     typescript: "npm:@typescript/typescript6@6.0.2"
-+    vitest: "npm:^4.1.10"
-   languageName: unknown
-   linkType: soft
- 
 diff --git a/deploy/a2d2/.env.example b/deploy/a2d2/.env.example
 new file mode 100644
 index 0000000..fb87c74
@@ -1623,6 +653,113 @@ index 0000000..459f794
 +
 +CREATE INDEX "a2d2_principal_bindings_community_workspace_active_idx"
 +  ON "a2d2_principal_bindings"("community_id", "workspace_id", "active");
+diff --git a/packages/backend/server/schema.prisma b/packages/backend/server/schema.prisma
+index 54c72e0..17dd3cd 100644
+--- a/packages/backend/server/schema.prisma
++++ b/packages/backend/server/schema.prisma
+@@ -53,6 +53,7 @@ model User {
+   workspaceMemberLastAccesses WorkspaceMemberLastAccess[]
+   quotaState                  EffectiveUserQuotaState?
+   ownedQuotaStates            EffectiveWorkspaceQuotaState[]
++  a2d2PrincipalBinding        A2d2PrincipalBinding?
+ 
+   @@index([email])
+   @@map("users")
+@@ -209,12 +210,45 @@ model Workspace {
+   docGrants                  DocGrant[]
+   mcpCredentials             McpCredential[]
+   artifacts                  WorkspaceArtifact[]
++  a2d2CommunityBinding       A2d2CommunityBinding?
+ 
+   @@index([lastCheckEmbeddings])
+   @@index([createdAt])
+   @@map("workspaces")
+ }
+ 
++model A2d2CommunityBinding {
++  communityId String   @id @map("community_id") @db.VarChar
++  workspaceId String   @unique @map("workspace_id") @db.VarChar
++  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
++  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
++
++  workspace  Workspace              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
++  principals A2d2PrincipalBinding[]
++
++  @@unique([communityId, workspaceId])
++  @@map("a2d2_community_bindings")
++}
++
++model A2d2PrincipalBinding {
++  communityId  String   @map("community_id") @db.VarChar
++  workspaceId  String   @map("workspace_id") @db.VarChar
++  pubkey       String   @db.Char(64)
++  principalKey String   @unique @map("principal_key") @db.VarChar
++  userId       String   @unique @map("user_id") @db.VarChar
++  role         String   @db.Text
++  active       Boolean  @default(true)
++  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
++  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
++
++  community A2d2CommunityBinding @relation(fields: [communityId, workspaceId], references: [communityId, workspaceId], onDelete: Cascade)
++  user      User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
++
++  @@id([communityId, pubkey])
++  @@index([communityId, workspaceId, active])
++  @@map("a2d2_principal_bindings")
++}
++
+ model Entitlement {
+   id            String    @id @default(uuid()) @db.VarChar
+   targetType    String    @map("target_type") @db.Text
+diff --git a/packages/backend/server/src/base/config/config.ts b/packages/backend/server/src/base/config/config.ts
+index 1f5e1bc..d6f1228 100644
+--- a/packages/backend/server/src/base/config/config.ts
++++ b/packages/backend/server/src/base/config/config.ts
+@@ -1,3 +1,3 @@
+-import { ApplyType } from '../utils';
++import { ApplyType } from '../utils/types';
+ 
+ export class Config extends ApplyType<AppConfig>() {}
+diff --git a/packages/backend/server/src/base/websocket/adapter.ts b/packages/backend/server/src/base/websocket/adapter.ts
+index fed2369..ef8fa25 100644
+--- a/packages/backend/server/src/base/websocket/adapter.ts
++++ b/packages/backend/server/src/base/websocket/adapter.ts
+@@ -25,6 +25,7 @@ export class SocketIoAdapter extends IoAdapter {
+     const logger = this.app.get(AFFiNELogger);
+     const config = this.app.get(WEBSOCKET_OPTIONS) as Config['websocket'] & {
+       canActivate: (socket: Socket) => Promise<boolean>;
++      canActivatePacket?: (socket: Socket) => Promise<boolean>;
+     };
+     const url = this.app.get(URLHelper);
+     const allowedOrigins = buildCorsAllowedOrigins(url);
+@@ -70,6 +71,27 @@ export class SocketIoAdapter extends IoAdapter {
+       });
+     }
+ 
++    if (config.canActivatePacket) {
++      server.on('connection', socket => {
++        socket.use((_event, next) => {
++          config
++            .canActivatePacket?.(socket)
++            .then(pass => {
++              if (pass) {
++                next();
++                return;
++              }
++              socket.disconnect(true);
++              next(new AuthenticationRequired());
++            })
++            .catch(error => {
++              socket.disconnect(true);
++              next(error);
++            });
++        });
++      });
++    }
++
+     const pubClient = this.app.get(SocketIoRedis);
+     const subClient = pubClient.duplicate();
+ 
 diff --git a/packages/backend/server/src/core/auth/a2d2/__tests__/broker.spec.ts b/packages/backend/server/src/core/auth/a2d2/__tests__/broker.spec.ts
 new file mode 100644
 index 0000000..1f6363e
@@ -3280,6 +2417,960 @@ index 0000000..dd55c19
 +    if (!this.enabled) throw new A2d2AuthError('broker_unavailable');
 +  }
 +}
+diff --git a/packages/backend/server/src/core/auth/controller.ts b/packages/backend/server/src/core/auth/controller.ts
+index 4c9aac4..39521ce 100644
+--- a/packages/backend/server/src/core/auth/controller.ts
++++ b/packages/backend/server/src/core/auth/controller.ts
+@@ -30,6 +30,7 @@ import {
+ import { Models } from '../../models';
+ import { validators } from '../utils/validators';
+ import { getAbuseRequestSource } from '../workspaces/abuse';
++import { A2d2ManagedAuthService } from './a2d2/service';
+ import { AuthSessionService } from './auth-session';
+ import { Public } from './guard';
+ import {
+@@ -76,7 +77,8 @@ export class AuthController {
+     private readonly sessionExchange: SessionExchangeService,
+     private readonly authSessions: AuthSessionService,
+     private readonly models: Models,
+-    private readonly config: Config
++    private readonly config: Config,
++    private readonly a2d2: A2d2ManagedAuthService
+   ) {
+     if (env.dev) {
+       // set DNS servers in dev mode
+@@ -199,6 +201,17 @@ export class AuthController {
+       return;
+     }
+ 
++    if (req.authType === 'a2d2') {
++      const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
++      const csrfHeader = req.get('x-affine-csrf-token');
++      if (!csrfHeader || !csrfCookie || csrfCookie !== csrfHeader) {
++        throw new ActionForbidden();
++      }
++      await this.a2d2.signOut(req, res);
++      res.status(HttpStatus.OK).send({});
++      return;
++    }
++
+     const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
+     const csrfHeader = req.get('x-affine-csrf-token');
+     if (!csrfHeader || !csrfCookie || csrfCookie !== csrfHeader) {
+@@ -361,7 +374,7 @@ export class AuthController {
+     if (req.authType === 'jwt') {
+       const principal = session as Partial<AuthSessionPrincipal> | undefined;
+       if (principal?.authSessionId) return;
+-    } else if (req.authType === 'session') {
++    } else if (req.authType === 'session' || req.authType === 'a2d2') {
+       const csrfCookie = getRequestCookie(req, AuthService.csrfCookieName);
+       const csrfHeader = req.get('x-affine-csrf-token');
+       if (csrfHeader && csrfCookie && csrfCookie === csrfHeader) return;
+diff --git a/packages/backend/server/src/core/auth/guard.ts b/packages/backend/server/src/core/auth/guard.ts
+index 47095c5..d7e87d7 100644
+--- a/packages/backend/server/src/core/auth/guard.ts
++++ b/packages/backend/server/src/core/auth/guard.ts
+@@ -23,6 +23,7 @@ import {
+   UnsupportedClientVersion,
+ } from '../../base';
+ import { WEBSOCKET_OPTIONS } from '../../base/websocket';
++import { A2d2ManagedAuthService } from './a2d2/service';
+ import { AccessTokenService, SessionAccessTokenError } from './access-token';
+ import { AuthSessionService } from './auth-session';
+ import { extractTokenFromHeader } from './input';
+@@ -45,6 +46,7 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+   private auth!: AuthService;
+   private accessTokens!: AccessTokenService;
+   private authSessions!: AuthSessionService;
++  private a2d2!: A2d2ManagedAuthService;
+   private readonly cachedVersionRange = new Map<string, semver.Range | null>();
+   private static readonly HARD_REQUIRED_VERSION = '>=0.25.0';
+   private static readonly CANARY_REQUIRED_VERSION = 'canary (within 2 months)';
+@@ -61,6 +63,15 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+     this.auth = this.ref.get(AuthService, { strict: false });
+     this.accessTokens = this.ref.get(AccessTokenService, { strict: false });
+     this.authSessions = this.ref.get(AuthSessionService, { strict: false });
++    this.a2d2 = this.ref.get(A2d2ManagedAuthService, { strict: false });
++  }
++
++  get managedAuthEnabled() {
++    return this.a2d2.enabled;
++  }
++
++  async revalidateManagedSocket(req: Request) {
++    return await this.a2d2.authenticate(req);
+   }
+ 
+   async canActivate(context: ExecutionContext) {
+@@ -99,6 +110,8 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+       throw new AccessDenied('Invalid internal request');
+     }
+ 
++    this.a2d2.assertRequestAllowed(req);
++
+     // api is public
+     const isPublic = this.reflector.getAllAndOverride<boolean>(
+       PUBLIC_ENTRYPOINT_SYMBOL,
+@@ -132,6 +145,11 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+     res?: Response,
+     isPublic = false
+   ): Promise<AuthenticatedRequestSession | null> {
++    if (this.a2d2.enabled) {
++      if (req.path?.startsWith('/api/a2d2/session/')) return null;
++      const session = await this.a2d2.authenticate(req, res);
++      return session ? { type: 'cookie_session', session } : null;
++    }
+     const bearer = req.headers.authorization
+       ? extractTokenFromHeader(req.headers.authorization)
+       : undefined;
+@@ -358,6 +376,15 @@ export const AuthWebsocketOptionsProvider: FactoryProvider = {
+ 
+         return !!session;
+       },
++      canActivatePacket: async (socket: Socket) => {
++        if (!guard.managedAuthEnabled) return true;
++        const upgradeReq = socket.client.request as Request;
++        try {
++          return !!(await guard.revalidateManagedSocket(upgradeReq));
++        } catch {
++          return false;
++        }
++      },
+     };
+   },
+   inject: [Config, AuthGuard],
+diff --git a/packages/backend/server/src/core/auth/index.ts b/packages/backend/server/src/core/auth/index.ts
+index f367229..d6d1f82 100644
+--- a/packages/backend/server/src/core/auth/index.ts
++++ b/packages/backend/server/src/core/auth/index.ts
+@@ -9,6 +9,11 @@ import { MailModule } from '../mail';
+ import { QuotaModule } from '../quota';
+ import { UserModule } from '../user';
+ import { AccessTokenService } from './access-token';
++import {
++  A2d2BrokerClient,
++  A2d2ManagedAuthService,
++  A2d2SessionController,
++} from './a2d2';
+ import { AuthSessionService } from './auth-session';
+ import { AuthChallengeStore } from './challenge-store';
+ import { AuthController } from './controller';
+@@ -49,6 +54,8 @@ import { AuthSigningKeyResolver } from './signing-key-resolver';
+     AuthSigningKeyResolver,
+     AuthCronJob,
+     AuthWebsocketOptionsProvider,
++    A2d2BrokerClient,
++    A2d2ManagedAuthService,
+   ],
+   exports: [
+     AuthService,
+@@ -63,8 +70,9 @@ import { AuthSigningKeyResolver } from './signing-key-resolver';
+     AuthSessionService,
+     AuthSigningKeyRing,
+     AuthWebsocketOptionsProvider,
++    A2d2ManagedAuthService,
+   ],
+-  controllers: [AuthController],
++  controllers: [AuthController, A2d2SessionController],
+ })
+ export class AuthModule {}
+ 
+@@ -79,5 +87,6 @@ export { AuthSessionService } from './auth-session';
+ export { OpenAppAuthService } from './open-app';
+ export { ClientTokenType } from './resolver';
+ export { AccessTokenService, AuthService, SessionIssuer };
++export { A2d2ManagedAuthService } from './a2d2';
+ export * from './session';
+ export { AuthSigningKeyRing } from './signing-key';
+diff --git a/packages/backend/server/src/core/auth/resolver.ts b/packages/backend/server/src/core/auth/resolver.ts
+index c5bfe84..85fe9d8 100644
+--- a/packages/backend/server/src/core/auth/resolver.ts
++++ b/packages/backend/server/src/core/auth/resolver.ts
+@@ -30,6 +30,7 @@ import type { MailDeliveryMetadata } from '../mail/types';
+ import { UserType } from '../user/types';
+ import { validators } from '../utils/validators';
+ import { getAbuseRequestSource } from '../workspaces/abuse';
++import { A2d2AuthError } from './a2d2/error';
+ import { Public } from './guard';
+ import { AuthService } from './service';
+ import { CurrentUser } from './session';
+@@ -56,6 +57,12 @@ export class AuthResolver {
+     private readonly config: Config
+   ) {}
+ 
++  private assertVendorAccountMutationAllowed() {
++    if (this.config.a2d2Auth.enabled) {
++      throw new A2d2AuthError('scope_or_membership_denied');
++    }
++  }
++
+   private mailMetadata(
+     context: GraphqlContext,
+     expiresAt?: Date
+@@ -85,6 +92,7 @@ export class AuthResolver {
+     @CurrentUser() currentUser: CurrentUser,
+     @Parent() user: UserType
+   ): Promise<ClientTokenType> {
++    this.assertVendorAccountMutationAllowed();
+     if (user.id !== currentUser.id) {
+       throw new ActionForbidden();
+     }
+@@ -105,6 +113,7 @@ export class AuthResolver {
+     @Args('newPassword') newPassword: string,
+     @Args('userId', { type: () => String, nullable: true }) userId?: string
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!userId) {
+       throw new LinkExpired();
+     }
+@@ -133,6 +142,7 @@ export class AuthResolver {
+     @Args('token') token: string,
+     @Args('email') email: string
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     // @see [sendChangeEmail]
+     const valid = await this.models.verificationToken.verify(
+       TokenType.VerifyEmail,
+@@ -166,6 +176,7 @@ export class AuthResolver {
+     _email: string | undefined,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!user.emailVerified) {
+       throw new EmailVerificationRequired();
+     }
+@@ -197,6 +208,7 @@ export class AuthResolver {
+     _email: string | undefined,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     const { token, expiresAt } =
+       await this.models.verificationToken.createWithExpiresAt(
+         TokenType.ChangePassword,
+@@ -225,6 +237,7 @@ export class AuthResolver {
+     @Args('callbackUrl') callbackUrl: string,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!user.emailVerified) {
+       throw new EmailVerificationRequired();
+     }
+@@ -252,6 +265,7 @@ export class AuthResolver {
+     @Args('callbackUrl') callbackUrl: string,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!token) {
+       throw new EmailTokenNotFound();
+     }
+@@ -302,6 +316,7 @@ export class AuthResolver {
+     @Args('callbackUrl') callbackUrl: string,
+     @Context() context: GraphqlContext
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     const { token, expiresAt } =
+       await this.models.verificationToken.createWithExpiresAt(
+         TokenType.VerifyEmail,
+@@ -322,6 +337,7 @@ export class AuthResolver {
+     @CurrentUser() user: CurrentUser,
+     @Args('token') token: string
+   ) {
++    this.assertVendorAccountMutationAllowed();
+     if (!token) {
+       throw new EmailTokenNotFound();
+     }
+@@ -351,6 +367,7 @@ export class AuthResolver {
+     @Args('userId') userId: string,
+     @Args('callbackUrl') callbackUrl: string
+   ): Promise<string> {
++    this.assertVendorAccountMutationAllowed();
+     const token = await this.models.verificationToken.create(
+       TokenType.ChangePassword,
+       userId
+diff --git a/packages/backend/server/src/core/doc/a2d2/__tests__/token.spec.ts b/packages/backend/server/src/core/doc/a2d2/__tests__/token.spec.ts
+new file mode 100644
+index 0000000..4f14790
+--- /dev/null
++++ b/packages/backend/server/src/core/doc/a2d2/__tests__/token.spec.ts
+@@ -0,0 +1,59 @@
++import { createHash } from 'node:crypto';
++
++import ava from 'ava';
++
++import {
++  bearerToken,
++  parseTokenAllowlist,
++  tokenMatchesAllowlist,
++} from '../token';
++
++const test = ava;
++const hash = (value: string) =>
++  createHash('sha256').update(value, 'utf8').digest('hex');
++
++test('the legacy single hash keeps working on its own', t => {
++  const only = hash('one');
++  t.deepEqual(parseTokenAllowlist(only, ''), [only]);
++  t.true(tokenMatchesAllowlist('one', parseTokenAllowlist(only, '')));
++});
++
++test('the single hash and the comma list are merged', t => {
++  const a = hash('a');
++  const b = hash('b');
++  const list = parseTokenAllowlist(a, ` ${b} `);
++  t.deepEqual(list, [a, b]);
++  t.true(tokenMatchesAllowlist('a', list));
++  t.true(tokenMatchesAllowlist('b', list));
++});
++
++test('duplicates collapse', t => {
++  const a = hash('a');
++  t.deepEqual(parseTokenAllowlist(a, `${a},${a}`), [a]);
++});
++
++test('one malformed entry drops the whole list', t => {
++  const a = hash('a');
++  t.deepEqual(parseTokenAllowlist(a, 'not-a-hash'), []);
++  t.deepEqual(parseTokenAllowlist(a, `${a.toUpperCase()}`), []);
++  t.deepEqual(parseTokenAllowlist('short', ''), []);
++});
++
++test('an empty allowlist refuses everything', t => {
++  t.deepEqual(parseTokenAllowlist('', ''), []);
++  t.false(tokenMatchesAllowlist('anything', []));
++});
++
++test('a token outside the list is refused', t => {
++  const list = parseTokenAllowlist(hash('a'), '');
++  t.false(tokenMatchesAllowlist('b', list));
++});
++
++test('the bearer header is read strictly', t => {
++  t.is(bearerToken('Bearer abc'), 'abc');
++  t.is(bearerToken('  Bearer   abc  '), 'abc');
++  t.is(bearerToken('bearer abc'), null);
++  t.is(bearerToken('abc'), null);
++  t.is(bearerToken(undefined), null);
++  t.is(bearerToken('Bearer a b'), null);
++});
+diff --git a/packages/backend/server/src/core/doc/a2d2/config.ts b/packages/backend/server/src/core/doc/a2d2/config.ts
+new file mode 100644
+index 0000000..ac402d2
+--- /dev/null
++++ b/packages/backend/server/src/core/doc/a2d2/config.ts
+@@ -0,0 +1,45 @@
++import { z } from 'zod';
++
++import { defineModuleConfig } from '../../../base/config';
++
++export interface A2d2DocsConfig {
++  enabled: boolean;
++  serviceTokenSha256: string;
++  serviceTokenSha256s: string;
++  serviceEditorId: string;
++}
++
++declare global {
++  interface AppConfigSchema {
++    a2d2Docs: A2d2DocsConfig;
++  }
++}
++
++defineModuleConfig('a2d2Docs', {
++  enabled: {
++    desc: 'Enable the A2D2 block-level document sync endpoints.',
++    default: false,
++    env: ['AFFINE_A2D2_DOCS_ENABLED', 'boolean'],
++    shape: z.boolean(),
++  },
++  serviceTokenSha256: {
++    desc: 'Single SHA-256 hash of the A2D2 document service credential.',
++    default: '',
++    env: 'AFFINE_A2D2_DOCS_SERVICE_TOKEN_SHA256',
++    shape: z.string(),
++    internal: true,
++  },
++  serviceTokenSha256s: {
++    desc: 'Comma separated SHA-256 hashes of A2D2 document service credentials.',
++    default: '',
++    env: 'AFFINE_A2D2_DOCS_SERVICE_TOKEN_SHA256S',
++    shape: z.string(),
++    internal: true,
++  },
++  serviceEditorId: {
++    desc: 'AFFiNE user id recorded as the editor for A2D2 sync writes.',
++    default: '',
++    env: 'AFFINE_A2D2_DOCS_SERVICE_EDITOR_ID',
++    shape: z.string(),
++  },
++});
+diff --git a/packages/backend/server/src/core/doc/a2d2/controller.ts b/packages/backend/server/src/core/doc/a2d2/controller.ts
+new file mode 100644
+index 0000000..a72ece6
+--- /dev/null
++++ b/packages/backend/server/src/core/doc/a2d2/controller.ts
+@@ -0,0 +1,131 @@
++import {
++  Controller,
++  Get,
++  Param,
++  Post,
++  RawBody,
++  Req,
++  Res,
++} from '@nestjs/common';
++import type { Request, Response } from 'express';
++
++import { Config } from '../../../base/config/config';
++import { Public } from '../../auth/guard';
++import { PgWorkspaceDocStorageAdapter } from '../adapters/workspace';
++import { DatabaseDocReader } from '../reader';
++import { bearerToken, parseTokenAllowlist, tokenMatchesAllowlist } from './token';
++
++const ID_SHAPE = /^[A-Za-z0-9_:-]{1,128}$/;
++const MAX_UPDATE_BYTES = 8 * 1024 * 1024;
++
++/**
++ * A2D2 동기화 워커가 쓰는 **블록 단위** 문서 통로.
++ *
++ * 마크다운을 안 거친다. 마크다운 통로는 콜아웃을 지우고 코드블록을 왕복마다
++ * 늘리고 블록 안 줄바꿈을 못 적는다(실측). 여기는 Yjs 업데이트를 그대로
++ * 주고받아서 그 문제가 생기지 않고, **바뀐 게 없으면 업데이트가 비어서
++ * 서버가 아무것도 안 한다** — 멱등성이 공짜로 따라온다.
++ *
++ * 쓰는 사람은 늘 싱크 봇으로 못 박는다. 그래야 봇이 쓴 글을 되받지 않는다.
++ */
++@Controller('/api/a2d2/docs')
++export class A2d2DocController {
++  constructor(
++    private readonly config: Config,
++    private readonly reader: DatabaseDocReader,
++    private readonly storage: PgWorkspaceDocStorageAdapter
++  ) {}
++
++  @Public()
++  @Get('/:workspaceId/:docId/yjs')
++  async read(
++    @Req() req: Request,
++    @Res() res: Response,
++    @Param('workspaceId') workspaceId: string,
++    @Param('docId') docId: string
++  ) {
++    if (!this.authorize(req, res)) return;
++    if (!this.validIds(res, workspaceId, docId)) return;
++
++    const doc = await this.reader.getDoc(workspaceId, docId);
++    if (!doc) {
++      res.status(404).json({ error: 'doc_not_found' });
++      return;
++    }
++    res.setHeader('Cache-Control', 'no-store');
++    res.setHeader('Content-Type', 'application/octet-stream');
++    res.setHeader('x-doc-timestamp', doc.timestamp.toString());
++    if (doc.editor) res.setHeader('x-doc-editor-id', doc.editor);
++    res.send(doc.bin);
++  }
++
++  @Public()
++  @Post('/:workspaceId/:docId/yjs')
++  async write(
++    @Req() req: Request,
++    @Res() res: Response,
++    @Param('workspaceId') workspaceId: string,
++    @Param('docId') docId: string,
++    @RawBody() update: Buffer | undefined
++  ) {
++    if (!this.authorize(req, res)) return;
++    if (!this.validIds(res, workspaceId, docId)) return;
++
++    const editor = this.config.a2d2Docs.serviceEditorId.trim();
++    if (!editor) {
++      // 편집자를 못 박지 못하면 되받기를 거를 수 없다. 열지 않고 멈춘다.
++      res.status(503).json({ error: 'a2d2_docs_editor_unset' });
++      return;
++    }
++    if (!update || update.length === 0) {
++      res.status(400).json({ error: 'empty_update' });
++      return;
++    }
++    if (update.length > MAX_UPDATE_BYTES) {
++      res.status(413).json({ error: 'update_too_large' });
++      return;
++    }
++
++    const timestamp = await this.storage.pushDocUpdates(
++      workspaceId,
++      docId,
++      [new Uint8Array(update)],
++      editor
++    );
++    res.setHeader('Cache-Control', 'no-store');
++    // timestamp 0 은 「받았지만 바꿀 게 없었다」는 뜻이다. 오류가 아니다.
++    res.json({ applied: timestamp !== 0, timestamp, editor });
++  }
++
++  private authorize(req: Request, res: Response): boolean {
++    const { enabled, serviceTokenSha256, serviceTokenSha256s } =
++      this.config.a2d2Docs;
++    if (!enabled) {
++      res.status(404).json({ error: 'not_found' });
++      return false;
++    }
++    const allowlist = parseTokenAllowlist(
++      serviceTokenSha256,
++      serviceTokenSha256s
++    );
++    if (allowlist.length === 0) {
++      // 설정이 비었거나 깨졌다. 열어 두느니 못 쓰게 한다.
++      res.status(503).json({ error: 'a2d2_docs_auth_unavailable' });
++      return false;
++    }
++    const token = bearerToken(req.headers.authorization);
++    if (!token || !tokenMatchesAllowlist(token, allowlist)) {
++      res.status(403).json({ error: 'a2d2_docs_forbidden' });
++      return false;
++    }
++    return true;
++  }
++
++  private validIds(res: Response, workspaceId: string, docId: string): boolean {
++    if (!ID_SHAPE.test(workspaceId) || !ID_SHAPE.test(docId)) {
++      res.status(400).json({ error: 'invalid_id' });
++      return false;
++    }
++    return true;
++  }
++}
+diff --git a/packages/backend/server/src/core/doc/a2d2/index.ts b/packages/backend/server/src/core/doc/a2d2/index.ts
+new file mode 100644
+index 0000000..d906d0e
+--- /dev/null
++++ b/packages/backend/server/src/core/doc/a2d2/index.ts
+@@ -0,0 +1,8 @@
++import './config';
++
++export { A2d2DocController } from './controller';
++export {
++  bearerToken,
++  parseTokenAllowlist,
++  tokenMatchesAllowlist,
++} from './token';
+diff --git a/packages/backend/server/src/core/doc/a2d2/token.ts b/packages/backend/server/src/core/doc/a2d2/token.ts
+new file mode 100644
+index 0000000..693399f
+--- /dev/null
++++ b/packages/backend/server/src/core/doc/a2d2/token.ts
+@@ -0,0 +1,52 @@
++import { createHash, timingSafeEqual } from 'node:crypto';
++
++/**
++ * 서비스 자격증명 허용목록.
++ *
++ * 계약은 Plane 쪽(`plane/a2d2/config.py`)과 **같은 모양**으로 맞춘다. 두 벌이
++ * 어긋나면 나중에 한쪽만 고치는 사고가 난다.
++ *
++ * - 옛 변수(해시 하나)는 그대로 동작한다
++ * - 새 변수(쉼표로 여럿)를 더해 합쳐 쓴다
++ * - 항목마다 64자리 소문자 hex 검사. **하나라도 깨지면 목록 전체를 버린다**
++ * - 비교는 timingSafeEqual — 걸린 시간으로 새지 않게
++ * - **목록이 비면 전부 거부한다.** 열려 버리는 쪽으로 무너지면 안 된다
++ */
++const HASH_SHAPE = /^[0-9a-f]{64}$/;
++
++export function parseTokenAllowlist(single: string, list: string): string[] {
++  const raw = [single, ...list.split(',')]
++    .map(entry => entry.trim())
++    .filter(entry => entry.length > 0);
++  if (raw.length === 0) return [];
++  if (!raw.every(entry => HASH_SHAPE.test(entry))) return [];
++  return [...new Set(raw)];
++}
++
++export function tokenMatchesAllowlist(
++  token: string,
++  allowlist: readonly string[]
++): boolean {
++  if (allowlist.length === 0) return false;
++  const presented = Buffer.from(
++    createHash('sha256').update(token, 'utf8').digest('hex'),
++    'utf8'
++  );
++  let matched = false;
++  for (const candidate of allowlist) {
++    const expected = Buffer.from(candidate, 'utf8');
++    if (
++      expected.length === presented.length &&
++      timingSafeEqual(expected, presented)
++    ) {
++      matched = true;
++    }
++  }
++  return matched;
++}
++
++export function bearerToken(header: string | undefined): string | null {
++  if (!header) return null;
++  const match = /^Bearer\s+(\S+)$/.exec(header.trim());
++  return match ? match[1] : null;
++}
+diff --git a/packages/backend/server/src/core/doc/index.ts b/packages/backend/server/src/core/doc/index.ts
+index 04dc620..620bf80 100644
+--- a/packages/backend/server/src/core/doc/index.ts
++++ b/packages/backend/server/src/core/doc/index.ts
+@@ -6,6 +6,7 @@ import { BackendRuntimeModule } from '../backend-runtime';
+ import { PermissionModule } from '../permission';
+ import { QuotaModule } from '../quota';
+ import { StorageModule } from '../storage';
++import { A2d2DocController } from './a2d2';
+ import { PgUserspaceDocStorageAdapter } from './adapters/userspace';
+ import { PgWorkspaceDocStorageAdapter } from './adapters/workspace';
+ import { DocEventsListener } from './event';
+@@ -16,6 +17,7 @@ import { DocWriter } from './writer';
+ 
+ @Module({
+   imports: [BackendRuntimeModule, QuotaModule, PermissionModule, StorageModule],
++  controllers: [A2d2DocController],
+   providers: [
+     DocStorageOptions,
+     PgWorkspaceDocStorageAdapter,
+diff --git a/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts b/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
+index 1b7ee0a..57989ad 100644
+--- a/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
++++ b/packages/backend/server/src/core/realtime/__tests__/registry.spec.ts
+@@ -880,6 +880,34 @@ test('new realtime providers publish changed events from domain events', t => {
+   );
+ });
+ 
++test('managed mode realtime membership snapshot omits vendor invite link', async t => {
++  const registry = new RealtimeRegistry();
++  const provider = new WorkspaceMembersRealtimeProvider(
++    {
++      get: async () => ({ inviteId: 'vendor-link' }),
++      ttl: async () => 60,
++    } as never,
++    { link: (path: string) => `https://app.affine.pro${path}` } as never,
++    {
++      user: () => ({
++        workspace: () => ({ assert: async () => {} }),
++      }),
++    } as never,
++    {} as never,
++    registry,
++    undefined,
++    { a2d2Auth: { enabled: true } } as never
++  );
++  provider.onModuleInit();
++
++  t.deepEqual(
++    await registry
++      .getRequest('workspace.invite-link.get')
++      .handle({ id: 'managed-user' } as never, { workspaceId: 'space' }),
++    { inviteLink: null }
++  );
++});
++
+ test('quota realtime provider exposes effective quota state snapshots', async t => {
+   const registry = new RealtimeRegistry();
+   const provider = new QuotaStateRealtimeProvider(
+diff --git a/packages/backend/server/src/core/user/resolver.ts b/packages/backend/server/src/core/user/resolver.ts
+index 7e8c36a..236c565 100644
+--- a/packages/backend/server/src/core/user/resolver.ts
++++ b/packages/backend/server/src/core/user/resolver.ts
+@@ -16,6 +16,7 @@ import { isNil, omitBy } from 'lodash-es';
+ 
+ import {
+   CannotDeleteOwnAccount,
++  Config,
+   EventBus,
+   type FileUpload,
+   ImageFormatNotSupported,
+@@ -32,6 +33,7 @@ import {
+   UserSettingsSchema,
+ } from '../../models';
+ import { processImage } from '../../native';
++import { A2d2AuthError } from '../auth/a2d2/error';
+ import { Public } from '../auth/guard';
+ import { sessionUser } from '../auth/service';
+ import { CurrentUser } from '../auth/session';
+@@ -50,11 +52,18 @@ import {
+   UserType,
+ } from './types';
+ 
++function assertVendorAccountMutationAllowed(config: Config) {
++  if (config.a2d2Auth.enabled) {
++    throw new A2d2AuthError('scope_or_membership_denied');
++  }
++}
++
+ @Resolver(() => UserType)
+ export class UserResolver {
+   constructor(
+     private readonly storage: AvatarStorage,
+-    private readonly models: Models
++    private readonly models: Models,
++    private readonly config: Config
+   ) {}
+ 
+   @Throttle('strict')
+@@ -115,6 +124,7 @@ export class UserResolver {
+     @Args({ name: 'avatar', type: () => GraphQLUpload })
+     avatar: FileUpload
+   ) {
++    assertVendorAccountMutationAllowed(this.config);
+     if (!user) {
+       throw new UserNotFound();
+     }
+@@ -155,6 +165,7 @@ export class UserResolver {
+     @CurrentUser() user: CurrentUser,
+     @Args('input', { type: () => UpdateUserInput }) input: UpdateUserInput
+   ): Promise<UserType> {
++    assertVendorAccountMutationAllowed(this.config);
+     input = omitBy(input, isNil);
+ 
+     if (Object.keys(input).length === 0) {
+@@ -169,6 +180,7 @@ export class UserResolver {
+     description: 'Remove user avatar',
+   })
+   async removeAvatar(@CurrentUser() user: CurrentUser) {
++    assertVendorAccountMutationAllowed(this.config);
+     if (!user) {
+       throw new UserNotFound();
+     }
+@@ -180,6 +192,7 @@ export class UserResolver {
+   async deleteAccount(
+     @CurrentUser() user: CurrentUser
+   ): Promise<DeleteAccount> {
++    assertVendorAccountMutationAllowed(this.config);
+     await this.models.user.delete(user.id);
+     return { success: true };
+   }
+@@ -271,7 +284,8 @@ const UserImportResultType = createUnionType({
+ export class UserManagementResolver {
+   constructor(
+     private readonly db: PrismaClient,
+-    private readonly models: Models
++    private readonly models: Models,
++    private readonly config: Config
+   ) {}
+ 
+   @Query(() => Int, {
+@@ -340,8 +354,10 @@ export class UserManagementResolver {
+     description: 'Create a new user',
+   })
+   async createUser(
+-    @Args({ name: 'input', type: () => CreateUserInput }) input: CreateUserInput
++    @Args({ name: 'input', type: () => CreateUserInput })
++    input: CreateUserInput
+   ) {
++    assertVendorAccountMutationAllowed(this.config);
+     const { id } = await this.models.user.create({
+       ...input,
+       registered: true,
+@@ -358,6 +374,7 @@ export class UserManagementResolver {
+     @Args({ name: 'input', type: () => ImportUsersInput })
+     input: ImportUsersInput
+   ): Promise<(typeof UserImportResultType)[]> {
++    assertVendorAccountMutationAllowed(this.config);
+     const results = await this.models.user.importUsers(input.users);
+ 
+     return results.map((result, i) => {
+@@ -379,6 +396,7 @@ export class UserManagementResolver {
+     @CurrentUser() user: CurrentUser,
+     @Args('id') id: string
+   ): Promise<DeleteAccount> {
++    assertVendorAccountMutationAllowed(this.config);
+     if (user.id === id) {
+       throw new CannotDeleteOwnAccount();
+     }
+@@ -393,6 +411,7 @@ export class UserManagementResolver {
+     @Args('id') id: string,
+     @Args('input') input: ManageUserInput
+   ): Promise<UserType> {
++    assertVendorAccountMutationAllowed(this.config);
+     const user = await this.db.user.findUnique({
+       where: { id },
+     });
+@@ -418,6 +437,7 @@ export class UserManagementResolver {
+     description: 'Ban an user',
+   })
+   async banUser(@Args('id') id: string): Promise<UserType> {
++    assertVendorAccountMutationAllowed(this.config);
+     return sessionUser(await this.models.user.ban(id));
+   }
+ 
+@@ -425,6 +445,7 @@ export class UserManagementResolver {
+     description: 'Reenable an banned user',
+   })
+   async enableUser(@Args('id') id: string): Promise<UserType> {
++    assertVendorAccountMutationAllowed(this.config);
+     return sessionUser(await this.models.user.enable(id));
+   }
+ }
+diff --git a/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts b/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
+index fd90008..7eea477 100644
+--- a/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
++++ b/packages/backend/server/src/core/workspaces/__tests__/abuse.spec.ts
+@@ -3,7 +3,6 @@ import { createHash } from 'node:crypto';
+ import {
+   createInviteLinkMutation,
+   inviteByEmailsMutation,
+-  WorkspaceInviteLinkExpireTime,
+ } from '@affine/graphql';
+ import { PrismaClient, WorkspaceMemberStatus } from '@prisma/client';
+ import test from 'ava';
+@@ -13,8 +12,8 @@ import Sinon from 'sinon';
+ import { createApp, type TestingApp } from '../../../__tests__/e2e/test';
+ import { Mockers } from '../../../__tests__/mocks';
+ import { Config } from '../../../base';
+-import { ActionForbidden, TooManyRequest } from '../../../base/error';
+-import { Models, WorkspaceRole } from '../../../models';
++import { TooManyRequest } from '../../../base/error';
++import { Models } from '../../../models';
+ import {
+   getAbuseRequestSource,
+   InviteAbuseDispositionService,
+diff --git a/packages/backend/server/src/core/workspaces/realtime.ts b/packages/backend/server/src/core/workspaces/realtime.ts
+index 21b57ce..f37c081 100644
+--- a/packages/backend/server/src/core/workspaces/realtime.ts
++++ b/packages/backend/server/src/core/workspaces/realtime.ts
+@@ -10,6 +10,7 @@ import { z } from 'zod';
+ 
+ import {
+   Cache,
++  Config,
+   isValidCacheTtl,
+   OnEvent,
+   QueryTooLong,
+@@ -216,7 +217,8 @@ export class WorkspaceMembersRealtimeProvider implements OnModuleInit {
+     private readonly ac: PermissionAccess,
+     private readonly models: Models,
+     @Optional() private readonly registry?: RealtimeRegistry,
+-    @Optional() private readonly publisher?: RealtimePublisher
++    @Optional() private readonly publisher?: RealtimePublisher,
++    @Optional() private readonly config?: Config
+   ) {}
+ 
+   onModuleInit() {
+@@ -356,6 +358,10 @@ export class WorkspaceMembersRealtimeProvider implements OnModuleInit {
+   ): Promise<WorkspaceInviteLinkSnapshot | null> {
+     await this.assertInviteManage(user.id, workspaceId);
+ 
++    if (this.config?.a2d2Auth.enabled) {
++      return null;
++    }
++
+     const cacheId = `workspace:inviteLink:${workspaceId}`;
+     const id = await this.cache.get<{ inviteId: string }>(cacheId);
+     if (!id) {
+diff --git a/packages/backend/server/src/core/workspaces/resolvers/member.ts b/packages/backend/server/src/core/workspaces/resolvers/member.ts
+index 3ab1afb..b04a9ff 100644
+--- a/packages/backend/server/src/core/workspaces/resolvers/member.ts
++++ b/packages/backend/server/src/core/workspaces/resolvers/member.ts
+@@ -109,6 +109,12 @@ export class WorkspaceMemberResolver {
+     private readonly runtime: BackendRuntimeProvider
+   ) {}
+ 
++  private assertVendorMembershipMutationAllowed() {
++    if (this.config.a2d2Auth.enabled) {
++      throw new ActionForbidden('Workspace membership is managed by A2D2.');
++    }
++  }
++
+   private async assertCanInviteOrShare(
+     userId: string,
+     context: {
+@@ -235,6 +241,7 @@ export class WorkspaceMemberResolver {
+     @Args('workspaceId') workspaceId: string,
+     @Args({ name: 'emails', type: () => [String] }) emails: string[]
+   ): Promise<InviteResult[]> {
++    this.assertVendorMembershipMutationAllowed();
+     await this.ac
+       .user(me.id)
+       .workspace(workspaceId)
+@@ -427,6 +434,10 @@ export class WorkspaceMemberResolver {
+       .workspace(workspace.id)
+       .assert('Workspace.Users.Manage');
+ 
++    if (this.config.a2d2Auth.enabled) {
++      return null;
++    }
++
+     const cacheId = `workspace:inviteLink:${workspace.id}`;
+     const id = await this.cache.get<{ inviteId: string }>(cacheId);
+     if (id) {
+@@ -448,6 +459,7 @@ export class WorkspaceMemberResolver {
+     @Args('expireTime', { type: () => WorkspaceInviteLinkExpireTime })
+     expireTime: WorkspaceInviteLinkExpireTime
+   ): Promise<InviteLink> {
++    this.assertVendorMembershipMutationAllowed();
+     await this.ac
+       .user(user.id)
+       .workspace(workspaceId)
+@@ -511,6 +523,7 @@ export class WorkspaceMemberResolver {
+     @Args('workspaceId') workspaceId: string,
+     @Args('userId') userId: string
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     await this.ac
+       .user(me.id)
+       .workspace(workspaceId)
+@@ -567,6 +580,7 @@ export class WorkspaceMemberResolver {
+     @Args('userId') userId: string,
+     @Args('permission', { type: () => WorkspaceRole }) newRole: WorkspaceRole
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     await this.ac
+       .user(user.id)
+       .workspace(workspaceId)
+@@ -642,6 +656,7 @@ export class WorkspaceMemberResolver {
+     @Args('workspaceId') workspaceId: string,
+     @Args('userId') userId: string
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     if (userId === me.id) {
+       throw new CanNotRevokeYourself();
+     }
+@@ -697,6 +712,7 @@ export class WorkspaceMemberResolver {
+     })
+     _sendAcceptMail: boolean
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     const role = await this.models.workspaceUser.getById(inviteId);
+     // invitation by email
+     if (role) {
+@@ -759,6 +775,7 @@ export class WorkspaceMemberResolver {
+     })
+     _workspaceName?: string
+   ) {
++    this.assertVendorMembershipMutationAllowed();
+     const role = await this.models.workspaceUser.getActive(
+       workspaceId,
+       user.id
+diff --git a/packages/backend/server/src/global.d.ts b/packages/backend/server/src/global.d.ts
+index 8a90ad7..7fc6aef 100644
+--- a/packages/backend/server/src/global.d.ts
++++ b/packages/backend/server/src/global.d.ts
+@@ -1,7 +1,7 @@
+ declare namespace Express {
+   interface Request {
+     session?: import('./core/auth/session').Session;
+-    authType?: 'jwt' | 'session';
++    authType?: 'jwt' | 'session' | 'a2d2';
+   }
+ }
+ 
+diff --git a/packages/frontend/apps/web/package.json b/packages/frontend/apps/web/package.json
+index 4ae07de..2cf14f4 100644
+--- a/packages/frontend/apps/web/package.json
++++ b/packages/frontend/apps/web/package.json
+@@ -23,6 +23,7 @@
+   "devDependencies": {
+     "@types/react": "^19.0.1",
+     "@types/react-dom": "^19.0.2",
+-    "typescript": "npm:@typescript/typescript6@6.0.2"
++    "typescript": "npm:@typescript/typescript6@6.0.2",
++    "vitest": "^4.1.10"
+   }
+ }
 diff --git a/packages/frontend/apps/web/src/a2d2-managed-auth.spec.ts b/packages/frontend/apps/web/src/a2d2-managed-auth.spec.ts
 new file mode 100644
 index 0000000..4e1fa11
@@ -3390,3 +3481,257 @@ index 0000000..7ce218d
 +export function isManagedWorkspacePath(workspaceId: string, pathname: string) {
 +  return pathname.startsWith(`/workspace/${workspaceId}/`);
 +}
+diff --git a/packages/frontend/apps/web/src/app.tsx b/packages/frontend/apps/web/src/app.tsx
+index 6b91cb6..7a7b91a 100644
+--- a/packages/frontend/apps/web/src/app.tsx
++++ b/packages/frontend/apps/web/src/app.tsx
+@@ -2,6 +2,7 @@ import { AffineContext } from '@affine/core/components/context';
+ import { AppContainer } from '@affine/core/desktop/components/app-container';
+ import { router } from '@affine/core/desktop/router';
+ import { configureCommonModules } from '@affine/core/modules';
++import { AuthService, DefaultServerService } from '@affine/core/modules/cloud';
+ import { I18nProvider } from '@affine/core/modules/i18n';
+ import { LifecycleService } from '@affine/core/modules/lifecycle';
+ import {
+@@ -10,6 +11,7 @@ import {
+ } from '@affine/core/modules/storage';
+ import { PopupWindowProvider } from '@affine/core/modules/url';
+ import { configureBrowserWorkbenchModule } from '@affine/core/modules/workbench';
++import { WorkspacesService } from '@affine/core/modules/workspace';
+ import { configureBrowserWorkspaceFlavours } from '@affine/core/modules/workspace-engine';
+ import createEmotionCache from '@affine/core/utils/create-emotion-cache';
+ import { getWorkerUrl } from '@affine/env/worker';
+@@ -95,6 +97,27 @@ window.addEventListener('focus', () => {
+ });
+ frameworkProvider.get(LifecycleService).applicationStart();
+ 
++export async function prepareA2d2ManagedWorkspace(workspaceId: string) {
++  const server = frameworkProvider.get(DefaultServerService).server;
++  await server.waitForConfigRevalidation();
++  const session = await server.scope.framework
++    .get(AuthService)
++    .session.revalidateOnce();
++  if (!session?.account) {
++    throw new Error('A2D2 managed session was not accepted');
++  }
++
++  const workspaces = frameworkProvider.get(WorkspacesService);
++  await workspaces.list.waitForRevalidation();
++  const managedWorkspace = workspaces.list.workspaces$.value.find(
++    workspace =>
++      workspace.id === workspaceId && workspace.flavour === 'affine-cloud'
++  );
++  if (!managedWorkspace) {
++    throw new Error('A2D2 managed workspace is unavailable');
++  }
++}
++
+ export function App() {
+   return (
+     <Suspense>
+diff --git a/packages/frontend/apps/web/src/index.tsx b/packages/frontend/apps/web/src/index.tsx
+index 01a9436..7fa42a1 100644
+--- a/packages/frontend/apps/web/src/index.tsx
++++ b/packages/frontend/apps/web/src/index.tsx
+@@ -4,9 +4,23 @@ import { Telemetry } from '@affine/core/components/telemetry';
+ import { StrictMode } from 'react';
+ import { createRoot } from 'react-dom/client';
+ 
+-import { App } from './app';
++import {
++  isManagedWorkspacePath,
++  managedWorkspacePath,
++  prepareA2d2ManagedLaunch,
++} from './a2d2-managed-auth';
+ 
+-function mountApp() {
++async function mountApp() {
++  const workspaceId = await prepareA2d2ManagedLaunch();
++  const { App, prepareA2d2ManagedWorkspace } = await import('./app');
++  if (workspaceId) {
++    await prepareA2d2ManagedWorkspace(workspaceId);
++    const workspacePath = managedWorkspacePath(workspaceId);
++    if (!isManagedWorkspacePath(workspaceId, location.pathname)) {
++      location.replace(workspacePath);
++      return;
++    }
++  }
+   // oxlint-disable-next-line typescript/no-non-null-assertion
+   const root = document.getElementById('app')!;
+   createRoot(root).render(
+@@ -17,8 +31,13 @@ function mountApp() {
+   );
+ }
+ 
+-try {
+-  mountApp();
+-} catch (err) {
++void mountApp().catch(err => {
+   console.error('Failed to bootstrap app', err);
+-}
++  const root = document.getElementById('app');
++  if (
++    root &&
++    (window.a2d2Engine || localStorage.getItem('a2d2-managed-workspace-id'))
++  ) {
++    root.textContent = 'A2D2 sign-in is unavailable. Please retry from A2D2.';
++  }
++});
+diff --git a/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx b/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
+index a3efb76..a9b90f0 100644
+--- a/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
++++ b/packages/frontend/core/src/components/root-app-sidebar/invite-members-button.tsx
+@@ -10,6 +10,7 @@ export const InviteMembersButton = () => {
+   const workspace = useService(WorkspaceService).workspace;
+ 
+   const isLocal = workspace.flavour === 'local';
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
+ 
+   const dialogService = useService(WorkspaceDialogService);
+   const onOpenInviteMembersModal = useCallback(() => {
+@@ -20,7 +21,7 @@ export const InviteMembersButton = () => {
+ 
+   const t = useI18n();
+ 
+-  if (isLocal) {
++  if (isLocal || managedByA2d2) {
+     return null;
+   }
+ 
+diff --git a/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx b/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
+index e501388..7ff5d9a 100644
+--- a/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
++++ b/packages/frontend/core/src/desktop/dialogs/setting/workspace-setting/members/cloud-members-panel.tsx
+@@ -56,6 +56,7 @@ export const CloudWorkspaceMembersPanel = ({
+   onChangeSettingState: (settingState: SettingState) => void;
+   isTeam?: boolean;
+ }) => {
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
+   const workspaceShareSettingService = useService(WorkspaceShareSettingService);
+   const subscription = useService(WorkspaceSubscriptionService).subscription;
+   const workspaceSubscription = useLiveData(subscription.subscription$);
+@@ -86,10 +87,14 @@ export const CloudWorkspaceMembersPanel = ({
+   }, [membersService]);
+ 
+   useEffect(() => {
+-    if (isOwnerOrAdmin) {
++    if (isOwnerOrAdmin && !managedByA2d2) {
+       workspaceShareSettingService.sharePreview.revalidateInviteLink();
+     }
+-  }, [isOwnerOrAdmin, workspaceShareSettingService.sharePreview]);
++  }, [
++    isOwnerOrAdmin,
++    managedByA2d2,
++    workspaceShareSettingService.sharePreview,
++  ]);
+ 
+   const workspaceQuotaService = useService(WorkspaceQuotaService);
+   useEffect(() => {
+@@ -296,8 +301,12 @@ export const CloudWorkspaceMembersPanel = ({
+ 
+   return (
+     <>
+-      <SettingRow name={title} desc={desc} spreadCol={!!isOwnerOrAdmin}>
+-        {isOwnerOrAdmin ? (
++      <SettingRow
++        name={title}
++        desc={managedByA2d2 ? 'Workspace membership is managed by A2D2.' : desc}
++        spreadCol={!!isOwnerOrAdmin && !managedByA2d2}
++      >
++        {isOwnerOrAdmin && !managedByA2d2 ? (
+           <>
+             <Button onClick={openInviteModal}>{t['Invite Members']()}</Button>
+             {!isTeam ? (
+@@ -327,8 +336,8 @@ export const CloudWorkspaceMembersPanel = ({
+ 
+       <div className={styles.membersPanel}>
+         <MemberList
+-          isOwner={!!isOwner}
+-          isAdmin={!!isAdmin}
++          isOwner={!managedByA2d2 && !!isOwner}
++          isAdmin={!managedByA2d2 && !!isAdmin}
+           goToTeamBilling={goToTeamBilling}
+         />
+       </div>
+diff --git a/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx b/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
+index 6f39e9c..97fe4bd 100644
+--- a/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
++++ b/packages/frontend/core/src/modules/app-sidebar/views/app-download-button/index.tsx
+@@ -14,6 +14,7 @@ export function AppDownloadButton({
+   style?: React.CSSProperties;
+ }) {
+   const [show, setShow] = useState(true);
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
+ 
+   const handleClose = useCatchEventCallback(() => {
+     setShow(false);
+@@ -26,7 +27,7 @@ export function AppDownloadButton({
+     open(url, '_blank');
+   }, []);
+ 
+-  if (!show) {
++  if (managedByA2d2 || !show) {
+     return null;
+   }
+   return (
+diff --git a/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx b/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
+index 91c5bbb..f14a825 100644
+--- a/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
++++ b/packages/frontend/core/src/modules/app-sidebar/views/open-in-app-card/open-in-app-card.tsx
+@@ -36,6 +36,9 @@ export const OpenInAppCard = () => {
+   }, []);
+ 
+   const appIcon = appIconMap[BUILD_CONFIG.appBuildType];
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
++
++  if (managedByA2d2) return null;
+ 
+   return (
+     <div
+diff --git a/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx b/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
+index 8116a48..a7f1402 100644
+--- a/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
++++ b/packages/frontend/core/src/modules/open-in-app/views/open-in-app-guard.tsx
+@@ -13,10 +13,15 @@ const WebOpenInAppGuard = ({ children }: { children: React.ReactNode }) => {
+   }
+   const service = useService(OpenInAppService);
+   const shouldOpenInApp = useLiveData(service.showOpenInAppPage$);
++  const managedByA2d2 = typeof window !== 'undefined' && 'a2d2Engine' in window;
+ 
+   useEffect(() => {
+-    service?.bootstrap();
+-  }, [service]);
++    if (managedByA2d2) {
++      service.hideOpenInAppPage();
++    } else {
++      service.bootstrap();
++    }
++  }, [managedByA2d2, service]);
+ 
+   const onOpenHere = useCallback(
+     (e: React.MouseEvent) => {
+@@ -27,9 +32,11 @@ const WebOpenInAppGuard = ({ children }: { children: React.ReactNode }) => {
+   );
+ 
+   if (shouldOpenInApp === undefined) {
+-    return null;
++    return managedByA2d2 ? children : null;
+   }
+ 
++  if (managedByA2d2) return children;
++
+   return shouldOpenInApp && !environment.isMobile ? (
+     <OpenInAppPage openHereClicked={onOpenHere} mode="open-doc" />
+   ) : (
+diff --git a/yarn.lock b/yarn.lock
+index fbf69c4..9490dac 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -1086,6 +1086,7 @@ __metadata:
+     react-dom: "npm:^19.2.1"
+     react-router-dom: "npm:^6.30.4"
+     typescript: "npm:@typescript/typescript6@6.0.2"
++    vitest: "npm:^4.1.10"
+   languageName: unknown
+   linkType: soft
+ 

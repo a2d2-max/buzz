@@ -183,6 +183,42 @@
           "sha256": "05d680be973937ceb10c561163f01550c384ae492b75daf442b514d3e3360296"
         },
         {
+          "bytes": 1754,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/doc/a2d2/__tests__/token.spec.ts",
+          "sha256": "e997fdd9a472cb58f9347f50985aea2341b51e17a6ec36a9fe2442815517741b"
+        },
+        {
+          "bytes": 1152,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/doc/a2d2/config.ts",
+          "sha256": "f2d776866cd3cc836f5d42790dbdb8ce6b5105cb69d5c60a846f50717710f38a"
+        },
+        {
+          "bytes": 4309,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/doc/a2d2/controller.ts",
+          "sha256": "875c11e4dda64de448f9805135932ab2caee0ce64f2db429c7d6fc507837923e"
+        },
+        {
+          "bytes": 160,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/doc/a2d2/index.ts",
+          "sha256": "d539c0c6f91041c6fc8ba2a6b69254bfbb71a7db16bc6d330c7e843c3ad8a28a"
+        },
+        {
+          "bytes": 1740,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/doc/a2d2/token.ts",
+          "sha256": "94a4602bfaf073764e96b3cea6a9c378438a3d8d51fa140a286486c9f48149d1"
+        },
+        {
+          "bytes": 1417,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/doc/index.ts",
+          "sha256": "75c0cb1439660b010c8533c1718366d4a9c41ed37e5f84cc309d1f49b164c971"
+        },
+        {
           "bytes": 31778,
           "mode": 420,
           "path": "packages/backend/server/src/core/realtime/__tests__/registry.spec.ts",
@@ -286,8 +322,8 @@
         }
       ],
       "patch": "patches/affine-a2d2.patch",
-      "patch_sha256": "7c56da3e36a8552f5abb6188bb2f21b2b85462f8f2945d50cd21e3a68ab794bb",
-      "source_delta_sha256": "d700a4608ce0b58d31d8ef680689ba026fc1fadf41c1742e4af23d0b5c736be7",
+      "patch_sha256": "fabfa0b8956d68b265fc65f4c7bab1890c02ecf56edb9887c52f80bf86665ee4",
+      "source_delta_sha256": "343014d8d9e19c3253dd9040103e14f553941e6710c91bd4b9733f6d0d8352fc",
       "upstream_commit": "b4c8548c09da21b2898443559a5b846f0ccf5dd8"
     },
     "plane": {
