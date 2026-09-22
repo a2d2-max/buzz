@@ -317,10 +317,10 @@
           "sha256": "bcab5c6dcb69b454dc16fc6401365c7af90d8b1a7f24f9ff86fb77d0e33e4289"
         },
         {
-          "bytes": 1788,
+          "bytes": 2946,
           "mode": 420,
           "path": "apps/api/plane/a2d2/config.py",
-          "sha256": "14ad84823d27fe8e38df96abe1a723f93fa68a402265c00e76c9b60a8e37bbe6"
+          "sha256": "fe53319e8f9a0d492030836a6864fb1e132ff97b54bc910e1c607262f720bc2b"
         },
         {
           "bytes": 4384,
@@ -359,10 +359,10 @@
           "sha256": "12d52dd479372d6b5612ded2f2a8fecfe7da9040f86344fedac8da41d180a90b"
         },
         {
-          "bytes": 2256,
+          "bytes": 2445,
           "mode": 420,
           "path": "apps/api/plane/api/middleware/api_authentication.py",
-          "sha256": "b167866c560b69fa9fb86a4756d8eac77944a3f6530e160562ab4a1c9481cf78"
+          "sha256": "5a42c44b89d5af6708d2e37a99b8a0502f13ff8f0c465cdbf07668016d63523b"
         },
         {
           "bytes": 1691,
@@ -423,6 +423,12 @@
           "mode": 420,
           "path": "apps/api/plane/tests/unit/a2d2/test_principal_reconciliation.py",
           "sha256": "339c0b2a3ac78669f753e1c5c93db2ee4d7f7ea684e7d5352e6e109fe734e39a"
+        },
+        {
+          "bytes": 7457,
+          "mode": 420,
+          "path": "apps/api/plane/tests/unit/a2d2/test_service_token_allowlist.py",
+          "sha256": "e75fd79b6e0656f41599c758d4826a204e6cdd8a4a70cd06c10be7265a912fef"
         },
         {
           "bytes": 1499,
@@ -564,8 +570,8 @@
         }
       ],
       "patch": "patches/plane-a2d2.patch",
-      "patch_sha256": "10ccf653a8ffc73f540b5149dad453ace30d3593e287b45b624dc56a84c159f0",
-      "source_delta_sha256": "48aecafbb63839e3e4ef9a15bc6028af327273fe176761069cfff04a0e6d30a1",
+      "patch_sha256": "e44d1e872bb71aaf49f9f4c8937e33f79025d665224f828982a8fe8dac57944b",
+      "source_delta_sha256": "75cf768965908f63bccdb4bc13683ec25e0852730bb3e3fe90a590d538083779",
       "upstream_commit": "2f895b82dad839c730c36a5c0cbc046f1e5d6b56"
     }
   },
@@ -586,7 +592,8 @@
       "relations": [
         "PLANE_A2D2_ENGINE_SECRET has the same secret bytes as BUZZ_ENGINE_PLANE_BROKER_KEY",
         "PLANE_A2D2_SERVICE_API_TOKEN_SHA256 is lowercase SHA-256 of PLANE_ENGINE_API_KEY",
-        "PLANE_A2D2_ORIGIN exactly equals BUZZ_ENGINE_PLANE_ORIGIN"
+        "PLANE_A2D2_ORIGIN exactly equals BUZZ_ENGINE_PLANE_ORIGIN",
+        "PLANE_A2D2_SERVICE_API_TOKEN_SHA256S is optional; it holds extra lowercase SHA-256 service token hashes separated by commas and is merged with PLANE_A2D2_SERVICE_API_TOKEN_SHA256. Managed mode needs at least one valid hash across both keys, and any malformed entry fails closed."
       ],
       "required_env_keys": [
         "PLANE_A2D2_AUTH_ENABLED",

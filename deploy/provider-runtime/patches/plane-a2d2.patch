@@ -1,5 +1,5 @@
 diff --git a/apps/api/plane/api/middleware/api_authentication.py b/apps/api/plane/api/middleware/api_authentication.py
-index ed03bbb8d4..c8a9d722e5 100644
+index ed03bbb8d4..eef3200847 100644
 --- a/apps/api/plane/api/middleware/api_authentication.py
 +++ b/apps/api/plane/api/middleware/api_authentication.py
 @@ -2,6 +2,10 @@
@@ -21,7 +21,7 @@ index ed03bbb8d4..c8a9d722e5 100644
  from plane.db.models import APIToken
  
  
-@@ -37,6 +42,21 @@ class APIKeyAuthentication(authentication.BaseAuthentication):
+@@ -37,6 +42,24 @@ class APIKeyAuthentication(authentication.BaseAuthentication):
          except APIToken.DoesNotExist:
              raise AuthenticationFailed("Given API token is not valid")
  
@@ -33,9 +33,12 @@ index ed03bbb8d4..c8a9d722e5 100644
 +            ) from error
 +        if config.enabled:
 +            token_sha256 = hashlib.sha256(token.encode()).hexdigest()
-+            if not api_token.is_service or not hmac.compare_digest(
-+                token_sha256, config.service_api_token_sha256
-+            ):
++            # 목록이 비면 any() 가 False 라서 전부 막힌다. 열려 버리지 않는다.
++            allowed = any(
++                hmac.compare_digest(token_sha256, allowed_sha256)
++                for allowed_sha256 in config.service_api_token_sha256s
++            )
++            if not api_token.is_service or not allowed:
 +                raise AuthenticationFailed(
 +                    "A2D2 managed mode only accepts the configured service credential"
 +                )
@@ -949,14 +952,16 @@ index 0000000000..81491b3792
 +        )
 diff --git a/apps/api/plane/a2d2/config.py b/apps/api/plane/a2d2/config.py
 new file mode 100644
-index 0000000000..de38ff6fb4
+index 0000000000..053614322a
 --- /dev/null
 +++ b/apps/api/plane/a2d2/config.py
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,85 @@
 +import os
 +import re
 +from dataclasses import dataclass
 +from urllib.parse import urlparse
++
++TOKEN_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 +
 +
 +@dataclass(frozen=True)
@@ -965,7 +970,12 @@ index 0000000000..de38ff6fb4
 +    broker_url: str
 +    origin: str
 +    secret: bytes
-+    service_api_token_sha256: str = ""
++    service_api_token_sha256s: tuple[str, ...] = ()
++
++    @property
++    def service_api_token_sha256(self) -> str:
++        """맨 앞 해시 하나. 예전 코드가 읽던 이름을 그대로 살려 둔다."""
++        return self.service_api_token_sha256s[0] if self.service_api_token_sha256s else ""
 +
 +
 +def _is_enabled(value: str | None) -> bool:
@@ -989,19 +999,39 @@ index 0000000000..de38ff6fb4
 +    return value.rstrip("/")
 +
 +
++def _token_sha256s(single: str, many: str) -> tuple[str, ...] | None:
++    """서비스 토큰 해시 목록을 읽는다.
++
++    옛 변수 하나와 새 변수(쉼표로 여럿)를 합쳐서 읽는다. 항목 하나라도 64자리
++    소문자 hex 가 아니면 None 을 돌려준다 — 조용히 건너뛰면 열쇠가 빠진 채로
++    열려 버릴 수 있어서다. 순서는 적힌 대로 두고 같은 값만 지운다.
++    """
++    collected: list[str] = []
++    for item in [single, *many.split(",")]:
++        candidate = item.strip()
++        if not candidate:
++            continue
++        if TOKEN_SHA256_PATTERN.fullmatch(candidate) is None:
++            return None
++        if candidate not in collected:
++            collected.append(candidate)
++    return tuple(collected)
++
++
 +def load_config() -> A2D2EngineConfig:
 +    enabled = _is_enabled(os.environ.get("PLANE_A2D2_AUTH_ENABLED"))
 +    broker = _root_url(os.environ.get("PLANE_A2D2_BROKER_URL", ""), loopback_http=True)
 +    origin = _root_url(os.environ.get("PLANE_A2D2_ORIGIN", ""), loopback_http=True)
 +    secret = os.environ.get("PLANE_A2D2_ENGINE_SECRET", "").encode()
-+    service_api_token_sha256 = os.environ.get(
-+        "PLANE_A2D2_SERVICE_API_TOKEN_SHA256", ""
++    service_api_token_sha256s = _token_sha256s(
++        os.environ.get("PLANE_A2D2_SERVICE_API_TOKEN_SHA256", ""),
++        os.environ.get("PLANE_A2D2_SERVICE_API_TOKEN_SHA256S", ""),
 +    )
 +    if enabled and (
 +        broker is None
 +        or origin is None
 +        or len(secret) < 32
-+        or re.fullmatch(r"[0-9a-f]{64}", service_api_token_sha256) is None
++        or not service_api_token_sha256s
 +    ):
 +        raise ValueError("A2D2 Plane authentication is enabled but incomplete")
 +    return A2D2EngineConfig(
@@ -1009,7 +1039,7 @@ index 0000000000..de38ff6fb4
 +        broker_url=broker or "",
 +        origin=origin or "",
 +        secret=secret,
-+        service_api_token_sha256=service_api_token_sha256,
++        service_api_token_sha256s=service_api_token_sha256s or (),
 +    )
 diff --git a/apps/api/plane/a2d2/middleware.py b/apps/api/plane/a2d2/middleware.py
 new file mode 100644
@@ -2151,14 +2181,11 @@ index 0000000000..fb10f7e72d
 +        ]
 diff --git a/apps/api/plane/tests/unit/a2d2/__init__.py b/apps/api/plane/tests/unit/a2d2/__init__.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..8b137891791fe96927ad78e64b0aad7bded08bdc
-GIT binary patch
-literal 1
-Icmd-A000XB3jhEB
-
-literal 0
-HcmV?d00001
-
+index 0000000000..8b13789179
+--- /dev/null
++++ b/apps/api/plane/tests/unit/a2d2/__init__.py
+@@ -0,0 +1 @@
++
 diff --git a/apps/api/plane/tests/unit/a2d2/test_broker.py b/apps/api/plane/tests/unit/a2d2/test_broker.py
 new file mode 100644
 index 0000000000..95063fd9ff
@@ -3427,6 +3454,219 @@ index 0000000000..3f867a6930
 +            A2D2ManagedPrincipal.objects.get().nostr_pubkey,
 +            undeclared_pubkey,
 +        )
+diff --git a/apps/api/plane/tests/unit/a2d2/test_service_token_allowlist.py b/apps/api/plane/tests/unit/a2d2/test_service_token_allowlist.py
+new file mode 100644
+index 0000000000..3c5e2b9f03
+--- /dev/null
++++ b/apps/api/plane/tests/unit/a2d2/test_service_token_allowlist.py
+@@ -0,0 +1,207 @@
++import hashlib
++import os
++from unittest.mock import patch
++
++from django.test import Client, SimpleTestCase, TestCase
++
++from plane.a2d2.config import A2D2EngineConfig, load_config
++from plane.db.models import APIToken, User
++
++
++ORIGIN = "https://plane.example.test"
++BASE_ENV = {
++    "PLANE_A2D2_AUTH_ENABLED": "true",
++    "PLANE_A2D2_BROKER_URL": "https://relay.example.test",
++    "PLANE_A2D2_ORIGIN": ORIGIN,
++    "PLANE_A2D2_ENGINE_SECRET": "s" * 32,
++    "PLANE_A2D2_SERVICE_API_TOKEN_SHA256": "",
++    "PLANE_A2D2_SERVICE_API_TOKEN_SHA256S": "",
++}
++
++
++def sha256_hex(value: str) -> str:
++    return hashlib.sha256(value.encode()).hexdigest()
++
++
++def auth_env(**overrides: str) -> dict[str, str]:
++    env = dict(BASE_ENV)
++    env.update(overrides)
++    return env
++
++
++class ServiceTokenConfigTest(SimpleTestCase):
++    """환경변수를 해시 목록으로 읽는 부분만 따로 본다. DB 안 쓴다."""
++
++    def load(self, **overrides: str) -> A2D2EngineConfig:
++        with patch.dict(os.environ, auth_env(**overrides), clear=False):
++            return load_config()
++
++    def test_old_single_variable_alone_still_works(self):
++        one = sha256_hex("plane_api_projection_service")
++
++        config = self.load(PLANE_A2D2_SERVICE_API_TOKEN_SHA256=one)
++
++        self.assertEqual(config.service_api_token_sha256s, (one,))
++        self.assertEqual(config.service_api_token_sha256, one)
++
++    def test_new_list_variable_alone_keeps_every_hash_in_order(self):
++        first = sha256_hex("service-one")
++        second = sha256_hex("service-two")
++        third = sha256_hex("service-three")
++
++        config = self.load(
++            PLANE_A2D2_SERVICE_API_TOKEN_SHA256S=f"{first}, {second} ,{third}"
++        )
++
++        self.assertEqual(config.service_api_token_sha256s, (first, second, third))
++        self.assertEqual(config.service_api_token_sha256, first)
++
++    def test_both_variables_are_merged_without_duplicates(self):
++        old = sha256_hex("plane_api_projection_service")
++        bridge = sha256_hex("board_bridge_service")
++
++        config = self.load(
++            PLANE_A2D2_SERVICE_API_TOKEN_SHA256=old,
++            PLANE_A2D2_SERVICE_API_TOKEN_SHA256S=f"{bridge},{old}",
++        )
++
++        self.assertEqual(config.service_api_token_sha256s, (old, bridge))
++
++    def test_enabled_without_any_hash_is_rejected(self):
++        with self.assertRaises(ValueError):
++            self.load()
++
++    def test_a_single_broken_entry_rejects_the_whole_list(self):
++        good = sha256_hex("service-one")
++
++        with self.assertRaises(ValueError):
++            self.load(PLANE_A2D2_SERVICE_API_TOKEN_SHA256S=f"{good},not-a-sha256")
++
++    def test_uppercase_hex_is_still_rejected(self):
++        with self.assertRaises(ValueError):
++            self.load(PLANE_A2D2_SERVICE_API_TOKEN_SHA256=sha256_hex("x").upper())
++
++    def test_disabled_mode_keeps_an_empty_tuple_instead_of_none(self):
++        with patch.dict(
++            os.environ,
++            auth_env(
++                PLANE_A2D2_AUTH_ENABLED="false",
++                PLANE_A2D2_SERVICE_API_TOKEN_SHA256S="not-a-sha256",
++            ),
++            clear=False,
++        ):
++            config = load_config()
++
++        self.assertFalse(config.enabled)
++        self.assertEqual(config.service_api_token_sha256s, ())
++        self.assertEqual(config.service_api_token_sha256, "")
++
++
++class ServiceTokenAllowlistTest(TestCase):
++    """실제 API 경로로 X-Api-Key 를 넣어 본다."""
++
++    def service_token(self, token_value: str) -> APIToken:
++        user = User.objects.create_user(
++            email=f"{token_value}@example.invalid",
++            username=token_value,
++            password=None,
++        )
++        return APIToken.objects.create(user=user, token=token_value, is_service=True)
++
++    def call(self, token_value: str, **env: str):
++        with patch.dict(os.environ, auth_env(**env), clear=False):
++            return Client().get("/api/v1/users/me/", HTTP_X_API_KEY=token_value)
++
++    def test_old_single_variable_token_still_passes(self):
++        token_value = "plane_api_projection_service"
++        token = self.service_token(token_value)
++
++        response = self.call(
++            token_value,
++            PLANE_A2D2_SERVICE_API_TOKEN_SHA256=sha256_hex(token_value),
++        )
++
++        self.assertEqual(response.status_code, 200)
++        token.refresh_from_db()
++        self.assertIsNotNone(token.last_used)
++
++    def test_every_token_on_the_list_passes(self):
++        projection = "plane_api_projection_service"
++        bridge = "board_bridge_service"
++        self.service_token(projection)
++        self.service_token(bridge)
++        env = {
++            "PLANE_A2D2_SERVICE_API_TOKEN_SHA256": sha256_hex(projection),
++            "PLANE_A2D2_SERVICE_API_TOKEN_SHA256S": ",".join(
++                [sha256_hex(bridge), sha256_hex("a-third-service")]
++            ),
++        }
++
++        for token_value in (projection, bridge):
++            with self.subTest(token=token_value):
++                response = self.call(token_value, **env)
++                self.assertEqual(response.status_code, 200)
++
++    def test_a_token_outside_the_list_is_rejected(self):
++        stranger = "plane_api_stranger"
++        self.service_token(stranger)
++
++        response = self.call(
++            stranger,
++            PLANE_A2D2_SERVICE_API_TOKEN_SHA256S=",".join(
++                [sha256_hex("service-one"), sha256_hex("service-two")]
++            ),
++        )
++
++        self.assertIn(response.status_code, {401, 403})
++
++    def test_personal_token_is_rejected_even_when_its_hash_is_on_the_list(self):
++        token_value = "plane_api_personal_bypass"
++        user = User.objects.create_user(
++            email="personal-on-list@example.invalid",
++            username="personal-on-list",
++            password="not-a-real-password",
++        )
++        APIToken.objects.create(user=user, token=token_value, is_service=False)
++
++        response = self.call(
++            token_value,
++            PLANE_A2D2_SERVICE_API_TOKEN_SHA256S=",".join(
++                [sha256_hex("service-one"), sha256_hex(token_value)]
++            ),
++        )
++
++        self.assertIn(response.status_code, {401, 403})
++
++    def test_enabled_with_no_hash_configured_keeps_rejecting_everything(self):
++        """켜 놓고 해시를 하나도 안 주면 설정이 아예 안 읽힌다.
++
++        옛 코드도 똑같이 ValueError 를 냈고, a2d2 세션 미들웨어가 그걸
++        503 a2d2_auth_unavailable 로 돌려준다. 동작을 그대로 못 박아 둔다.
++        """
++        token_value = "plane_api_projection_service"
++        self.service_token(token_value)
++
++        response = self.call(token_value)
++
++        self.assertEqual(response.status_code, 503)
++        self.assertEqual(response.json(), {"error": "a2d2_auth_unavailable"})
++
++    def test_an_empty_allowlist_reaching_the_middleware_still_denies(self):
++        """설정이 어쩌다 빈 목록을 내줘도 열리면 안 된다."""
++        token_value = "plane_api_projection_service"
++        self.service_token(token_value)
++        empty = A2D2EngineConfig(
++            enabled=True,
++            broker_url="https://relay.example.test",
++            origin=ORIGIN,
++            secret=b"s" * 32,
++            service_api_token_sha256s=(),
++        )
++
++        with patch(
++            "plane.api.middleware.api_authentication.load_config", return_value=empty
++        ):
++            response = Client().get("/api/v1/users/me/", HTTP_X_API_KEY=token_value)
++
++        self.assertIn(response.status_code, {401, 403})
 diff --git a/apps/api/uv.lock b/apps/api/uv.lock
 new file mode 100644
 index 0000000000..a84a44e748
