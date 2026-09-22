@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Pre-push scope signal (warn-only, never fails the push).
 #
-# The scoped pre-push lanes derive their file set from `git diff origin/main...HEAD`,
-# and lefthook's own stock discovery is `git diff HEAD @{push}` — both inspect the
+# The scoped pre-push lanes derive their file set from the configured integration
+# base through `scripts/list-pre-push-files.sh`, while lefthook's own stock
+# discovery is `git diff HEAD @{push}` — both inspect the
 # checked-out HEAD, not the SHAs actually being pushed. Pushing a non-checked-out
 # ref (e.g. `git push origin other-branch`, an explicit refspec, or `--all`) can
 # therefore run the scoped lanes against HEAD while pushing a different commit, so

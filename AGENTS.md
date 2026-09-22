@@ -126,9 +126,13 @@ and fast unit tests in parallel (Rust, desktop JS, Tauri Rust, mobile Flutter)
 — no overlap with pre-commit. Builds are CI-only. Run `just fix-all` to auto-fix
 all formatting in one shot. Run `just ci` for the full local gate. Run `just
 hooks` to re-install hooks after env changes. Each globbed pre-push lane is
-scoped to the branch's merge-base diff against `origin/main` (`git diff
-origin/main...HEAD`), matching CI's paths-filter — so a lane only fires when this
-branch actually changed a file it covers, never because `origin/main` moved.
+scoped to the branch's merge-base diff against its integration base, matching
+CI's paths-filter. The default is `origin/main`; maintained fork branches can
+set a full remote-tracking ref with `git config "branch.$(git branch --show-current).base" "refs/remotes/<remote>/<branch>"`.
+The branch-skew, scoped-file, and file-size
+gates all resolve this same setting and fail closed if it is invalid or missing.
+This means a lane only fires when the feature branch changed a file it covers,
+never merely because its integration branch moved.
 These lanes validate the checked-out HEAD; pushing a non-HEAD ref (explicit
 refspec, `--all`) gets a non-fatal `push-head-scope` warning and relies on CI for
 its path-scoped checks.

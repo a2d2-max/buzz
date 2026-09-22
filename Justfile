@@ -105,7 +105,7 @@ security-review-check:
 # The ratchet inspects only files changed from the merge base, so this stays
 # cheap enough to run unconditionally without duplicating path filters.
 file-size-check:
-    node --test scripts/check-file-sizes-core.test.mjs
+    node --test scripts/check-file-sizes-core.test.mjs scripts/pre-push-base.test.mjs
     node desktop/scripts/check-file-sizes.mjs
     node web/scripts/check-file-sizes.mjs
     node mobile/scripts/check-file-sizes.mjs
