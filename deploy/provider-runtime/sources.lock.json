@@ -183,6 +183,12 @@
           "sha256": "05d680be973937ceb10c561163f01550c384ae492b75daf442b514d3e3360296"
         },
         {
+          "bytes": 6514,
+          "mode": 420,
+          "path": "packages/backend/server/src/core/doc/a2d2/__tests__/controller.spec.ts",
+          "sha256": "a73625216b319c9c0a6151a17d0ebdcb227cbae4dc19ab5028db42455ad9a397"
+        },
+        {
           "bytes": 1754,
           "mode": 420,
           "path": "packages/backend/server/src/core/doc/a2d2/__tests__/token.spec.ts",
@@ -322,8 +328,8 @@
         }
       ],
       "patch": "patches/affine-a2d2.patch",
-      "patch_sha256": "fabfa0b8956d68b265fc65f4c7bab1890c02ecf56edb9887c52f80bf86665ee4",
-      "source_delta_sha256": "343014d8d9e19c3253dd9040103e14f553941e6710c91bd4b9733f6d0d8352fc",
+      "patch_sha256": "d650b56a6406a11da4beba877bfccc8a0e6afded6eab5f2f5f314a8795680edf",
+      "source_delta_sha256": "2332eba9132a6e1a610129cb3e5608d07fc7d4fb203a3391af2b0a5c7c6ea678",
       "upstream_commit": "b4c8548c09da21b2898443559a5b846f0ccf5dd8"
     },
     "plane": {

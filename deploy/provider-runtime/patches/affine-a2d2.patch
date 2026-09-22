@@ -2687,6 +2687,231 @@ index c5bfe84..85fe9d8 100644
      const token = await this.models.verificationToken.create(
        TokenType.ChangePassword,
        userId
+diff --git a/packages/backend/server/src/core/doc/a2d2/__tests__/controller.spec.ts b/packages/backend/server/src/core/doc/a2d2/__tests__/controller.spec.ts
+new file mode 100644
+index 0000000..0d7c149
+--- /dev/null
++++ b/packages/backend/server/src/core/doc/a2d2/__tests__/controller.spec.ts
+@@ -0,0 +1,219 @@
++import { createHash } from 'node:crypto';
++
++import ava from 'ava';
++
++import { A2d2DocController } from '../controller';
++
++const test = ava;
++const TOKEN = 'service-token';
++const HASH = createHash('sha256').update(TOKEN, 'utf8').digest('hex');
++const WS = 'workspace-1';
++const DOC = 'doc-1';
++
++interface Captured {
++  status: number;
++  body: unknown;
++  headers: Record<string, string>;
++  sent?: unknown;
++}
++
++function fakeRes() {
++  const captured: Captured = { status: 200, body: undefined, headers: {} };
++  const res = {
++    status(code: number) {
++      captured.status = code;
++      return res;
++    },
++    json(payload: unknown) {
++      captured.body = payload;
++      return res;
++    },
++    setHeader(key: string, value: string) {
++      captured.headers[key.toLowerCase()] = value;
++    },
++    send(payload: unknown) {
++      captured.sent = payload;
++    },
++  };
++  return { res: res as any, captured };
++}
++
++function fakeReq(authorization?: string) {
++  return { headers: authorization ? { authorization } : {} } as any;
++}
++
++function build(options: {
++  enabled?: boolean;
++  single?: string;
++  list?: string;
++  editor?: string;
++  doc?: { bin: Buffer; timestamp: number; editor?: string } | null;
++  push?: (...args: unknown[]) => Promise<number>;
++}) {
++  const pushed: unknown[][] = [];
++  const config = {
++    a2d2Docs: {
++      enabled: options.enabled ?? true,
++      serviceTokenSha256: options.single ?? HASH,
++      serviceTokenSha256s: options.list ?? '',
++      serviceEditorId: options.editor ?? 'sync-bot',
++    },
++  } as any;
++  const reader = {
++    getDoc: async () => options.doc ?? null,
++  } as any;
++  const storage = {
++    pushDocUpdates: async (...args: unknown[]) => {
++      pushed.push(args);
++      return options.push ? await options.push(...args) : 1234;
++    },
++  } as any;
++  return {
++    controller: new A2d2DocController(config, reader, storage),
++    pushed,
++  };
++}
++
++test('a request without a bearer token is refused', async t => {
++  const { controller } = build({});
++  const { res, captured } = fakeRes();
++  await controller.read(fakeReq(), res, WS, DOC);
++  t.is(captured.status, 403);
++  t.deepEqual(captured.body, { error: 'a2d2_docs_forbidden' });
++});
++
++test('a wrong token is refused', async t => {
++  const { controller } = build({});
++  const { res, captured } = fakeRes();
++  await controller.read(fakeReq('Bearer nope'), res, WS, DOC);
++  t.is(captured.status, 403);
++});
++
++test('the endpoints hide themselves when the feature is off', async t => {
++  const { controller } = build({ enabled: false });
++  const { res, captured } = fakeRes();
++  await controller.read(fakeReq(`Bearer ${TOKEN}`), res, WS, DOC);
++  t.is(captured.status, 404);
++});
++
++test('an empty allowlist refuses instead of opening up', async t => {
++  const { controller } = build({ single: '', list: '' });
++  const { res, captured } = fakeRes();
++  await controller.read(fakeReq(`Bearer ${TOKEN}`), res, WS, DOC);
++  t.is(captured.status, 503);
++  t.deepEqual(captured.body, { error: 'a2d2_docs_auth_unavailable' });
++});
++
++test('reading returns the raw binary with its timestamp and editor', async t => {
++  const bin = Buffer.from([1, 2, 3]);
++  const { controller } = build({
++    doc: { bin, timestamp: 42, editor: 'someone' },
++  });
++  const { res, captured } = fakeRes();
++  await controller.read(fakeReq(`Bearer ${TOKEN}`), res, WS, DOC);
++  t.is(captured.sent, bin);
++  t.is(captured.headers['x-doc-timestamp'], '42');
++  t.is(captured.headers['x-doc-editor-id'], 'someone');
++  t.is(captured.headers['content-type'], 'application/octet-stream');
++});
++
++test('a missing doc is a 404, not an empty success', async t => {
++  const { controller } = build({ doc: null });
++  const { res, captured } = fakeRes();
++  await controller.read(fakeReq(`Bearer ${TOKEN}`), res, WS, DOC);
++  t.is(captured.status, 404);
++});
++
++test('a malformed id is refused before any storage call', async t => {
++  const { controller, pushed } = build({});
++  const { res, captured } = fakeRes();
++  await controller.write(
++    fakeReq(`Bearer ${TOKEN}`),
++    res,
++    'bad id!',
++    DOC,
++    Buffer.from([1])
++  );
++  t.is(captured.status, 400);
++  t.is(pushed.length, 0);
++});
++
++test('writing without a configured sync bot is refused — the echo filter needs it', async t => {
++  const { controller, pushed } = build({ editor: '  ' });
++  const { res, captured } = fakeRes();
++  await controller.write(
++    fakeReq(`Bearer ${TOKEN}`),
++    res,
++    WS,
++    DOC,
++    Buffer.from([1])
++  );
++  t.is(captured.status, 503);
++  t.deepEqual(captured.body, { error: 'a2d2_docs_editor_unset' });
++  t.is(pushed.length, 0);
++});
++
++test('an empty body is refused', async t => {
++  const { controller, pushed } = build({});
++  const { res, captured } = fakeRes();
++  await controller.write(fakeReq(`Bearer ${TOKEN}`), res, WS, DOC, undefined);
++  t.is(captured.status, 400);
++  t.is(pushed.length, 0);
++});
++
++test('an oversized update is refused', async t => {
++  const { controller, pushed } = build({});
++  const { res, captured } = fakeRes();
++  await controller.write(
++    fakeReq(`Bearer ${TOKEN}`),
++    res,
++    WS,
++    DOC,
++    Buffer.alloc(8 * 1024 * 1024 + 1)
++  );
++  t.is(captured.status, 413);
++  t.is(pushed.length, 0);
++});
++
++test('a write is handed to the upstream push with the sync bot as editor', async t => {
++  const { controller, pushed } = build({ editor: 'sync-bot' });
++  const { res, captured } = fakeRes();
++  const update = Buffer.from([9, 8, 7]);
++  await controller.write(fakeReq(`Bearer ${TOKEN}`), res, WS, DOC, update);
++  t.is(pushed.length, 1);
++  t.is(pushed[0][0], WS);
++  t.is(pushed[0][1], DOC);
++  t.deepEqual(pushed[0][2], [new Uint8Array(update)]);
++  t.is(pushed[0][3], 'sync-bot');
++  t.deepEqual(captured.body, {
++    applied: true,
++    timestamp: 1234,
++    editor: 'sync-bot',
++  });
++});
++
++test('timestamp 0 means nothing changed — it is not an error', async t => {
++  const { controller } = build({ push: async () => 0 });
++  const { res, captured } = fakeRes();
++  await controller.write(
++    fakeReq(`Bearer ${TOKEN}`),
++    res,
++    WS,
++    DOC,
++    Buffer.from([1])
++  );
++  t.deepEqual(captured.body, {
++    applied: false,
++    timestamp: 0,
++    editor: 'sync-bot',
++  });
++});
++
++test('a token from the comma list is accepted too', async t => {
++  const other = createHash('sha256').update('second', 'utf8').digest('hex');
++  const { controller } = build({ list: other, doc: { bin: Buffer.from([]), timestamp: 1 } });
++  const { res, captured } = fakeRes();
++  await controller.read(fakeReq('Bearer second'), res, WS, DOC);
++  t.is(captured.status, 200);
++  t.is(captured.headers['x-doc-timestamp'], '1');
++});
 diff --git a/packages/backend/server/src/core/doc/a2d2/__tests__/token.spec.ts b/packages/backend/server/src/core/doc/a2d2/__tests__/token.spec.ts
 new file mode 100644
 index 0000000..4f14790
