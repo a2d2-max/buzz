@@ -3437,3 +3437,134 @@ async fn test_nip29_relay_rejects_last_owner_self_demotion() {
         "the last owner must keep their role"
     );
 }
+
+/// A fresh 64-char hex id standing in for a mention nobody has claimed yet.
+fn fresh_target_id() -> String {
+    format!(
+        "{:032x}{:032x}",
+        Uuid::new_v4().as_u128(),
+        Uuid::new_v4().as_u128()
+    )
+}
+
+/// Builds a kind:24250 mention claim for `target_id` carrying `nonce`.
+fn mention_claim_event(keys: &Keys, target_id: &str, nonce: &str) -> nostr::Event {
+    let kind = u16::try_from(buzz_core::kind::KIND_AGENT_MENTION_CLAIM).expect("kind fits u16");
+    EventBuilder::new(Kind::Custom(kind), "")
+        .tags([
+            Tag::parse(["e", target_id]).expect("e tag"),
+            Tag::parse(["nonce", nonce]).expect("nonce tag"),
+        ])
+        .sign_with_keys(keys)
+        .expect("sign claim")
+}
+
+/// Two runtimes share one agent key and race for the same mention. The relay
+/// is the referee: the first claim wins, the second is told it lost, and the
+/// winner's own nonce re-claims (reconnect replay) instead of losing.
+#[tokio::test]
+#[ignore]
+async fn test_mention_claim_is_granted_to_exactly_one_runtime() {
+    let url = relay_url();
+    ensure_test_community(&relay_authority()).await;
+    let keys = Keys::generate();
+    let mut client = BuzzTestClient::connect(&url, &keys).await.expect("connect");
+
+    let target = fresh_target_id();
+
+    let first = client
+        .send_event(mention_claim_event(&keys, &target, "runtime-1"))
+        .await
+        .expect("first claim");
+    assert!(first.accepted, "first claim rejected: {}", first.message);
+
+    let second = client
+        .send_event(mention_claim_event(&keys, &target, "runtime-2"))
+        .await
+        .expect("second claim");
+    assert!(
+        !second.accepted,
+        "second runtime must not also get the mention"
+    );
+    assert_eq!(second.message, "duplicate: already claimed");
+
+    let replay = client
+        .send_event(mention_claim_event(&keys, &target, "runtime-1"))
+        .await
+        .expect("replayed claim");
+    assert!(
+        replay.accepted,
+        "the holder re-claiming its own mention must win: {}",
+        replay.message
+    );
+    assert_eq!(replay.message, "already yours");
+
+    // A claim without an `e` tag is a protocol error, not a lost race.
+    let malformed = EventBuilder::new(
+        Kind::Custom(u16::try_from(buzz_core::kind::KIND_AGENT_MENTION_CLAIM).expect("kind")),
+        "",
+    )
+    .sign_with_keys(&keys)
+    .expect("sign malformed claim");
+    let rejected = client
+        .send_event(malformed)
+        .await
+        .expect("malformed claim answered");
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.message, "invalid: claim needs one e tag");
+
+    client.disconnect().await.expect("disconnect");
+}
+
+/// Submits one claim through the HTTP bridge (`POST /events`) and returns the
+/// status plus the `{event_id, accepted, message}` body.
+async fn post_mention_claim(
+    keys: &Keys,
+    target_id: &str,
+    nonce: &str,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let event = mention_claim_event(keys, target_id, nonce);
+    let response = reqwest::Client::new()
+        .post(format!("{}/events", relay_http_url()))
+        .header("X-Pubkey", keys.public_key().to_hex())
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&event).expect("serialize claim"))
+        .send()
+        .await
+        .expect("POST /events");
+    let status = response.status();
+    (status, response.json().await.expect("claim response JSON"))
+}
+
+/// The agent runtime claims over the HTTP bridge, not the WebSocket — that is
+/// its only correlated request/response path. A lost claim must still be HTTP
+/// 200 with `accepted: false`, so the runtime can tell it apart from a
+/// transport failure.
+#[tokio::test]
+#[ignore]
+async fn test_mention_claim_over_http_bridge_is_granted_once() {
+    ensure_test_community(&relay_authority()).await;
+    let keys = Keys::generate();
+    let target = fresh_target_id();
+
+    let (status, body) = post_mention_claim(&keys, &target, "runtime-1").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "first claim: {body}");
+    assert_eq!(body["accepted"], serde_json::json!(true), "body: {body}");
+
+    let (status, body) = post_mention_claim(&keys, &target, "runtime-2").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "a lost claim must not be an HTTP error: {body}"
+    );
+    assert_eq!(body["accepted"], serde_json::json!(false), "body: {body}");
+    assert_eq!(
+        body["message"],
+        serde_json::json!("duplicate: already claimed")
+    );
+
+    let (status, body) = post_mention_claim(&keys, &target, "runtime-1").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "replayed claim: {body}");
+    assert_eq!(body["accepted"], serde_json::json!(true), "body: {body}");
+    assert_eq!(body["message"], serde_json::json!("already yours"));
+}

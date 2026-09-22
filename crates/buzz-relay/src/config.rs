@@ -322,6 +322,16 @@ pub struct Config {
     /// 60 seconds after the last message.
     pub ephemeral_ttl_override: Option<i32>,
 
+    /// Lifetime of one agent mention claim (kind:24250), in seconds.
+    ///
+    /// `BUZZ_CLAIM_TTL_SECS`, default
+    /// [`DEFAULT_CLAIM_TTL_SECS`](buzz_pubsub::mention_claim::DEFAULT_CLAIM_TTL_SECS),
+    /// clamped down to
+    /// [`MAX_CLAIM_TTL_SECS`](buzz_pubsub::mention_claim::MAX_CLAIM_TTL_SECS).
+    /// A claim parks one mention for another runtime, so an over-long lease
+    /// would strand the mention when the winner dies mid-turn.
+    pub claim_ttl_secs: u64,
+
     /// Root directory for the relay's local git scratch. No authoritative
     /// repository state lives here — runtime reads/writes hydrate ephemeral
     /// repos from object storage per request. Temporary workspaces, buffered
@@ -397,6 +407,20 @@ fn positive_u64_from_env(name: &str, default: u64) -> Result<u64, ConfigError> {
             "{name} must be valid Unicode"
         ))),
     }
+}
+
+/// Resolves `BUZZ_CLAIM_TTL_SECS` — the lifetime of one agent mention claim.
+///
+/// Defaults to [`buzz_pubsub::mention_claim::DEFAULT_CLAIM_TTL_SECS`] and is
+/// clamped down to [`buzz_pubsub::mention_claim::MAX_CLAIM_TTL_SECS`], so a
+/// fat-fingered value cannot park a mention for a day. A non-positive or
+/// non-numeric value fails startup loudly rather than falling back silently.
+fn claim_ttl_secs_from_env() -> Result<u64, ConfigError> {
+    Ok(positive_u64_from_env(
+        "BUZZ_CLAIM_TTL_SECS",
+        buzz_pubsub::mention_claim::DEFAULT_CLAIM_TTL_SECS,
+    )?
+    .min(buzz_pubsub::mention_claim::MAX_CLAIM_TTL_SECS))
 }
 
 fn positive_usize_from_env(name: &str, default: usize) -> Result<usize, ConfigError> {
@@ -955,6 +979,8 @@ impl Config {
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&v| v > 0);
 
+        let claim_ttl_secs = claim_ttl_secs_from_env()?;
+
         if let Some(ttl) = ephemeral_ttl_override {
             warn!(
                 "BUZZ_EPHEMERAL_TTL_OVERRIDE={ttl}s — all ephemeral channels will use \
@@ -1285,6 +1311,7 @@ impl Config {
             media_uploads_per_minute,
             audit_enabled,
             ephemeral_ttl_override,
+            claim_ttl_secs,
             git_repo_path,
             git_pack_cache_path,
             git_max_pack_bytes,
@@ -1325,6 +1352,49 @@ mod tests {
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
     // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `BUZZ_CLAIM_TTL_SECS`: default, override, ceiling, and loud failure.
+    #[test]
+    fn claim_ttl_is_defaulted_clamped_and_validated() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("BUZZ_CLAIM_TTL_SECS");
+
+        std::env::remove_var("BUZZ_CLAIM_TTL_SECS");
+        assert_eq!(
+            claim_ttl_secs_from_env().expect("default"),
+            buzz_pubsub::mention_claim::DEFAULT_CLAIM_TTL_SECS
+        );
+        assert_eq!(
+            buzz_pubsub::mention_claim::DEFAULT_CLAIM_TTL_SECS,
+            600,
+            "documented default"
+        );
+
+        std::env::set_var("BUZZ_CLAIM_TTL_SECS", "120");
+        assert_eq!(claim_ttl_secs_from_env().expect("override"), 120);
+
+        std::env::set_var("BUZZ_CLAIM_TTL_SECS", "86400");
+        assert_eq!(
+            claim_ttl_secs_from_env().expect("clamped"),
+            buzz_pubsub::mention_claim::MAX_CLAIM_TTL_SECS
+        );
+
+        std::env::set_var("BUZZ_CLAIM_TTL_SECS", "0");
+        assert!(claim_ttl_secs_from_env().is_err(), "zero must fail startup");
+
+        std::env::set_var("BUZZ_CLAIM_TTL_SECS", "later");
+        assert!(
+            claim_ttl_secs_from_env().is_err(),
+            "non-numeric must fail startup"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("BUZZ_CLAIM_TTL_SECS", value),
+            None => std::env::remove_var("BUZZ_CLAIM_TTL_SECS"),
+        }
+    }
 
     /// Look up against a fixed set, standing in for process env.
     fn env_of<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + use<'a> {

@@ -339,6 +339,7 @@ out of the box with `just setup` or `just relay`. Common overrides:
 | `BUZZ_MAX_EVENT_CONTENT_BYTES`  | `262144`                    | Maximum UTF-8 bytes in one event's `content`. Must be positive and leave at least 65536 bytes below `BUZZ_MAX_FRAME_BYTES`. |
 | `BUZZ_MAX_FRAME_BYTES`          | `524288`                    | Maximum inbound WebSocket frame and assembled message bytes. The 65536-byte configuration floor is not a guarantee for escape-heavy JSON or unusually large tags. |
 | `BUZZ_AUDIT_ENABLED`            | `true`                      | Tamper-evident event/media audit log. Set `false`/`0`/`off` to skip its DB pool and writes. Does not disable the separate moderation audit trail. |
+| `BUZZ_CLAIM_TTL_SECS`           | `600`                       | Lifetime of one agent mention claim (kind:24250), in seconds. Values above `3600` are clamped to `3600`; a zero or non-numeric value fails startup. |
 | `BUZZ_AUTO_MIGRATE`             | `false`                     | Opt in with `true`/`1`/`yes`/`on` to run embedded SQLx migrations on relay startup |
 | `RELAY_OWNER_PUBKEY`              | unset                       | Bootstrapped as `owner` in `relay_members` at first start |
 | `BUZZ_ALLOW_NIP_OA_AUTH`        | `false`                     | Enable NIP-OA owner attestation for membership |

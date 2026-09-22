@@ -27,6 +27,8 @@ pub mod cache_invalidation;
 pub mod conn_control;
 /// Error types for pub/sub operations.
 pub mod error;
+/// Agent mention claims — at most one runtime answers a given mention.
+pub mod mention_claim;
 /// Redis-backed NIP-98 replay seen-set.
 pub mod nip98_replay;
 pub use nip98_replay::RedisNip98ReplayGuard;
@@ -363,6 +365,21 @@ impl PubSubManager {
         pubkeys: &[PublicKey],
     ) -> Result<HashMap<String, String>, PubSubError> {
         presence::get_presence_bulk(&self.pool, ctx, pubkeys).await
+    }
+
+    /// Attempts an agent mention claim — see [`mention_claim::try_claim`].
+    ///
+    /// A Redis failure surfaces as `Err` so the caller fails closed; a win is
+    /// only ever reported when Redis itself set the key.
+    pub async fn try_mention_claim(
+        &self,
+        ctx: &TenantContext,
+        pubkey: &PublicKey,
+        target_event_id: &str,
+        token: &str,
+        ttl_secs: u64,
+    ) -> Result<mention_claim::ClaimAttempt, PubSubError> {
+        mention_claim::try_claim(&self.pool, ctx, pubkey, target_event_id, token, ttl_secs).await
     }
 }
 

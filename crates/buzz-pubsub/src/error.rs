@@ -23,6 +23,10 @@ pub enum PubSubError {
     #[error("Pub/sub subscriber task stopped")]
     SubscriberStopped,
 
+    /// A Redis command returned a reply the caller cannot interpret.
+    #[error("Unexpected Redis reply: {0}")]
+    UnexpectedReply(String),
+
     /// A Redis channel key could not be parsed as a valid channel ID.
     #[error("Invalid channel key: {0}")]
     InvalidChannelKey(String),

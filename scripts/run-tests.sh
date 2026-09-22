@@ -131,6 +131,13 @@ run_unit_tests() {
   run_test_step "buzz-acp unit tests" \
     cargo test -p buzz-acp --lib -- --nocapture
 
+  # buzz-pubsub library tests, infra-free half only: its Redis tests (presence,
+  # NIP-98 replay, mention claim) are #[ignore]d and run in the integration
+  # lane below, and in CI in the Relay E2E job which has a live Redis.
+  # Nothing else ran this crate's --lib tests.
+  run_test_step "buzz-pubsub unit tests" \
+    cargo test -p buzz-pubsub --lib -- --nocapture
+
   # Mirror the three infra-free relay handler modules in `just test-unit`'s
   # nextest expression. Keep the side-effects filter pinned to `::tests::` so
   # it does not select the sibling Postgres-backed test module.
@@ -142,6 +149,18 @@ run_unit_tests() {
 
   run_test_step "buzz-relay side-effects helper tests" \
     cargo test -p buzz-relay --lib handlers::side_effects::tests:: -- --nocapture
+
+  # Agent mention claim: tag validation, the Redis-outcome mapping, and the
+  # HTTP bridge's answer shape. All infra-free (the live-Redis half lives in
+  # buzz-pubsub). Without this step the module would run in no lane.
+  run_test_step "buzz-relay mention claim tests" \
+    cargo test -p buzz-relay --lib handlers::claim::tests:: -- --nocapture
+
+  run_test_step "buzz-relay HTTP bridge helper tests" \
+    cargo test -p buzz-relay --lib api::bridge::tests:: -- --nocapture
+
+  run_test_step "buzz-relay NIP-11 document tests" \
+    cargo test -p buzz-relay --lib nip11::tests:: -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------
@@ -153,6 +172,13 @@ run_integration_tests() {
 
   run_test_step "buzz-db tests" \
     cargo test -p buzz-db -- --nocapture
+
+  # Redis-backed buzz-pubsub tests, including the agent mention-claim
+  # arbitration (SET NX EX + the re-claim Lua script). They are #[ignore]d so
+  # the infra-free lane stays green without Redis; here Redis exists, so a
+  # missing one is a failure rather than a silent skip.
+  run_test_step "buzz-pubsub Redis tests" \
+    cargo test -p buzz-pubsub --lib -- --ignored --nocapture
 
   if find crates/buzz-auth/tests -maxdepth 1 -name '*.rs' -print -quit 2>/dev/null | grep -q .; then
     run_test_step "buzz-auth integration tests" \
