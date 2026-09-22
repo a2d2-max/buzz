@@ -1148,10 +1148,10 @@ index 0000000000..50fb5e3c5b
 +        return JsonResponse({"error": "a2d2_session_revoked"}, status=401)
 diff --git a/apps/api/plane/a2d2/principals.py b/apps/api/plane/a2d2/principals.py
 new file mode 100644
-index 0000000000..ec8e4930ec
+index 0000000000..8984c6b47d
 --- /dev/null
 +++ b/apps/api/plane/a2d2/principals.py
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,211 @@
 +import hashlib
 +from dataclasses import dataclass
 +from uuid import UUID
@@ -1285,6 +1285,7 @@ index 0000000000..ec8e4930ec
 +            is_onboarded=True,
 +            is_tour_completed=True,
 +            onboarding_step=MANAGED_ONBOARDING_STEP,
++            language="ko",
 +        )
 +        principal = A2D2ManagedPrincipal.objects.create(
 +            community_id=session.community_id,
@@ -2122,6 +2123,31 @@ index 0000000000..b333113987
 +            ),
 +        ),
 +    ]
+diff --git a/apps/api/plane/db/migrations/0125_a2d2_korean_profile_language.py b/apps/api/plane/db/migrations/0125_a2d2_korean_profile_language.py
+new file mode 100644
+index 0000000000..8064c28e3c
+--- /dev/null
++++ b/apps/api/plane/db/migrations/0125_a2d2_korean_profile_language.py
+@@ -0,0 +1,19 @@
++# Generated for the A2D2 Korean default profile language.
++
++from django.db import migrations
++
++
++def set_korean_language(apps, schema_editor):
++    Profile = apps.get_model("db", "Profile")
++    Profile.objects.filter(language="en").update(language="ko")
++
++
++def restore_english_language(apps, schema_editor):
++    Profile = apps.get_model("db", "Profile")
++    Profile.objects.filter(language="ko").update(language="en")
++
++
++class Migration(migrations.Migration):
++    dependencies = [("db", "0124_a2d2_managed_project")]
++
++    operations = [migrations.RunPython(set_korean_language, restore_english_language)]
 diff --git a/apps/api/plane/db/models/a2d2.py b/apps/api/plane/db/models/a2d2.py
 new file mode 100644
 index 0000000000..fb10f7e72d
@@ -3454,6 +3480,114 @@ index 0000000000..3f867a6930
 +            A2D2ManagedPrincipal.objects.get().nostr_pubkey,
 +            undeclared_pubkey,
 +        )
+diff --git a/apps/api/plane/tests/unit/a2d2/test_profile_language.py b/apps/api/plane/tests/unit/a2d2/test_profile_language.py
+new file mode 100644
+index 0000000000..271021f4a8
+--- /dev/null
++++ b/apps/api/plane/tests/unit/a2d2/test_profile_language.py
+@@ -0,0 +1,102 @@
++import importlib
++from uuid import uuid4
++
++from django.apps import apps as global_apps
++from django.test import TestCase
++
++from plane.a2d2.broker import BrokerSession
++from plane.a2d2.principals import ensure_managed_profile, expected_principal_key, provision
++from plane.db.models import Profile, User
++
++
++LANGUAGE_MIGRATION = importlib.import_module("plane.db.migrations.0125_a2d2_korean_profile_language")
++
++
++def owner_session(community_id, pubkey: str) -> BrokerSession:
++    return BrokerSession(
++        session_token=f"session-{pubkey[:8]}",
++        community_id=community_id,
++        pubkey=pubkey,
++        role="owner",
++        principal_key=expected_principal_key(community_id, pubkey),
++        expires_at=2_000_000_000,
++    )
++
++
++class ManagedProfileLanguageTest(TestCase):
++    """새로 만드는 계정만 한국어로 시작하고, 그 뒤로는 사용자가 고른 언어를 지킨다."""
++
++    def test_a_new_managed_account_starts_in_korean(self):
++        community_id = uuid4()
++        identity = provision(owner_session(community_id, "a1" * 32))
++
++        profile = Profile.objects.get(user=identity.user)
++        self.assertEqual(profile.language, "ko")
++
++    def test_signing_in_again_keeps_the_language_the_user_picked(self):
++        community_id = uuid4()
++        pubkey = "b2" * 32
++        identity = provision(owner_session(community_id, pubkey))
++
++        profile = Profile.objects.get(user=identity.user)
++        profile.language = "en"
++        profile.save(update_fields=["language"])
++
++        provision(owner_session(community_id, pubkey))
++
++        profile.refresh_from_db()
++        self.assertEqual(profile.language, "en")
++
++    def test_ensure_managed_profile_never_touches_the_language(self):
++        community_id = uuid4()
++        identity = provision(owner_session(community_id, "c3" * 32))
++        profile = Profile.objects.get(user=identity.user)
++        profile.language = "fr"
++        profile.is_onboarded = False
++        profile.save(update_fields=["language", "is_onboarded"])
++
++        ensure_managed_profile(identity.user, identity.workspace)
++
++        profile.refresh_from_db()
++        self.assertEqual(profile.language, "fr")
++        self.assertTrue(profile.is_onboarded)
++
++
++class KoreanLanguageMigrationTest(TestCase):
++    """0125 데이터 마이그레이션은 `en` 만 건드리고 되돌릴 수도 있어야 한다."""
++
++    def make_profile(self, name: str, language: str) -> Profile:
++        user = User.objects.create_user(
++            email=f"{name}@internal.invalid",
++            username=name,
++            password=None,
++        )
++        profile, _ = Profile.objects.get_or_create(user=user)
++        profile.language = language
++        profile.save(update_fields=["language"])
++        return profile
++
++    def test_forward_changes_only_english_profiles(self):
++        english = self.make_profile("lang-en", "en")
++        french = self.make_profile("lang-fr", "fr")
++        korean = self.make_profile("lang-ko", "ko")
++
++        LANGUAGE_MIGRATION.set_korean_language(global_apps, None)
++
++        english.refresh_from_db()
++        french.refresh_from_db()
++        korean.refresh_from_db()
++        self.assertEqual(english.language, "ko")
++        self.assertEqual(french.language, "fr")
++        self.assertEqual(korean.language, "ko")
++
++    def test_reverse_puts_korean_profiles_back_to_english(self):
++        korean = self.make_profile("back-ko", "ko")
++        french = self.make_profile("back-fr", "fr")
++
++        LANGUAGE_MIGRATION.restore_english_language(global_apps, None)
++
++        korean.refresh_from_db()
++        french.refresh_from_db()
++        self.assertEqual(korean.language, "en")
++        self.assertEqual(french.language, "fr")
 diff --git a/apps/api/plane/tests/unit/a2d2/test_service_token_allowlist.py b/apps/api/plane/tests/unit/a2d2/test_service_token_allowlist.py
 new file mode 100644
 index 0000000000..3c5e2b9f03

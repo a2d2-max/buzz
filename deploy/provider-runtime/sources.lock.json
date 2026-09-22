@@ -371,10 +371,10 @@
           "sha256": "c04e4c5062924596c46f1da2d068b960885c5ab67e7a90fa2652711081ab36c8"
         },
         {
-          "bytes": 7484,
+          "bytes": 7511,
           "mode": 420,
           "path": "apps/api/plane/a2d2/principals.py",
-          "sha256": "1a1a821602220f190c1c3098a4de95921595ba4fec59e366dc1e9637fccb1ec7"
+          "sha256": "7121b2cba945eeb87be1658a50c897c7d69b30b879899c0f3f5eadcd0f5c7174"
         },
         {
           "bytes": 8344,
@@ -425,6 +425,12 @@
           "sha256": "bd1b4d8c890b0ceee3bd1344ace49c097334c7e1f1949249a0af00a38d3e63d3"
         },
         {
+          "bytes": 599,
+          "mode": 420,
+          "path": "apps/api/plane/db/migrations/0125_a2d2_korean_profile_language.py",
+          "sha256": "7cffc779b4a919743e3b7041563e02d26207fb2a41e4f5c4b66e85ad6795f216"
+        },
+        {
           "bytes": 2436,
           "mode": 420,
           "path": "apps/api/plane/db/models/__init__.py",
@@ -465,6 +471,12 @@
           "mode": 420,
           "path": "apps/api/plane/tests/unit/a2d2/test_principal_reconciliation.py",
           "sha256": "339c0b2a3ac78669f753e1c5c93db2ee4d7f7ea684e7d5352e6e109fe734e39a"
+        },
+        {
+          "bytes": 3669,
+          "mode": 420,
+          "path": "apps/api/plane/tests/unit/a2d2/test_profile_language.py",
+          "sha256": "09d12e7bd62080e5b3837c5dab20f6e6e348ee837cd3889b8003304ec4d42d68"
         },
         {
           "bytes": 7457,
@@ -612,8 +624,8 @@
         }
       ],
       "patch": "patches/plane-a2d2.patch",
-      "patch_sha256": "e44d1e872bb71aaf49f9f4c8937e33f79025d665224f828982a8fe8dac57944b",
-      "source_delta_sha256": "75cf768965908f63bccdb4bc13683ec25e0852730bb3e3fe90a590d538083779",
+      "patch_sha256": "13f9db66b79e05174a4b86cb8d6c5bf192641027731f21af47b0b8924e7d8dbe",
+      "source_delta_sha256": "48e2c258216d1fe41fd2715275f3c021270ef6fe95711ebf5b921c13028c4177",
       "upstream_commit": "2f895b82dad839c730c36a5c0cbc046f1e5d6b56"
     }
   },
