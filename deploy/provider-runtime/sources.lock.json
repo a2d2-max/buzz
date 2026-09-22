@@ -1,9 +1,9 @@
 {
   "providers": {
     "affine": {
-      "accepted_archive_sha256": "9db31a65d9610885c4f6071eddd3e9bb7a15aea82d412ef7d803619d4bdd36cb",
+      "accepted_archive_sha256": "d5aa7007fabbaf63ac5971e7a68fd6980ca47c45fa0847f78e22e5a7db380674",
       "accepted_base_image": "node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5",
-      "accepted_image_id": "sha256:74853b5f5b7d6163f5e799c9e11af4b4903fe10244ae6c0314820f2034c5cad5",
+      "accepted_image_id": "sha256:343423bbbcb6d3a5268ca7339b7b7b598e611a64cb879cb8632c90f3ab031a74",
       "accepted_platform": "amd64/linux",
       "accepted_scope": "build source excluding git/dependencies/dist/cache/test output/private env",
       "accepted_source_manifest_sha256": "a8ccc4a4c812bb3fb850f693fde54ebc7f147fb8dbbbcdbc55c16fae4cc80221",
