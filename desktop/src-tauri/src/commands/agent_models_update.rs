@@ -434,17 +434,21 @@ pub async fn update_managed_agent(
         // process is still alive. A stop failure aborts before mutation.
         let mut access_restart_relays = Vec::new();
         if access_policy_changed && record.backend == crate::managed_agents::BackendKind::Local {
+            // Restart ONLY the pairs that are actually live right now. Never
+            // derive a relay from the record's stale scalar `runtime_pid`:
+            // that field is a leftover of the pre-pair (one-runtime-per-agent)
+            // model, survives a crash or a previous launch, and using it here
+            // turned "the owner narrowed this agent's access" into "cold-start
+            // this agent" — including agents the user had opted out of
+            // auto-start. Nothing live = nothing to restart; the new policy is
+            // persisted below and applies at the agent's next real start.
+            // `live_runtime_keys_for` polls each child, so a tracked-but-exited
+            // pair is not resurrected either.
             access_restart_relays =
-                crate::managed_agents::managed_agent_runtime_keys(&runtimes, &record.pubkey)
+                crate::managed_agents::live_runtime_keys_for(&mut runtimes, &record.pubkey)
                     .into_iter()
                     .map(|key| key.relay_url)
                     .collect();
-            if access_restart_relays.is_empty() && record.runtime_pid.is_some() {
-                access_restart_relays.push(crate::relay::effective_agent_relay_url(
-                    &record.relay_url,
-                    &relay_ws_url_with_override(&state),
-                ));
-            }
             if !access_restart_relays.is_empty() {
                 crate::managed_agents::stop_managed_agent_process(&app, record, &mut runtimes)?;
             }

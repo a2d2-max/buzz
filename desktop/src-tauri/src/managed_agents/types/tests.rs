@@ -22,6 +22,43 @@ fn persona_record_defaults_active_when_field_is_missing() {
     assert!(record.name_pool.is_empty());
 }
 
+/// The absent-key default for `start_on_app_launch` is `false`.
+///
+/// Auto-start fans one live `buzz-acp` pair out per (agent × community), so a
+/// `true` default made every record the migration or an old writer left
+/// key-less join the fan-out — the shape that produced 79 live processes on an
+/// owner machine. Flipping `default_start_on_app_launch` back to `true` turns
+/// this row RED.
+#[test]
+fn managed_agent_record_without_start_on_app_launch_defaults_to_off() {
+    let record: ManagedAgentRecord = serde_json::from_str(
+        r#"{
+            "pubkey": "abcd1234",
+            "name": "test-agent",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://localhost:3000",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "system_prompt": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }"#,
+    )
+    .expect("record without start_on_app_launch should deserialize");
+
+    assert!(
+        !record.start_on_app_launch,
+        "a missing key must not opt the agent into the per-community fan-out"
+    );
+}
+
 /// Legacy agent records (created before NIP-OA) lack the `auth_tag` field.
 /// `#[serde(default)]` must ensure they deserialize with `auth_tag: None`.
 #[test]

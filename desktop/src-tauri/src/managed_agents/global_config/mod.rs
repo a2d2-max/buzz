@@ -33,6 +33,14 @@ use crate::managed_agents::env_vars::{
 use crate::managed_agents::storage::{atomic_write_json_restricted, managed_agents_base_dir};
 use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 
+/// `max_live_runtimes` when the key is absent from `global-agent-config.json`.
+///
+/// Deliberately NOT `usize::default()` — a zero cap would refuse every spawn.
+/// `GlobalAgentConfig` therefore hand-rolls `Default` instead of deriving it.
+fn default_max_live_runtimes() -> usize {
+    crate::managed_agents::DEFAULT_MAX_LIVE_RUNTIMES
+}
+
 /// The global agent configuration record.
 ///
 /// Shape mirrors the per-agent/persona trio (`env_vars` + `provider` + `model`)
@@ -43,7 +51,7 @@ use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 /// `effective_config::resolve_effective_config`: for a linked instance,
 /// definition → global (the record's own `provider`/`model` bytes are never
 /// consulted); for a definition-less instance, instance → global.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalAgentConfig {
     /// Global env vars injected into ALL agents unconditionally.
     ///
@@ -70,6 +78,55 @@ pub struct GlobalAgentConfig {
     /// Preferred ACP runtime for definitions without an explicit runtime.
     #[serde(default)]
     pub preferred_runtime: Option<String>,
+
+    /// Ceiling on simultaneously live `buzz-acp` pair runtimes, counted across
+    /// every agent and every community.
+    ///
+    /// Auto-start fans one pair out per (agent × community), so without a
+    /// ceiling the live process count is a product and grows past what one
+    /// machine can serve — and the same agent answers from several relays at
+    /// once. Every spawn path (reconcile planning, `start_pair`, launch
+    /// restore) checks this number; over-budget pairs surface as a `Failed`
+    /// status row rather than a silent skip.
+    ///
+    /// Absent key → [`DEFAULT_MAX_LIVE_RUNTIMES`]. Must be ≥ 1; validated by
+    /// [`validate_global_config`].
+    ///
+    /// [`DEFAULT_MAX_LIVE_RUNTIMES`]: crate::managed_agents::DEFAULT_MAX_LIVE_RUNTIMES
+    #[serde(default = "default_max_live_runtimes")]
+    pub max_live_runtimes: usize,
+}
+
+impl GlobalAgentConfig {
+    /// The cap to actually enforce, floored at 1.
+    ///
+    /// [`validate_global_config`] rejects `0` at the persist boundary, but the
+    /// file is a plain JSON document a user can hand-edit, and
+    /// `load_global_agent_config` does not re-validate on read. A `0` that
+    /// reached a spawn path would refuse every agent with no way back through
+    /// the app, so every enforcement site reads the cap through here.
+    pub fn effective_max_live_runtimes(&self) -> usize {
+        self.max_live_runtimes.max(1)
+    }
+}
+
+impl Default for GlobalAgentConfig {
+    /// Hand-rolled (not derived) because `max_live_runtimes` must default to
+    /// [`DEFAULT_MAX_LIVE_RUNTIMES`], not `0`. `load_global_agent_config`
+    /// returns this value whenever the file is missing or unreadable, and
+    /// every `unwrap_or_default()` call site feeds it straight into the cap
+    /// check — a derived `0` would refuse every spawn on a fresh install.
+    ///
+    /// [`DEFAULT_MAX_LIVE_RUNTIMES`]: crate::managed_agents::DEFAULT_MAX_LIVE_RUNTIMES
+    fn default() -> Self {
+        Self {
+            env_vars: BTreeMap::new(),
+            provider: None,
+            model: None,
+            preferred_runtime: None,
+            max_live_runtimes: default_max_live_runtimes(),
+        }
+    }
 }
 
 /// Validate a `GlobalAgentConfig` before persisting it.
@@ -138,6 +195,12 @@ pub fn validate_global_config(config: &GlobalAgentConfig) -> Result<(), String> 
             // Note: blank/whitespace-only values are normalized to None by
             // normalize_global_config_fields, called from save_global_agent_config.
         }
+    }
+
+    // A zero cap would refuse every spawn with no way back through the UI, so
+    // it is rejected at the persist boundary rather than clamped silently.
+    if config.max_live_runtimes < 1 {
+        return Err("global config `max_live_runtimes` must be at least 1".to_string());
     }
 
     Ok(())

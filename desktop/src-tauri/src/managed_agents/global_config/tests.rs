@@ -267,6 +267,7 @@ fn roundtrip_serialization() {
         provider: Some("anthropic".to_string()),
         model: Some("claude-opus-4".to_string()),
         preferred_runtime: Some("claude".to_string()),
+        max_live_runtimes: 8,
     };
     let json = serde_json::to_string(&config).expect("serialize");
     let back: GlobalAgentConfig = serde_json::from_str(&json).expect("deserialize");
@@ -601,6 +602,7 @@ fn populated_global_config_round_trips() {
         provider: Some("anthropic".to_string()),
         model: Some("claude-opus-4-5".to_string()),
         preferred_runtime: None,
+        max_live_runtimes: 12,
     };
     let json = serde_json::to_string(&original).expect("serialization must not fail");
     let decoded: GlobalAgentConfig =
@@ -608,6 +610,68 @@ fn populated_global_config_round_trips() {
     assert_eq!(
         decoded, original,
         "populated config must round-trip losslessly"
+    );
+}
+
+// ── max_live_runtimes ────────────────────────────────────────────────────────
+
+/// A config file written before the cap existed has no `max_live_runtimes`
+/// key. It must read back as [`DEFAULT_MAX_LIVE_RUNTIMES`], never as `0` —
+/// a `0` cap refuses every spawn.
+///
+/// [`DEFAULT_MAX_LIVE_RUNTIMES`]: crate::managed_agents::DEFAULT_MAX_LIVE_RUNTIMES
+#[test]
+fn absent_max_live_runtimes_reads_as_the_default_cap() {
+    let decoded: GlobalAgentConfig =
+        serde_json::from_str(r#"{"env_vars":{},"provider":null,"model":null}"#)
+            .expect("a pre-cap config must still deserialize");
+    assert_eq!(
+        decoded.max_live_runtimes,
+        crate::managed_agents::DEFAULT_MAX_LIVE_RUNTIMES
+    );
+    assert!(decoded.max_live_runtimes >= 1);
+}
+
+/// `Default` is hand-rolled precisely so the derived `0` cannot leak in
+/// through the many `load_global_agent_config(..).unwrap_or_default()` call
+/// sites. Re-deriving `Default` turns this row RED.
+#[test]
+fn default_config_carries_a_usable_cap() {
+    assert_eq!(
+        GlobalAgentConfig::default().max_live_runtimes,
+        crate::managed_agents::DEFAULT_MAX_LIVE_RUNTIMES
+    );
+}
+
+#[test]
+fn validate_rejects_a_zero_cap() {
+    let config = GlobalAgentConfig {
+        max_live_runtimes: 0,
+        ..Default::default()
+    };
+    let err = validate_global_config(&config).unwrap_err();
+    assert!(
+        err.contains("max_live_runtimes"),
+        "zero cap must be rejected by name, got: {err}"
+    );
+}
+
+/// A hand-edited `0` never reaches `validate_global_config` (it is a read, not
+/// a save), so the enforcement accessor floors it.
+#[test]
+fn effective_cap_floors_a_hand_edited_zero() {
+    let config = GlobalAgentConfig {
+        max_live_runtimes: 0,
+        ..Default::default()
+    };
+    assert_eq!(config.effective_max_live_runtimes(), 1);
+    assert_eq!(
+        GlobalAgentConfig {
+            max_live_runtimes: 5,
+            ..Default::default()
+        }
+        .effective_max_live_runtimes(),
+        5
     );
 }
 

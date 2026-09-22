@@ -66,10 +66,32 @@ export function pendingReconcileRelays(
 }
 
 /**
+ * `ManagedAgentRuntimeStatus.errorCode` for a pair the backend's live-runtime
+ * cap refused. Mirrors the Rust `RUNTIME_CAP_ERROR_CODE`
+ * (`desktop/src-tauri/src/managed_agents/runtime_types.rs`).
+ */
+export const RUNTIME_CAP_ERROR_CODE = "runtime_cap";
+
+/**
+ * Whether a `failed` row means "this relay is broken, try again later".
+ *
+ * A cap refusal is not a fault — it is a steady state that persists until the
+ * user stops an agent or raises `max_live_runtimes`. Feeding it to the retry
+ * ladder would re-run the whole reconcile on a 5s/30s/2m loop and re-emit
+ * dozens of identical rows forever, so it is excluded here rather than at the
+ * call site (every classifier caller would otherwise have to remember).
+ */
+function isRetryableFailure(row: ManagedAgentRuntimeStatus): boolean {
+  return row.lifecycle === "failed" && row.errorCode !== RUNTIME_CAP_ERROR_CODE;
+}
+
+/**
  * Split an attempted batch into relays that reconciled cleanly vs. those that
  * still failed. A relay failed if the call threw (`rows === null` marks the
- * whole batch failed) or it produced a `failed` lifecycle row. A relay that
- * produced no rows (no eligible agents there) counts as reconciled.
+ * whole batch failed) or it produced a *retryable* `failed` lifecycle row. A
+ * relay that produced no rows (no eligible agents there) counts as reconciled,
+ * and so does one whose only failures were cap refusals — see
+ * `isRetryableFailure`.
  */
 export function classifyReconcileResult(
   attempted: readonly string[],
@@ -81,7 +103,7 @@ export function classifyReconcileResult(
   }
   const failedRelays = new Set<string>();
   for (const row of rows) {
-    if (row.lifecycle !== "failed") continue;
+    if (!isRetryableFailure(row)) continue;
     const canonical = canonicalize(row.requestedRelayUrl ?? row.relayUrl);
     if (canonical !== null) failedRelays.add(canonical);
   }
