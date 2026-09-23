@@ -1,18 +1,19 @@
-//! Typed event builder functions (38 builders).
+//! Typed event builder functions (39 builders).
 //!
 //! All functions return `Result<nostr::EventBuilder, SdkError>`.
 //! The caller signs: `builder.sign_with_keys(&keys)?`.
 
 use buzz_core::{
     kind::{
-        KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_DELETION,
-        KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-        KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
-        KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
-        KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
-        KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_AGENT_MENTION_CLAIM, KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY,
+        KIND_APPROVAL_GRANT, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET,
+        KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+        KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
+        KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST,
+        KIND_IA_UNARCHIVE_REQUEST, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
+        KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT,
+        KIND_PRESENCE_UPDATE, KIND_PROJECT, KIND_USER_STATUS, KIND_WORKFLOW_DEF,
+        KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -498,6 +499,86 @@ pub fn build_reaction(
     }
     let tags = vec![tag(&["e", &target_event_id.to_hex()])?];
     Ok(EventBuilder::new(Kind::Custom(7), emoji).tags(tags))
+}
+
+pub use buzz_core::kind::{MENTION_CLAIM_LOST_MESSAGE, MENTION_CLAIM_MAX_NONCE_CHARS};
+
+/// Build an agent mention claim (kind:24250).
+///
+/// A claim asks the relay for the exclusive right to answer one mention, so
+/// that several runtimes sharing an agent key do not all reply to it. The
+/// event carries exactly one `e` tag naming the mention and one `nonce` tag
+/// identifying this runtime. It is ephemeral: never stored, never fanned out.
+///
+/// ⚠ `nonce` **must be unique per runtime process** — a random value of at
+/// least 16 bytes picked once at startup. It must never be a hostname, an
+/// agent name, a deployment id, or any other constant two processes could both
+/// produce: the relay uses it as the claim's owner token, so two runtimes that
+/// share a key *and* a nonce are indistinguishable to it and **both are told
+/// the mention is theirs**. It is rejected here when empty or longer than
+/// [`MENTION_CLAIM_MAX_NONCE_CHARS`].
+pub fn build_mention_claim(
+    target_event_id: nostr::EventId,
+    nonce: &str,
+) -> Result<EventBuilder, SdkError> {
+    let chars = nonce.chars().count();
+    if chars == 0 || chars > MENTION_CLAIM_MAX_NONCE_CHARS {
+        return Err(SdkError::InvalidInput(format!(
+            "claim nonce must be 1..={MENTION_CLAIM_MAX_NONCE_CHARS} characters (got {chars})"
+        )));
+    }
+    let tags = vec![
+        tag(&["e", &target_event_id.to_hex()])?,
+        tag(&["nonce", nonce])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(KIND_AGENT_MENTION_CLAIM as u16), "").tags(tags))
+}
+
+/// The relay's answer to one mention claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MentionClaimAnswer {
+    /// This runtime holds the mention and must answer it.
+    Won,
+    /// Another runtime holds the mention — this one must stay quiet.
+    Lost,
+    /// The relay did not decide: a malformed claim, a Redis failure, or any
+    /// answer this version does not understand. The caller must **not** read
+    /// it as a loss — a relay fault that muted the agent would be worse than a
+    /// duplicate reply.
+    Undecided,
+}
+
+/// Classify the `POST /events` body the relay returns for a mention claim.
+///
+/// The body is `{"event_id", "accepted", "message"}`, and a lost claim is a
+/// normal HTTP 200 with `accepted: false` — only `message` separates it from a
+/// relay-side failure, which also answers `accepted: false` (with
+/// `"error: claim unavailable"` or `"invalid: …"`).
+///
+/// The loss test is **equality** with [`MENTION_CLAIM_LOST_MESSAGE`], not a
+/// `"duplicate"` prefix: the relay's generic ingest path answers `duplicate:`
+/// and `duplicate: already processed` for an event it already stored, which a
+/// mixed-version rollout or a bridge retry resend can put in front of this
+/// parser. Reading those as a lost claim would silently mute the agent on a
+/// mention nobody had claimed. Everything else is
+/// [`MentionClaimAnswer::Undecided`], including a body with no `accepted`
+/// field at all.
+pub fn classify_mention_claim_response(body: &serde_json::Value) -> MentionClaimAnswer {
+    match body.get("accepted").and_then(serde_json::Value::as_bool) {
+        Some(true) => MentionClaimAnswer::Won,
+        Some(false) => {
+            let message = body
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if message == MENTION_CLAIM_LOST_MESSAGE {
+                MentionClaimAnswer::Lost
+            } else {
+                MentionClaimAnswer::Undecided
+            }
+        }
+        None => MentionClaimAnswer::Undecided,
+    }
 }
 
 /// Build a NIP-25 reaction event using a NIP-30 custom emoji.
@@ -2928,6 +3009,80 @@ mod tests {
         let eid = event_id();
         let max_emoji = "a".repeat(64);
         assert!(build_reaction(eid, &max_emoji).is_ok());
+    }
+
+    #[test]
+    fn mention_claim_carries_one_e_tag_and_the_nonce() {
+        let eid = event_id();
+        let ev = sign(build_mention_claim(eid, "a1b2c3d4e5f60718").unwrap());
+        assert_eq!(ev.kind.as_u16(), 24250);
+        assert_eq!(ev.content, "");
+        let e_tags: Vec<_> = ev
+            .tags
+            .iter()
+            .filter(|t| t.kind().to_string() == "e")
+            .filter_map(|t| t.content())
+            .collect();
+        assert_eq!(e_tags, vec![eid.to_hex()]);
+        let nonces: Vec<_> = ev
+            .tags
+            .iter()
+            .filter(|t| t.kind().to_string() == "nonce")
+            .filter_map(|t| t.content())
+            .collect();
+        assert_eq!(nonces, vec!["a1b2c3d4e5f60718"]);
+    }
+
+    #[test]
+    fn mention_claim_rejects_unusable_nonces() {
+        let eid = event_id();
+        assert!(
+            matches!(build_mention_claim(eid, ""), Err(SdkError::InvalidInput(_))),
+            "an empty nonce would be stored as the claim event id, silently \
+             losing this runtime's identity"
+        );
+        let too_long = "a".repeat(MENTION_CLAIM_MAX_NONCE_CHARS + 1);
+        assert!(matches!(
+            build_mention_claim(eid, &too_long),
+            Err(SdkError::InvalidInput(_))
+        ));
+        assert!(build_mention_claim(eid, &"a".repeat(MENTION_CLAIM_MAX_NONCE_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn claim_response_classification_separates_a_loss_from_a_fault() {
+        use serde_json::json;
+        assert_eq!(
+            classify_mention_claim_response(&json!({"accepted": true, "message": ""})),
+            MentionClaimAnswer::Won
+        );
+        assert_eq!(
+            classify_mention_claim_response(&json!({"accepted": true, "message": "already yours"})),
+            MentionClaimAnswer::Won
+        );
+        assert_eq!(
+            classify_mention_claim_response(
+                &json!({"accepted": false, "message": MENTION_CLAIM_LOST_MESSAGE})
+            ),
+            MentionClaimAnswer::Lost
+        );
+        for fault in [
+            json!({"accepted": false, "message": "error: claim unavailable"}),
+            json!({"accepted": false, "message": "invalid: claim needs one e tag"}),
+            // The generic ingest path's duplicate answers. Reading these as a
+            // lost claim would mute the agent on a mention nobody claimed.
+            json!({"accepted": false, "message": "duplicate:"}),
+            json!({"accepted": false, "message": "duplicate: already processed"}),
+            json!({"accepted": false}),
+            json!({"message": MENTION_CLAIM_LOST_MESSAGE}),
+            json!(null),
+        ] {
+            assert_eq!(
+                classify_mention_claim_response(&fault),
+                MentionClaimAnswer::Undecided,
+                "a relay fault must never be read as a lost claim: {fault}"
+            );
+        }
     }
 
     #[test]

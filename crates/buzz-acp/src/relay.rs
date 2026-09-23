@@ -276,7 +276,91 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
+/// The NIP-11 document paths tried in order: the standardized relay root
+/// first, then Buzz's explicit `/info` alias for relays that only expose it
+/// there.
+const NIP11_PATHS: [&str; 2] = ["/", "/info"];
+
+/// Draft-extension identifier a relay advertises when it arbitrates agent
+/// mention claims (kind:24250).
+const CLAIM_EXTENSION: &str = "buzz-claim";
+
+/// Whether a NIP-11 document advertises arbitrated mention claims at the kind
+/// this build sends.
+///
+/// Both halves are required. `supported_extensions` alone says the relay knows
+/// the word; `claim.kind` is what it will actually arbitrate, and the two can
+/// disagree across relay versions. Kept pure so the parse is testable without
+/// a server.
+fn document_advertises_claim(document: &serde_json::Value) -> bool {
+    let advertised = document
+        .get("supported_extensions")
+        .and_then(Value::as_array)
+        .is_some_and(|extensions| {
+            extensions
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|extension| extension == CLAIM_EXTENSION)
+        });
+    let kind_matches = document
+        .get("claim")
+        .and_then(|claim| claim.get("kind"))
+        .and_then(Value::as_u64)
+        == Some(u64::from(buzz_core::kind::KIND_AGENT_MENTION_CLAIM));
+    advertised && kind_matches
+}
+
 impl RestClient {
+    /// GET and parse one NIP-11 document path.
+    ///
+    /// The single place this crate speaks NIP-11 over HTTP, so every reader of
+    /// the document (relay identity, advertised capabilities) sees the same
+    /// transport and parse behaviour. `Err` carries a human-readable reason for
+    /// the caller's aggregated failure list.
+    async fn fetch_nip11(&self, path: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{}{path}", self.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/nostr+json")
+            .send()
+            .await
+            .map_err(|error| format!("GET {path} failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("GET {path} returned HTTP {}", response.status()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| format!("GET {path} returned invalid NIP-11 JSON: {error}"))
+    }
+
+    /// Whether this relay arbitrates agent mention claims (kind:24250).
+    ///
+    /// True only when the NIP-11 document both lists `buzz-claim` in
+    /// `supported_extensions` *and* advertises `claim.kind` equal to
+    /// [`buzz_core::kind::KIND_AGENT_MENTION_CLAIM`]. A relay that advertises
+    /// the extension without that descriptor, or under a different kind, is
+    /// reported as unsupported: a claim sent as the wrong kind would be
+    /// ingested as an ordinary event instead of arbitrated, so the caller would
+    /// believe it won a race the relay never ran.
+    ///
+    /// `Err` means the document could not be read at all — the caller decides
+    /// what an unknown relay means, and must not read it as "claims lost".
+    pub async fn relay_supports_mention_claim(&self) -> Result<bool, RelayError> {
+        let mut failures = Vec::new();
+        for path in NIP11_PATHS {
+            match self.fetch_nip11(path).await {
+                Ok(document) => return Ok(document_advertises_claim(&document)),
+                Err(failure) => failures.push(failure),
+            }
+        }
+        Err(RelayError::Http(format!(
+            "failed to fetch a usable NIP-11 document: {}",
+            failures.join("; ")
+        )))
+    }
+
     /// Fetch the relay's stable signing identity from its NIP-11 document.
     ///
     /// Relay-authored workflow attribution is trusted only when the event signer
@@ -288,31 +372,11 @@ impl RestClient {
         let mut failures = Vec::new();
         let mut saw_document_without_self = false;
 
-        for path in ["/", "/info"] {
-            let url = format!("{}{path}", self.base_url);
-            let response = match self
-                .http
-                .get(&url)
-                .header(reqwest::header::ACCEPT, "application/nostr+json")
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    failures.push(format!("GET {path} failed: {error}"));
-                    continue;
-                }
-            };
-
-            if !response.status().is_success() {
-                failures.push(format!("GET {path} returned HTTP {}", response.status()));
-                continue;
-            }
-
-            let document: serde_json::Value = match response.json().await {
+        for path in NIP11_PATHS {
+            let document = match self.fetch_nip11(path).await {
                 Ok(document) => document,
-                Err(error) => {
-                    failures.push(format!("GET {path} returned invalid NIP-11 JSON: {error}"));
+                Err(failure) => {
+                    failures.push(failure);
                     continue;
                 }
             };

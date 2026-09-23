@@ -499,6 +499,21 @@ pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
 /// handle one mention event (`e` tag = target event id). Never stored, never
 /// fanned out; the relay answers only with OK.
 pub const KIND_AGENT_MENTION_CLAIM: u32 = 24250;
+/// Longest accepted `nonce` tag value on a mention claim, in characters.
+///
+/// Lives here rather than in the relay so the runtime that *builds* a claim
+/// and the relay that *validates* one cannot disagree about the limit: a
+/// runtime that sent a longer nonce would have its claim rejected as invalid
+/// and, failing open, would answer a mention another runtime already holds.
+pub const MENTION_CLAIM_MAX_NONCE_CHARS: usize = 64;
+/// The relay's exact answer when another runtime already holds the mention.
+///
+/// This is the **only** string that means "stay quiet". The generic ingest
+/// path answers `duplicate: …` too (a resent event the relay already has), and
+/// a runtime that treated those as a lost claim would silently drop mentions
+/// nobody had claimed — so the check is equality against this constant, shared
+/// by the relay that emits it and the runtime that reads it.
+pub const MENTION_CLAIM_LOST_MESSAGE: &str = "duplicate: already claimed";
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
 /// huddle channel with an `h` tag; never stored in the timeline.
 pub const KIND_HUDDLE_REACTION: u32 = 24810;

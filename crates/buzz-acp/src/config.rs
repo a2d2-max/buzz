@@ -60,6 +60,22 @@ pub enum DedupMode {
     Queue,
 }
 
+/// Whether this runtime asks the relay for the exclusive right to answer a
+/// mention before it handles one.
+///
+/// Several runtimes can share one agent key (a laptop, a server, a phone).
+/// Without a claim each of them sees the same mention and each answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ClaimMode {
+    /// Claim each mention when the relay advertises `buzz-claim`; behave
+    /// exactly as before when it does not. A claim that cannot be decided
+    /// (transport failure, relay fault) is handled, not dropped — a relay blip
+    /// must never mute the agent.
+    Auto,
+    /// Never claim. Every runtime sharing this key answers every mention.
+    Off,
+}
+
 /// How to handle new @mentions while a turn is already in-flight for that channel.
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum MultipleEventHandling {
@@ -350,6 +366,14 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_DEDUP", default_value = "queue", value_enum)]
     pub dedup: DedupMode,
 
+    /// Whether to claim a mention on the relay before answering it, so only
+    /// one of several runtimes sharing this agent key replies.
+    /// auto (default): claim when the relay advertises the `buzz-claim`
+    /// extension; behave as before when it does not.
+    /// off: never claim.
+    #[arg(long, env = "BUZZ_ACP_CLAIM", default_value = "auto", value_enum)]
+    pub claim: ClaimMode,
+
     /// How ACP provider sessions are scoped in channels.
     /// channel (default): one provider session per channel (legacy behavior).
     /// thread: each canonical channel thread gets an isolated provider session;
@@ -558,6 +582,8 @@ pub struct Config {
     pub initial_message: Option<String>,
     pub subscribe_mode: SubscribeMode,
     pub dedup_mode: DedupMode,
+    /// Whether mentions are claimed on the relay before being handled.
+    pub claim_mode: ClaimMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
     pub multiple_event_handling: MultipleEventHandling,
@@ -1172,6 +1198,7 @@ impl Config {
             initial_message: args.initial_message,
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
+            claim_mode: args.claim,
             session_policy: args.session_policy,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
@@ -1225,7 +1252,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} claim={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1237,6 +1264,7 @@ impl Config {
             self.heartbeat_interval_secs,
             self.subscribe_mode,
             self.dedup_mode,
+            self.claim_mode,
             self.session_policy,
             self.multiple_event_handling,
             self.ignore_self,
@@ -1551,6 +1579,7 @@ mod tests {
             initial_message: None,
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
+            claim_mode: ClaimMode::Auto,
             session_policy: crate::scope::SessionPolicy::Channel,
             multiple_event_handling: MultipleEventHandling::Queue,
             ignore_self: true,
@@ -2716,6 +2745,38 @@ channels = "ALL"
         ]);
         assert_eq!(args.session_policy, crate::scope::SessionPolicy::Thread);
         assert_eq!(args.session_policy.to_string(), "thread");
+    }
+
+    // ── Mention claim mode ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_claim_mode_defaults_to_auto_and_accepts_off() {
+        let key = "0".repeat(64);
+        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(
+            default.claim,
+            ClaimMode::Auto,
+            "claiming must be on by default — a duplicate answer from a second \
+             runtime is the defect this flag exists to prevent"
+        );
+        let off = CliArgs::parse_from(["buzz-acp", "--private-key", &key, "--claim", "off"]);
+        assert_eq!(off.claim, ClaimMode::Off);
+    }
+
+    #[test]
+    fn test_claim_mode_reaches_config_and_summary() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        assert!(
+            config.summary().contains("claim=Auto"),
+            "operators read the startup summary to confirm claiming is on, got: {}",
+            config.summary()
+        );
+        config.claim_mode = ClaimMode::Off;
+        assert!(
+            config.summary().contains("claim=Off"),
+            "got: {}",
+            config.summary()
+        );
     }
 
     // ── Multiple-event-handling validation + default ──────────────────────────
