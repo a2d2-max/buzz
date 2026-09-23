@@ -16,6 +16,9 @@ use serde_json::Value;
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
+use buzz_core::kind::KIND_AGENT_MENTION_CLAIM;
+
+use crate::handlers::claim::{decide_mention_claim, ClaimDecision};
 use crate::handlers::ingest::{IngestAuth, IngestError};
 use crate::state::AppState;
 
@@ -953,9 +956,22 @@ async fn submit_event_authed(
     }
 
     let kind_u32 = buzz_core::kind::event_kind_u32(&event);
+
+    // Agent mention claims are decided in Redis and answered inline: they
+    // never reach `ingest_event`, so nothing is stored, published, or fanned
+    // out. The runtime submits them here rather than over the WebSocket
+    // because this is its only correlated request/response path.
+    // Pure Nostr over HTTP: full scopes, channel access via membership.
+    let scopes = buzz_auth::Scope::all_known();
+
+    if bypasses_ingest(kind_u32) {
+        let decision = decide_mention_claim(state, tenant, &event, &pubkey, &scopes).await;
+        return claim_submit_outcome(&event.id.to_hex(), kind_u32, decision);
+    }
+
     let auth = IngestAuth::Http {
         pubkey,
-        scopes: buzz_auth::Scope::all_known(), // Pure Nostr: full scopes, channel access via membership
+        scopes,
         auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
     };
 
@@ -1001,6 +1017,37 @@ async fn submit_event_authed(
                 response: e,
             }
         }
+    }
+}
+
+/// True when the bridge answers `kind` itself instead of handing it to
+/// [`crate::handlers::ingest::ingest_event`].
+///
+/// Only the agent mention claim (kind:24250) qualifies: `ingest_event` has no
+/// scope entry for it and would answer "restricted: unknown event kind", and
+/// a claim must never be stored or fanned out anyway.
+fn bypasses_ingest(kind: u32) -> bool {
+    kind == KIND_AGENT_MENTION_CLAIM
+}
+
+/// Shapes a claim decision into the bridge's `{event_id, accepted, message}`
+/// body.
+///
+/// Always HTTP 200, including a lost claim: the runtime must be able to tell
+/// "another runtime won" (200, `accepted: false`) apart from a transport or
+/// auth failure (4xx/5xx). A 400 here would make a normal race look like a bug.
+fn claim_submit_outcome(event_id_hex: &str, kind: u32, decision: ClaimDecision) -> SubmitOutcome {
+    if let Some(reason) = decision.reject_reason {
+        crate::handlers::ingest::reject_with_transport("http", reason);
+    }
+    SubmitOutcome::Ok {
+        accepted: decision.accepted,
+        kind,
+        response: Json(serde_json::json!({
+            "event_id": event_id_hex,
+            "accepted": decision.accepted,
+            "message": decision.message,
+        })),
     }
 }
 
@@ -4237,5 +4284,108 @@ mod postgres_tests {
             log.contains(&pubkey_hex[..16]),
             "attribution line must carry the pubkey;\nlog:\n{log}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::claim::ClaimDecision;
+
+    /// Unwraps a `SubmitOutcome` into (HTTP-ok?, body).
+    fn body_of(outcome: SubmitOutcome) -> (bool, Value) {
+        match outcome.into_response() {
+            Ok(Json(value)) => (true, value),
+            Err((status, Json(value))) => {
+                assert_ne!(status, StatusCode::OK, "error arm must not be 200");
+                (false, value)
+            }
+        }
+    }
+
+    /// The claim kind is the only kind the bridge answers itself. If this
+    /// branch disappears, a claim falls through to `ingest_event`, which has
+    /// no scope entry for kind:24250 and rejects it as an unknown kind — so
+    /// the branch is the whole feature on the HTTP path.
+    #[test]
+    fn only_the_mention_claim_bypasses_ingest() {
+        assert!(bypasses_ingest(buzz_core::kind::KIND_AGENT_MENTION_CLAIM));
+        for kind in [
+            buzz_core::kind::KIND_TEXT_NOTE,
+            buzz_core::kind::KIND_STREAM_MESSAGE,
+            buzz_core::kind::KIND_AGENT_OBSERVER_FRAME,
+            buzz_core::kind::KIND_PRESENCE_UPDATE,
+        ] {
+            assert!(
+                !bypasses_ingest(kind),
+                "kind {kind} must still go through ingest_event"
+            );
+        }
+    }
+
+    /// A lost claim is a normal answer, not a transport error: HTTP 200 with
+    /// `accepted: false`. A 400 would make the runtime retry a race it lost.
+    #[test]
+    fn a_lost_claim_is_http_200_with_accepted_false() {
+        let event_id = "a".repeat(64);
+        let decision = ClaimDecision {
+            accepted: false,
+            message: "duplicate: already claimed",
+            reject_reason: None,
+            outcome: "lost",
+        };
+
+        let (is_ok, body) = body_of(claim_submit_outcome(
+            &event_id,
+            buzz_core::kind::KIND_AGENT_MENTION_CLAIM,
+            decision,
+        ));
+
+        assert!(is_ok, "a lost claim must not be an HTTP error");
+        assert_eq!(body["event_id"], serde_json::json!(event_id));
+        assert_eq!(body["accepted"], serde_json::json!(false));
+        assert_eq!(
+            body["message"],
+            serde_json::json!("duplicate: already claimed")
+        );
+    }
+
+    /// Win and Redis-outage answers carry the same body shape, so the runtime
+    /// parses one contract for every outcome.
+    #[test]
+    fn won_and_unavailable_claims_share_the_body_shape() {
+        let event_id = "b".repeat(64);
+
+        let (is_ok, won) = body_of(claim_submit_outcome(
+            &event_id,
+            buzz_core::kind::KIND_AGENT_MENTION_CLAIM,
+            ClaimDecision {
+                accepted: true,
+                message: "",
+                reject_reason: None,
+                outcome: "won",
+            },
+        ));
+        assert!(is_ok);
+        assert_eq!(won["accepted"], serde_json::json!(true));
+        assert_eq!(won["message"], serde_json::json!(""));
+
+        let (is_ok, unavailable) = body_of(claim_submit_outcome(
+            &event_id,
+            buzz_core::kind::KIND_AGENT_MENTION_CLAIM,
+            ClaimDecision {
+                accepted: false,
+                message: "error: claim unavailable",
+                reject_reason: Some("error"),
+                outcome: "unavailable",
+            },
+        ));
+        assert!(is_ok, "fail-closed is still a decided answer, not a 5xx");
+        assert_eq!(unavailable["accepted"], serde_json::json!(false));
+        assert_eq!(
+            unavailable["message"],
+            serde_json::json!("error: claim unavailable")
+        );
+        assert_eq!(unavailable["event_id"], serde_json::json!(event_id));
     }
 }

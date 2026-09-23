@@ -495,6 +495,10 @@ pub const KIND_PAIRING: u32 = 24134;
 pub const KIND_TYPING_INDICATOR: u32 = 20002;
 /// Ephemeral: owner-scoped encrypted agent observer telemetry and control frame.
 pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
+/// Ephemeral: an agent runtime asks the relay for the exclusive right to
+/// handle one mention event (`e` tag = target event id). Never stored, never
+/// fanned out; the relay answers only with OK.
+pub const KIND_AGENT_MENTION_CLAIM: u32 = 24250;
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
 /// huddle channel with an `h` tag; never stored in the timeline.
 pub const KIND_HUDDLE_REACTION: u32 = 24810;
@@ -728,6 +732,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_BLOSSOM_AUTH,
     KIND_PAIRING,
     KIND_AGENT_OBSERVER_FRAME,
+    KIND_AGENT_MENTION_CLAIM,
     KIND_HTTP_AUTH,
     KIND_STREAM_MESSAGE,
     KIND_STREAM_MESSAGE_V2,
@@ -907,6 +912,9 @@ const _: () = assert!(
     KIND_GIT_REPO_STATE >= PARAM_REPLACEABLE_KIND_MIN
         && KIND_GIT_REPO_STATE <= PARAM_REPLACEABLE_KIND_MAX
 );
+
+// Compile-time: the mention claim is ephemeral — the relay must never store it.
+const _: () = assert!(is_ephemeral(KIND_AGENT_MENTION_CLAIM)); // 24250 ∈ 20000–29999
 
 // Compile-time: all Buzz kind constants fit in nostr's u16-backed Kind.
 const _: () = assert!(KIND_AUTH <= u16::MAX as u32);

@@ -65,9 +65,38 @@ pub struct RelayInfo {
     /// provider-agnostic; provider credentials remain server-side.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gif: Option<GifDescriptor>,
+    /// Agent mention claims (kind:24250). Always present — the feature is
+    /// unconditional — so a runtime can read the kind and the lease length
+    /// instead of hard-coding them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ClaimDescriptor>,
     /// Relay's own signing pubkey (NIP-11 `self` field, NIP-43).
     #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
     pub relay_self: Option<String>,
+}
+
+/// Public capability descriptor for agent mention claims.
+///
+/// Serialised as `"claim": {"kind": 24250, "ttl_secs": <configured>}`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimDescriptor {
+    /// Event kind a runtime sends to claim one mention.
+    pub kind: u32,
+    /// How long a won claim is held before it expires, in seconds
+    /// (`BUZZ_CLAIM_TTL_SECS`).
+    pub ttl_secs: u64,
+}
+
+/// Builds the always-present claim descriptor for the configured `ttl_secs`.
+///
+/// The kind comes straight from [`buzz_core::kind::KIND_AGENT_MENTION_CLAIM`]
+/// and the TTL from config, so the advertised lease and the enforced one
+/// cannot drift.
+pub(crate) fn claim_descriptor(ttl_secs: u64) -> ClaimDescriptor {
+    ClaimDescriptor {
+        kind: buzz_core::kind::KIND_AGENT_MENTION_CLAIM,
+        ttl_secs,
+    }
 }
 
 /// Public capability descriptor for relay-proxied GIF search.
@@ -195,7 +224,10 @@ impl RelayInfo {
             supported_nips.push(NIP_RELAY_MEMBERSHIP);
         }
 
-        let mut supported_extensions = vec!["nip-er".to_string()];
+        // `buzz-claim` is unconditional: every Buzz relay arbitrates agent
+        // mention claims. Its descriptor carries the configured TTL and is
+        // attached in `nip11_document`.
+        let mut supported_extensions = vec!["nip-er".to_string(), "buzz-claim".to_string()];
         let gif = gif_provider.map(|provider| {
             supported_extensions.push("buzz-gif".to_string());
             GifDescriptor {
@@ -220,6 +252,9 @@ impl RelayInfo {
             pairing_relay_url: pairing_relay_url.map(str::to_string),
             admin_api: admin_api.map(str::to_string),
             gif,
+            claim: Some(claim_descriptor(
+                buzz_pubsub::mention_claim::DEFAULT_CLAIM_TTL_SECS,
+            )),
             relay_self: relay_self.map(|s| s.to_string()),
         }
     }
@@ -302,6 +337,10 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
     if let Some(limitation) = info.limitation.as_mut() {
         limitation.max_content_length = Some(state.config.max_event_content_bytes as u64);
     }
+    // The descriptor is always present; `build` seeds it with the default TTL
+    // because it takes no config, so the served document restates the
+    // configured one here.
+    info.claim = Some(claim_descriptor(state.config.claim_ttl_secs));
     let tenant_host = if state.config.push_enabled {
         crate::tenant::bind_community(&state.db, raw_host)
             .await
@@ -485,6 +524,49 @@ mod tests {
         let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, None, None);
         let json = serde_json::to_value(&info).expect("serialize");
         assert!(json.get("pairing_relay_url").is_none());
+    }
+
+    /// The claim capability is unconditional: every document advertises the
+    /// extension and the descriptor, so a runtime never has to guess the kind.
+    #[test]
+    fn claim_extension_and_descriptor_are_always_advertised() {
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, None, None);
+        let json = serde_json::to_value(&info).expect("serialize");
+
+        assert!(
+            json["supported_extensions"]
+                .as_array()
+                .expect("extensions")
+                .contains(&serde_json::json!("buzz-claim")),
+            "every relay arbitrates mention claims: {json}"
+        );
+        assert_eq!(
+            json["claim"]["kind"],
+            serde_json::json!(buzz_core::kind::KIND_AGENT_MENTION_CLAIM)
+        );
+        assert_eq!(json["claim"]["kind"], serde_json::json!(24250));
+    }
+
+    /// `nip11_document` restates the descriptor from `config.claim_ttl_secs`;
+    /// this pins the shape and proves the TTL is not a hard-coded constant.
+    #[test]
+    fn claim_descriptor_carries_the_configured_ttl() {
+        let descriptor = claim_descriptor(120);
+        assert_eq!(
+            descriptor.kind,
+            buzz_core::kind::KIND_AGENT_MENTION_CLAIM,
+            "descriptor kind must be the production constant"
+        );
+        assert_eq!(descriptor.ttl_secs, 120);
+        assert_eq!(
+            serde_json::to_value(descriptor).expect("serialize"),
+            serde_json::json!({"kind": 24250, "ttl_secs": 120})
+        );
+        assert_ne!(
+            claim_descriptor(120).ttl_secs,
+            claim_descriptor(600).ttl_secs,
+            "the advertised TTL must follow its argument"
+        );
     }
 
     #[test]

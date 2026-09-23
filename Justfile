@@ -449,16 +449,25 @@ test-unit:
         # pairs `--run-ignored ignored-only` with a `postgres_tests::`
         # default-filter — so a red one shipped green, exactly the gap the
         # api::admin clause above was added to close.
-        # Deliberately scoped to these three modules instead of all of
+        # The claim clauses (handlers::claim, api::bridge::tests, nip11) cover
+        # the agent mention-claim seam: tag validation, the Redis-outcome
+        # mapping, the HTTP bridge answer shape, and the NIP-11 descriptor.
+        # All are pure functions — the live-Redis half is in buzz-pubsub.
+        # Deliberately scoped to these modules instead of all of
         # `handlers::`: the wider set is mostly Postgres-backed, and five of its
         # non-postgres_tests cases only "pass" without a database by waiting out
         # the ~30s sqlx acquire timeout, so they do not belong in the infra-free
         # unit job either.
         cargo nextest run -p buzz-relay --lib \
-            -E '(test(/^api::admin::/) - test(=api::admin::tests::disabled_mode_allows_unauthenticated_requests_on_the_admin_host) - test(=api::admin::tests::nip98_mode_unrostered_signer_does_not_consume_a_replay_slot)) + test(/^handlers::channel_authz::/) + test(/^handlers::moderation_authz::/) + test(/^handlers::side_effects::tests::/)'
+            -E '(test(/^api::admin::/) - test(=api::admin::tests::disabled_mode_allows_unauthenticated_requests_on_the_admin_host) - test(=api::admin::tests::nip98_mode_unrostered_signer_does_not_consume_a_replay_slot)) + test(/^handlers::channel_authz::/) + test(/^handlers::moderation_authz::/) + test(/^handlers::side_effects::tests::/) + test(/^handlers::claim::tests::/) + test(/^api::bridge::tests::/) + test(/^nip11::tests::/)'
         # ACP author-gate and queue tests protect the trust boundary between
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.
+        # buzz-pubsub --lib: the agent mention-claim helper. Its Redis tests
+        # are #[ignore]d and selected by the Relay E2E job (the lane with a
+        # live Redis); what runs here is the infra-free half — key scoping and
+        # the pure helpers. No other lane ran this crate at all.
+        cargo nextest run -p buzz-pubsub --lib
         cargo nextest run -p buzz-acp --lib
     else
         ./scripts/run-tests.sh unit

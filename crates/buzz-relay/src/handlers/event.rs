@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_unshared_gated_event, AUTHOR_ONLY_KINDS,
-    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_AGENT_MENTION_CLAIM, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -674,6 +674,25 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             false,
             "invalid: AUTH events cannot be submitted via EVENT",
         ));
+        return;
+    }
+
+    // Mention claims are arbitrated in Redis and answered with OK only —
+    // never stored, never published, never fanned out. The branch sits above
+    // the generic ephemeral path on purpose: a claim must not reach
+    // `handle_ephemeral_event` (pub/sub fan-out) or `ingest_event` (storage).
+    if kind_u32 == KIND_AGENT_MENTION_CLAIM {
+        // Scope, pubkey binding, tags and signature are all enforced inside
+        // the shared seam, so this transport cannot drift from the HTTP one.
+        super::claim::handle_mention_claim_event(
+            event,
+            &event_id_hex,
+            auth_pubkey,
+            &scopes,
+            Arc::clone(&conn),
+            state,
+        )
+        .await;
         return;
     }
 

@@ -570,9 +570,20 @@ jobs:
           cargo test -p buzz-test-client --test e2e_relay invite -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip43_membership_snapshots_are_rejected -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip29_departure_wire -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay test_mention_claim -- --ignored --nocapture
         env:
           RELAY_URL: ws://localhost:3000
           GIT_CREDENTIAL_NOSTR_BIN: ${{ github.workspace }}/target/ci/git-credential-nostr
+      - name: Redis-backed pub/sub unit tests
+        # buzz-pubsub's Redis tests are #[ignore]d because they need a live
+        # Redis, and the infra-free Unit Tests job has none. This is the lane
+        # that has one (start-relay-for-tests.sh brings up the compose Redis),
+        # so select them here. Without this step the agent mention-claim
+        # arbitration — SET NX EX plus the re-claim Lua script — is decided by
+        # no test in CI at all, and flipping win to lose ships green.
+        run: cargo test -p buzz-pubsub --lib -- --ignored --nocapture
+        env:
+          REDIS_URL: redis://localhost:6379
       - name: Media read-auth e2e
         # Reads require kind:24242 `t=get` auth, so these binaries are the only
         # coverage that a real relay rejects bare reads and honours host- and
