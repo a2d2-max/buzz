@@ -826,12 +826,32 @@ pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
 pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
 pub const DEFAULT_AGENT_PARALLELISM: u32 = 10;
 
+/// Ceiling on simultaneously live `buzz-acp` pair runtimes across ALL agents
+/// and ALL communities.
+///
+/// Auto-start fans out one pair per (agent × community), so the process count
+/// is a product, not a sum: 26 local agents × 3 communities produced 79 live
+/// harness processes on an owner machine before this cap existed. 8 is the
+/// working ceiling — comfortably above a normal working set (a handful of
+/// agents in one or two communities) and far below the runaway. Raise it in
+/// `agents/global-agent-config.json` (`max_live_runtimes`) when a machine
+/// genuinely needs more.
+pub const DEFAULT_MAX_LIVE_RUNTIMES: usize = 8;
+
 fn default_agent_parallelism() -> u32 {
     DEFAULT_AGENT_PARALLELISM
 }
 
+/// Default for `ManagedAgentRecord.start_on_app_launch` and
+/// `CreateManagedAgentRequest.start_on_app_launch`.
+///
+/// `false` since the autostart fan-out cap: a missing key must NOT opt an
+/// agent into "keep a warm pair in every community". Auto-start is a
+/// proactive policy the user opts into per agent, not a correctness
+/// prerequisite — a manual-start agent still wakes on @mention, on channel
+/// attach, and from the Settings/members controls.
 fn default_start_on_app_launch() -> bool {
-    true
+    false
 }
 
 fn default_auto_restart_on_config_change() -> bool {

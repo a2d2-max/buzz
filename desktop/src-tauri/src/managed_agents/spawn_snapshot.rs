@@ -99,7 +99,12 @@ pub(crate) struct SpawnConfigInputs<'a> {
 /// a derived impl here would print env values, auth tags, and CLI arguments.
 ///
 /// [`ManagedAgentProcess`]: super::ManagedAgentProcess
+// `Default` in test builds only: the runtime fixtures need a filler snapshot to
+// stand a fake live pair up with, and hand-writing 25 empty fields at each call
+// site invites them to drift apart. Production code must always build this from
+// `from_inputs` so a real process' snapshot is never silently empty.
 #[derive(Clone, Serialize)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct SpawnConfigSnapshot {
     /// The ACP harness binary the desktop launches (`buzz-acp`).
     pub acp_command: String,

@@ -597,6 +597,8 @@ type E2eConfig = {
       provider: string | null;
       model: string | null;
       preferred_runtime?: string | null;
+      /** Live-runtime cap; defaults to the Rust DEFAULT_MAX_LIVE_RUNTIMES. */
+      max_live_runtimes?: number;
     };
     /** Explicit owner-only agent-access capability; independent of baked defaults. */
     ownerOnlyAccessBuild?: boolean;
@@ -2547,7 +2549,8 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     needs_restart: seed.needsRestart ?? false,
     restart_diff: seed.restartDiff ?? [],
     log_path: `/tmp/mock-agent-${seed.pubkey}.log`,
-    start_on_app_launch: true,
+    // Mirrors the Rust default (`default_start_on_app_launch` = false).
+    start_on_app_launch: false,
     auto_restart_on_config_change: seed.autoRestartOnConfigChange ?? true,
     backend: seed.backend ?? { type: "local" },
     backend_agent_id: null,
@@ -8742,6 +8745,7 @@ let mockGlobalAgentConfig: {
   provider: string | null;
   model: string | null;
   preferred_runtime?: string | null;
+  max_live_runtimes?: number;
 } | null = null;
 
 // Per-page get_nsec call counter for sequenced error testing.
@@ -9723,7 +9727,8 @@ async function handleCreateManagedAgent(
     last_error: null,
     last_error_code: null,
     log_path: `/tmp/mock-agent-${pubkey}.log`,
-    start_on_app_launch: args.input.startOnAppLaunch ?? true,
+    // `undefined` inherits the Rust serde default, which is now false.
+    start_on_app_launch: args.input.startOnAppLaunch ?? false,
     auto_restart_on_config_change: true,
     backend: args.input.backend ?? { type: "local" as const },
     backend_agent_id: null,
@@ -11547,7 +11552,7 @@ export function maybeInstallE2eTauriMocks() {
   };
   window.__BUZZ_E2E_USERS_BATCH_PENDING__ = () => heldUsersBatchReleases.length;
   mockGlobalAgentConfig = config.mock?.globalAgentConfig
-    ? { ...config.mock.globalAgentConfig }
+    ? { max_live_runtimes: 8, ...config.mock.globalAgentConfig }
     : null;
   resetMockRelayMembers(config);
   resetMockRelayAgents(config);
@@ -14358,6 +14363,9 @@ export function maybeInstallE2eTauriMocks() {
             provider: null,
             model: null,
             preferred_runtime: null,
+            // Mirrors the Rust DEFAULT_MAX_LIVE_RUNTIMES so the defaults
+            // editor round-trips the cap instead of dropping it on save.
+            max_live_runtimes: 8,
           }
         );
       }

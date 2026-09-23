@@ -153,7 +153,9 @@ test("mapping carries the runtime and definition fields", async () => {
   assert.equal(input.model, undefined);
   assert.equal(input.provider, undefined);
   assert.equal(input.spawnAfterCreate, true);
-  assert.equal(input.startOnAppLaunch, true);
+  // Auto-start fans a live pair out per (agent x community): a new agent does
+  // not opt into it. Mirrors the Rust `default_start_on_app_launch` = false.
+  assert.equal(input.startOnAppLaunch, false);
   assert.deepEqual(input.backend, { type: "local" });
 });
 
@@ -176,7 +178,7 @@ test("no backend intent is byte-identical to the pre-intent mapping", async () =
     model: undefined,
     provider: undefined,
     spawnAfterCreate: true,
-    startOnAppLaunch: true,
+    startOnAppLaunch: false,
     backend: { type: "local" },
   });
 });
@@ -194,7 +196,7 @@ test("Buzz shared compute definition carries native provider and auto model", as
   assert.equal(input.provider, "relay-mesh");
   assert.equal(input.model, "auto");
   assert.equal(input.spawnAfterCreate, true);
-  assert.equal(input.startOnAppLaunch, true);
+  assert.equal(input.startOnAppLaunch, false);
 });
 
 test("provider intent forces startOnAppLaunch off and omits local commands", async () => {

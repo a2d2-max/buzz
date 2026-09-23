@@ -464,6 +464,10 @@ pub(crate) fn build_agent_harness_command(
 /// publishes the triggering message before this spawn and passes its send
 /// timestamp here so the harness's first REQ replays past that message no
 /// matter how long the spawn takes. buzz-acp clamps stale floors to ~15 min.
+///
+/// `_cap`: proof that [`super::runtime_commands::enforce_runtime_cap`] admitted
+/// this pair. Taken by value so no spawn path can skip the live-runtime cap —
+/// a new caller does not compile until it calls the gate.
 pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
@@ -471,6 +475,7 @@ pub fn spawn_agent_child(
     lazy: bool,
     owner_hex: Option<&str>,
     replay_floor_unix: Option<u64>,
+    _cap: super::runtime_commands::RuntimeCapChecked,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
@@ -973,6 +978,19 @@ pub fn start_managed_agent_process(
     replay_floor_unix: Option<u64>,
 ) -> Result<(), String> {
     let key = bound_runtime_key(record, workspace_relay)?;
+
+    // The live-runtime cap. This is the path the Start button, channel attach,
+    // create-with-spawn, the auto-restart policy and the huddle add-agent
+    // dialog all take — `start_pair` is only the reconcile/pair-scoped entry —
+    // so the gate has to sit here too or the cap would only bind auto-start.
+    // Running it before the liveness short-circuit below is harmless: an
+    // already-live pair is admitted by `enforce_runtime_cap` itself.
+    let cap_checked = super::runtime_commands::enforce_runtime_cap(
+        runtimes,
+        &key,
+        super::runtime_commands::configured_runtime_cap(app),
+    )?;
+
     if let Some(runtime) = runtimes.get_mut(&key) {
         if runtime
             .child
@@ -997,6 +1015,7 @@ pub fn start_managed_agent_process(
         false,
         owner_hex,
         replay_floor_unix,
+        cap_checked,
     )?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {

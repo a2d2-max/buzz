@@ -182,6 +182,10 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     // pre-existing definition slugs exist for collision checks) and before event
     // sync republishes — the backfilled link flips the 30177 projection.
     backfill_standalone_agents(app);
+    // Self-contained one-time migration (see `migration/autostart_optout.rs`):
+    // opt stored agents out of launch auto-start. Removable by deleting this
+    // line, its `mod autostart_optout;` declaration, and the two module files.
+    autostart_optout::migrate_autostart_optout(app);
     // Repair dropped team↔member links, then detach directory-backed teams,
     // gated on a clean repair so a failure preserves `source_dir` for a retry.
     team_membership::repair_then_detach_teams(app);
@@ -1371,6 +1375,10 @@ pub use fold::fold_personas_into_agent_store;
 use fold::load_persona_runtimes;
 mod backfill;
 pub use backfill::backfill_standalone_agents;
+// Self-contained one-time autostart opt-out migration. Removing it means
+// deleting this declaration, the single `migrate_autostart_optout(app)` call in
+// `run_boot_migrations`, and `migration/autostart_optout{,_tests}.rs`.
+mod autostart_optout;
 mod detach;
 mod pollen;
 mod team_membership;

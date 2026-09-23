@@ -201,7 +201,9 @@ test("create agent persists Buzz shared compute with auto model", async ({
     model: "auto",
     provider: "relay-mesh",
     spawnAfterCreate: true,
-    startOnAppLaunch: true,
+    // Auto-start is opt-in per agent since the live-runtime cap: a mint never
+    // fans a new pair out across every community.
+    startOnAppLaunch: false,
   });
 });
 

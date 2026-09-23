@@ -21,6 +21,9 @@ mod inbound_tests;
 // runner (same constraint as `persona_events::tests::flush_barrier`).
 #[cfg(all(test, not(target_os = "windows")))]
 mod catalog_reconcile_tests;
+// Same Windows gate as above: builds a real `AppState` via `build_app_state()`.
+#[cfg(all(test, not(target_os = "windows")))]
+mod access_refresh_tests;
 
 #[derive(Debug)]
 enum InboundRuntimeRefresh {
@@ -348,17 +351,23 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                             .managed_agent_processes
                             .lock()
                             .map_err(|error| error.to_string())?;
-                        let mut relay_urls =
-                            crate::managed_agents::managed_agent_runtime_keys(&runtimes, &d_tag)
+                        // Restart ONLY the pairs that are actually live right
+                        // now — `live_runtime_keys_for` polls each child, so a
+                        // tracked-but-exited entry is not resurrected either.
+                        // The relay URLs come from the live runtime keys,
+                        // never from `record.runtime_pid`: that scalar is a
+                        // stale leftover of the pre-pair (one-runtime-per-agent)
+                        // model, survives a crash or a previous launch, and
+                        // reading it here cold-STARTED agents the user had
+                        // opted out of auto-start — an access-policy edit from
+                        // another device would resurrect them. Nothing live =
+                        // nothing to restart: the new policy is already on
+                        // disk and applies at the agent's next real start.
+                        let relay_urls =
+                            crate::managed_agents::live_runtime_keys_for(&mut runtimes, &d_tag)
                                 .into_iter()
                                 .map(|key| key.relay_url)
                                 .collect::<Vec<_>>();
-                        if relay_urls.is_empty() && record.runtime_pid.is_some() {
-                            relay_urls.push(crate::relay::effective_agent_relay_url(
-                                &record.relay_url,
-                                &crate::relay::relay_ws_url_with_override(&state),
-                            ));
-                        }
                         if !relay_urls.is_empty() {
                             crate::managed_agents::stop_managed_agent_process(
                                 &app,
