@@ -57,8 +57,11 @@ pub const EVIDENCE_SNAP_MS: u64 = 30_000;
 pub const QUOTE_NEXT_LINES: usize = 1;
 /// 담당자 근거 글의 최소 길이(글자·숫자만 셈). "제가" 같은 말은 누구인지 못 보여 준다.
 pub const MIN_ASSIGNEE_QUOTE_CHARS: usize = 4;
-/// 모델 답의 목록 길이 상한: 결정, 할 일, 주제, 주제마다 내용.
-pub const MAX_ITEMS: (usize, usize, usize, usize) = (30, 40, 15, 8);
+/// 모델 답의 목록 길이 상한: 결정, 주제, 주제마다 내용.
+/// 할 일에는 상한을 안 건다. Gemini 는 스키마 전체가 복잡하면 400 INVALID_ARGUMENT 로 거절하는데,
+/// 칸이 일곱 개인 할 일에 상한을 걸면 그 한도를 넘는다(2026-10-12 gemini-3.8-flash: 결정 30 +
+/// 할 일 20 은 거절, 할 일 상한을 빼면 통과). 할 일을 잘라 버리는 것보다 다 받는 편이 낫다.
+pub const MAX_ITEMS: (usize, usize, usize) = (30, 15, 8);
 /// 답이 잘려서 짧게 다시 물을 때의 주제·내용 상한.
 pub const COMPACT_ITEMS: (usize, usize) = (5, 3);
 /// 다시 하기 전 기다림의 상한(ms). 서버가 `Retry-After` 를 주면 [`MAX_RETRY_AFTER_MS`] 까지 따른다.
@@ -450,7 +453,7 @@ const COMPACT_NOTE: &str = "
 /// 적고 `generationConfig.responseFormat[].text.{mimeType, schema}` 를 쓰라고
 /// 한다. 2026-10-12 에 gemini-3.8-flash 로 둘 다 200 인 것을 확인하고 새 쪽을 쓴다.
 fn response_schema(compact: bool) -> Value {
-    let (decisions, items, mut topics, mut points) = MAX_ITEMS;
+    let (decisions, mut topics, mut points) = MAX_ITEMS;
     if compact {
         (topics, points) = COMPACT_ITEMS;
     }
@@ -474,7 +477,6 @@ fn response_schema(compact: bool) -> Value {
             },
             "action_items": {
                 "type": "array",
-                "maxItems": items,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -2276,7 +2278,8 @@ mod tests {
             schema["action_items"]["items"]["properties"]["status"]["enum"],
             json!(["확정", "애매"])
         );
-        assert_eq!(schema["action_items"]["maxItems"], 40);
+        assert!(schema["action_items"].get("maxItems").is_none());
+        assert_eq!(schema["decisions"]["maxItems"], 30);
         assert_eq!(schema["topics"]["maxItems"], 15);
         let system = body["systemInstruction"]["parts"][0]["text"]
             .as_str()
