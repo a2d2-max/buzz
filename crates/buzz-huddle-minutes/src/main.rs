@@ -19,7 +19,8 @@ use buzz_huddle_minutes::check::{cer, check, check_mix, Tolerance};
 use buzz_huddle_minutes::chirp::ChirpStt;
 use buzz_huddle_minutes::collect::{find_channels, plan_meetings, CollectError};
 use buzz_huddle_minutes::followup::{
-    FollowUps, FollowedUp, NotionStep, Step as FollowStep, SummaryStep,
+    FollowUps, FollowedUp, NotionStep, Step as FollowStep, SummaryStep, WORKER_GEMINI_TIMEOUT,
+    WORKER_MAX_RETRY_AFTER_MS,
 };
 use buzz_huddle_minutes::gcs_minutes::GcsMinutes;
 use buzz_huddle_minutes::ledger::LEDGER_KEY_FORMAT;
@@ -237,6 +238,9 @@ enum Command {
         /// 답(생각 포함) 토큰 상한.
         #[arg(long, default_value_t = summary::DEFAULT_MAX_OUTPUT_TOKENS)]
         max_output_tokens: u32,
+        /// 요청 하나의 시간 상한(초).
+        #[arg(long, default_value_t = summary::DEFAULT_REQUEST_TIMEOUT.as_secs())]
+        request_timeout_secs: u64,
         /// 입력 단가(100만 토큰당 달러). 출력 단가와 같이 주면 아는 단가 대신 쓴다.
         #[arg(long, requires = "output_usd_per_mtok")]
         input_usd_per_mtok: Option<f64>,
@@ -575,39 +579,45 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 deadline,
             };
             // After the script: summary and Notion page, each only when on.
-            let follow_http = reqwest::Client::builder()
-                .timeout(notion::NOTION_TIMEOUT.max(Duration::from_secs(300)))
+            // Gemini's time limits come with its settings (each request, and
+            // the run's deadline from the follow-ups).
+            let gemini_http = reqwest::Client::builder().build()?;
+            let notion_http = reqwest::Client::builder()
+                .timeout(notion::NOTION_TIMEOUT)
                 .build()?;
             let summary_tokens = match summary_switch {
                 Switch::On => Some(Tokens::new(token_source()?)?),
                 Switch::Off => None,
             };
-            let gemini_settings = summary::GeminiSettings::new(&summary_model);
+            let mut gemini_settings = summary::GeminiSettings::new(&summary_model);
+            gemini_settings.request_timeout = WORKER_GEMINI_TIMEOUT;
+            gemini_settings.retry.max_retry_after_ms = WORKER_MAX_RETRY_AFTER_MS;
             let notion_token = match notion_switch {
                 Switch::On => Some(token_from_env("NOTION_TOKEN")?),
                 Switch::Off => None,
             };
-            let notion_settings = notion::NotionSettings::default();
+            let mut notion_settings = notion::NotionSettings::default();
+            notion_settings.retry.max_retry_after_ms = WORKER_MAX_RETRY_AFTER_MS;
             let names = summary::PubkeyPrefixNames;
-            let mut follow = FollowUps {
-                summary: summary_tokens.as_ref().map(|tokens| SummaryStep {
-                    http: &follow_http,
+            let mut follow = FollowUps::new(
+                summary_tokens.as_ref().map(|tokens| SummaryStep {
+                    http: &gemini_http,
                     settings: &gemini_settings,
                     tokens,
                 }),
-                notion: match &notion_token {
+                match &notion_token {
                     Some(token) => Some(NotionStep {
-                        client: notion::NotionClient::new(&follow_http, &notion_settings, token)?,
+                        client: notion::NotionClient::new(&notion_http, &notion_settings, token)?,
                         title_prefix: String::new(),
                         channel_label: None,
                         kind: None,
                     }),
                     None => None,
                 },
-                names: &names,
-            };
-            let follow =
-                (follow.summary.is_some() || follow.notion.is_some()).then_some(&mut follow);
+                &names,
+            )
+            .with_deadline(deadline);
+            let follow = follow.any().then_some(&mut follow);
             let code = match (out, minutes_bucket, &gcs) {
                 (Some(out), _, _) => {
                     let home = LocalMinutes::open(&out)?;
@@ -672,6 +682,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             gcp_auth,
             thinking_level,
             max_output_tokens,
+            request_timeout_secs,
             input_usd_per_mtok,
             output_usd_per_mtok,
         } => {
@@ -685,15 +696,15 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             settings.location = location;
             settings.thinking_level = Some(thinking_level.as_str().to_string());
             settings.max_output_tokens = max_output_tokens;
+            settings.request_timeout = Duration::from_secs(request_timeout_secs);
             if let (Some(input), Some(output)) = (input_usd_per_mtok, output_usd_per_mtok) {
                 settings.price = Some(summary::Price {
                     input_usd_per_mtok: input,
                     output_usd_per_mtok: output,
                 });
             }
-            let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()?;
+            // Each request's limit comes with the settings.
+            let http = reqwest::Client::builder().build()?;
             let names = summary::PubkeyPrefixNames;
             let result = summary::summarize(&http, &settings, &tokens, &transcript, &names).await?;
             if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -707,7 +718,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 .filter(|item| item.status == summary::ItemStatus::Firm)
                 .count();
             eprintln!(
-                "summary: model {} ({}) | input {} output {} thinking {} tokens in {} call(s){} | cost {}",
+                "summary: model {} ({}) | input {} output {} thinking {} tokens in {} call(s){}, {:.1} s | cost {}",
                 result.model,
                 usage.model_version.as_deref().unwrap_or("?"),
                 usage.input_tokens,
@@ -715,6 +726,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 usage.thinking_tokens,
                 usage.calls,
                 if usage.compact { ", asked again shorter" } else { "" },
+                usage.elapsed_ms as f64 / 1_000.0,
                 usage
                     .cost_usd
                     .map_or("unknown price".to_string(), |usd| format!("${usd:.6}"))
@@ -776,6 +788,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let page = notion::MeetingPage {
                 transcript: &transcript,
                 summary: Some(&summary),
+                summary_note: None,
                 names: &names,
                 title_prefix: &title_prefix,
                 channel_label: channel_name.as_deref(),
@@ -970,10 +983,13 @@ async fn process_channels<H: MinutesHome>(
                         "{channel_id} meeting {m}: script already there | {}",
                         follow_line(&followed)
                     );
-                    if followed.has_failure() {
-                        follow_failed += 1;
+                    if let Some(usage) = &followed.summary_usage {
+                        eprintln!("  {}", usage_line(usage));
                     }
-                    continue;
+                    match count_follow_up(&followed, &mut failed, &mut follow_failed) {
+                        true => return ExitCode::FAILURE,
+                        false => continue,
+                    }
                 }
                 Ok(Done::Skipped(skip)) => {
                     eprintln!("{channel_id} meeting {m}: skipped ({})", skip.as_str());
@@ -1021,13 +1037,14 @@ async fn process_channels<H: MinutesHome>(
             report.unplaced_sessions_in_channel
         );
             eprintln!(
-            "  stt run {} | requests {} reused from ledger {} retries {} gave up [{}] | unreadable ledger lines {}",
+            "  stt run {} | requests {} reused from ledger {} retries {} gave up [{}] | unreadable ledger lines {} | billed {} s for the script (reused pieces included)",
             report.run,
             report.stt_requests,
             report.stt_reused,
             report.stt_retries,
             by_kind.join(", "),
-            report.ledger_unreadable_lines
+            report.ledger_unreadable_lines,
+            output.transcript.stt.billed_seconds
         );
             for (i, speaker) in report.speakers.iter().enumerate() {
                 eprintln!(
@@ -1060,8 +1077,11 @@ async fn process_channels<H: MinutesHome>(
             );
             if let Some(followed) = followed {
                 eprintln!("  {}", follow_line(&followed));
-                if followed.has_failure() {
-                    follow_failed += 1;
+                if let Some(usage) = &followed.summary_usage {
+                    eprintln!("  {}", usage_line(usage));
+                }
+                if count_follow_up(&followed, &mut failed, &mut follow_failed) {
+                    return ExitCode::FAILURE;
                 }
             }
         }
@@ -1092,19 +1112,61 @@ async fn process_channels<H: MinutesHome>(
     ExitCode::SUCCESS
 }
 
-/// One log line for the steps after the script (no text, no ids).
+/// Count what came after the script: the minutes home failing is a failed
+/// meeting (its script stands), a failed step is a follow-up failure.
+/// `true` when the whole run should stop.
+fn count_follow_up(followed: &FollowedUp, failed: &mut usize, follow_failed: &mut usize) -> bool {
+    match &followed.home_error {
+        Some(error) => {
+            *failed += 1;
+            if error.stops_the_run() {
+                eprintln!("stopping: later meetings would fail the same way");
+                return true;
+            }
+        }
+        None if followed.has_failure() => *follow_failed += 1,
+        None => {}
+    }
+    false
+}
+
+/// One log line for the steps after the script (kinds and codes only: no
+/// meeting text, no Notion message).
 fn follow_line(followed: &FollowedUp) -> String {
     let step = |step: &FollowStep| match step {
         FollowStep::Off => "off".to_string(),
         FollowStep::AlreadyDone => "already done".to_string(),
         FollowStep::Done => "done".to_string(),
-        FollowStep::Waiting => "waiting for the summary".to_string(),
+        FollowStep::GaveUp => {
+            "given up earlier for this script (the page says 요약 실패)".to_string()
+        }
+        FollowStep::Later(why) => format!("next run ({})", why.as_str()),
         FollowStep::Failed(error) => format!("failed: {error}"),
     };
     format!(
         "summary {} | notion {}",
         step(&followed.summary),
         step(&followed.notion)
+    )
+}
+
+/// The summary's tokens and cost, numbers only.
+fn usage_line(usage: &summary::Usage) -> String {
+    format!(
+        "summary usage: input {} output {} thinking {} tokens in {} call(s){}, {:.1} s | cost {}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.thinking_tokens,
+        usage.calls,
+        if usage.compact {
+            ", asked again shorter"
+        } else {
+            ""
+        },
+        usage.elapsed_ms as f64 / 1_000.0,
+        usage
+            .cost_usd
+            .map_or("unknown price".to_string(), |usd| format!("${usd:.6}"))
     )
 }
 

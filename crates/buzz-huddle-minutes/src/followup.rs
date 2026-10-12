@@ -1,32 +1,260 @@
 //! After the script: the summary (Gemini) and the Notion page, done while
 //! the worker still holds the meeting.
 //!
-//! Each step is done once. A summary already stored for this script is not
-//! asked for again (it costs money); a Notion page whose record says it was
-//! written to the end is not written again. A step that fails is left for
-//! the next run, which does only what is missing. With the summary on, the
-//! Notion page waits for it.
+//! What is done after the script counts only for the very script it was
+//! made from — the sha256 of the script's bytes — so a script written again
+//! (`--overwrite`) never gets an older script's summary or page:
+//!
+//! - The summary (`{first}.summary.json`) keeps that sha256
+//!   ([`Summary::script_sha256`]). A stored summary that cannot be read is a
+//!   failure: Gemini is not asked again (it costs money).
+//! - The Notion record keeps the script's sha256 and the summary's
+//!   ([`RecordStamp`]): a page written before its summary existed is written
+//!   again once it does. With the summary on, the page waits for it.
+//!
+//! Failures have one shape for both steps (the worker docs have the table):
+//!
+//! - Each meeting keeps one record per step for its script,
+//!   `{first}.summary-failed.json` and `{first}.notion-failed.json`
+//!   ([`StepFailures`]). Deleting it lets the next run start over.
+//! - A try that cost money, or may have — an answer came (200), or the
+//!   request was sent and then timed out or the connection closed — is not
+//!   sent again in the run and counts as a paid try; after
+//!   [`PAID_SUMMARY_TRIES`] of them the summary is given up.
+//! - A failure that cost nothing (no connection, 5xx, 429, 400) counts as a
+//!   free failure and that meeting waits ([`backoff`]) before its next try;
+//!   other meetings go on. After more than [`FREE_SUMMARY_FAILS`] the summary
+//!   is given up; the Notion page keeps trying.
+//! - A given-up summary leaves the page written with [`SUMMARY_GIVEN_UP`] in
+//!   its place, and the meeting is finished.
+//! - A step is off for the rest of the run only on what the service says:
+//!   refused credentials or permission and 429 at once, other trouble
+//!   (unavailable, timed out, cut off) on [`TROUBLE_IN_A_ROW`] meetings in a
+//!   row; any answer starts the count again.
+//!
+//! The records are read first; the script is read only when a step is left
+//! to do. Nothing new starts with less than [`FOLLOW_UP_MIN_LEFT`] before
+//! the run's deadline, and Gemini gets the deadline too: no request or wait
+//! that would end after it. Before writing the summary or a record the
+//! worker checks it still holds the meeting.
 //!
 //! Who said what is shown through [`DisplayNames`]: today pubkey prefixes;
 //! a map that also knows a diarized `speaker_label` can take its place
 //! without touching this flow.
 
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 use buzz_gcp::token::Tokens;
+use serde::{Deserialize, Serialize};
 
 use crate::collect::MeetingPlan;
+use crate::models::sha256_hex;
 use crate::notion::{
-    self, MeetingKind, MeetingPage, NotionClient, NotionRecord, ProcessingStatus,
-    PublishMeetingError, PublishReport,
+    self, MeetingKind, MeetingPage, NotionClient, NotionErrorKind, NotionRecord, ProcessingStatus,
+    PublishMeetingError, PublishReport, RecordStamp,
 };
-use crate::runner::{MeetingError, MinutesHome};
-use crate::summary::{self, DisplayNames, GeminiSettings, Summary};
+use crate::runner::{Beside, MeetingError, MinutesHome};
+use crate::summary::{
+    self, DisplayNames, GeminiSettings, Summary, SummaryError, SummaryErrorKind, Usage,
+};
 use crate::transcript::Transcript;
+
+/// Tries of one script's summary that cost money, or may have, before the
+/// summary is given up.
+pub const PAID_SUMMARY_TRIES: u32 = 3;
+/// Free failures of one script's summary that are tried again; one more and
+/// it is given up (about ten and a half hours of waiting). The Notion page
+/// is never given up.
+pub const FREE_SUMMARY_FAILS: u32 = 6;
+/// The wait after a step's first free failure; it doubles with each one
+/// after, up to [`MAX_BACKOFF`].
+pub const FIRST_BACKOFF: Duration = Duration::from_secs(10 * 60);
+/// The longest wait between tries of one step.
+pub const MAX_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
+/// Trouble (unavailable, timed out, cut off) on this many meetings in a row
+/// turns the step off for the rest of the run.
+pub const TROUBLE_IN_A_ROW: u32 = 2;
+/// Nothing after the script starts with less than this left before the
+/// run's deadline; the next run does it.
+pub const FOLLOW_UP_MIN_LEFT: Duration = Duration::from_secs(10 * 60);
+/// Time limit of one Gemini request in the worker; the attempts stay as in
+/// [`GeminiSettings::retry`]. Long enough for the whole
+/// [`summary::DEFAULT_MAX_OUTPUT_TOKENS`] (32,768) at 61 tokens a second or
+/// more (measured 2026-10-12 on a 58-minute meeting: 998 tokens in 12.2 s,
+/// at least 82 a second), and short enough to start inside
+/// [`FOLLOW_UP_MIN_LEFT`].
+pub const WORKER_GEMINI_TIMEOUT: Duration = Duration::from_secs(540);
+/// `Retry-After` from Gemini and Notion is followed this far (ms) in the
+/// worker.
+pub const WORKER_MAX_RETRY_AFTER_MS: u64 = 60_000;
+// A request started with FOLLOW_UP_MIN_LEFT to go must be able to finish.
+const _: () = assert!(WORKER_GEMINI_TIMEOUT.as_secs() < FOLLOW_UP_MIN_LEFT.as_secs());
+/// On the Notion page in place of a summary that was given up.
+pub const SUMMARY_GIVEN_UP: &str = "요약 실패: 이 스크립트로는 요약을 만들지 못했어요.";
+/// [`RecordStamp::summary_sha256`] of a page written with the summary given
+/// up.
+pub const SUMMARY_GIVEN_UP_STAMP: &str = "failed";
+/// Value of [`StepFailures::format`].
+pub const STEP_FAILURES_FORMAT: &str = "huddle-step-failures/1";
+
+/// The wait after a step's `free_fails`-th free failure (1 and up):
+/// [`FIRST_BACKOFF`] doubled each time, at most [`MAX_BACKOFF`].
+pub fn backoff(free_fails: u32) -> Duration {
+    let doublings = free_fails.saturating_sub(1).min(16);
+    FIRST_BACKOFF
+        .saturating_mul(1u32 << doublings)
+        .min(MAX_BACKOFF)
+}
+
+/// Failures of one step (summary or Notion page) for one script, kept beside
+/// it (`{first}.summary-failed.json`, `{first}.notion-failed.json`). Holds
+/// no meeting text. Deleting the file lets the next run start over.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepFailures {
+    /// [`STEP_FAILURES_FORMAT`].
+    pub format: String,
+    /// sha256 of the script the failures are about; another script's count
+    /// as none.
+    pub script_sha256: String,
+    /// Tries that cost money, or may have (the summary only).
+    #[serde(default)]
+    pub paid_tries: u32,
+    /// Failures that cost nothing.
+    #[serde(default)]
+    pub free_fails: u32,
+    /// Kind of the last failure, e.g. `transient`.
+    #[serde(default, alias = "kind")]
+    pub last_kind: String,
+    /// Its code, e.g. `HTTP 500 INTERNAL` (no meeting text).
+    #[serde(default, alias = "code")]
+    pub last_code: String,
+    /// No new try before this (UTC ms).
+    #[serde(default)]
+    pub next_try_after_unix_ms: u64,
+}
+
+impl StepFailures {
+    fn new(script_sha256: &str) -> Self {
+        Self {
+            format: STEP_FAILURES_FORMAT.into(),
+            script_sha256: script_sha256.into(),
+            ..Self::default()
+        }
+    }
+
+    /// The summary is given up for this script.
+    pub fn summary_given_up(&self) -> bool {
+        self.paid_tries >= PAID_SUMMARY_TRIES || self.free_fails > FREE_SUMMARY_FAILS
+    }
+
+    /// Count one failure at `now` (UTC ms); a free one sets the next try.
+    fn count(&mut self, cost: Cost, kind: &str, code: &str, now: u64) {
+        self.last_kind = kind.into();
+        self.last_code = code.into();
+        match cost {
+            Cost::Paid => self.paid_tries += 1,
+            Cost::Free => {
+                self.free_fails += 1;
+                let wait = u64::try_from(backoff(self.free_fails).as_millis()).unwrap_or(u64::MAX);
+                self.next_try_after_unix_ms = now.saturating_add(wait);
+            }
+            Cost::Uncounted => {}
+        }
+    }
+
+    /// How this failure was counted, for the log.
+    fn tally(&self, cost: Cost, given_up: bool, now: u64) -> String {
+        let end = if given_up { ", given up" } else { "" };
+        match cost {
+            Cost::Paid => format!(
+                " (paid try {} of {PAID_SUMMARY_TRIES}{end})",
+                self.paid_tries
+            ),
+            Cost::Free if given_up => format!(" (free failure {}{end})", self.free_fails),
+            Cost::Free => format!(
+                " (free failure {}, next try in {} min)",
+                self.free_fails,
+                self.next_try_after_unix_ms
+                    .saturating_sub(now)
+                    .div_ceil(60_000)
+            ),
+            Cost::Uncounted => String::new(),
+        }
+    }
+}
+
+/// How a failure counts for its meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cost {
+    /// Cost money, or may have.
+    Paid,
+    /// Cost nothing: wait, then try again.
+    Free,
+    /// Not the meeting's doing (refused credentials or permission).
+    Uncounted,
+}
+
+/// What a result says about the service, for the rest of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    /// Refused (credentials, permission) or rate-limited: off now.
+    Refused,
+    /// Unavailable, timed out or cut off: off after [`TROUBLE_IN_A_ROW`].
+    Trouble,
+    /// The service answered.
+    Answered,
+}
+
+fn summary_class(error: &SummaryError) -> (Cost, Signal) {
+    use SummaryErrorKind as Kind;
+    let cost = match error.kind {
+        _ if error.may_have_cost() => Cost::Paid,
+        Kind::Auth | Kind::Permission => Cost::Uncounted,
+        _ => Cost::Free,
+    };
+    let signal = match error.kind {
+        Kind::Auth | Kind::Permission | Kind::RateLimited => Signal::Refused,
+        Kind::Transient => Signal::Trouble,
+        Kind::BadRequest | Kind::BadResponse | Kind::OutOfTime => Signal::Answered,
+    };
+    (cost, signal)
+}
+
+fn notion_class(kind: NotionErrorKind) -> (Cost, Signal) {
+    use NotionErrorKind as Kind;
+    match kind {
+        Kind::Auth | Kind::Permission => (Cost::Uncounted, Signal::Refused),
+        Kind::RateLimited => (Cost::Free, Signal::Refused),
+        Kind::Transient => (Cost::Free, Signal::Trouble),
+        Kind::NotFound | Kind::BadRequest | Kind::BadResponse => (Cost::Free, Signal::Answered),
+    }
+}
+
+/// One step's state for the rest of the run.
+#[derive(Debug, Default)]
+struct ForRun {
+    off: bool,
+    trouble_in_a_row: u32,
+}
+
+impl ForRun {
+    fn heard(&mut self, signal: Signal) {
+        match signal {
+            Signal::Refused => self.off = true,
+            Signal::Trouble => {
+                self.trouble_in_a_row += 1;
+                self.off |= self.trouble_in_a_row >= TROUBLE_IN_A_ROW;
+            }
+            Signal::Answered => self.trouble_in_a_row = 0,
+        }
+    }
+}
 
 /// How to ask Gemini for the summary.
 pub struct SummaryStep<'a> {
-    /// HTTP client (with a time limit).
+    /// HTTP client.
     pub http: &'a reqwest::Client,
-    /// Model, project, retries.
+    /// Model, project, retries, time limit of each request.
     pub settings: &'a GeminiSettings,
     /// Google access tokens.
     pub tokens: &'a Tokens,
@@ -44,7 +272,15 @@ pub struct NotionStep<'a> {
     pub kind: Option<MeetingKind>,
 }
 
-/// What to do after the script. A step left `None` is off.
+fn system_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// What to do after the script, for one run. A step left `None` is off.
 pub struct FollowUps<'a> {
     /// The summary.
     pub summary: Option<SummaryStep<'a>>,
@@ -52,6 +288,86 @@ pub struct FollowUps<'a> {
     pub notion: Option<NotionStep<'a>>,
     /// pubkey → name, for the summary and the page.
     pub names: &'a dyn DisplayNames,
+    deadline: Option<Instant>,
+    clock: &'a dyn Fn() -> u64,
+    summary_run: ForRun,
+    notion_run: ForRun,
+}
+
+impl<'a> FollowUps<'a> {
+    /// These steps, with no deadline and the system clock.
+    pub fn new(
+        summary: Option<SummaryStep<'a>>,
+        notion: Option<NotionStep<'a>>,
+        names: &'a dyn DisplayNames,
+    ) -> Self {
+        Self {
+            summary,
+            notion,
+            names,
+            deadline: None,
+            clock: &system_now_ms,
+            summary_run: ForRun::default(),
+            notion_run: ForRun::default(),
+        }
+    }
+
+    /// Nothing new starts with less than [`FOLLOW_UP_MIN_LEFT`] before
+    /// `deadline`.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Another clock (UTC ms) for waiting after failures (tests).
+    pub fn with_clock(mut self, clock: &'a dyn Fn() -> u64) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Some step is on.
+    pub fn any(&self) -> bool {
+        self.summary.is_some() || self.notion.is_some()
+    }
+
+    fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    fn short_of_time(&self) -> bool {
+        self.deadline.is_some_and(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) < FOLLOW_UP_MIN_LEFT
+        })
+    }
+}
+
+/// Why a step was not tried this run (a later run does it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Later {
+    /// The Notion page waits for the summary.
+    Summary,
+    /// Less than [`FOLLOW_UP_MIN_LEFT`] before the run's deadline.
+    TimeLimit,
+    /// Off for the rest of this run: refused, rate-limited, or trouble on
+    /// [`TROUBLE_IN_A_ROW`] meetings in a row.
+    OffForRun,
+    /// This meeting waits after its free failures ([`backoff`]).
+    Backoff,
+    /// The minutes home failed in an earlier step.
+    Home,
+}
+
+impl Later {
+    /// For the log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Summary => "waiting for the summary",
+            Self::TimeLimit => "too little time left in this run",
+            Self::OffForRun => "off for this run (refused, rate-limited or in trouble)",
+            Self::Backoff => "waiting after earlier failures",
+            Self::Home => "the minutes home failed",
+        }
+    }
 }
 
 /// What happened to one step.
@@ -59,45 +375,62 @@ pub struct FollowUps<'a> {
 pub enum Step {
     /// Not asked for.
     Off,
-    /// Done on an earlier run; nothing sent.
+    /// Done on an earlier run for this very script; nothing sent.
     AlreadyDone,
     /// Done now.
     Done,
-    /// The Notion page waits for the summary (it failed this run).
-    Waiting,
-    /// Failed now; the next run tries again. The error, codes only.
+    /// The summary was given up for this script on an earlier run
+    /// ([`StepFailures::summary_given_up`]); nothing sent.
+    GaveUp,
+    /// Not tried this run; a later run does it.
+    Later(Later),
+    /// Failed now. Kind and codes only, never meeting text, and how it was
+    /// counted.
     Failed(String),
 }
 
 /// The two steps after the script.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FollowedUp {
     /// The summary.
     pub summary: Step,
     /// The Notion page.
     pub notion: Step,
+    /// The minutes home failed (a record not read or written, or the hold
+    /// lost): the meeting failed, though its script stands. The step it
+    /// happened in is [`Step::Failed`].
+    pub home_error: Option<MeetingError>,
+    /// Tokens and cost of the summary made this run (none when none was
+    /// made now; a paid failure's are not known).
+    pub summary_usage: Option<Usage>,
 }
 
 impl FollowedUp {
-    /// A step failed (or waits): the next run has something to do.
-    pub fn left_for_next_run(&self) -> bool {
+    fn steps(&self) -> [&Step; 2] {
         [&self.summary, &self.notion]
+    }
+
+    /// A later run has something to do.
+    pub fn left_for_next_run(&self) -> bool {
+        self.steps()
             .iter()
-            .any(|step| matches!(step, Step::Failed(_) | Step::Waiting))
+            .any(|step| matches!(step, Step::Failed(_) | Step::Later(_)))
     }
 
     /// A step failed this run.
     pub fn has_failure(&self) -> bool {
-        [&self.summary, &self.notion]
+        self.steps()
             .iter()
             .any(|step| matches!(step, Step::Failed(_)))
     }
 
-    /// Nothing was done or tried this run.
+    /// Nothing was done, tried or left this run.
     pub fn nothing_left(&self) -> bool {
-        [&self.summary, &self.notion]
-            .iter()
-            .all(|step| matches!(step, Step::Off | Step::AlreadyDone))
+        self.home_error.is_none()
+            && self
+                .steps()
+                .iter()
+                .all(|step| matches!(step, Step::Off | Step::AlreadyDone | Step::GaveUp))
     }
 }
 
@@ -105,109 +438,348 @@ fn io(error: serde_json::Error) -> MeetingError {
     MeetingError::Io(std::io::Error::other(error))
 }
 
-/// The summary and the Notion page of `meeting`, whose script is
-/// `transcript`. Call it while holding the meeting. `fresh` means the script
-/// was written just now: earlier results belong to an older script and are
-/// done again. Steps that fail are reported, not returned as errors; an
-/// error is the minutes home failing.
+/// One meeting being followed up: what the steps share.
+struct Held<'a, H: MinutesHome> {
+    home: &'a H,
+    hold: &'a H::Hold,
+    meeting: &'a MeetingPlan,
+    script_sha256: &'a str,
+    given: Option<&'a Transcript>,
+    read: Option<Transcript>,
+}
+
+impl<H: MinutesHome> Held<'_, H> {
+    /// The script: as given, or read now. It must still be the script the
+    /// sha256 is of.
+    async fn script(&mut self) -> Result<&Transcript, MeetingError> {
+        if let Some(given) = self.given {
+            return Ok(given);
+        }
+        let script = match self.read.take() {
+            Some(script) => script,
+            None => {
+                let name = self.home.script_name(self.meeting);
+                let bytes = self
+                    .home
+                    .read_script(self.meeting)
+                    .await?
+                    .ok_or_else(|| MeetingError::Scripts(format!("{name}: gone")))?;
+                if sha256_hex(&bytes) != self.script_sha256 {
+                    return Err(MeetingError::Scripts(format!("{name}: changed")));
+                }
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    MeetingError::Scripts(format!("{name}: not a script ({:?})", e.classify()))
+                })?
+            }
+        };
+        Ok(self.read.insert(script))
+    }
+
+    /// This script's failures of a step (none for another script's). The
+    /// inner `Err` is a record that cannot be read.
+    async fn failures(&self, beside: Beside) -> Result<Result<StepFailures, ()>, MeetingError> {
+        let fresh = StepFailures::new(self.script_sha256);
+        Ok(match self.home.read_beside(self.meeting, beside).await? {
+            None => Ok(fresh),
+            Some(bytes) => match serde_json::from_slice::<StepFailures>(&bytes) {
+                Ok(failures) if failures.script_sha256 == self.script_sha256 => Ok(failures),
+                Ok(_) => Ok(fresh),
+                Err(_) => Err(()),
+            },
+        })
+    }
+
+    /// Fails with [`MeetingError::HoldLost`] when another worker has taken
+    /// the meeting over.
+    async fn check_held(&self) -> Result<(), MeetingError> {
+        match self.home.still_held(self.hold).await? {
+            true => Ok(()),
+            false => Err(MeetingError::HoldLost),
+        }
+    }
+
+    async fn write(&self, beside: Beside, json: Vec<u8>) -> Result<(), MeetingError> {
+        self.check_held().await?;
+        self.home.write_beside(self.meeting, beside, json).await?;
+        Ok(())
+    }
+
+    async fn write_failures(
+        &self,
+        beside: Beside,
+        failures: &StepFailures,
+    ) -> Result<(), MeetingError> {
+        let json = serde_json::to_vec_pretty(failures).map_err(io)?;
+        self.write(beside, json).await
+    }
+}
+
+/// Where the summary stands, for the page.
+enum ForPage {
+    /// The summary is off: the page goes without one, whatever it had.
+    Off,
+    /// This script's summary and the sha256 of its stored bytes.
+    Made(Box<Summary>, String),
+    /// Given up for this script.
+    GivenUp,
+    /// Not there (yet): the page waits.
+    Missing,
+}
+
+/// The summary and the Notion page of `meeting`, whose script's bytes have
+/// the sha256 `script_sha256`. Call it while holding the meeting (`hold`).
+/// `transcript` is that script when the caller has it; otherwise it is read
+/// only if a step needs it. Steps that fail are reported, never returned:
+/// the script and its report stand whatever happens here.
 pub async fn follow_up_held<H: MinutesHome>(
     home: &H,
+    hold: &H::Hold,
     meeting: &MeetingPlan,
-    transcript: &Transcript,
-    fresh: bool,
+    script_sha256: &str,
+    transcript: Option<&Transcript>,
     steps: &mut FollowUps<'_>,
-) -> Result<FollowedUp, MeetingError> {
-    let mut made: Option<Summary> = None;
-    let summary_step = match &steps.summary {
-        None => Step::Off,
-        Some(step) => {
-            let stored = if fresh {
-                None
-            } else {
-                home.read_summary(meeting)
-                    .await?
-                    .and_then(|bytes| serde_json::from_slice::<Summary>(&bytes).ok())
-                    // A summary of another version of the script is not this one's.
-                    .filter(|stored| stored.huddle_id == summary::huddle_id(transcript))
-            };
-            match stored {
-                Some(stored) => {
-                    made = Some(stored);
-                    Step::AlreadyDone
-                }
-                None => match summary::summarize(
-                    step.http,
-                    step.settings,
-                    step.tokens,
-                    transcript,
-                    steps.names,
-                )
-                .await
-                {
-                    Ok(summary) => {
-                        let json = serde_json::to_vec_pretty(&summary).map_err(io)?;
-                        home.write_summary(meeting, json).await?;
-                        made = Some(summary);
-                        Step::Done
-                    }
-                    Err(error) => Step::Failed(error.to_string()),
+) -> FollowedUp {
+    let mut held = Held {
+        home,
+        hold,
+        meeting,
+        script_sha256,
+        given: transcript,
+        read: None,
+    };
+    let (summary, for_page) = match summary_step(&mut held, steps).await {
+        Ok(done) => done,
+        Err(error) => {
+            return FollowedUp {
+                summary: Step::Failed(format!("minutes home: {error}")),
+                notion: match steps.notion {
+                    Some(_) => Step::Later(Later::Home),
+                    None => Step::Off,
                 },
+                home_error: Some(error),
+                summary_usage: None,
             }
         }
     };
+    let summary_usage = match (&summary, &for_page) {
+        (Step::Done, ForPage::Made(made, _)) => Some(made.usage.clone()),
+        _ => None,
+    };
+    match notion_step(&mut held, steps, for_page).await {
+        Ok(notion) => FollowedUp {
+            summary,
+            notion,
+            home_error: None,
+            summary_usage,
+        },
+        Err(error) => FollowedUp {
+            summary,
+            notion: Step::Failed(format!("minutes home: {error}")),
+            home_error: Some(error),
+            summary_usage,
+        },
+    }
+}
 
-    let notion_step = match steps.notion.as_mut() {
-        None => Step::Off,
-        Some(_) if steps.summary.is_some() && made.is_none() => Step::Waiting,
-        Some(step) => {
-            let done = !fresh
-                && home
-                    .read_notion_record(meeting)
-                    .await?
-                    .and_then(|bytes| serde_json::from_slice::<NotionRecord>(&bytes).ok())
-                    .is_some_and(|record| record.done);
-            if done {
-                Step::AlreadyDone
-            } else {
-                let page = MeetingPage {
-                    transcript,
-                    summary: made.as_ref(),
-                    names: steps.names,
-                    title_prefix: &step.title_prefix,
-                    channel_label: step.channel_label.as_deref(),
-                    kind: step.kind,
-                    status: ProcessingStatus::Done,
-                };
-                let mut report = PublishReport::default();
-                match notion::publish_held(home, meeting, &mut step.client, &page, &mut report)
-                    .await
-                {
-                    Ok(()) => Step::Done,
-                    Err(PublishMeetingError::Home(error)) => return Err(error),
-                    // Marked "실패" on the page (or found by notion-stale).
-                    Err(PublishMeetingError::Notion(error)) => Step::Failed(error.to_string()),
-                }
-            }
+async fn summary_step<H: MinutesHome>(
+    held: &mut Held<'_, H>,
+    steps: &mut FollowUps<'_>,
+) -> Result<(Step, ForPage), MeetingError> {
+    if steps.summary.is_none() {
+        return Ok((Step::Off, ForPage::Off));
+    }
+    if let Some(bytes) = held.home.read_beside(held.meeting, Beside::Summary).await? {
+        let Ok(stored) = serde_json::from_slice::<Summary>(&bytes) else {
+            // Asking again would pay again: someone has to look.
+            let failed = Step::Failed("stored summary unreadable".into());
+            return Ok((failed, ForPage::Missing));
+        };
+        if stored.script_sha256 == held.script_sha256 {
+            let sha = sha256_hex(&bytes);
+            return Ok((Step::AlreadyDone, ForPage::Made(Box::new(stored), sha)));
         }
+        // Another script's summary: this script still needs its own.
+    }
+    let Ok(mut failures) = held.failures(Beside::SummaryFailed).await? else {
+        // Its paid tries are not known: not paid for again.
+        let failed = Step::Failed("stored summary failures unreadable".into());
+        return Ok((failed, ForPage::Missing));
     };
-    Ok(FollowedUp {
-        summary: summary_step,
-        notion: notion_step,
-    })
+    if failures.summary_given_up() {
+        return Ok((Step::GaveUp, ForPage::GivenUp));
+    }
+    if steps.now() < failures.next_try_after_unix_ms {
+        return Ok((Step::Later(Later::Backoff), ForPage::Missing));
+    }
+    if steps.summary_run.off {
+        return Ok((Step::Later(Later::OffForRun), ForPage::Missing));
+    }
+    if steps.short_of_time() {
+        return Ok((Step::Later(Later::TimeLimit), ForPage::Missing));
+    }
+    let Some(step) = &steps.summary else {
+        return Ok((Step::Off, ForPage::Off));
+    };
+    // No request or wait past the run's deadline.
+    let mut settings = step.settings.clone();
+    settings.deadline = steps.deadline;
+    let transcript = held.script().await?;
+    let asked =
+        summary::summarize(step.http, &settings, step.tokens, transcript, steps.names).await;
+    let error = match asked {
+        Ok(mut made) => {
+            steps.summary_run.heard(Signal::Answered);
+            made.script_sha256 = held.script_sha256.to_string();
+            let json = serde_json::to_vec_pretty(&made).map_err(io)?;
+            let sha = sha256_hex(&json);
+            held.write(Beside::Summary, json).await?;
+            return Ok((Step::Done, ForPage::Made(Box::new(made), sha)));
+        }
+        Err(error) => error,
+    };
+    // Nothing sent: the deadline came first.
+    if error.kind == SummaryErrorKind::OutOfTime && !error.may_have_cost() {
+        return Ok((Step::Later(Later::TimeLimit), ForPage::Missing));
+    }
+    let (cost, signal) = summary_class(&error);
+    steps.summary_run.heard(signal);
+    let now = steps.now();
+    failures.count(cost, error.kind.as_str(), &error.code, now);
+    if cost != Cost::Uncounted {
+        held.write_failures(Beside::SummaryFailed, &failures)
+            .await?;
+    }
+    let given_up = failures.summary_given_up();
+    let failed = Step::Failed(format!(
+        "{} {}{}",
+        error.kind,
+        error.code,
+        failures.tally(cost, given_up, now)
+    ));
+    Ok((
+        failed,
+        if given_up {
+            ForPage::GivenUp
+        } else {
+            ForPage::Missing
+        },
+    ))
+}
+
+async fn notion_step<H: MinutesHome>(
+    held: &mut Held<'_, H>,
+    steps: &mut FollowUps<'_>,
+    for_page: ForPage,
+) -> Result<Step, MeetingError> {
+    if steps.notion.is_none() {
+        return Ok(Step::Off);
+    }
+    let (summary, summary_stamp) = match for_page {
+        ForPage::Missing => return Ok(Step::Later(Later::Summary)),
+        // Not compared: the page keeps what it was written with.
+        ForPage::Off => (None, None),
+        ForPage::Made(summary, sha) => (Some(summary), Some(sha)),
+        ForPage::GivenUp => (None, Some(SUMMARY_GIVEN_UP_STAMP.to_string())),
+    };
+    let done = held
+        .home
+        .read_notion_record(held.meeting)
+        .await?
+        .and_then(|bytes| serde_json::from_slice::<NotionRecord>(&bytes).ok())
+        .is_some_and(|record| {
+            record.done
+                && record.script_sha256 == held.script_sha256
+                && summary_stamp
+                    .as_ref()
+                    .is_none_or(|stamp| *stamp == record.summary_sha256)
+        });
+    if done {
+        return Ok(Step::AlreadyDone);
+    }
+    // Trying again costs nothing: a record that cannot be read starts over.
+    let mut failures = held
+        .failures(Beside::NotionFailed)
+        .await?
+        .unwrap_or_else(|()| StepFailures::new(held.script_sha256));
+    if steps.now() < failures.next_try_after_unix_ms {
+        return Ok(Step::Later(Later::Backoff));
+    }
+    if steps.notion_run.off {
+        return Ok(Step::Later(Later::OffForRun));
+    }
+    if steps.short_of_time() {
+        return Ok(Step::Later(Later::TimeLimit));
+    }
+    let Some(step) = steps.notion.as_mut() else {
+        return Ok(Step::Off);
+    };
+    let given_up = summary_stamp.as_deref() == Some(SUMMARY_GIVEN_UP_STAMP);
+    let stamp = RecordStamp {
+        script_sha256: held.script_sha256.to_string(),
+        summary_sha256: summary_stamp.unwrap_or_default(),
+    };
+    let (home, hold, meeting) = (held.home, held.hold, held.meeting);
+    let transcript = held.script().await?;
+    let page = MeetingPage {
+        transcript,
+        summary: summary.as_deref(),
+        summary_note: given_up.then_some(SUMMARY_GIVEN_UP),
+        names: steps.names,
+        title_prefix: &step.title_prefix,
+        channel_label: step.channel_label.as_deref(),
+        kind: step.kind,
+        status: ProcessingStatus::Done,
+    };
+    let mut report = PublishReport::default();
+    let published = notion::publish_held(
+        home,
+        hold,
+        meeting,
+        &mut step.client,
+        &page,
+        &stamp,
+        &mut report,
+    )
+    .await;
+    let error = match published {
+        Ok(()) => {
+            steps.notion_run.heard(Signal::Answered);
+            return Ok(Step::Done);
+        }
+        Err(PublishMeetingError::Home(error)) => return Err(error),
+        // Marked "실패" on the page (or found by notion-stale).
+        Err(PublishMeetingError::Notion(error)) => error,
+    };
+    let (cost, signal) = notion_class(error.kind);
+    steps.notion_run.heard(signal);
+    let now = steps.now();
+    // Only the kind and codes: Notion's message can quote the page.
+    failures.count(cost, error.kind.as_str(), error.short_code(), now);
+    if cost != Cost::Uncounted {
+        held.write_failures(Beside::NotionFailed, &failures).await?;
+    }
+    Ok(Step::Failed(format!(
+        "{}{}",
+        error.short(),
+        failures.tally(cost, false, now)
+    )))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
+    use buzz_gcp::fake::FakeGcs;
+    use buzz_gcp::gcs::Gcs;
     use buzz_gcp::token::{AccessToken, TokenSource};
     use serde_json::json;
     use uuid::Uuid;
 
     use super::*;
+    use crate::gcs_minutes::GcsMinutes;
     use crate::notion::tests::{
-        fake_notion, minutes_pages, plan_for, settings_for as notion_settings, FakeNotion,
+        fake_notion, minutes_pages, plan_for, plan_in, settings_for as notion_settings, FakeNotion,
     };
     use crate::notion::{minutes_property, NotionSettings};
     use crate::pipeline::{MinutesSettings, SttPolicy};
@@ -221,6 +793,7 @@ mod tests {
     use crate::vad::{SegmentPlan, SpeechDetector, SpeechSpan, VadError};
 
     const A: &str = "aaaaaaaa00000000000000000000000000000000000000000000000000000001";
+    const FIRST: Uuid = Uuid::from_u128(3);
 
     fn script() -> Transcript {
         transcript_with(&[
@@ -229,7 +802,26 @@ mod tests {
         ])
     }
 
-    /// A fake Gemini that answers well, or refuses (HTTP 400) while
+    fn other_script() -> Transcript {
+        transcript_with(&[(1_000, A, "완전히 다른 새 내용이에요.")])
+    }
+
+    /// sha256 of the bytes the runner writes for `script`.
+    fn sha_of(script: &Transcript) -> String {
+        sha256_hex(&serde_json::to_vec_pretty(script).unwrap())
+    }
+
+    /// The two steps, with the minutes home fine.
+    fn pair(followed: &FollowedUp) -> (Step, Step) {
+        assert!(followed.home_error.is_none(), "{followed:?}");
+        (followed.summary.clone(), followed.notion.clone())
+    }
+
+    fn failed_with(step: &Step, text: &str) -> bool {
+        matches!(step, Step::Failed(failure) if failure.contains(text))
+    }
+
+    /// A fake Gemini that answers well, or refuses (HTTP 400, free) while
     /// `refuse` is set.
     async fn gemini(refuse: Arc<AtomicBool>) -> FakeServer {
         FakeServer::start(move |_| {
@@ -242,10 +834,17 @@ mod tests {
         .await
     }
 
+    /// A fake Gemini whose answers are always cut off (paid, unusable).
+    async fn cut_off_gemini() -> FakeServer {
+        FakeServer::start(|_| gemini_reply(&answer(json!([])), "MAX_TOKENS")).await
+    }
+
     struct World {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         home: LocalMinutes,
         meeting: MeetingPlan,
+        /// Another meeting (channel 9, first session 10).
+        meeting_b: MeetingPlan,
         gemini: FakeServer,
         refuse: Arc<AtomicBool>,
         notion: FakeServer,
@@ -254,21 +853,35 @@ mod tests {
         gemini_settings: GeminiSettings,
         notion_settings: NotionSettings,
         tokens: Tokens,
+        /// The follow-ups' clock (UTC ms), moved by hand.
+        clock: Arc<AtomicU64>,
+        clock_fn: Box<dyn Fn() -> u64>,
     }
 
     async fn world() -> World {
         let dir = tempfile::tempdir().unwrap();
         let meeting = plan_for(&dir.path().join("recordings")).await;
+        let meeting_b = plan_in(
+            &dir.path().join("recordings"),
+            Uuid::from_u128(9),
+            Uuid::from_u128(10),
+        )
+        .await;
         let home = LocalMinutes::open(&dir.path().join("minutes")).unwrap();
         let refuse = Arc::new(AtomicBool::new(false));
         let gemini = gemini(refuse.clone()).await;
         let (notion, state) = fake_notion(FakeNotion::default()).await;
+        let clock = Arc::new(AtomicU64::new(1_791_800_000_000));
+        let read = clock.clone();
         World {
+            clock,
+            clock_fn: Box::new(move || read.load(Ordering::SeqCst)),
             gemini_settings: gemini_settings(&gemini),
             notion_settings: notion_settings(&notion),
-            _dir: dir,
+            dir,
             home,
             meeting,
+            meeting_b,
             gemini,
             refuse,
             notion,
@@ -279,103 +892,199 @@ mod tests {
     }
 
     impl World {
-        fn steps(&self) -> FollowUps<'_> {
-            FollowUps {
-                summary: Some(SummaryStep {
-                    http: &self.http,
-                    settings: &self.gemini_settings,
-                    tokens: &self.tokens,
-                }),
-                notion: Some(NotionStep {
-                    client: NotionClient::new(&self.http, &self.notion_settings, "t").unwrap(),
-                    title_prefix: String::new(),
-                    channel_label: None,
-                    kind: None,
-                }),
-                names: &PubkeyPrefixNames,
+        fn summary_step<'a>(&'a self, settings: &'a GeminiSettings) -> SummaryStep<'a> {
+            SummaryStep {
+                http: &self.http,
+                settings,
+                tokens: &self.tokens,
             }
         }
 
-        async fn follow(&self, fresh: bool) -> FollowedUp {
-            follow_up_held(
-                &self.home,
-                &self.meeting,
-                &script(),
-                fresh,
-                &mut self.steps(),
+        fn notion_step(&self) -> NotionStep<'_> {
+            NotionStep {
+                client: NotionClient::new(&self.http, &self.notion_settings, "t").unwrap(),
+                title_prefix: String::new(),
+                channel_label: None,
+                kind: None,
+            }
+        }
+
+        /// One run's steps on the world's clock: the summary from
+        /// `summary` when given, the Notion page when `notion`.
+        fn run<'a>(&'a self, summary: Option<&'a GeminiSettings>, notion: bool) -> FollowUps<'a> {
+            FollowUps::new(
+                summary.map(|settings| self.summary_step(settings)),
+                notion.then(|| self.notion_step()),
+                &PubkeyPrefixNames,
             )
-            .await
-            .unwrap()
+            .with_clock(&*self.clock_fn)
+        }
+
+        fn steps(&self) -> FollowUps<'_> {
+            self.run(Some(&self.gemini_settings), true)
+        }
+
+        fn now(&self) -> u64 {
+            self.clock.load(Ordering::SeqCst)
+        }
+
+        fn advance(&self, by: Duration) {
+            self.clock
+                .fetch_add(by.as_millis() as u64, Ordering::SeqCst);
+        }
+
+        /// One run's follow-up of `script`, holding the meeting.
+        async fn follow_with(&self, script: &Transcript, steps: &mut FollowUps<'_>) -> FollowedUp {
+            self.follow_meeting(&self.meeting, script, steps).await
+        }
+
+        /// The same for `meeting`.
+        async fn follow_meeting(
+            &self,
+            meeting: &MeetingPlan,
+            script: &Transcript,
+            steps: &mut FollowUps<'_>,
+        ) -> FollowedUp {
+            let hold = self.home.hold(meeting).await.unwrap().unwrap();
+            let followed = follow_up_held(
+                &self.home,
+                &hold,
+                meeting,
+                &sha_of(script),
+                Some(script),
+                steps,
+            )
+            .await;
+            self.home.release(hold).await.unwrap();
+            followed
+        }
+
+        async fn follow(&self) -> FollowedUp {
+            self.follow_with(&script(), &mut self.steps()).await
+        }
+
+        /// Both steps, the summary from `settings`.
+        async fn follow_from(&self, settings: &GeminiSettings) -> FollowedUp {
+            let mut steps = self.run(Some(settings), true);
+            self.follow_with(&script(), &mut steps).await
+        }
+
+        /// Both steps for the stored script named by `sha`, not handed over.
+        async fn follow_stored(&self, sha: &str) -> FollowedUp {
+            let hold = self.home.hold(&self.meeting).await.unwrap().unwrap();
+            let mut steps = self.steps();
+            let followed =
+                follow_up_held(&self.home, &hold, &self.meeting, sha, None, &mut steps).await;
+            self.home.release(hold).await.unwrap();
+            followed
         }
 
         fn record(&self) -> Option<NotionRecord> {
-            std::fs::read(self.home.notion_record_path(Uuid::from_u128(3)))
+            std::fs::read(self.home.notion_record_path(FIRST))
                 .ok()
                 .map(|bytes| serde_json::from_slice(&bytes).unwrap())
         }
 
-        fn page_status(&self) -> String {
+        fn summary_bytes(&self) -> Vec<u8> {
+            std::fs::read(self.home.summary_path(FIRST)).unwrap()
+        }
+
+        fn failures(&self) -> StepFailures {
+            let path = self.home.beside_path(FIRST, Beside::SummaryFailed);
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        }
+
+        fn notion_failures(&self) -> StepFailures {
+            let path = self.home.beside_path(FIRST, Beside::NotionFailed);
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (self.gemini.requests().len(), self.notion.requests().len())
+        }
+
+        /// The one page's status and its blocks as JSON text.
+        fn page(&self) -> (String, String) {
             let state = self.state.lock().unwrap();
             let pages = minutes_pages(&state);
             assert_eq!(pages.len(), 1, "one page for the meeting");
-            pages[0].properties[minutes_property::STATUS]["select"]["name"]
+            let status = pages[0].properties[minutes_property::STATUS]["select"]["name"]
                 .as_str()
                 .unwrap()
-                .to_string()
+                .to_string();
+            (status, serde_json::to_string(&pages[0].children).unwrap())
         }
     }
 
-    fn followed(summary: Step, notion: Step) -> FollowedUp {
-        FollowedUp { summary, notion }
-    }
-
-    /// Script → summary → Notion page once; the next run sends nothing.
+    /// Script → summary → Notion page once, both stamped with the script;
+    /// the next run sends nothing.
     #[tokio::test]
     async fn summary_then_notion_once() {
         let world = world().await;
-        assert_eq!(world.follow(true).await, followed(Step::Done, Step::Done));
-        assert!(world.home.summary_path(Uuid::from_u128(3)).exists());
-        assert!(world.record().unwrap().done);
-        assert_eq!(world.page_status(), "완료");
+        let first = world.follow().await;
+        assert_eq!(pair(&first), (Step::Done, Step::Done));
+        let usage = first
+            .summary_usage
+            .as_ref()
+            .expect("usage of the summary made now");
+        assert_eq!((usage.input_tokens, usage.calls), (1_000, 1));
+        let stored: Summary = serde_json::from_slice(&world.summary_bytes()).unwrap();
+        assert_eq!(stored.script_sha256, sha_of(&script()));
+        let record = world.record().unwrap();
+        assert!(record.done);
+        assert_eq!(record.script_sha256, sha_of(&script()));
+        assert_eq!(record.summary_sha256, sha256_hex(&world.summary_bytes()));
+        assert_eq!(world.page().0, "완료");
 
-        let (gemini, notion) = (world.gemini.requests().len(), world.notion.requests().len());
-        let again = world.follow(false).await;
-        assert_eq!(again, followed(Step::AlreadyDone, Step::AlreadyDone));
+        let before = world.counts();
+        let again = world.follow().await;
+        assert_eq!(pair(&again), (Step::AlreadyDone, Step::AlreadyDone));
         assert!(again.nothing_left());
-        assert_eq!(
-            world.gemini.requests().len(),
-            gemini,
-            "summary not paid twice"
-        );
-        assert_eq!(world.notion.requests().len(), notion);
-
-        // A script written again (--overwrite) gets a new summary and page.
-        assert_eq!(world.follow(true).await, followed(Step::Done, Step::Done));
-        assert_eq!(world.gemini.requests().len(), gemini + 1);
+        assert!(again.summary_usage.is_none());
+        assert_eq!(world.counts(), before, "nothing paid or sent twice");
     }
 
-    /// A failed summary leaves no summary and the page waits; the next run
-    /// asks for the summary again (once), then writes the page.
+    /// A free summary failure (refused before an answer): no summary, the
+    /// page waits, and this meeting waits 10 minutes before asking again
+    /// (once), then writes the page.
     #[tokio::test]
     async fn a_failed_summary_is_tried_again_and_the_page_waits() {
         let world = world().await;
         world.refuse.store(true, Ordering::SeqCst);
-        let first = world.follow(true).await;
-        assert!(matches!(first.summary, Step::Failed(_)), "{first:?}");
-        assert_eq!(first.notion, Step::Waiting);
+        let first = world.follow().await;
+        assert!(
+            failed_with(
+                &first.summary,
+                "bad-request HTTP 400 INVALID_ARGUMENT (free failure 1, next try in 10 min)"
+            ),
+            "{first:?}"
+        );
+        assert_eq!(first.notion, Step::Later(Later::Summary));
         assert!(first.left_for_next_run());
-        assert!(!world.home.summary_path(Uuid::from_u128(3)).exists());
+        assert!(!world.home.summary_path(FIRST).exists());
+        let failures = world.failures();
+        assert_eq!((failures.paid_tries, failures.free_fails), (0, 1));
+        assert_eq!(failures.next_try_after_unix_ms, world.now() + 600_000);
         assert!(world.notion.requests().is_empty(), "no page yet");
 
         world.refuse.store(false, Ordering::SeqCst);
         let before = world.gemini.requests().len();
-        assert_eq!(world.follow(false).await, followed(Step::Done, Step::Done));
+        let waiting = world.follow().await;
+        assert_eq!(
+            pair(&waiting),
+            (Step::Later(Later::Backoff), Step::Later(Later::Summary))
+        );
+        assert!(!waiting.has_failure());
+        assert_eq!(world.gemini.requests().len(), before, "not asked yet");
+        world.advance(FIRST_BACKOFF);
+        assert_eq!(pair(&world.follow().await), (Step::Done, Step::Done));
         assert_eq!(world.gemini.requests().len() - before, 1);
-        assert_eq!(world.page_status(), "완료");
+        assert_eq!(world.page().0, "완료");
     }
 
     /// A failed Notion page is marked "실패" and recorded as not done; the
-    /// next run writes that same page again without asking for the summary.
+    /// meeting waits, then writes that same page again without asking for
+    /// the summary.
     #[tokio::test]
     async fn a_failed_notion_page_is_tried_again_alone() {
         let world = world().await;
@@ -383,21 +1092,499 @@ mod tests {
             400,
             &json!({ "code": "validation_error", "message": "refused" }),
         )];
-        let first = world.follow(true).await;
+        let first = world.follow().await;
         assert_eq!(first.summary, Step::Done);
-        assert!(matches!(first.notion, Step::Failed(_)), "{first:?}");
+        assert!(
+            failed_with(
+                &first.notion,
+                "validation_error (free failure 1, next try in 10 min)"
+            ),
+            "{first:?}"
+        );
         let record = world.record().unwrap();
         assert!(!record.done);
-        assert_eq!(world.page_status(), "실패");
+        assert_eq!(world.page().0, "실패");
+        assert_eq!(world.notion_failures().free_fails, 1);
 
         let gemini = world.gemini.requests().len();
         assert_eq!(
-            world.follow(false).await,
-            followed(Step::AlreadyDone, Step::Done)
+            pair(&world.follow().await),
+            (Step::AlreadyDone, Step::Later(Later::Backoff))
         );
+        world.advance(FIRST_BACKOFF);
+        assert_eq!(pair(&world.follow().await), (Step::AlreadyDone, Step::Done));
         assert_eq!(world.gemini.requests().len(), gemini, "summary kept");
         assert_eq!(world.record().unwrap().page_id, record.page_id, "same page");
-        assert_eq!(world.page_status(), "완료");
+        assert_eq!(world.page().0, "완료");
+    }
+
+    /// A script written again (`--overwrite`) is another script: it gets its
+    /// own summary, and the same page is written again for it.
+    #[tokio::test]
+    async fn a_script_written_again_gets_its_own_summary_and_page() {
+        let world = world().await;
+        world.follow().await;
+        let page_id = world.record().unwrap().page_id;
+        let gemini = world.gemini.requests().len();
+        let again = world.follow_with(&other_script(), &mut world.steps()).await;
+        assert_eq!(pair(&again), (Step::Done, Step::Done));
+        assert_eq!(world.gemini.requests().len(), gemini + 1);
+        let record = world.record().unwrap();
+        assert_eq!(record.page_id, page_id);
+        assert_eq!(record.script_sha256, sha_of(&other_script()));
+
+        // With the summary off, the script alone decides.
+        let mut only_notion = FollowUps::new(None, Some(world.notion_step()), &PubkeyPrefixNames);
+        let back = world.follow_with(&script(), &mut only_notion).await;
+        assert_eq!(pair(&back), (Step::Off, Step::Done));
+        assert_eq!(world.record().unwrap().script_sha256, sha_of(&script()));
+    }
+
+    /// --overwrite, then the page fails before Notion gives a page id: the
+    /// old "done" does not stand for the new script.
+    #[tokio::test]
+    async fn an_old_done_record_does_not_count_for_a_new_script() {
+        let world = world().await;
+        world.follow().await;
+        let page_id = world.record().unwrap().page_id;
+        // The people lookup (its failure is let go), then reading the known
+        // page.
+        let refused = || {
+            Reply::json(
+                400,
+                &json!({ "code": "validation_error", "message": "refused" }),
+            )
+        };
+        world.state.lock().unwrap().queued = vec![refused(), refused()];
+        let failed = world.follow_with(&other_script(), &mut world.steps()).await;
+        assert!(
+            failed_with(&failed.notion, "validation_error"),
+            "{failed:?}"
+        );
+        let record = world.record().unwrap();
+        assert!(!record.done);
+        assert_eq!(record.page_id, page_id);
+        assert_eq!(record.script_sha256, sha_of(&other_script()));
+        assert_eq!(world.page().0, "완료", "the page was not reached");
+        world.advance(FIRST_BACKOFF);
+        let next = world.follow_with(&other_script(), &mut world.steps()).await;
+        assert_eq!(pair(&next), (Step::AlreadyDone, Step::Done));
+    }
+
+    /// Paid tries are counted per script: three, then the summary is given
+    /// up and nothing more is paid. Deleting the record starts over, and so
+    /// does a script written again.
+    #[tokio::test]
+    async fn paid_tries_stop_after_three() {
+        let world = world().await;
+        let cut = cut_off_gemini().await;
+        let settings = gemini_settings(&cut);
+        let mut calls = Vec::new();
+        let mut summary = Vec::new();
+        for _ in 0..4 {
+            let mut steps = world.run(Some(&settings), false);
+            let followed = world.follow_with(&script(), &mut steps).await;
+            calls.push(cut.requests().len());
+            summary.push(followed.summary.clone());
+            assert!(followed.home_error.is_none(), "{followed:?}");
+        }
+        // Each try is the answer and one shorter ask again.
+        assert_eq!(calls, [2, 4, 6, 6], "the fourth run pays nothing");
+        assert!(failed_with(&summary[0], "paid try 1 of 3)"), "{summary:?}");
+        assert!(
+            failed_with(&summary[2], "paid try 3 of 3, given up)"),
+            "{summary:?}"
+        );
+        assert!(failed_with(&summary[2], "bad-response "), "{summary:?}");
+        assert_eq!(summary[3], Step::GaveUp);
+        let failures = world.failures();
+        assert_eq!(failures.format, STEP_FAILURES_FORMAT);
+        assert_eq!((failures.paid_tries, failures.free_fails), (3, 0));
+        assert_eq!(failures.last_kind, "bad-response");
+        assert_eq!(failures.script_sha256, sha_of(&script()));
+        assert_eq!(failures.next_try_after_unix_ms, 0, "paid tries do not wait");
+
+        // Deleting the record (the way back, by hand) starts over.
+        std::fs::remove_file(world.home.beside_path(FIRST, Beside::SummaryFailed)).unwrap();
+        let again = world
+            .follow_with(&script(), &mut world.run(Some(&settings), false))
+            .await;
+        assert!(failed_with(&again.summary, "paid try 1 of 3)"), "{again:?}");
+        assert_eq!(cut.requests().len(), 8);
+
+        let other = world
+            .follow_with(&other_script(), &mut world.run(Some(&settings), false))
+            .await;
+        assert!(failed_with(&other.summary, "paid try 1 of 3)"), "{other:?}");
+        assert_eq!(cut.requests().len(), 10);
+    }
+
+    /// A given-up summary still gets its page, which says so; then the
+    /// meeting is finished.
+    #[tokio::test]
+    async fn a_given_up_summary_still_gets_its_page() {
+        let world = world().await;
+        let cut = cut_off_gemini().await;
+        let settings = gemini_settings(&cut);
+        for _ in 1..PAID_SUMMARY_TRIES {
+            let tried = world.follow_from(&settings).await;
+            assert_eq!(tried.notion, Step::Later(Later::Summary));
+        }
+        assert!(world.notion.requests().is_empty());
+
+        let last = world.follow_from(&settings).await;
+        assert!(failed_with(&last.summary, "given up"), "{last:?}");
+        assert_eq!(last.notion, Step::Done);
+        let (status, body) = world.page();
+        assert_eq!(status, "완료");
+        assert!(body.contains(SUMMARY_GIVEN_UP), "{body}");
+        assert_eq!(
+            world.record().unwrap().summary_sha256,
+            SUMMARY_GIVEN_UP_STAMP
+        );
+
+        let before = (cut.requests().len(), world.notion.requests().len());
+        let after = world.follow_from(&settings).await;
+        assert_eq!(pair(&after), (Step::GaveUp, Step::AlreadyDone));
+        assert!(after.nothing_left());
+        assert_eq!(
+            (cut.requests().len(), world.notion.requests().len()),
+            before
+        );
+    }
+
+    /// A stored summary (or failure count) that cannot be read is a
+    /// failure; Gemini is not asked again.
+    #[tokio::test]
+    async fn an_unreadable_stored_summary_is_not_paid_for_again() {
+        let world = world().await;
+        std::fs::write(world.home.summary_path(FIRST), b"{ not json").unwrap();
+        let first = world.follow().await;
+        assert_eq!(
+            pair(&first),
+            (
+                Step::Failed("stored summary unreadable".into()),
+                Step::Later(Later::Summary)
+            )
+        );
+        std::fs::remove_file(world.home.summary_path(FIRST)).unwrap();
+        let failures = world.home.beside_path(FIRST, Beside::SummaryFailed);
+        std::fs::write(failures, b"{ not json").unwrap();
+        let second = world.follow().await;
+        assert!(
+            failed_with(&second.summary, "failures unreadable"),
+            "{second:?}"
+        );
+        assert_eq!(world.counts(), (0, 0));
+    }
+
+    /// The Notion error message (it can quote the page) stays out of the
+    /// step and the record: kind, HTTP status and code only.
+    #[tokio::test]
+    async fn a_failed_page_logs_no_notion_message() {
+        let world = world().await;
+        world.state.lock().unwrap().append_failures = vec![Reply::json(
+            400,
+            &json!({ "code": "validation_error", "message": "body.children[0] instead was `견적서 얘기해요.`" }),
+        )];
+        let followed = world.follow().await;
+        let Step::Failed(text) = &followed.notion else {
+            panic!("{followed:?}")
+        };
+        assert!(
+            !text.contains("견적서") && !text.contains("instead was"),
+            "{text}"
+        );
+        assert!(
+            text.starts_with("bad-request HTTP 400 validation_error ("),
+            "{text}"
+        );
+        let record = std::fs::read(world.home.beside_path(FIRST, Beside::NotionFailed)).unwrap();
+        let record = String::from_utf8(record).unwrap();
+        assert!(!record.contains("견적서") && !record.contains("instead was"));
+        assert_eq!(
+            world.notion_failures().last_code,
+            "HTTP 400 validation_error"
+        );
+    }
+
+    /// Notion first without a summary; the summary turned on later reaches
+    /// the page. Turned off again, the page is left as it is.
+    #[tokio::test]
+    async fn a_summary_turned_on_later_reaches_the_page() {
+        let world = world().await;
+        let mut only_notion = FollowUps::new(None, Some(world.notion_step()), &PubkeyPrefixNames);
+        let first = world.follow_with(&script(), &mut only_notion).await;
+        assert_eq!(pair(&first), (Step::Off, Step::Done));
+        assert_eq!(world.record().unwrap().summary_sha256, "");
+        let notion = world.notion.requests().len();
+
+        let later = world.follow().await;
+        assert_eq!(pair(&later), (Step::Done, Step::Done));
+        assert!(
+            world.notion.requests().len() > notion,
+            "the page is written again"
+        );
+        assert_eq!(
+            world.record().unwrap().summary_sha256,
+            sha256_hex(&world.summary_bytes())
+        );
+
+        let mut only_notion = FollowUps::new(None, Some(world.notion_step()), &PubkeyPrefixNames);
+        let off = world.follow_with(&script(), &mut only_notion).await;
+        assert_eq!(pair(&off), (Step::Off, Step::AlreadyDone));
+    }
+
+    /// --overwrite: a new script whose summary fails does not get the old
+    /// summary, nor the old page; a later run makes its own.
+    #[tokio::test]
+    async fn an_overwritten_script_never_gets_the_old_summary() {
+        let world = world().await;
+        assert_eq!(pair(&world.follow().await), (Step::Done, Step::Done));
+        let old = world.summary_bytes();
+        world.refuse.store(true, Ordering::SeqCst);
+        let refused = world.follow_with(&other_script(), &mut world.steps()).await;
+        assert!(matches!(refused.summary, Step::Failed(_)), "{refused:?}");
+        assert_eq!(refused.notion, Step::Later(Later::Summary));
+        assert_eq!(
+            world.record().unwrap().script_sha256,
+            sha_of(&script()),
+            "the page is not claimed for the new script"
+        );
+        world.refuse.store(false, Ordering::SeqCst);
+        world.advance(FIRST_BACKOFF);
+        let gemini = world.gemini.requests().len();
+        let next = world.follow_with(&other_script(), &mut world.steps()).await;
+        assert_eq!(pair(&next), (Step::Done, Step::Done));
+        assert_eq!(world.gemini.requests().len() - gemini, 1);
+        assert_ne!(world.summary_bytes(), old);
+        assert_eq!(
+            world.record().unwrap().script_sha256,
+            sha_of(&other_script())
+        );
+    }
+
+    /// With less than [`FOLLOW_UP_MIN_LEFT`] before the deadline nothing new
+    /// starts; what is done is still seen as done.
+    #[tokio::test]
+    async fn too_little_time_leaves_the_steps_for_the_next_run() {
+        let world = world().await;
+        let soon = Instant::now() + FOLLOW_UP_MIN_LEFT - Duration::from_secs(5);
+        let late = world
+            .follow_with(&script(), &mut world.steps().with_deadline(soon))
+            .await;
+        assert_eq!(
+            pair(&late),
+            (Step::Later(Later::TimeLimit), Step::Later(Later::Summary))
+        );
+        assert!(late.left_for_next_run() && !late.has_failure());
+        assert_eq!(world.counts(), (0, 0));
+
+        let mut only_notion =
+            FollowUps::new(None, Some(world.notion_step()), &PubkeyPrefixNames).with_deadline(soon);
+        let late = world.follow_with(&script(), &mut only_notion).await;
+        assert_eq!(pair(&late), (Step::Off, Step::Later(Later::TimeLimit)));
+        assert_eq!(world.counts(), (0, 0));
+
+        let plenty = Instant::now() + FOLLOW_UP_MIN_LEFT + Duration::from_secs(60);
+        let mut steps = world.steps().with_deadline(plenty);
+        assert_eq!(
+            pair(&world.follow_with(&script(), &mut steps).await),
+            (Step::Done, Step::Done)
+        );
+        let done = world
+            .follow_with(&script(), &mut world.steps().with_deadline(soon))
+            .await;
+        assert_eq!(pair(&done), (Step::AlreadyDone, Step::AlreadyDone));
+    }
+
+    /// Refused credentials or permission turn a step off for the rest of the
+    /// run; the next run tries again.
+    #[tokio::test]
+    async fn a_refused_step_is_off_for_the_rest_of_the_run() {
+        let world = world().await;
+        let forbidden = FakeServer::start(|_| {
+            Reply::json(403, &json!({ "error": { "status": "PERMISSION_DENIED" } }))
+        })
+        .await;
+        let settings = gemini_settings(&forbidden);
+        let mut run = FollowUps::new(
+            Some(world.summary_step(&settings)),
+            Some(world.notion_step()),
+            &PubkeyPrefixNames,
+        );
+        let first = world.follow_with(&script(), &mut run).await;
+        assert!(
+            failed_with(&first.summary, "permission HTTP 403"),
+            "{first:?}"
+        );
+        let second = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(
+            pair(&second),
+            (Step::Later(Later::OffForRun), Step::Later(Later::Summary))
+        );
+        assert_eq!(forbidden.requests().len(), 1);
+        let mut next_run = FollowUps::new(
+            Some(world.summary_step(&settings)),
+            None,
+            &PubkeyPrefixNames,
+        );
+        world.follow_with(&script(), &mut next_run).await;
+        assert_eq!(forbidden.requests().len(), 2);
+
+        world.state.lock().unwrap().append_failures = vec![Reply::json(
+            401,
+            &json!({ "code": "unauthorized", "message": "API token is invalid." }),
+        )];
+        let mut run = world.steps();
+        let first = world.follow_with(&script(), &mut run).await;
+        assert!(
+            failed_with(&first.notion, "auth HTTP 401 unauthorized"),
+            "{first:?}"
+        );
+        let notion = world.notion.requests().len();
+        let second = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(pair(&second), (Step::Done, Step::Later(Later::OffForRun)));
+        assert_eq!(world.notion.requests().len(), notion);
+    }
+
+    /// The script is read only when a step is left, and must still be the
+    /// script it was named by.
+    #[tokio::test]
+    async fn the_script_is_read_only_when_a_step_is_left() {
+        let world = world().await;
+        let bytes = serde_json::to_vec_pretty(&script()).unwrap();
+        let sha = sha256_hex(&bytes);
+        let path = world.home.transcript_path(FIRST);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            pair(&world.follow_stored(&sha).await),
+            (Step::Done, Step::Done)
+        );
+        // Everything done: other bytes in its place go unseen.
+        std::fs::write(&path, b"not read").unwrap();
+        assert_eq!(
+            pair(&world.follow_stored(&sha).await),
+            (Step::AlreadyDone, Step::AlreadyDone)
+        );
+        // Something left: read, and found changed.
+        std::fs::remove_file(world.home.summary_path(FIRST)).unwrap();
+        let changed = world.follow_stored(&sha).await;
+        assert!(failed_with(&changed.summary, "changed"), "{changed:?}");
+        assert!(
+            matches!(changed.home_error, Some(MeetingError::Scripts(_))),
+            "{changed:?}"
+        );
+        assert_eq!(world.gemini.requests().len(), 1);
+    }
+
+    struct Bucket {
+        _recordings: tempfile::TempDir,
+        meeting: MeetingPlan,
+        fake: FakeGcs,
+        home: GcsMinutes,
+        lease: String,
+    }
+
+    async fn bucket() -> Bucket {
+        let recordings = tempfile::tempdir().unwrap();
+        let meeting = plan_for(recordings.path()).await;
+        let fake = FakeGcs::start(3_600).await;
+        fake.accept_token("t");
+        let tokens = Tokens::new(TokenSource::Static(AccessToken::new("t"))).unwrap();
+        let gcs = Arc::new(Gcs::with_base_url(tokens, fake.url()).unwrap());
+        Bucket {
+            lease: format!("{}lease", GcsMinutes::ledger_prefix(&meeting)),
+            _recordings: recordings,
+            meeting,
+            fake,
+            home: GcsMinutes::new(gcs, "minutes"),
+        }
+    }
+
+    /// Another worker takes the meeting over while Gemini answers: the paid
+    /// summary is not written, the meeting fails, and its lease is left to
+    /// the other worker.
+    #[tokio::test]
+    async fn nothing_is_written_once_the_hold_is_lost() {
+        let bucket = bucket().await;
+        let (fake, lease) = (bucket.fake.clone(), bucket.lease.clone());
+        let gemini = FakeServer::start(move |_| {
+            fake.insert("minutes", &lease, b"{}".to_vec());
+            gemini_reply(&answer(json!([])), "STOP")
+        })
+        .await;
+        let settings = gemini_settings(&gemini);
+        let http = reqwest::Client::new();
+        let tokens = Tokens::new(TokenSource::Static(AccessToken::new("g"))).unwrap();
+        let mut steps = FollowUps::new(
+            Some(SummaryStep {
+                http: &http,
+                settings: &settings,
+                tokens: &tokens,
+            }),
+            None,
+            &PubkeyPrefixNames,
+        );
+        let hold = bucket.home.hold(&bucket.meeting).await.unwrap().unwrap();
+        let followed = follow_up_held(
+            &bucket.home,
+            &hold,
+            &bucket.meeting,
+            &sha_of(&script()),
+            Some(&script()),
+            &mut steps,
+        )
+        .await;
+        bucket.home.release(hold).await.unwrap();
+        assert!(
+            matches!(followed.home_error, Some(MeetingError::HoldLost)),
+            "{followed:?}"
+        );
+        assert!(failed_with(&followed.summary, "hold"), "{followed:?}");
+        assert_eq!(gemini.requests().len(), 1);
+        let objects = bucket.fake.objects("minutes");
+        let summary = GcsMinutes::beside_key(&bucket.meeting, Beside::Summary);
+        assert!(!objects.contains_key(&summary));
+        assert!(objects.contains_key(&bucket.lease), "the other worker's");
+    }
+
+    /// The same for the Notion record: the page went out, the record is not
+    /// written over the other worker's.
+    #[tokio::test]
+    async fn no_notion_record_once_the_hold_is_lost() {
+        let bucket = bucket().await;
+        let (notion, state) = fake_notion(FakeNotion::default()).await;
+        let settings = notion_settings(&notion);
+        let http = reqwest::Client::new();
+        let mut steps = FollowUps::new(
+            None,
+            Some(NotionStep {
+                client: NotionClient::new(&http, &settings, "t").unwrap(),
+                title_prefix: String::new(),
+                channel_label: None,
+                kind: None,
+            }),
+            &PubkeyPrefixNames,
+        );
+        let hold = bucket.home.hold(&bucket.meeting).await.unwrap().unwrap();
+        bucket.fake.insert("minutes", &bucket.lease, b"{}".to_vec());
+        let followed = follow_up_held(
+            &bucket.home,
+            &hold,
+            &bucket.meeting,
+            &sha_of(&script()),
+            Some(&script()),
+            &mut steps,
+        )
+        .await;
+        assert!(
+            matches!(followed.home_error, Some(MeetingError::HoldLost)),
+            "{followed:?}"
+        );
+        assert_eq!(minutes_pages(&state.lock().unwrap()).len(), 1);
+        let record = GcsMinutes::notion_record_key(&bucket.meeting);
+        assert!(!bucket.fake.objects("minutes").contains_key(&record));
     }
 
     /// Test double: must never be reached.
@@ -419,6 +1606,34 @@ mod tests {
         }
     }
 
+    /// Hears nothing.
+    struct Silent;
+
+    impl SpeechDetector for Silent {
+        fn detect(&mut self, _: &[f32]) -> Result<Vec<SpeechSpan>, VadError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn minutes_settings() -> MinutesSettings {
+        MinutesSettings {
+            segment_plan: SegmentPlan::default(),
+            stt: SttPolicy::default(),
+            ledger_version: "test".into(),
+            audio_key: String::new(),
+            now_unix_ms: 0,
+        }
+    }
+
+    fn options(meeting: &MeetingPlan) -> RunOptions {
+        RunOptions {
+            prefix: "h".into(),
+            now_unix_ms: meeting.started_at_unix_ms() + 3_600_000,
+            quiet_ms: 0,
+            overwrite: false,
+        }
+    }
+
     /// A meeting whose own script is there: the runner does only the steps
     /// after it, transcribing nothing; with nothing left (or no steps) it is
     /// skipped as before.
@@ -426,34 +1641,22 @@ mod tests {
     async fn the_runner_does_only_what_is_left_after_the_script() {
         let world = world().await;
         let mut transcript = script();
-        transcript.session_ids = vec![Uuid::from_u128(3)];
+        transcript.session_ids = vec![FIRST];
         std::fs::write(
-            world.home.transcript_path(Uuid::from_u128(3)),
+            world.home.transcript_path(FIRST),
             serde_json::to_vec(&transcript).unwrap(),
         )
         .unwrap();
-        let store = LocalStore::new(world._dir.path().join("recordings"));
-        let settings = MinutesSettings {
-            segment_plan: SegmentPlan::default(),
-            stt: SttPolicy::default(),
-            ledger_version: "test".into(),
-            audio_key: String::new(),
-            now_unix_ms: 0,
-        };
-        let options = RunOptions {
-            prefix: "h".into(),
-            now_unix_ms: world.meeting.started_at_unix_ms() + 3_600_000,
-            quiet_ms: 0,
-            overwrite: false,
-        };
-        for expected in [Some(followed(Step::Done, Step::Done)), None] {
+        let store = LocalStore::new(world.dir.path().join("recordings"));
+        let options = options(&world.meeting);
+        for expected in [Some((Step::Done, Step::Done)), None] {
             let done = run_meeting_with(
                 &world.home,
                 &store,
                 &world.meeting,
                 &mut Unused,
                 &Unused,
-                &settings,
+                &minutes_settings(),
                 &options,
                 Some(&mut world.steps()),
             )
@@ -461,10 +1664,10 @@ mod tests {
             .unwrap();
             match expected {
                 Some(expected) => {
-                    assert!(
-                        matches!(&done, Done::FollowedUp(f) if *f == expected),
-                        "{done:?}"
-                    )
+                    let Done::FollowedUp(followed) = &done else {
+                        panic!("{done:?}")
+                    };
+                    assert_eq!(pair(followed), expected);
                 }
                 // Both done the first time: nothing left.
                 None => assert!(matches!(done, Done::Skipped(_)), "{done:?}"),
@@ -476,11 +1679,657 @@ mod tests {
             &world.meeting,
             &mut Unused,
             &Unused,
-            &settings,
+            &minutes_settings(),
             &options,
         )
         .await
         .unwrap();
         assert!(matches!(done, Done::Skipped(_)), "{done:?}");
+    }
+
+    /// The minutes home failing after the script (here: the hold lost while
+    /// Gemini answers) fails the meeting but keeps its script and report.
+    #[tokio::test]
+    async fn a_failure_after_the_script_keeps_the_script_and_its_report() {
+        let bucket = bucket().await;
+        let (fake, lease) = (bucket.fake.clone(), bucket.lease.clone());
+        let gemini = FakeServer::start(move |_| {
+            fake.insert("minutes", &lease, b"{}".to_vec());
+            gemini_reply(&answer(json!([])), "STOP")
+        })
+        .await;
+        let settings = gemini_settings(&gemini);
+        let http = reqwest::Client::new();
+        let tokens = Tokens::new(TokenSource::Static(AccessToken::new("g"))).unwrap();
+        let mut steps = FollowUps::new(
+            Some(SummaryStep {
+                http: &http,
+                settings: &settings,
+                tokens: &tokens,
+            }),
+            None,
+            &PubkeyPrefixNames,
+        );
+        let store = LocalStore::new(bucket._recordings.path());
+        let done = run_meeting_with(
+            &bucket.home,
+            &store,
+            &bucket.meeting,
+            &mut Silent,
+            &Unused,
+            &minutes_settings(),
+            &options(&bucket.meeting),
+            Some(&mut steps),
+        )
+        .await
+        .unwrap();
+        let Done::Written {
+            output,
+            script,
+            follow: Some(followed),
+            ..
+        } = &done
+        else {
+            panic!("{done:?}")
+        };
+        assert_eq!(
+            *script,
+            format!("gs://minutes/{}", GcsMinutes::script_key(&bucket.meeting))
+        );
+        assert_eq!(output.transcript.session_ids, vec![FIRST]);
+        assert!(
+            matches!(followed.home_error, Some(MeetingError::HoldLost)),
+            "{followed:?}"
+        );
+        let objects = bucket.fake.objects("minutes");
+        assert!(objects.contains_key(&GcsMinutes::script_key(&bucket.meeting)));
+        assert!(!objects.contains_key(&GcsMinutes::beside_key(&bucket.meeting, Beside::Summary)));
+    }
+
+    /// A Gemini that takes longer than the worker's time limit: the answer
+    /// would come (and be paid for) after the client gave up.
+    fn slow_gemini() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    drop(stream);
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A request that timed out may have been paid for: it is not sent again
+    /// in the run, and counts against the script's paid tries.
+    #[tokio::test]
+    async fn a_timeout_counts_as_a_paid_try() {
+        let world = world().await;
+        let (base, seen) = slow_gemini();
+        let mut settings = world.gemini_settings.clone();
+        settings.base_url = base;
+        settings.request_timeout = Duration::from_millis(200);
+        let mut calls = Vec::new();
+        let mut summary = Vec::new();
+        for _ in 0..4 {
+            let mut steps = world.run(Some(&settings), false);
+            let followed = world.follow_with(&script(), &mut steps).await;
+            calls.push(seen.load(Ordering::SeqCst));
+            summary.push(followed.summary);
+        }
+        assert_eq!(calls, [1, 2, 3, 3], "{summary:?}");
+        assert!(
+            failed_with(&summary[0], "transient timeout (paid try 1 of 3)"),
+            "{summary:?}"
+        );
+        assert_eq!(summary[3], Step::GaveUp);
+        assert_eq!(world.failures().paid_tries, 3);
+    }
+
+    /// Cut off (paid), then the shorter ask fails for good: the paid answer
+    /// still counts. That trouble alone does not turn the summary off; a
+    /// second meeting in trouble right after does.
+    #[tokio::test]
+    async fn a_paid_answer_counts_even_when_the_shorter_ask_fails() {
+        let world = world().await;
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let server = FakeServer::start(move |_| match counter.fetch_add(1, Ordering::SeqCst) {
+            0 => gemini_reply(&answer(json!([])), "MAX_TOKENS"),
+            _ => Reply::json(503, &json!({ "error": { "status": "UNAVAILABLE" } })),
+        })
+        .await;
+        let settings = gemini_settings(&server);
+        let mut run = world.run(Some(&settings), false);
+        let followed = world.follow_with(&script(), &mut run).await;
+        assert!(
+            failed_with(&followed.summary, "paid try 1 of 3)"),
+            "{followed:?}"
+        );
+        assert_eq!(world.failures().paid_tries, 1);
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert!(failed_with(&b.summary, "free failure 1"), "{b:?}");
+        let sent = server.requests().len();
+        let third = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(third.summary, Step::Later(Later::OffForRun));
+        assert_eq!(server.requests().len(), sent);
+    }
+
+    /// 429 every time: the step is off for the rest of the run.
+    #[tokio::test]
+    async fn rate_limits_turn_the_step_off_for_the_run() {
+        let world = world().await;
+        let limited = FakeServer::start(|_| {
+            Reply::json(429, &json!({ "error": { "status": "RESOURCE_EXHAUSTED" } }))
+        })
+        .await;
+        let settings = gemini_settings(&limited);
+        let mut run = FollowUps::new(
+            Some(world.summary_step(&settings)),
+            Some(world.notion_step()),
+            &PubkeyPrefixNames,
+        );
+        let first = world.follow_with(&script(), &mut run).await;
+        assert!(failed_with(&first.summary, "rate-limited"), "{first:?}");
+        let after_first = limited.requests().len();
+        let second = world.follow_with(&other_script(), &mut run).await;
+        assert!(matches!(second.summary, Step::Later(_)), "{second:?}");
+        assert_eq!(limited.requests().len(), after_first);
+    }
+
+    /// No wait whose end, plus a request, would pass the run's deadline:
+    /// the failure comes back at once.
+    #[tokio::test]
+    async fn gemini_never_waits_past_the_deadline() {
+        let world = world().await;
+        let limited = FakeServer::start(|_| {
+            Reply::json(429, &json!({ "error": { "status": "RESOURCE_EXHAUSTED" } }))
+                .with_header("retry-after", "5")
+        })
+        .await;
+        let mut settings = gemini_settings(&limited);
+        // The first request just fits; the wait after it does not.
+        settings.request_timeout = FOLLOW_UP_MIN_LEFT;
+        let deadline = Instant::now() + FOLLOW_UP_MIN_LEFT + Duration::from_secs(2);
+        let mut steps = FollowUps::new(
+            Some(world.summary_step(&settings)),
+            None,
+            &PubkeyPrefixNames,
+        )
+        .with_deadline(deadline);
+        let started = Instant::now();
+        let followed = world.follow_with(&script(), &mut steps).await;
+        assert!(started.elapsed() < Duration::from_secs(3), "waited");
+        assert!(
+            failed_with(
+                &followed.summary,
+                "rate-limited HTTP 429 RESOURCE_EXHAUSTED; not waited"
+            ),
+            "{followed:?}"
+        );
+        assert_eq!(limited.requests().len(), 1);
+    }
+
+    /// No request that could not end before the run's deadline: nothing is
+    /// sent and the summary is left for the next run (not a failure).
+    #[tokio::test]
+    async fn no_request_that_cannot_end_before_the_deadline() {
+        let world = world().await;
+        let mut settings = world.gemini_settings.clone();
+        settings.request_timeout = FOLLOW_UP_MIN_LEFT + Duration::from_secs(60);
+        let deadline = Instant::now() + FOLLOW_UP_MIN_LEFT + Duration::from_secs(2);
+        let mut steps = FollowUps::new(
+            Some(world.summary_step(&settings)),
+            Some(world.notion_step()),
+            &PubkeyPrefixNames,
+        )
+        .with_deadline(deadline);
+        let followed = world.follow_with(&script(), &mut steps).await;
+        assert_eq!(
+            pair(&followed),
+            (Step::Later(Later::TimeLimit), Step::Later(Later::Summary))
+        );
+        assert!(!followed.has_failure());
+        assert_eq!(world.counts(), (0, 0));
+    }
+
+    /// Notion rate-limited after its retries: the page step is off for the
+    /// rest of the run too.
+    #[tokio::test]
+    async fn notion_rate_limits_turn_the_page_off_for_the_run() {
+        let world = world().await;
+        world.state.lock().unwrap().append_failures = vec![
+            Reply::json(
+                429,
+                &json!({ "code": "rate_limited", "message": "slow down" })
+            );
+            40
+        ];
+        let mut run = FollowUps::new(None, Some(world.notion_step()), &PubkeyPrefixNames);
+        let first = world.follow_with(&script(), &mut run).await;
+        assert!(failed_with(&first.notion, "rate-limited"), "{first:?}");
+        let notion = world.notion.requests().len();
+        let second = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(pair(&second), (Step::Off, Step::Later(Later::OffForRun)));
+        assert_eq!(world.notion.requests().len(), notion);
+    }
+
+    /// A Gemini that hangs while `slow` is set and answers well otherwise.
+    fn hanging_gemini(slow: Arc<AtomicBool>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        let body = gemini_reply(&answer(json!([])), "STOP").body;
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (slow, body) = (slow.load(Ordering::SeqCst), body.clone());
+                std::thread::spawn(move || {
+                    if slow {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        return;
+                    }
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut request = vec![0; length];
+                    reader.read_exact(&mut request).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn third_script() -> Transcript {
+        transcript_with(&[(1_000, A, "세 번째 회의예요.")])
+    }
+
+    fn fourth_script() -> Transcript {
+        transcript_with(&[(1_000, A, "네 번째 회의예요.")])
+    }
+
+    /// A time-out skips only its meeting: the next meeting of the run is
+    /// summarized, and a time-out after that success starts the count again.
+    #[tokio::test]
+    async fn a_timeout_skips_only_its_meeting() {
+        let world = world().await;
+        let slow = Arc::new(AtomicBool::new(true));
+        let (base, seen) = hanging_gemini(slow.clone());
+        let mut settings = world.gemini_settings.clone();
+        settings.base_url = base;
+        settings.request_timeout = Duration::from_millis(300);
+        let mut run = FollowUps::new(
+            Some(world.summary_step(&settings)),
+            None,
+            &PubkeyPrefixNames,
+        );
+        let first = world.follow_with(&script(), &mut run).await;
+        assert!(
+            failed_with(&first.summary, "timeout (paid try 1 of 3)"),
+            "{first:?}"
+        );
+        slow.store(false, Ordering::SeqCst);
+        let second = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(second.summary, Step::Done);
+        slow.store(true, Ordering::SeqCst);
+        let third = world.follow_with(&third_script(), &mut run).await;
+        assert!(failed_with(&third.summary, "timeout"), "{third:?}");
+        slow.store(false, Ordering::SeqCst);
+        let fourth = world.follow_with(&fourth_script(), &mut run).await;
+        assert_eq!(fourth.summary, Step::Done);
+        assert_eq!(seen.load(Ordering::SeqCst), 4);
+    }
+
+    /// Two meetings in a row timing out turn the summary off for the run.
+    #[tokio::test]
+    async fn two_timeouts_in_a_row_turn_the_summary_off() {
+        let world = world().await;
+        let (base, seen) = hanging_gemini(Arc::new(AtomicBool::new(true)));
+        let mut settings = world.gemini_settings.clone();
+        settings.base_url = base;
+        settings.request_timeout = Duration::from_millis(300);
+        let mut run = FollowUps::new(
+            Some(world.summary_step(&settings)),
+            None,
+            &PubkeyPrefixNames,
+        );
+        for script in [script(), other_script()] {
+            let followed = world.follow_with(&script, &mut run).await;
+            assert!(failed_with(&followed.summary, "timeout"), "{followed:?}");
+        }
+        let third = world.follow_with(&third_script(), &mut run).await;
+        assert_eq!(third.summary, Step::Later(Later::OffForRun));
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    // ---- review round 3 (r3_*), turned into checks ----
+
+    /// Meeting B's script (channel 9, session 10).
+    fn b_script() -> Transcript {
+        let mut script = transcript_with(&[(1_000, A, "다른 회의의 내용이에요.")]);
+        script.channel_id = Uuid::from_u128(9);
+        script.session_ids = vec![Uuid::from_u128(10)];
+        script
+    }
+
+    /// Accepts, reads the request, then closes after `close_ms` without
+    /// answering.
+    fn silent_server(close_ms: u64) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = [0u8; 65536];
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                    let _ = stream.read(&mut buf);
+                    std::thread::sleep(Duration::from_millis(close_ms));
+                    drop(stream);
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn paid_tries(world: &World) -> Option<u32> {
+        std::fs::read(world.home.beside_path(FIRST, Beside::SummaryFailed))
+            .ok()
+            .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            .and_then(|record| record["paid_tries"].as_u64())
+            .map(|n| n as u32)
+    }
+
+    /// A request that times out after it was sent may have cost money: one
+    /// request a run, counted, three at most.
+    #[tokio::test]
+    async fn r3_timeout_is_counted() {
+        let world = world().await;
+        let (base, seen) = silent_server(2_000);
+        let mut settings = world.gemini_settings.clone();
+        settings.base_url = base;
+        settings.request_timeout = Duration::from_millis(300);
+        let mut counted = Vec::new();
+        for _ in 0..4 {
+            let mut steps = FollowUps::new(
+                Some(world.summary_step(&settings)),
+                None,
+                &PubkeyPrefixNames,
+            );
+            world.follow_with(&script(), &mut steps).await;
+            counted.push((seen.load(Ordering::SeqCst), paid_tries(&world)));
+        }
+        assert_eq!(
+            counted,
+            [(1, Some(1)), (2, Some(2)), (3, Some(3)), (3, Some(3))]
+        );
+    }
+
+    /// The connection closed after the request was sent, no answer: the
+    /// same as a time-out (Gemini may have answered and charged).
+    #[tokio::test]
+    async fn r3_dropped_after_send_is_counted_and_not_sent_again() {
+        let world = world().await;
+        let (base, seen) = silent_server(150);
+        let mut settings = world.gemini_settings.clone();
+        settings.base_url = base;
+        let mut counted = Vec::new();
+        for _ in 0..4 {
+            let mut steps = FollowUps::new(
+                Some(world.summary_step(&settings)),
+                None,
+                &PubkeyPrefixNames,
+            );
+            world.follow_with(&script(), &mut steps).await;
+            counted.push((seen.load(Ordering::SeqCst), paid_tries(&world)));
+        }
+        assert_eq!(
+            counted,
+            [(1, Some(1)), (2, Some(2)), (3, Some(3)), (3, Some(3))]
+        );
+    }
+
+    /// Meeting A always gets a 500: meeting B after it in the run is still
+    /// summarized and written, and A waits before its next try.
+    #[tokio::test]
+    async fn r3_one_poison_meeting_does_not_block_the_others() {
+        let world = world().await;
+        let server = FakeServer::start(|request| {
+            if String::from_utf8_lossy(&request.body).contains("견적서") {
+                Reply::json(500, &json!({ "error": { "status": "INTERNAL" } }))
+            } else {
+                gemini_reply(&answer(json!([])), "STOP")
+            }
+        })
+        .await;
+        let settings = gemini_settings(&server);
+        let mut sent_for_a = Vec::new();
+        for run in 0..2 {
+            let mut steps = FollowUps::new(
+                Some(world.summary_step(&settings)),
+                Some(world.notion_step()),
+                &PubkeyPrefixNames,
+            );
+            let before = server.requests().len();
+            let a = world.follow_with(&script(), &mut steps).await;
+            sent_for_a.push(server.requests().len() - before);
+            let b = world
+                .follow_meeting(&world.meeting_b, &b_script(), &mut steps)
+                .await;
+            let expected = if run == 0 {
+                Step::Done
+            } else {
+                Step::AlreadyDone
+            };
+            assert_eq!((b.summary, b.notion), (expected.clone(), expected), "{a:?}");
+        }
+        // Four tries (with retries) the first run, none the next: A waits.
+        assert_eq!(sent_for_a, [4, 0]);
+    }
+
+    /// One 200 whose body is cut: counted for that meeting only; the next
+    /// meeting of the run is summarized.
+    #[tokio::test]
+    async fn r3_one_cut_body_does_not_turn_the_summary_off() {
+        let world = world().await;
+        let cut = Arc::new(AtomicBool::new(true));
+        let flag = cut.clone();
+        let server = FakeServer::start(move |_| {
+            let reply = gemini_reply(&answer(json!([])), "STOP");
+            if flag.swap(false, Ordering::SeqCst) {
+                reply.cut_off()
+            } else {
+                reply
+            }
+        })
+        .await;
+        let settings = gemini_settings(&server);
+        let mut steps = FollowUps::new(
+            Some(world.summary_step(&settings)),
+            None,
+            &PubkeyPrefixNames,
+        );
+        let a = world.follow_with(&script(), &mut steps).await;
+        assert!(failed_with(&a.summary, "paid try 1 of 3)"), "{a:?}");
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut steps)
+            .await;
+        assert_eq!(b.summary, Step::Done);
+        assert_eq!(paid_tries(&world), Some(1));
+    }
+
+    // ---- one shape for failures: each rule ----
+
+    /// 10 minutes, doubled each time, at most 6 hours.
+    #[test]
+    fn backoff_doubles_up_to_six_hours() {
+        let minutes: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs() / 60).collect();
+        assert_eq!(minutes, [10, 20, 40, 80, 160, 320, 360, 360]);
+        assert_eq!(backoff(u32::MAX), MAX_BACKOFF);
+    }
+
+    /// Free failures (500): the meeting waits longer each time, other runs
+    /// send nothing meanwhile; after more than six the summary is given up
+    /// and the page says so.
+    #[tokio::test]
+    async fn free_failures_back_off_then_give_up() {
+        let world = world().await;
+        let broken =
+            FakeServer::start(|_| Reply::json(500, &json!({ "error": { "status": "INTERNAL" } })))
+                .await;
+        let settings = gemini_settings(&broken);
+        let mut waits = Vec::new();
+        for n in 1..=FREE_SUMMARY_FAILS {
+            let failed = world.follow_from(&settings).await;
+            assert!(
+                failed_with(&failed.summary, &format!("free failure {n}, next try in")),
+                "{failed:?}"
+            );
+            let failures = world.failures();
+            assert_eq!((failures.free_fails, failures.paid_tries), (n, 0));
+            let wait = failures.next_try_after_unix_ms - world.now();
+            waits.push(wait / 60_000);
+            // Not yet: nothing is sent.
+            let sent = broken.requests().len();
+            world.advance(Duration::from_millis(wait - 1));
+            let waiting = world.follow_from(&settings).await;
+            assert_eq!(waiting.summary, Step::Later(Later::Backoff));
+            assert_eq!(broken.requests().len(), sent);
+            world.advance(Duration::from_millis(1));
+        }
+        assert_eq!(waits, [10, 20, 40, 80, 160, 320]);
+        let last = world.follow_from(&settings).await;
+        assert!(
+            failed_with(&last.summary, "free failure 7, given up)"),
+            "{last:?}"
+        );
+        assert_eq!(last.notion, Step::Done);
+        assert!(world.page().1.contains(SUMMARY_GIVEN_UP));
+        // Four tries (with retries) each time.
+        assert_eq!(broken.requests().len(), 4 * 7);
+        let after = world.follow_from(&settings).await;
+        assert_eq!(pair(&after), (Step::GaveUp, Step::AlreadyDone));
+    }
+
+    /// Trouble (500 after the retries) on two meetings in a row turns the
+    /// summary off for the run; one alone does not.
+    #[tokio::test]
+    async fn trouble_on_two_meetings_in_a_row_turns_the_summary_off() {
+        let world = world().await;
+        let broken =
+            FakeServer::start(|_| Reply::json(500, &json!({ "error": { "status": "INTERNAL" } })))
+                .await;
+        let settings = gemini_settings(&broken);
+        let mut run = world.run(Some(&settings), false);
+        let a = world.follow_with(&script(), &mut run).await;
+        assert!(failed_with(&a.summary, "free failure 1"), "{a:?}");
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert!(failed_with(&b.summary, "free failure 1"), "{b:?}");
+        let sent = broken.requests().len();
+        let third = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(third.summary, Step::Later(Later::OffForRun));
+        assert_eq!(broken.requests().len(), sent);
+    }
+
+    /// The Notion page has the same shape: trouble on two meetings in a row
+    /// turns it off for the run, a failed meeting waits, and the page is
+    /// never given up.
+    #[tokio::test]
+    async fn notion_has_the_same_shape_and_never_gives_up() {
+        let world = world().await;
+        let unavailable = || {
+            Reply::json(
+                503,
+                &json!({ "code": "service_unavailable", "message": "later" }),
+            )
+        };
+        world.state.lock().unwrap().append_failures = vec![unavailable(); 400];
+        let mut run = world.run(None, true);
+        let a = world.follow_with(&script(), &mut run).await;
+        assert!(failed_with(&a.notion, "transient HTTP 503"), "{a:?}");
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert!(failed_with(&b.notion, "transient HTTP 503"), "{b:?}");
+        let sent = world.notion.requests().len();
+        let third = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(third.notion, Step::Later(Later::OffForRun));
+        assert_eq!(world.notion.requests().len(), sent);
+
+        // A 400 each run: the page waits, tries again, and never gives up.
+        let refused = || Reply::json(400, &json!({ "code": "validation_error", "message": "no" }));
+        world.state.lock().unwrap().append_failures = vec![refused(); 20];
+        for n in 2..=9 {
+            world.advance(MAX_BACKOFF);
+            let mut run = world.run(None, true);
+            let tried = world.follow_with(&script(), &mut run).await;
+            assert!(
+                failed_with(&tried.notion, &format!("free failure {n}, next try in")),
+                "{tried:?}"
+            );
+        }
+        assert_eq!(world.notion_failures().free_fails, 9);
+    }
+
+    /// A record from before (`huddle-summary-failed/1`: `kind`, `code`,
+    /// `paid_tries`) still counts.
+    #[tokio::test]
+    async fn an_older_failure_record_still_counts() {
+        let world = world().await;
+        let old = json!({
+            "format": "huddle-summary-failed/1",
+            "script_sha256": sha_of(&script()),
+            "kind": "bad-response",
+            "code": "finish reason SAFETY",
+            "paid_tries": 2,
+        });
+        std::fs::write(
+            world.home.beside_path(FIRST, Beside::SummaryFailed),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(world.failures().last_kind, "bad-response");
+        let cut = cut_off_gemini().await;
+        let settings = gemini_settings(&cut);
+        let last = world
+            .follow_with(&script(), &mut world.run(Some(&settings), false))
+            .await;
+        assert!(
+            failed_with(&last.summary, "paid try 3 of 3, given up)"),
+            "{last:?}"
+        );
     }
 }

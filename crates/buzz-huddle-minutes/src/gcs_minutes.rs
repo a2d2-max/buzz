@@ -26,8 +26,7 @@ use uuid::Uuid;
 
 use crate::collect::MeetingPlan;
 use crate::ledger::{outcome_line, parse_lines, run_line, Ledger, Outcome};
-use crate::runner::{MeetingError, MinutesHome};
-use crate::transcript::Transcript;
+use crate::runner::{script_info, Beside, MeetingError, MinutesHome, ScriptInfo};
 
 /// How long a hold lasts. A worker that dies leaves the meeting held this
 /// long at most; processing a meeting takes minutes.
@@ -42,11 +41,8 @@ const MAX_LEASE: u64 = 4 * 1024;
 /// Largest script, bundle or piece read.
 const MAX_READ: u64 = 64 * 1024 * 1024;
 
-/// 노션 기록 이름 끝. 스크립트와 같은 곳에 있어서 스크립트를 읽을 때 뺀다.
+/// 노션 기록 이름 끝(스크립트 옆). 스크립트는 `{uuid}.json` 꼴만 읽으니 안 섞인다.
 const NOTION_RECORD_SUFFIX: &str = ".notion.json";
-/// Summary name end; beside the script too, so also left out when scripts
-/// are read.
-const SUMMARY_SUFFIX: &str = ".summary.json";
 
 /// The minutes bucket as a [`MinutesHome`].
 #[derive(Debug, Clone)]
@@ -102,13 +98,14 @@ impl GcsMinutes {
         )
     }
 
-    /// Where a meeting's summary lives (beside the script).
-    pub fn summary_key(meeting: &MeetingPlan) -> String {
+    /// Where a file beside a meeting's script lives.
+    pub fn beside_key(meeting: &MeetingPlan, beside: Beside) -> String {
         format!(
-            "transcripts/{}/{}/{}{SUMMARY_SUFFIX}",
+            "transcripts/{}/{}/{}{}",
             meeting.community_id,
             meeting.channel_id,
-            meeting.first_session_id()
+            meeting.first_session_id(),
+            beside.suffix()
         )
     }
 
@@ -242,28 +239,35 @@ impl MinutesHome for GcsMinutes {
         }
     }
 
-    async fn processed_sessions(
-        &self,
-        meeting: &MeetingPlan,
-    ) -> Result<Vec<(Uuid, String)>, MeetingError> {
+    async fn still_held(&self, hold: &GcsHold) -> Result<bool, MeetingError> {
+        match self.gcs.stat(&self.bucket, &hold.name).await {
+            Ok(lease) => Ok(lease.generation == hold.generation),
+            Err(error) if error.kind == GcsErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn scripts(&self, meeting: &MeetingPlan) -> Result<Vec<ScriptInfo>, MeetingError> {
         let prefix = format!(
             "transcripts/{}/{}/",
             meeting.community_id, meeting.channel_id
         );
-        let mut processed = Vec::new();
+        let mut found = Vec::new();
         for object in self.gcs.list(&self.bucket, &prefix).await? {
-            if object.name.ends_with(NOTION_RECORD_SUFFIX) || object.name.ends_with(SUMMARY_SUFFIX)
-            {
+            // Scripts are `{first session id}.json`; everything else beside
+            // them (summary, Notion record, …) is not one.
+            let is_script = object
+                .name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .is_some_and(|id| Uuid::parse_str(id).is_ok());
+            if !is_script {
                 continue;
             }
             let bytes = self.gcs.get(&self.bucket, &object.name, MAX_READ).await?;
-            let transcript: Transcript = serde_json::from_slice(&bytes)
-                .map_err(|e| MeetingError::Scripts(format!("{}: {e}", object.name)))?;
-            for session in transcript.session_ids {
-                processed.push((session, object.name.clone()));
-            }
+            found.push(script_info(object.name, &bytes)?);
         }
-        Ok(processed)
+        Ok(found)
     }
 
     fn script_name(&self, meeting: &MeetingPlan) -> String {
@@ -306,16 +310,21 @@ impl MinutesHome for GcsMinutes {
         self.read_if_there(&Self::script_key(meeting)).await
     }
 
-    async fn read_summary(&self, meeting: &MeetingPlan) -> Result<Option<Vec<u8>>, MeetingError> {
-        self.read_if_there(&Self::summary_key(meeting)).await
-    }
-
-    async fn write_summary(
+    async fn read_beside(
         &self,
         meeting: &MeetingPlan,
+        beside: Beside,
+    ) -> Result<Option<Vec<u8>>, MeetingError> {
+        self.read_if_there(&Self::beside_key(meeting, beside)).await
+    }
+
+    async fn write_beside(
+        &self,
+        meeting: &MeetingPlan,
+        beside: Beside,
         json: Vec<u8>,
     ) -> Result<String, MeetingError> {
-        let key = Self::summary_key(meeting);
+        let key = Self::beside_key(meeting, beside);
         self.gcs
             .put(&self.bucket, &key, json, JSON, Write::Overwrite)
             .await?;

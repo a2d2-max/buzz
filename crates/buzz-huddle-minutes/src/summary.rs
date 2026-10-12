@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use buzz_gcp::token::Tokens;
 use chrono::{
@@ -66,8 +66,11 @@ pub const MAX_ITEMS: (usize, usize, usize) = (30, 15, 8);
 pub const COMPACT_ITEMS: (usize, usize) = (5, 3);
 /// 다시 하기 전 기다림의 상한(ms). 서버가 `Retry-After` 를 주면 [`MAX_RETRY_AFTER_MS`] 까지 따른다.
 pub const MAX_BACKOFF_MS: u64 = 60_000;
-/// `Retry-After` 를 따르는 상한(ms). 노션 워크스페이스 한도는 1분을 넘기도 한다.
+/// `Retry-After` 를 따르는 상한(ms)의 기본값([`RetryPolicy::max_retry_after_ms`]).
+/// 노션 워크스페이스 한도는 1분을 넘기도 한다.
 pub const MAX_RETRY_AFTER_MS: u64 = 300_000;
+/// Gemini 요청 하나의 시간 상한 기본값([`GeminiSettings::request_timeout`]).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 한국 시간(UTC+9, 서머타임 없음).
 pub fn kst() -> FixedOffset {
@@ -124,6 +127,9 @@ pub struct Summary {
     pub usage: Usage,
     /// 코드가 모델 답을 고친 개수.
     pub corrections: Corrections,
+    /// 요약한 스크립트 바이트의 sha256(작업기가 채운다). 비어 있으면 모른다.
+    #[serde(default)]
+    pub script_sha256: String,
 }
 
 /// 결정사항 하나.
@@ -204,6 +210,9 @@ pub struct Usage {
     pub calls: u32,
     /// 첫 답이 잘려서 짧게 다시 물었나.
     pub compact: bool,
+    /// 요약에 걸린 시간(ms, 다시 하기·다시 묻기 포함).
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 impl Usage {
@@ -279,6 +288,8 @@ pub struct RetryPolicy {
     pub retry_delay_ms: u64,
     /// 429 뒤 첫 기다림(ms). 다시 할 때마다 두 배. `Retry-After` 가 있으면 그걸 따른다.
     pub rate_limit_delay_ms: u64,
+    /// `Retry-After` 를 이만큼(ms)까지만 따른다.
+    pub max_retry_after_ms: u64,
 }
 
 impl Default for RetryPolicy {
@@ -287,6 +298,7 @@ impl Default for RetryPolicy {
             retries: 3,
             retry_delay_ms: 500,
             rate_limit_delay_ms: 5_000,
+            max_retry_after_ms: MAX_RETRY_AFTER_MS,
         }
     }
 }
@@ -294,7 +306,7 @@ impl Default for RetryPolicy {
 impl RetryPolicy {
     /// `retry` 번째(0부터) 다시 하기 전 기다림. `retry_after` 는 서버가 준 초.
     /// 두 배씩 늘리되 [`MAX_BACKOFF_MS`] 를 넘지 않고, 서버 값은
-    /// [`MAX_RETRY_AFTER_MS`] 까지 따른다. 여러 작업기가 한꺼번에 다시 몰리지
+    /// [`max_retry_after_ms`](Self::max_retry_after_ms) 까지 따른다. 여러 작업기가 한꺼번에 다시 몰리지
     /// 않게 0~20% 를 무작위로 더 기다린다.
     pub fn wait(&self, rate_limited: bool, retry: u32, retry_after: Option<u64>) -> Duration {
         let base = if rate_limited {
@@ -306,7 +318,7 @@ impl RetryPolicy {
             .saturating_mul(1u64 << retry.min(16))
             .min(MAX_BACKOFF_MS);
         let ms = match retry_after {
-            Some(seconds) => seconds.saturating_mul(1_000).min(MAX_RETRY_AFTER_MS),
+            Some(seconds) => seconds.saturating_mul(1_000).min(self.max_retry_after_ms),
             None => backoff,
         };
         let spread = ms / 5;
@@ -338,6 +350,10 @@ pub struct GeminiSettings {
     pub retry: RetryPolicy,
     /// 단가. `None` 이면 비용을 못 매긴다.
     pub price: Option<Price>,
+    /// 요청 하나의 시간 상한(받는 데까지).
+    pub request_timeout: Duration,
+    /// 이 시각 뒤로 넘어가는 요청·기다림은 하지 않는다(작업기 실행의 마감).
+    pub deadline: Option<Instant>,
 }
 
 impl GeminiSettings {
@@ -352,6 +368,8 @@ impl GeminiSettings {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             retry: RetryPolicy::default(),
             price: known_price(model),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            deadline: None,
         }
     }
 
@@ -382,6 +400,8 @@ pub enum SummaryErrorKind {
     BadRequest,
     /// 답이 왔는데 형식이 깨짐(JSON 아님, 짧게 다시 물어도 잘림, 후보 없음).
     BadResponse,
+    /// 마감([`GeminiSettings::deadline`]) 전에 요청 하나를 끝낼 시간이 없다.
+    OutOfTime,
 }
 
 impl SummaryErrorKind {
@@ -394,6 +414,7 @@ impl SummaryErrorKind {
             Self::Transient => "transient",
             Self::BadRequest => "bad-request",
             Self::BadResponse => "bad-response",
+            Self::OutOfTime => "out-of-time",
         }
     }
 }
@@ -404,7 +425,7 @@ impl std::fmt::Display for SummaryErrorKind {
     }
 }
 
-/// 요약 실패. 종류와 짧은 코드만 담는다(회의 내용·토큰은 안 담는다).
+/// 요약 실패. 종류와 짧은 코드, 돈이 났는지만 담는다(회의 내용·토큰은 안 담는다).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("summary failed ({kind}): {code}")]
 pub struct SummaryError {
@@ -412,6 +433,11 @@ pub struct SummaryError {
     pub kind: SummaryErrorKind,
     /// 예: `HTTP 403 PERMISSION_DENIED`.
     pub code: String,
+    /// 실패하기 전에 200 으로 받은(돈이 난) 답 수.
+    pub paid_calls: u32,
+    /// 요청을 다 보낸 뒤 답 없이 시간이 다 됐거나 연결이 끊겼다: Gemini 가 답했으면
+    /// 돈이 났다.
+    pub maybe_paid: bool,
 }
 
 impl SummaryError {
@@ -419,7 +445,14 @@ impl SummaryError {
         Self {
             kind,
             code: code.into(),
+            paid_calls: 0,
+            maybe_paid: false,
         }
+    }
+
+    /// 돈이 났거나 났을 수 있는 실패.
+    pub fn may_have_cost(&self) -> bool {
+        self.kind == SummaryErrorKind::BadResponse || self.paid_calls > 0 || self.maybe_paid
     }
 }
 
@@ -1394,6 +1427,7 @@ pub fn check_answer(
         topics,
         usage: Usage::default(),
         corrections: checker.corrections,
+        script_sha256: String::new(),
     })
 }
 
@@ -1460,6 +1494,12 @@ fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 
 /// generateContent 를 한 번(다시 하기 포함) 부른다. 답 글과 사용량을 돌려주고,
 /// 답이 길이 상한에서 잘렸으면 글 대신 `None`.
+///
+/// 돈이 났거나 났을 수 있는 실패는 다시 보내지 않는다: 200 을 받고 본문이 끊기거나
+/// 형식이 깨진 것([`SummaryError::paid_calls`]), 보낸 뒤 시간이 다 된 것
+/// ([`SummaryError::maybe_paid`]). `settings.deadline` 이 있으면 요청 하나
+/// (`request_timeout`)나 기다림이 마감을 넘기지 않게 한다: 요청을 못 보내면
+/// [`SummaryErrorKind::OutOfTime`], 못 기다리면 그 실패를 바로 돌려준다.
 async fn generate(
     client: &reqwest::Client,
     settings: &GeminiSettings,
@@ -1469,6 +1509,15 @@ async fn generate(
     let mut retry = 0u32;
     let mut renewed = false;
     loop {
+        if settings
+            .deadline
+            .is_some_and(|deadline| Instant::now() + settings.request_timeout > deadline)
+        {
+            return Err(SummaryError::new(
+                SummaryErrorKind::OutOfTime,
+                "no time for a request before the run's deadline",
+            ));
+        }
         let token = tokens.token().await.map_err(|error| {
             // A token source that did not answer is worth another try later;
             // one that said no is an authentication failure.
@@ -1481,11 +1530,25 @@ async fn generate(
         })?;
         let sent = client
             .post(settings.endpoint())
+            .timeout(settings.request_timeout)
             .bearer_auth(token.secret())
             .json(body)
             .send()
             .await;
         let (kind, code, retry_after) = match sent {
+            // Sent, then no answer: timed out, or the connection closed.
+            // Gemini may still have answered (and charged). Not sent again.
+            Err(error) if !error.is_connect() && !error.is_builder() => {
+                let code = if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "connection closed after sending"
+                };
+                return Err(SummaryError {
+                    maybe_paid: true,
+                    ..SummaryError::new(SummaryErrorKind::Transient, code)
+                });
+            }
             Err(error) => (
                 SummaryErrorKind::Transient,
                 if error.is_timeout() {
@@ -1500,12 +1563,27 @@ async fn generate(
                 let status = response.status();
                 let retry_after = retry_after_seconds(response.headers());
                 match response.text().await {
+                    // A 200 is a finished (paid) answer: not asked for again.
+                    Err(_) if status.is_success() => {
+                        return Err(SummaryError {
+                            paid_calls: 1,
+                            ..SummaryError::new(
+                                SummaryErrorKind::Transient,
+                                format!("HTTP {} body cut off", status.as_u16()),
+                            )
+                        });
+                    }
                     Err(_) => (
                         SummaryErrorKind::Transient,
                         format!("HTTP {} body cut off", status.as_u16()),
                         None,
                     ),
-                    Ok(text) if status.is_success() => return read_response(&text),
+                    Ok(text) if status.is_success() => {
+                        return read_response(&text).map_err(|error| SummaryError {
+                            paid_calls: 1,
+                            ..error
+                        })
+                    }
                     Ok(text) => {
                         let code = format!("HTTP {} {}", status.as_u16(), error_status(&text));
                         let kind = match status.as_u16() {
@@ -1536,6 +1614,15 @@ async fn generate(
         let wait = settings
             .retry
             .wait(kind == SummaryErrorKind::RateLimited, retry, retry_after);
+        if settings
+            .deadline
+            .is_some_and(|deadline| Instant::now() + wait + settings.request_timeout > deadline)
+        {
+            return Err(SummaryError::new(
+                kind,
+                format!("{code}; not waited: the run's deadline"),
+            ));
+        }
         tokio::time::sleep(wait).await;
         retry += 1;
     }
@@ -1554,6 +1641,7 @@ fn read_response(text: &str) -> Result<(Option<String>, Usage), SummaryError> {
         cost_usd: None,
         calls: 1,
         compact: false,
+        elapsed_ms: 0,
     };
     let candidate = response.candidates.first().ok_or_else(|| {
         let reason = response.prompt_feedback.block_reason.as_deref();
@@ -1589,28 +1677,41 @@ pub async fn summarize(
     transcript: &Transcript,
     names: &dyn DisplayNames,
 ) -> Result<Summary, SummaryError> {
+    let started = Instant::now();
     let mut usage = Usage::default();
+    // A failure after a paid answer still counts that answer.
+    let paid = |error: SummaryError, usage: &Usage| SummaryError {
+        paid_calls: error.paid_calls + usage.calls,
+        ..error
+    };
     for compact in [false, true] {
         let body = build_request(transcript, names, settings, compact);
-        let (answer, used) = generate(client, settings, tokens, &body).await?;
+        let (answer, used) = generate(client, settings, tokens, &body)
+            .await
+            .map_err(|error| paid(error, &usage))?;
         usage.add(&used);
         usage.compact = compact;
         let Some(answer) = answer else {
             continue;
         };
-        let mut summary = check_answer(&answer, transcript, names)?;
+        let mut summary =
+            check_answer(&answer, transcript, names).map_err(|error| paid(error, &usage))?;
         usage.cost_usd = settings.price.map(|price| {
             (usage.input_tokens as f64 * price.input_usd_per_mtok
                 + (usage.output_tokens + usage.thinking_tokens) as f64 * price.output_usd_per_mtok)
                 / 1_000_000.0
         });
         summary.model = settings.model.clone();
+        usage.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         summary.usage = usage;
         return Ok(summary);
     }
-    Err(SummaryError::new(
-        SummaryErrorKind::BadResponse,
-        "answer cut off at the token limit twice (MAX_TOKENS)",
+    Err(paid(
+        SummaryError::new(
+            SummaryErrorKind::BadResponse,
+            "answer cut off at the token limit twice (MAX_TOKENS)",
+        ),
+        &usage,
     ))
 }
 
@@ -2224,6 +2325,22 @@ pub(crate) mod tests {
         )
     }
 
+    /// `Retry-After` is followed only as far as the policy says.
+    #[test]
+    fn retry_after_is_capped_by_the_policy() {
+        let policy = RetryPolicy {
+            max_retry_after_ms: 60_000,
+            ..RetryPolicy::default()
+        };
+        let wait = policy.wait(true, 0, Some(300));
+        assert!(
+            wait >= Duration::from_secs(60) && wait <= Duration::from_secs(72),
+            "{wait:?}"
+        );
+        let default = RetryPolicy::default().wait(true, 0, Some(300));
+        assert!(default >= Duration::from_secs(300), "{default:?}");
+    }
+
     pub(crate) fn settings_for(server: &FakeServer) -> GeminiSettings {
         let mut settings = GeminiSettings::new(DEFAULT_MODEL);
         settings.base_url = server.base.clone();
@@ -2231,6 +2348,7 @@ pub(crate) mod tests {
             retries: 3,
             retry_delay_ms: 1,
             rate_limit_delay_ms: 1,
+            ..RetryPolicy::default()
         };
         settings
     }
@@ -2393,9 +2511,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn cut_off_body_is_retried() {
+    async fn a_cut_off_paid_answer_is_not_asked_again() {
+        // A 200 is a finished, paid answer: asking again would pay again.
         let ok = gemini_reply(&answer(json!([])), "STOP");
-        let server = replying(vec![ok.clone().cut_off(), ok]).await;
+        let server = replying(vec![ok.clone().cut_off(), ok.clone()]).await;
+        let error = run(&server, "t").await.unwrap_err();
+        assert_eq!(error.kind, SummaryErrorKind::Transient);
+        assert_eq!(error.paid_calls, 1);
+        assert!(error.may_have_cost());
+        assert_eq!(server.requests().len(), 1);
+
+        // Any other answer cut off is asked again.
+        let unavailable = Reply::json(503, &json!({ "error": { "status": "UNAVAILABLE" } }));
+        let server = replying(vec![unavailable.cut_off(), ok]).await;
         run(&server, "t").await.unwrap();
         assert_eq!(server.requests().len(), 2);
     }

@@ -230,7 +230,8 @@ impl std::fmt::Display for NotionErrorKind {
     }
 }
 
-/// 노션 실패. 종류와 노션 오류 코드·메시지(짧게)만 담는다.
+/// 노션 실패. 종류와 노션 오류 코드·메시지(짧게)만 담는다. 메시지는 페이지 글을
+/// 옮겨 올 수 있으니 작업기 로그에는 [`NotionError::short`] 를 쓴다.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("notion failed ({kind}): {code}")]
 pub struct NotionError {
@@ -238,6 +239,18 @@ pub struct NotionError {
     pub kind: NotionErrorKind,
     /// 예: `HTTP 400 validation_error: …`.
     pub code: String,
+}
+
+impl NotionError {
+    /// 종류, HTTP 상태, 노션 오류 코드만(메시지 없이): 작업기 로그에 쓴다.
+    pub fn short(&self) -> String {
+        format!("{} {}", self.kind.as_str(), self.short_code())
+    }
+
+    /// HTTP 상태와 노션 오류 코드만(메시지 없이), 예: `HTTP 400 validation_error`.
+    pub fn short_code(&self) -> &str {
+        self.code.split(": ").next().unwrap_or("")
+    }
 }
 
 impl NotionError {
@@ -682,6 +695,8 @@ pub struct MeetingPage<'a> {
     pub transcript: &'a Transcript,
     /// 요약. 없으면 본문에 스크립트만 넣는다.
     pub summary: Option<&'a Summary>,
+    /// 요약이 없을 때 "요약" 제목 아래 넣을 한 문단(예: 요약을 못 만든 까닭).
+    pub summary_note: Option<&'a str>,
     /// pubkey → 이름.
     pub names: &'a dyn DisplayNames,
     /// 제목 앞에 붙일 말(예: `[시험] `).
@@ -939,6 +954,10 @@ pub fn body_blocks(
     };
     let mut out = Vec::new();
 
+    if let (None, Some(note)) = (page.summary, page.summary_note) {
+        out.push(heading("요약"));
+        out.extend(paragraph(note));
+    }
     if let Some(summary) = page.summary {
         out.push(heading("요약"));
         let paragraphs: Vec<&str> = summary
@@ -1392,6 +1411,21 @@ pub struct NotionRecord {
     /// 이 칸이 없던 기록은 false 로 읽어서, 다음 실행이 같은 페이지를 다시 고친다.
     #[serde(default)]
     pub done: bool,
+    /// 페이지에 쓴 스크립트의 sha256([`RecordStamp`]).
+    #[serde(default)]
+    pub script_sha256: String,
+    /// 페이지에 쓴 요약: 요약 파일의 sha256, 요약을 포기했으면 `failed`, 없으면 비움.
+    #[serde(default)]
+    pub summary_sha256: String,
+}
+
+/// 노션 기록에 같이 적는, 페이지에 무엇을 썼는지.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordStamp {
+    /// 스크립트 바이트의 sha256.
+    pub script_sha256: String,
+    /// 요약 파일의 sha256, `failed`, 또는 비움.
+    pub summary_sha256: String,
 }
 
 impl NotionRecord {
@@ -1402,6 +1436,8 @@ impl NotionRecord {
             page_id: page_id.into(),
             huddle_key: huddle_key(transcript),
             done: false,
+            script_sha256: String::new(),
+            summary_sha256: String::new(),
         }
     }
 }
@@ -1419,11 +1455,17 @@ pub enum PublishMeetingError {
 
 /// 회의를 잡은(hold) 채로 부른다: 기록에서 page id 를 읽어 [`publish`] 하고,
 /// 페이지가 생겼으면(실패했어도) 기록을 남긴다. 기록을 못 읽으면 없는 것으로 친다.
+/// 기록에는 `stamp`(무엇을 썼는지)를 같이 적는다. 실패하면 page id 를 못 받았어도
+/// 아는 page id 로 `done=false` 를 적어서, 옛 "끝남"이 남지 않게 한다.
+/// 기록을 쓰기 전에 아직 `hold` 를 쥐고 있는지 본다(놓쳤으면 안 쓰고
+/// [`MeetingError::HoldLost`]).
 pub async fn publish_held<H: MinutesHome>(
     home: &H,
+    hold: &H::Hold,
     meeting: &MeetingPlan,
     client: &mut NotionClient<'_>,
     page: &MeetingPage<'_>,
+    stamp: &RecordStamp,
     report: &mut PublishReport,
 ) -> Result<(), PublishMeetingError> {
     let known = home
@@ -1432,10 +1474,20 @@ pub async fn publish_held<H: MinutesHome>(
         .and_then(|bytes| serde_json::from_slice::<NotionRecord>(&bytes).ok())
         .map(|record| record.page_id);
     let result = publish(client, page, known.as_deref(), report).await;
-    if !report.page_id.is_empty() {
+    let page_id = if report.page_id.is_empty() {
+        known.filter(|_| result.is_err())
+    } else {
+        Some(report.page_id.clone())
+    };
+    if let Some(page_id) = page_id {
+        if !home.still_held(hold).await? {
+            return Err(MeetingError::HoldLost.into());
+        }
         let record = NotionRecord {
             done: result.is_ok(),
-            ..NotionRecord::new(page.transcript, &report.page_id)
+            script_sha256: stamp.script_sha256.clone(),
+            summary_sha256: stamp.summary_sha256.clone(),
+            ..NotionRecord::new(page.transcript, &page_id)
         };
         let json = serde_json::to_vec_pretty(&record)
             .map_err(|error| MeetingError::Io(std::io::Error::other(error)))?;
@@ -1458,7 +1510,16 @@ pub async fn publish_meeting<H: MinutesHome>(
     let Some(hold) = home.hold(meeting).await? else {
         return Ok(false);
     };
-    let done = publish_held(home, meeting, client, page, report).await;
+    let done = publish_held(
+        home,
+        &hold,
+        meeting,
+        client,
+        page,
+        &RecordStamp::default(),
+        report,
+    )
+    .await;
     let released = home.release(hold).await;
     done?;
     released?;
@@ -1537,7 +1598,7 @@ pub(crate) mod tests {
     pub(crate) struct FakeNotion {
         pub(crate) pages: Vec<FakePage>,
         /// 어느 요청이든 앞에서부터 하나씩 꺼내 답한다.
-        queued: Vec<Reply>,
+        pub(crate) queued: Vec<Reply>,
         /// 붙이기 요청에만 앞에서부터 꺼내 답한다.
         pub(crate) append_failures: Vec<Reply>,
         /// 페이지 고치기(PATCH /v1/pages)에만 앞에서부터 꺼내 답한다.
@@ -1559,7 +1620,7 @@ pub(crate) mod tests {
         created_time: String,
         last_edited_time: String,
         pub(crate) properties: Map<String, Value>,
-        children: Vec<Value>,
+        pub(crate) children: Vec<Value>,
         in_trash: bool,
     }
 
@@ -1830,6 +1891,7 @@ pub(crate) mod tests {
                 retries: 3,
                 retry_delay_ms: 1,
                 rate_limit_delay_ms: 1,
+                ..RetryPolicy::default()
             },
             failed_mark_wait: Duration::from_millis(1),
             ..NotionSettings::default()
@@ -1911,6 +1973,7 @@ pub(crate) mod tests {
             }],
             usage: Usage::default(),
             corrections: Corrections::default(),
+            script_sha256: String::new(),
         }
     }
 
@@ -1918,6 +1981,7 @@ pub(crate) mod tests {
         MeetingPage {
             transcript,
             summary: Some(summary),
+            summary_note: None,
             names: &PubkeyPrefixNames,
             title_prefix: "[시험] ",
             channel_label: None,
@@ -2502,11 +2566,19 @@ pub(crate) mod tests {
 
     /// `channel` 의 회의 하나(첫 세션 3)를 시험용 녹음 폴더에 두고 계획을 세운다.
     pub(crate) async fn plan_for(dir: &std::path::Path) -> MeetingPlan {
+        plan_in(dir, Uuid::from_u128(2), Uuid::from_u128(3)).await
+    }
+
+    /// 커뮤니티 1 의 `channel` 에 `session` 하나뿐인 회의를 두고 계획을 세운다.
+    pub(crate) async fn plan_in(
+        dir: &std::path::Path,
+        channel: Uuid,
+        session: Uuid,
+    ) -> MeetingPlan {
         use crate::store::{LocalStore, RecordingStore};
         use buzz_huddle_recording::{chunk_key, ChunkHeader, Record};
         let store = LocalStore::new(dir);
-        let (community, channel, session) =
-            (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let community = Uuid::from_u128(1);
         let mut bytes = ChunkHeader {
             protocol_version: 2,
             session_id: session,
@@ -2639,9 +2711,10 @@ pub(crate) mod tests {
         assert!(names.contains(&GcsMinutes::notion_record_key(&meeting_plan)));
         assert!(GcsMinutes::notion_record_key(&meeting_plan)
             .ends_with("/00000000-0000-0000-0000-000000000003.notion.json"));
-        // 스크립트를 읽을 때 기록은 스크립트가 아니니 뺀다.
-        let processed = home.processed_sessions(&meeting_plan).await.unwrap();
-        assert_eq!(processed.len(), meeting().session_ids.len());
+        // 기록은 스크립트가 아니다: `{uuid}.json` 꼴만 스크립트로 읽는다.
+        let scripts = home.scripts(&meeting_plan).await.unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].session_ids, meeting().session_ids);
     }
 
     #[tokio::test]

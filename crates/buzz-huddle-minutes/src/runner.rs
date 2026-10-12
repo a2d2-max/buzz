@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::collect::{CollectError, MeetingPlan, Skip};
 use crate::followup::{follow_up_held, FollowUps, FollowedUp};
 use crate::ledger::{Ledger, SttLedger};
+use crate::models::sha256_hex;
 use crate::pipeline::{
     build_minutes, mixed_audio_key, MinutesError, MinutesOutput, MinutesSettings,
 };
@@ -46,16 +47,19 @@ pub trait MinutesHome {
     ) -> impl Future<Output = Result<Option<Self::Hold>, MeetingError>>;
     /// Let go of the meeting.
     fn release(&self, hold: Self::Hold) -> impl Future<Output = Result<(), MeetingError>>;
-    /// Every session id already in a script of this meeting's channel,
-    /// with the script's name. An unreadable script is an error: skipping
-    /// it could process a meeting twice.
-    fn processed_sessions(
+    /// Whether `hold` is still this worker's (a lease may have expired and
+    /// been taken over). Checked before writing what comes after the script.
+    fn still_held(&self, hold: &Self::Hold) -> impl Future<Output = Result<bool, MeetingError>>;
+    /// Every script of this meeting's channel: name, sessions and the
+    /// sha256 of its bytes. An unreadable script is an error: skipping it
+    /// could process a meeting twice.
+    fn scripts(
         &self,
         meeting: &MeetingPlan,
-    ) -> impl Future<Output = Result<Vec<(Uuid, String)>, MeetingError>>;
-    /// Name of this meeting's script, as [`processed_sessions`] gives it.
+    ) -> impl Future<Output = Result<Vec<ScriptInfo>, MeetingError>>;
+    /// Name of this meeting's script, as [`scripts`] gives it.
     ///
-    /// [`processed_sessions`]: MinutesHome::processed_sessions
+    /// [`scripts`]: MinutesHome::scripts
     fn script_name(&self, meeting: &MeetingPlan) -> String;
     /// Open the meeting's ledger.
     fn open_ledger(
@@ -87,19 +91,55 @@ pub trait MinutesHome {
         &self,
         meeting: &MeetingPlan,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, MeetingError>>;
-    /// This meeting's summary (`{first session}.summary.json` beside the
-    /// script), if there is one.
-    fn read_summary(
+    /// A file kept beside this meeting's script, if it is there.
+    fn read_beside(
         &self,
         meeting: &MeetingPlan,
+        beside: Beside,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, MeetingError>>;
-    /// Store this meeting's summary (replacing an older one); returns where
-    /// it went.
-    fn write_summary(
+    /// Store a file beside this meeting's script (replacing an older one);
+    /// returns where it went.
+    fn write_beside(
         &self,
         meeting: &MeetingPlan,
+        beside: Beside,
         json: Vec<u8>,
     ) -> impl Future<Output = Result<String, MeetingError>>;
+}
+
+/// One script of a channel, as [`MinutesHome::scripts`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptInfo {
+    /// Its name ([`MinutesHome::script_name`] for the meeting it belongs to).
+    pub name: String,
+    /// sha256 of its bytes (hex).
+    pub sha256: String,
+    /// The sessions it covers.
+    pub session_ids: Vec<Uuid>,
+}
+
+/// Files kept beside a meeting's script, named `{first session id}` +
+/// [`suffix`](Beside::suffix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Beside {
+    /// The summary (`huddle-summary/1`).
+    Summary,
+    /// The summary's failures for the current script
+    /// ([`crate::followup::StepFailures`]).
+    SummaryFailed,
+    /// The Notion page's failures for the current script.
+    NotionFailed,
+}
+
+impl Beside {
+    /// What follows the first session id in the name.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Summary => ".summary.json",
+            Self::SummaryFailed => ".summary-failed.json",
+            Self::NotionFailed => ".notion-failed.json",
+        }
+    }
 }
 
 /// The local folder where scripts, ledgers and locks live.
@@ -138,7 +178,13 @@ impl LocalMinutes {
 
     /// Summary of the meeting whose first session is `first`.
     pub fn summary_path(&self, first: Uuid) -> PathBuf {
-        self.dir.join(format!("{first}.summary.json"))
+        self.beside_path(first, Beside::Summary)
+    }
+
+    /// A file beside the script of the meeting whose first session is
+    /// `first`.
+    pub fn beside_path(&self, first: Uuid, beside: Beside) -> PathBuf {
+        self.dir.join(format!("{first}{}", beside.suffix()))
     }
 }
 
@@ -161,12 +207,14 @@ impl MinutesHome for LocalMinutes {
         Ok(())
     }
 
-    async fn processed_sessions(
-        &self,
-        _meeting: &MeetingPlan,
-    ) -> Result<Vec<(Uuid, String)>, MeetingError> {
+    async fn still_held(&self, _hold: &std::fs::File) -> Result<bool, MeetingError> {
+        // An OS lock held through an open file cannot be taken away.
+        Ok(true)
+    }
+
+    async fn scripts(&self, _meeting: &MeetingPlan) -> Result<Vec<ScriptInfo>, MeetingError> {
         let scripts = |error: &dyn std::fmt::Display| MeetingError::Scripts(error.to_string());
-        let mut processed = Vec::new();
+        let mut found = Vec::new();
         for entry in std::fs::read_dir(&self.dir).map_err(|e| scripts(&e))? {
             let entry = entry.map_err(|e| scripts(&e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -174,13 +222,9 @@ impl MinutesHome for LocalMinutes {
                 continue;
             }
             let bytes = std::fs::read(entry.path()).map_err(|e| scripts(&e))?;
-            let transcript: Transcript =
-                serde_json::from_slice(&bytes).map_err(|e| scripts(&format!("{name}: {e}")))?;
-            for session in transcript.session_ids {
-                processed.push((session, name.clone()));
-            }
+            found.push(script_info(name, &bytes)?);
         }
-        Ok(processed)
+        Ok(found)
     }
 
     fn script_name(&self, meeting: &MeetingPlan) -> String {
@@ -227,19 +271,36 @@ impl MinutesHome for LocalMinutes {
         read_if_there(&self.transcript_path(meeting.first_session_id()))
     }
 
-    async fn read_summary(&self, meeting: &MeetingPlan) -> Result<Option<Vec<u8>>, MeetingError> {
-        read_if_there(&self.summary_path(meeting.first_session_id()))
-    }
-
-    async fn write_summary(
+    async fn read_beside(
         &self,
         meeting: &MeetingPlan,
+        beside: Beside,
+    ) -> Result<Option<Vec<u8>>, MeetingError> {
+        read_if_there(&self.beside_path(meeting.first_session_id(), beside))
+    }
+
+    async fn write_beside(
+        &self,
+        meeting: &MeetingPlan,
+        beside: Beside,
         json: Vec<u8>,
     ) -> Result<String, MeetingError> {
-        let path = self.summary_path(meeting.first_session_id());
+        let path = self.beside_path(meeting.first_session_id(), beside);
         write_private(&path, &json)?;
         Ok(path.display().to_string())
     }
+}
+
+/// A script's [`ScriptInfo`] from its name and bytes.
+pub fn script_info(name: String, bytes: &[u8]) -> Result<ScriptInfo, MeetingError> {
+    // Only the kind of error: serde's text can quote the script.
+    let transcript: Transcript = serde_json::from_slice(bytes)
+        .map_err(|e| MeetingError::Scripts(format!("{name}: not a script ({:?})", e.classify())))?;
+    Ok(ScriptInfo {
+        name,
+        sha256: sha256_hex(bytes),
+        session_ids: transcript.session_ids,
+    })
 }
 
 /// The file's bytes, or `None` when there is no such file.
@@ -301,6 +362,10 @@ pub enum MeetingError {
     /// A script could not be read.
     #[error("scripts: {0}")]
     Scripts(String),
+    /// Another worker took the meeting over (the hold expired) before
+    /// something was written; nothing more is written.
+    #[error("the hold on the meeting was lost; nothing more written")]
+    HoldLost,
 }
 
 impl MeetingError {
@@ -383,7 +448,7 @@ where
         return Ok(Done::Locked);
     };
     let done = run_held(
-        home, store, meeting, detector, stt, settings, options, follow,
+        home, &hold, store, meeting, detector, stt, settings, options, follow,
     )
     .await;
     // Let go whatever happened; a failure to let go is reported only when
@@ -397,6 +462,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_held<H, S, D, T>(
     home: &H,
+    hold: &H::Hold,
     store: &S,
     meeting: &MeetingPlan,
     detector: &mut D,
@@ -414,25 +480,23 @@ where
     // Checked while holding the meeting: a worker that finished just
     // before us wrote its script before letting go.
     let own = home.script_name(meeting);
-    let scripts = home.processed_sessions(meeting).await?;
-    let own_there = scripts.iter().any(|(_, script)| *script == own);
+    let scripts = home.scripts(meeting).await?;
+    let own_sha = scripts
+        .iter()
+        .find(|script| script.name == own)
+        .map(|script| script.sha256.clone());
     let processed: HashSet<Uuid> = scripts
-        .into_iter()
-        .filter(|(_, script)| !(options.overwrite && *script == own))
-        .map(|(session, _)| session)
+        .iter()
+        .filter(|script| !(options.overwrite && script.name == own))
+        .flat_map(|script| script.session_ids.iter().copied())
         .collect();
     if let Some(skip) = meeting.skip_reason(&processed, options.now_unix_ms, options.quiet_ms) {
         // This very meeting's script is there: only what comes after it
-        // (summary, Notion page) may be left.
-        let only_follow_up = skip == Skip::AlreadyProcessed && own_there && !options.overwrite;
-        if let (true, Some(steps)) = (only_follow_up, follow) {
-            let bytes = home
-                .read_script(meeting)
-                .await?
-                .ok_or_else(|| MeetingError::Scripts(format!("{own}: gone")))?;
-            let transcript: Transcript = serde_json::from_slice(&bytes)
-                .map_err(|e| MeetingError::Scripts(format!("{own}: {e}")))?;
-            let followed = follow_up_held(home, meeting, &transcript, false, steps).await?;
+        // (summary, Notion page) may be left. The script itself is read
+        // only if a step needs it.
+        let only_follow_up = skip == Skip::AlreadyProcessed && !options.overwrite;
+        if let (true, Some(sha), Some(steps)) = (only_follow_up, own_sha, follow) {
+            let followed = follow_up_held(home, hold, meeting, &sha, None, steps).await;
             if followed.nothing_left() {
                 return Ok(Done::Skipped(skip));
             }
@@ -455,9 +519,14 @@ where
         .put_new(&settings.audio_key, std::mem::take(&mut output.mixed_audio))
         .await?;
     let json = serde_json::to_vec_pretty(&output.transcript).map_err(std::io::Error::other)?;
+    let sha = sha256_hex(&json);
     let script = home.write_script(meeting, json, options.overwrite).await?;
+    // What comes after never takes the script and its report away: its
+    // failures are steps in `follow`.
     let follow = match follow {
-        Some(steps) => Some(follow_up_held(home, meeting, &output.transcript, true, steps).await?),
+        Some(steps) => {
+            Some(follow_up_held(home, hold, meeting, &sha, Some(&output.transcript), steps).await)
+        }
         None => None,
     };
     Ok(Done::Written {

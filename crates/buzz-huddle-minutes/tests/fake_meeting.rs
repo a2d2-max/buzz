@@ -28,7 +28,7 @@ use buzz_huddle_minutes::pipeline::{
     build_minutes, MinutesError, MinutesOutput, MinutesSettings, SttPolicy,
 };
 use buzz_huddle_minutes::runner::{
-    run_meeting, Done, LocalMinutes, MeetingError, MinutesHome, RunOptions,
+    run_meeting, Beside, Done, LocalMinutes, MeetingError, MinutesHome, RunOptions,
 };
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Clip, FakeMeeting,
@@ -1923,10 +1923,16 @@ async fn a_meeting_goes_through_the_minutes_bucket() {
         }
     }
 
-    // A summary beside the script is not taken for a script.
-    home.write_summary(&plan, b"{}".to_vec())
-        .await
-        .expect("summary");
+    // Files beside the script are not taken for scripts: the summary, the
+    // summary failures, and any later `{first}.*.json` (only `{uuid}.json`
+    // names are scripts).
+    for beside in [Beside::Summary, Beside::SummaryFailed] {
+        home.write_beside(&plan, beside, b"{}".to_vec())
+            .await
+            .expect("beside");
+    }
+    let later = GcsMinutes::script_key(&plan).replace(".json", ".later.json");
+    fake.insert(MINUTES_BUCKET, &later, b"{}".to_vec());
     // Without replacing, the meeting is done.
     let stt = Counting::new(&truth_stt);
     let skipped = run_meeting(
