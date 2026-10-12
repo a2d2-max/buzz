@@ -154,16 +154,16 @@ def fetch_fleurs(out_dir: Path, n: int, split: str = "test") -> Path:
         cols = line.split("\t")
         if len(cols) < 7:
             continue
-        sent_id, fname, raw_text = cols[0], cols[1], cols[2]
+        sent_id, fname, raw_text, gender = cols[0], cols[1], cols[2], cols[6]
         if not sent_id.isdigit() or not re.fullmatch(r"\d+\.wav", fname):
             raise RuntimeError(f"FLEURS tsv 형식이 예상과 다르다: {line[:80]!r}")
-        rows.append((int(sent_id), fname, raw_text))
+        rows.append((int(sent_id), fname, raw_text, gender))
 
-    picked: dict[int, tuple[int, str, str]] = {}
+    picked: dict[int, tuple[int, str, str, str]] = {}
     for row in sorted(rows):
         picked.setdefault(row[0], row)
     chosen = list(picked.values())[:n]
-    wanted = {fname for _, fname, _ in chosen}
+    wanted = {row[1] for row in chosen}
 
     missing = {f for f in wanted if not (audio_dir / f).exists()}
     if missing:
@@ -196,11 +196,12 @@ def fetch_fleurs(out_dir: Path, n: int, split: str = "test") -> Path:
 
     manifest = out_dir / "manifest.jsonl"
     with manifest.open("w", encoding="utf-8") as fh:
-        for sent_id, fname, raw_text in chosen:
+        for sent_id, fname, raw_text, gender in chosen:
             rec = {
                 "id": f"fleurs-ko-{split}-{sent_id}-{fname.removesuffix('.wav')}",
                 "audio": f"audio/{fname}",
                 "text": raw_text,
+                "gender": gender,
                 "source": FLEURS_SOURCE,
             }
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")

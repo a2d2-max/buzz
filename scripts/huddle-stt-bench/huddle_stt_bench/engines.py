@@ -41,13 +41,20 @@ def load_mono(path: Path) -> tuple[np.ndarray, int]:
     return samples.mean(axis=1).astype(np.float32), sr
 
 
-def vad_pieces(samples: np.ndarray, sr: int, vad_model: Path) -> list[np.ndarray]:
-    """긴 오디오를 silero VAD 로 말소리 조각(약 20초까지)으로 자른다. VAD 는 16kHz 만 받는다."""
+VAD_SR = 16000
+
+
+def vad_spans(
+    samples: np.ndarray, sr: int, vad_model: Path, max_speech_sec: float = 20.0, min_silence_sec: float = 0.25
+) -> tuple[list[tuple[int, int]], int]:
+    """silero VAD 말소리 구간을 찾는다. (16kHz 기준 [시작, 끝) 샘플 위치 목록, 16kHz 로 본 전체 길이).
+
+    VAD 는 16kHz 만 받는다. 다른 샘플레이트면 경계만 찾으려고 선형 보간으로 줄인 사본을 쓴다.
+    """
     import sherpa_onnx
 
-    vad_sr = 16000
+    vad_sr = VAD_SR
     if sr != vad_sr:
-        # 경계만 찾으면 되니 선형 보간으로 줄인 사본을 쓰고, 자르기는 원본에서 한다
         n = int(len(samples) * vad_sr / sr)
         x = np.interp(np.linspace(0, len(samples) - 1, n), np.arange(len(samples)), samples)
         x = x.astype(np.float32)
@@ -55,8 +62,8 @@ def vad_pieces(samples: np.ndarray, sr: int, vad_model: Path) -> list[np.ndarray
         x = samples
     cfg = sherpa_onnx.VadModelConfig()
     cfg.silero_vad.model = str(vad_model)
-    cfg.silero_vad.min_silence_duration = 0.25
-    cfg.silero_vad.max_speech_duration = 20
+    cfg.silero_vad.min_silence_duration = min_silence_sec
+    cfg.silero_vad.max_speech_duration = max_speech_sec
     cfg.sample_rate = vad_sr
     cfg.num_threads = 1
     vad = sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=60)
@@ -74,6 +81,18 @@ def vad_pieces(samples: np.ndarray, sr: int, vad_model: Path) -> list[np.ndarray
         drain()
     vad.flush()
     drain()
+    return spans, len(x)
+
+
+def vad_pieces(samples: np.ndarray, sr: int, vad_model: Path) -> list[np.ndarray]:
+    """긴 오디오를 silero VAD 로 말소리 조각(약 20초까지)으로 자른다."""
+    return [samples[a:b] for a, b in merged_spans(samples, sr, vad_model)]
+
+
+def merged_spans(samples: np.ndarray, sr: int, vad_model: Path) -> list[tuple[int, int]]:
+    """vad_pieces 가 자르는 자리. 원래 샘플레이트 기준 [시작, 끝) 위치 목록."""
+    spans, n16 = vad_spans(samples, sr, vad_model)
+    vad_sr = VAD_SR
 
     # VAD 는 짧은 쉼마다 잘라서 조각이 너무 잘다. 짧은 조각에서는 모델이 없는 말을 지어내고
     # 조각 앞머리 소리도 잘린다. 그래서 앞뒤로 0.2초 여유를 두고, 이어진 조각을 20초까지 합친다.
@@ -81,7 +100,7 @@ def vad_pieces(samples: np.ndarray, sr: int, vad_model: Path) -> list[np.ndarray
     max_len = 20 * vad_sr
     merged: list[list[int]] = []
     for a, b in spans:
-        a, b = max(0, a - pad), min(len(x), b + pad)
+        a, b = max(0, a - pad), min(n16, b + pad)
         if merged and b - merged[-1][0] <= max_len:
             merged[-1][1] = max(merged[-1][1], b)
         else:
@@ -89,7 +108,7 @@ def vad_pieces(samples: np.ndarray, sr: int, vad_model: Path) -> list[np.ndarray
                 a = max(a, merged[-1][1])  # 여유 때문에 앞 조각과 겹치지 않게
             merged.append([a, b])
     scale = sr / vad_sr
-    return [samples[int(a * scale) : int(b * scale)] for a, b in merged if b > a]
+    return [(int(a * scale), int(b * scale)) for a, b in merged if b > a]
 
 
 def qwen3_audio_tokens(sec: float) -> int:
@@ -361,11 +380,11 @@ class GoogleChirp3Engine:
         """Google 이 응답에 적어 준 초(이미 요청마다 올림된 값)로 계산한 비용."""
         return billed_sec / 60.0 * self.USD_PER_MIN
 
-    def _post(self, body: dict) -> tuple[requests.Response, int]:
+    def _post(self, body: dict, method: str = "recognize") -> tuple[requests.Response, int]:
         """429·5xx·연결 끊김·타임아웃이면 간격을 늘려 가며 세 번까지 다시 보낸다. (응답, 다시 보낸 횟수)."""
         for retries, wait in enumerate((*self.RETRY_WAITS, None)):
             try:
-                resp = self._session().post(f"{self.base}/recognizers/_:recognize", json=body, timeout=300)
+                resp = self._session().post(f"{self.base}/recognizers/_:{method}", json=body, timeout=300)
             except (requests.ConnectionError, requests.Timeout) as e:
                 if wait is None:
                     raise EngineError(f"요청 실패 {type(e).__name__} ({retries}번 다시 보냄)") from None

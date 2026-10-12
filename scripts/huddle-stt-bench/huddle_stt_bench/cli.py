@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from . import engines, fetch, run
+from . import engines, fetch, long_compare, run
 
 GCP_PROJECT = "a2d2-lab"
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +48,21 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("rescore", help="이미 있는 결과 JSON 을 지금 채점 규칙으로 다시 센다(받아쓰기는 안 돌림)")
     s.add_argument("result_json", type=Path)
 
+    lc = sub.add_parser("long-compare", help="긴 트랙을 Chirp 3 에 보내는 방식(A·A2·B·Bw)을 비교한다")
+    lc.add_argument("--tracks", type=int, default=2, help="사람(트랙) 수 (기본: %(default)s)")
+    lc.add_argument("--track-sec", type=float, default=240.0, help="트랙 길이 하한(초) (기본: %(default)s)")
+    lc.add_argument("--speech-sec", type=float, default=120.0, help="트랙마다 문장 클립 합(초) (기본: %(default)s)")
+    lc.add_argument("--seed", type=int, default=20261012)
+    lc.add_argument("--methods", default="A,A2,B,Bw", help="쉼표로 구분 (기본: %(default)s)")
+    lc.add_argument("--budget-sec", type=float, default=1800.0,
+                    help="Chirp 가 매긴 초 상한. 장부(.cache/long-compare/chirp-ledger.jsonl)에 이어서 센다 (기본: %(default)s)")
+    lc.add_argument("--gcp-project", default=GCP_PROJECT)
+    lc.add_argument("--gcp-auth", default="adc", choices=["adc", "gcloud"])
+    lc.add_argument("--gcs-prefix", default=long_compare.DEFAULT_GCS_PREFIX,
+                    help=f"BatchRecognize 입력을 올릴 곳. {long_compare.GCS_ALLOWED_PREFIX} 아래만 허용 (기본: %(default)s)")
+    lc.add_argument("--concurrency", type=int, default=4, help="Recognize 동시 요청 수 (기본: %(default)s)")
+    lc.add_argument("--dry-run", action="store_true", help="트랙과 계획(예상 매긴 초)만 만들고 아무것도 보내지 않는다")
+
     args = p.parse_args(argv)
     cache_dir = args.cache_dir.resolve()
 
@@ -56,6 +71,13 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.cmd == "rescore":
         run.rescore(args.result_json.resolve(), cache_dir)
+        return
+    if args.cmd == "long-compare":
+        long_compare.long_compare(
+            cache_dir, args.tracks, args.track_sec, args.speech_sec, args.seed,
+            [m.strip() for m in args.methods.split(",") if m.strip()], args.budget_sec,
+            args.gcp_project, args.gcp_auth, args.gcs_prefix, args.concurrency, args.dry_run,
+        )
         return
 
     built = [
