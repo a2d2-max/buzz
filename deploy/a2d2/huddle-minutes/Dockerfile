@@ -10,7 +10,7 @@
 #   /usr/local/bin/buzz-huddle-minutes          작업기 실행 파일
 #   /opt/huddle-minutes/cache/models/            모델 (--cache /opt/huddle-minutes/cache)
 #     silero_vad.onnx                            models.rs 의 주소·sha256 그대로
-#     (화자 분리 모델 자리 — 아래 models 단계 참고)
+#     (화자 분리 모델은 아직 안 넣는다 — 아래 models 단계 참고)
 # sherpa-onnx 는 sherpa-onnx-sys 기본값(static)으로 실행 파일 안에 정적
 # 링크된다(onnxruntime 포함). 그래서 따로 넣을 공유 라이브러리가 없다.
 # cloudbuild.yaml 이 ldd 로 이것을 확인한다.
@@ -54,8 +54,11 @@ RUN set -eu; \
     curl -fsSL --retry 3 "$url" -o /models/silero_vad.onnx; \
     echo "$sha  /models/silero_vad.onnx" | sha256sum -c -; \
     chmod 0644 /models/silero_vad.onnx
-# 화자 분리 모델 자리: 다른 브랜치에서 모델을 정하면 위와 같은 방식(models.rs
-# 에 주소·sha256 을 두고 여기서 읽어 확인)으로 /models/ 에 더한다.
+# 화자 분리 모델은 넣지 않는다: 작업기에서 화자 분리가 꺼져 있어서(기본값)
+# Silero 만 있으면 된다. models.rs 의 화자 모델(ModelFile, 주소가 concat! 로
+# 여러 줄)은 위 awk 로 바르게 읽히지 않는다. 화자 분리를 켤 때는 이 단계를
+# 1단계에서 만든 실행 파일의 `buzz-huddle-minutes fetch-models --cache /models/..`
+# 로 바꿀 것(주소·sha256 확인을 코드가 한 곳에서 한다).
 
 # ─── 3. 실행 환경 ────────────────────────────────────────────────────────────
 FROM debian:${DEBIAN_VERSION}-slim

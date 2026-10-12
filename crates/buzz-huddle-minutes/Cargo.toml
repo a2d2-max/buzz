@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Huddle minutes worker: rebuilds per-speaker audio from huddle recordings, cuts speech segments, transcribes them and writes huddle-transcript/1"
+description = "Huddle minutes worker: rebuilds per-speaker audio from huddle recordings, cuts speech segments, splits shared (room) tracks by speaker, transcribes them and writes huddle-transcript/2"
 
 [[bin]]
 name = "buzz-huddle-minutes"

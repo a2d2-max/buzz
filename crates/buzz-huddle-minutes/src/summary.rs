@@ -22,7 +22,7 @@
 //! 토큰은 [`Tokens`] 에서 받는다(Cloud Run 은 메타데이터 서버). 토큰 값과 회의
 //! 내용은 로그·오류에 남기지 않는다.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::stt::FAILED_TEXT;
-use crate::transcript::Transcript;
+use crate::transcript::{Segment, Transcript, UNPLACED_ROOM_SPEAKER};
 
 /// [`Summary::format`] 값.
 pub const SUMMARY_FORMAT: &str = "huddle-summary/1";
@@ -552,29 +552,78 @@ fn response_schema(compact: bool) -> Value {
     })
 }
 
-/// 참석자 id(P1, P2, …) ↔ pubkey. 참석자 순서, 그다음 참석자 목록에 없는 화자.
+/// 참석자 id(P1, P2, …) ↔ 사람 열쇠([`Segment::who`]: pubkey, 또는 회의실 화자
+/// 이름표). 참석자 순서, 그다음 참석자 목록에 없는 화자. 누군지 모르는 줄
+/// ("회의실 화자 ?")은 아무도 아니라 id 가 없다.
 fn participant_ids(transcript: &Transcript) -> Vec<(String, String)> {
-    let mut pubkeys: Vec<&str> = transcript
+    let mut keys: Vec<&str> = attending(transcript).collect();
+    for key in transcript.segments.iter().filter_map(Segment::who) {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys.into_iter()
+        .enumerate()
+        .map(|(i, key)| (format!("P{}", i + 1), key.to_string()))
+        .collect()
+}
+
+/// 보여 줄 참석자 pubkey: 참석자 목록 순서. 회의실 마이크 주인이면서 자기 말이
+/// 하나도 안 잡힌 사람(말 시간 0, 그 기기에서 회의실 화자 줄이 나옴)은 빠진다 — 그
+/// 사람이 아니라 회의실이다.
+pub fn attending(transcript: &Transcript) -> impl Iterator<Item = &str> {
+    transcript.participants.iter().filter_map(|p| {
+        let room_only = p.speech_ms == 0
+            && transcript
+                .segments
+                .iter()
+                .any(|s| s.device == p.pubkey && s.speaker_label.is_some());
+        (!room_only).then_some(p.pubkey.as_str())
+    })
+}
+
+/// pubkey 로 아는 사람들(참석자와 화자가 정해진 줄). 회의실 화자 이름표는 아니다.
+fn known_pubkeys(transcript: &Transcript) -> HashSet<&str> {
+    transcript
         .participants
         .iter()
         .map(|p| p.pubkey.as_str())
-        .collect();
-    for segment in &transcript.segments {
-        if !pubkeys.contains(&segment.speaker.as_str()) {
-            pubkeys.push(&segment.speaker);
-        }
-    }
-    pubkeys
-        .into_iter()
-        .enumerate()
-        .map(|(i, pubkey)| (format!("P{}", i + 1), pubkey.to_string()))
+        .chain(
+            transcript
+                .segments
+                .iter()
+                .filter_map(|s| s.speaker.as_deref()),
+        )
         .collect()
+}
+
+/// 줄을 말한 사람의 이름: pubkey 면 `names` 로, 회의실 화자면 이름표 그대로
+/// (기기 주인 이름을 대신 쓰지 않는다).
+pub fn line_name(segment: &Segment, names: &dyn DisplayNames) -> String {
+    match (segment.speaker.as_deref(), segment.speaker_label.as_deref()) {
+        (Some(pubkey), _) => names.display_name(pubkey),
+        (None, Some(label)) => label.to_string(),
+        (None, None) => UNPLACED_ROOM_SPEAKER.to_string(),
+    }
+}
+
+/// 사람 열쇠의 이름: pubkey 면 `names` 로, 회의실 화자 이름표면 그대로.
+fn key_name(key: &str, known: &HashSet<&str>, names: &dyn DisplayNames) -> String {
+    if known.contains(key) {
+        names.display_name(key)
+    } else {
+        key.to_string()
+    }
 }
 
 /// 스크립트 줄 하나(받아쓰기에 성공한, 비지 않은 줄).
 struct Line<'a> {
     start_ms: u64,
-    speaker: &'a str,
+    /// 말한 사람([`Segment::who`]); 누군지 모르면 `None`.
+    speaker: Option<&'a str>,
+    /// 자기 기기 트랙의 줄(회의실 이름표 없음, 확실도 1). 목소리로 맞춘 회의실
+    /// 줄은 아니다: 그 확실도는 자르지 않은 코사인이라 1 을 살짝 넘을 수 있다.
+    own: bool,
     text: &'a str,
     /// 글자·숫자만, 소문자.
     squashed: String,
@@ -587,7 +636,8 @@ fn usable_lines(transcript: &Transcript) -> Vec<Line<'_>> {
         .filter(|s| s.text != FAILED_TEXT && !s.text.trim().is_empty())
         .map(|s| Line {
             start_ms: s.start_ms,
-            speaker: &s.speaker,
+            speaker: s.who(),
+            own: s.speaker_label.is_none() && s.speaker_confidence.is_some_and(|c| c >= 1.0),
             text: &s.text,
             squashed: squash(&s.text),
         })
@@ -648,10 +698,11 @@ pub fn build_prompt(transcript: &Transcript, names: &dyn DisplayNames) -> String
         "회의 길이: {}분\n\n",
         transcript.duration_ms / 60_000
     ));
+    let known = known_pubkeys(transcript);
     let people: Vec<String> = ids
         .iter()
-        .map(|(id, pubkey)| {
-            json!({ "id": id, "name": one_line(&names.display_name(pubkey)) }).to_string()
+        .map(|(id, key)| {
+            json!({ "id": id, "name": one_line(&key_name(key, &known, names)) }).to_string()
         })
         .collect();
     prompt.push_str(&format!("참석자(JSON):\n[\n{}\n]\n\n", people.join(",\n")));
@@ -660,7 +711,7 @@ pub fn build_prompt(transcript: &Transcript, names: &dyn DisplayNames) -> String
         .map(|line| {
             json!({
                 "ms": line.start_ms,
-                "id": id_of.get(line.speaker).copied().unwrap_or("?"),
+                "id": line.speaker.and_then(|key| id_of.get(key).copied()).unwrap_or("?"),
                 "text": one_line(line.text)
             })
             .to_string()
@@ -822,8 +873,10 @@ fn is_acceptance(text: &str) -> bool {
 /// 모델 답을 스크립트에 대 보고 고치는 일.
 struct Checker<'a> {
     lines: Vec<Line<'a>>,
-    /// 모델이 담당자로 낼 수 있는 값 → pubkey.
+    /// 모델이 담당자로 낼 수 있는 값 → 사람 열쇠(pubkey 또는 회의실 화자 이름표).
     ids: HashMap<String, String>,
+    /// pubkey 로 아는 사람들. 담당자로 멘션할 수 있는 건 이들뿐이다.
+    known: HashSet<&'a str>,
     /// pubkey → 이름(글자·숫자만).
     names: HashMap<String, String>,
     started: Option<DateTime<FixedOffset>>,
@@ -834,11 +887,12 @@ impl<'a> Checker<'a> {
     fn new(transcript: &'a Transcript, display: &dyn DisplayNames) -> Self {
         let mut ids = HashMap::new();
         let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
-        for (id, pubkey) in participant_ids(transcript) {
-            ids.insert(id, pubkey.clone());
-            ids.insert(pubkey.clone(), pubkey.clone());
-            let name = display.display_name(&pubkey).trim().to_string();
-            by_name.entry(name).or_default().push(pubkey);
+        let known = known_pubkeys(transcript);
+        for (id, key) in participant_ids(transcript) {
+            ids.insert(id, key.clone());
+            ids.insert(key.clone(), key.clone());
+            let name = key_name(&key, &known, display).trim().to_string();
+            by_name.entry(name).or_default().push(key);
         }
         // 모델이 P 번호 대신 이름을 내기도 한다(2026-10-12 실제 시험에서 봄).
         // 이름이 한 사람만 가리킬 때만 받는다.
@@ -851,11 +905,12 @@ impl<'a> Checker<'a> {
         }
         let names = ids
             .values()
-            .map(|pubkey| (pubkey.clone(), squash(&display.display_name(pubkey))))
+            .map(|key| (key.clone(), squash(&key_name(key, &known, display))))
             .collect();
         Self {
             lines: usable_lines(transcript),
             ids,
+            known,
             names,
             started: meeting_start_kst(transcript),
             corrections: Corrections::default(),
@@ -890,7 +945,9 @@ impl<'a> Checker<'a> {
             .filter(|&j| j + 1 < self.lines.len())
             .find(|&j| {
                 let (first, next) = (&self.lines[j], &self.lines[j + 1]);
-                first.speaker == next.speaker
+                // Joined only when the same known person said both.
+                first.speaker.is_some()
+                    && first.speaker == next.speaker
                     && format!("{}{}", first.squashed, next.squashed).contains(quote)
             })
             .map(|j| (j, 2))
@@ -928,7 +985,13 @@ impl<'a> Checker<'a> {
         let Some(found) = self.find_quote(self.window(line), &quote) else {
             return false;
         };
-        if self.lines[found.0].speaker != pubkey {
+        // A line whose speaker is not known by pubkey is no one's word; a
+        // room line matched by voice is not proof either, whatever its
+        // confidence.
+        let (from, span) = found;
+        if self.lines[from].speaker != Some(pubkey)
+            || !self.lines[from..from + span].iter().all(|line| line.own)
+        {
             return false;
         }
         let said = self.text_of(found);
@@ -978,7 +1041,11 @@ impl<'a> Checker<'a> {
         let mut assignee_pubkey = None;
         let mut assignee_quote = None;
         if let Some(id) = draft.assignee_id.as_deref().filter(|id| !id.is_empty()) {
-            let pubkey = self.ids.get(id.trim()).cloned();
+            let key = self.ids.get(id.trim()).cloned();
+            // A room speaker's label is someone, but no one to mention: the
+            // item has no assignee and stays unsure (not a correction).
+            let room = key.as_deref().is_some_and(|key| !self.known.contains(key));
+            let pubkey = key.filter(|_| !room);
             let ok = match (line, draft.assignee_quote.as_deref(), pubkey.as_deref()) {
                 (Some(line), Some(quote), Some(pubkey)) => {
                     self.assignee_ok(line, &task_keys, quote, pubkey)
@@ -988,7 +1055,7 @@ impl<'a> Checker<'a> {
             if ok {
                 assignee_pubkey = pubkey;
                 assignee_quote = draft.assignee_quote.clone();
-            } else {
+            } else if !room {
                 self.corrections.assignee_cleared += 1;
             }
         }
@@ -1821,6 +1888,117 @@ pub(crate) mod tests {
 
     fn check(items: Value) -> Summary {
         check_answer(&answer(items), &meeting(), &KoreanNames).unwrap()
+    }
+
+    /// The meeting with 민수 (B) heard on a room microphone (device D): his
+    /// lines are "회의실 화자 1", and one line nobody can place.
+    fn room_meeting() -> Transcript {
+        const D: &str = "dddddddd00000000000000000000000000000000000000000000000000000004";
+        let mut transcript = meeting();
+        transcript.participants.retain(|p| p.pubkey != B);
+        // The room device's owner: none of the speech was theirs.
+        transcript
+            .participants
+            .push(crate::transcript::Participant {
+                pubkey: D.into(),
+                speech_ms: 0,
+            });
+        for segment in &mut transcript.segments {
+            if segment.speaker.as_deref() == Some(B) {
+                segment.device = D.into();
+                segment.speaker = None;
+                segment.speaker_label = Some("회의실 화자 1".into());
+                segment.speaker_confidence = None;
+            }
+        }
+        let mut unplaced = Segment::own(D.into(), 50_000, 52_000, "음, 그건 잘 모르겠네요.".into());
+        unplaced.speaker = None;
+        unplaced.speaker_confidence = None;
+        unplaced.speaker_label = Some(UNPLACED_ROOM_SPEAKER.into());
+        transcript.segments.push(unplaced);
+        transcript
+    }
+
+    /// A room speaker is one person in the prompt, named by the label; a
+    /// line nobody can place is no one's ("?"). Picked as the assignee, the
+    /// label gets no pubkey (no mention) and the item stays unsure — not a
+    /// correction.
+    #[test]
+    fn a_room_speaker_assignee_is_not_mentioned_and_stays_unsure() {
+        let transcript = room_meeting();
+        let ids = participant_ids(&transcript);
+        let room = ids
+            .iter()
+            .find(|(_, key)| key == "회의실 화자 1")
+            .map(|(id, _)| id.clone())
+            .expect("the room speaker has an id");
+        assert!(ids.iter().all(|(_, key)| key != UNPLACED_ROOM_SPEAKER));
+        // The room microphone's owner who said nothing is not a person here.
+        assert!(
+            ids.iter().all(|(_, key)| !key.starts_with("dddddddd")),
+            "{ids:?}"
+        );
+        let prompt = build_prompt(&transcript, &KoreanNames);
+        assert!(
+            prompt.contains(&format!(r#""id":"{room}","name":"회의실 화자 1""#)),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(r#"{"id":"?","ms":50000,"text":"음, 그건 잘 모르겠네요."}"#),
+            "{prompt}"
+        );
+
+        let item = item(
+            "고객사에 견적서 보내기",
+            Some(&room),
+            Some("네, 금요일 오후 3시까지 보낼게요"),
+            Some("2026-10-16T15:00"),
+            Some("금요일 오후 3시까지"),
+            20_000,
+        );
+        let summary = check_answer(&answer(json!([item])), &transcript, &KoreanNames).unwrap();
+        let item = &summary.action_items[0];
+        assert_eq!(item.assignee_pubkey, None);
+        assert_eq!(item.status, ItemStatus::Unsure);
+        assert_eq!(summary.corrections.assignee_cleared, 0);
+        // The due date still stands on its own words.
+        assert_eq!(item.due.as_deref(), Some("2026-10-16T15:00:00+09:00"));
+    }
+
+    /// 민수(B)'s promise heard on a room microphone and matched to him by
+    /// voice (confidence under 1) is no proof: no assignee.
+    #[test]
+    fn a_voice_matched_line_is_not_proof_of_an_assignee() {
+        // 0.8 is a usual match; the cosine is not clamped, so a room line
+        // can come out a hair over 1.
+        for confidence in [0.8, 1.000_05] {
+            let mut transcript = meeting();
+            for segment in &mut transcript.segments {
+                if segment.speaker.as_deref() == Some(B) {
+                    segment.device = "dd".repeat(32);
+                    segment.speaker_label = Some("회의실 화자 1".into());
+                    segment.speaker_confidence = Some(confidence);
+                }
+            }
+            let summary = check_answer(
+                &answer(json!([quote_item(20_000)])),
+                &transcript,
+                &KoreanNames,
+            )
+            .unwrap();
+            assert_eq!(
+                summary.action_items[0].assignee_pubkey, None,
+                "{confidence}"
+            );
+            assert_eq!(
+                summary.action_items[0].status,
+                ItemStatus::Unsure,
+                "{confidence}"
+            );
+        }
+        // The same lines from his own device do count.
+        let summary = check(json!([quote_item(20_000)]));
+        assert_eq!(summary.action_items[0].assignee_pubkey.as_deref(), Some(B));
     }
 
     /// 견적서: 지영이 민수를 불러 부탁하고, 민수가 시각까지 말하며 맡았다.

@@ -1731,6 +1731,7 @@ mod tests {
             ledger_version: "test".into(),
             audio_key: String::new(),
             now_unix_ms: 0,
+            speakers: crate::speakers::SpeakerSettings::default(),
         }
     }
 

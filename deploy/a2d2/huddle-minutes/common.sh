@@ -56,7 +56,8 @@ image_cache_dir=/opt/huddle-minutes/cache
 # 작업기 실행: 인자는 하위 명령 하나, 나머지는 환경 변수(BUZZ_MINUTES_*).
 # 받아쓰기 인증(BUZZ_MINUTES_GCP_AUTH=metadata)과 시간 상한(BUZZ_MINUTES_TIME_LIMIT_MINUTES=50)은
 # 작업기 기본값을 그대로 쓴다. PREFIX 는 기본값과 같지만 위 IAM 조건과 같은 변수에서
-# 오게 일부러 적는다. 화자 분리 모델이 붙으면 그 경로 변수를 여기에 더한다.
+# 오게 일부러 적는다. 화자 분리(BUZZ_MINUTES_SPEAKERS·BLEED·VOICES_LEARN)는 작업기
+# 기본값(꺼짐)을 그대로 쓴다. 켤 때는 화자 모델도 이미지에 넣어야 한다(Dockerfile 2단계).
 job_command=process
 job_env=(
   "BUZZ_MINUTES_ALL=true"
@@ -64,6 +65,7 @@ job_env=(
   "BUZZ_MINUTES_PREFIX=$recordings_prefix"
   "BUZZ_MINUTES_BUCKET=$minutes_bucket"
   "BUZZ_MINUTES_CHIRP_PROJECT=$project"
+  "BUZZ_MINUTES_CACHE=$image_cache_dir"
   "BUZZ_MINUTES_VAD_MODEL=$image_cache_dir/models/silero_vad.onnx"
   "BUZZ_MINUTES_SUMMARY=on" # 모델은 작업기 기본값(gemini-3.8-flash)
   "BUZZ_MINUTES_NOTION=on"  # 토큰은 NOTION_TOKEN 비밀

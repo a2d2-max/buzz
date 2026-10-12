@@ -265,6 +265,13 @@ pub const LEDGER_KEY_FORMAT: &str = "huddle-minutes-ledger-key/1";
 /// itself comes from speech detection on decoded audio: if a change moves
 /// it, the key changes and that piece is sent again. Other settings give
 /// another key too.
+///
+/// The same key means the same sound sent: the audio is the decoded track
+/// between those bounds. Telling speakers apart and dropping leaked sound
+/// only move or drop bounds, so their settings are not in the key (turning
+/// them on or off re-sends only pieces whose bounds moved). Anything that
+/// changes the sound itself before transcription (noise removal, level
+/// matching, …) must put its settings into the key.
 pub fn piece_key(
     version: &str,
     speaker: &str,

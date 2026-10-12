@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::collect::MeetingPlan;
 use crate::runner::{MeetingError, MinutesHome};
-use crate::summary::{huddle_id, kst, DisplayNames, ItemStatus, RetryPolicy, Summary};
+use crate::summary::{huddle_id, kst, line_name, DisplayNames, ItemStatus, RetryPolicy, Summary};
 use crate::transcript::Transcript;
 
 /// 노션 API 주소.
@@ -742,11 +742,15 @@ pub struct PublishReport {
 /// 참석자 pubkey: 참석자 목록 순서, 그다음 목록에 없는 화자.
 fn attendee_pubkeys(transcript: &Transcript) -> Vec<&str> {
     let mut pubkeys: Vec<&str> = Vec::new();
-    let all = transcript
-        .participants
-        .iter()
-        .map(|p| p.pubkey.as_str())
-        .chain(transcript.segments.iter().map(|s| s.speaker.as_str()));
+    let all = crate::summary::attending(transcript)
+        // Only people known by pubkey: a room speaker's label is no one to
+        // mention.
+        .chain(
+            transcript
+                .segments
+                .iter()
+                .filter_map(|s| s.speaker.as_deref()),
+        );
     for pubkey in all {
         if !pubkeys.contains(&pubkey) {
             pubkeys.push(pubkey);
@@ -1057,7 +1061,7 @@ pub fn body_blocks(
     }
     for segment in segments {
         let mut runs = time_link(segment.start_ms);
-        let name = page.names.display_name(&segment.speaker);
+        let name = line_name(segment, page.names);
         runs.extend(text_runs(
             &format!(" {name}: {}", segment.text.trim()),
             None,
@@ -2565,6 +2569,39 @@ pub(crate) mod tests {
     }
 
     /// `channel` 의 회의 하나(첫 세션 3)를 시험용 녹음 폴더에 두고 계획을 세운다.
+    /// Notion attendees are people known by pubkey: a room speaker's label
+    /// and a line nobody can place are no one to mention; a line is shown
+    /// under its label, never under the room device's owner.
+    #[test]
+    fn room_speakers_are_named_by_label_and_never_mentioned() {
+        const A: &str = "aaaaaaaa00000000000000000000000000000000000000000000000000000001";
+        const D: &str = "dddddddd00000000000000000000000000000000000000000000000000000004";
+        let mut transcript = crate::test_http::transcript_with(&[(1_000, A, "안녕하세요.")]);
+        let mut room = crate::transcript::Segment::own(D.into(), 2_000, 3_000, "네.".into());
+        room.speaker = None;
+        room.speaker_confidence = None;
+        room.speaker_label = Some("회의실 화자 1".into());
+        let mut unplaced = room.clone();
+        unplaced.speaker_label = Some(crate::transcript::UNPLACED_ROOM_SPEAKER.into());
+        transcript.segments.extend([room.clone(), unplaced.clone()]);
+        // The room device's owner, none of whose speech was heard, is left
+        // out; someone who joined and said nothing on their own device stays.
+        const E: &str = "eeeeeeee00000000000000000000000000000000000000000000000000000005";
+        for pubkey in [D, E] {
+            transcript
+                .participants
+                .push(crate::transcript::Participant {
+                    pubkey: pubkey.into(),
+                    speech_ms: 0,
+                });
+        }
+        assert_eq!(attendee_pubkeys(&transcript), vec![A, E]);
+        let names = crate::summary::PubkeyPrefixNames;
+        assert_eq!(line_name(&room, &names), "회의실 화자 1");
+        assert_eq!(line_name(&unplaced, &names), "회의실 화자 ?");
+        assert_ne!(line_name(&room, &names), names.display_name(D));
+    }
+
     pub(crate) async fn plan_for(dir: &std::path::Path) -> MeetingPlan {
         plan_in(dir, Uuid::from_u128(2), Uuid::from_u128(3)).await
     }

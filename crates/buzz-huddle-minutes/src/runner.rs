@@ -30,7 +30,6 @@ use crate::pipeline::{
 };
 use crate::store::{PutNew, RecordingStore, StoreError};
 use crate::stt::SpeechToText;
-use crate::transcript::Transcript;
 use crate::vad::SpeechDetector;
 
 /// Where a channel's scripts, ledgers and holds live.
@@ -291,15 +290,23 @@ impl MinutesHome for LocalMinutes {
     }
 }
 
+/// The sessions a script covers: all a listing needs. Only this is read,
+/// so a script in another format (a later `huddle-transcript/N`, say after
+/// going back to an older worker) never fails the channel.
+#[derive(serde::Deserialize)]
+struct ScriptSessions {
+    session_ids: Vec<Uuid>,
+}
+
 /// A script's [`ScriptInfo`] from its name and bytes.
 pub fn script_info(name: String, bytes: &[u8]) -> Result<ScriptInfo, MeetingError> {
     // Only the kind of error: serde's text can quote the script.
-    let transcript: Transcript = serde_json::from_slice(bytes)
+    let script: ScriptSessions = serde_json::from_slice(bytes)
         .map_err(|e| MeetingError::Scripts(format!("{name}: not a script ({:?})", e.classify())))?;
     Ok(ScriptInfo {
         name,
         sha256: sha256_hex(bytes),
-        session_ids: transcript.session_ids,
+        session_ids: script.session_ids,
     })
 }
 
@@ -579,4 +586,43 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600))?;
     }
     std::fs::rename(&partial, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listing reads only the sessions: `/1`, `/2` and a script whose
+    /// lines it cannot make sense of all list.
+    #[test]
+    fn scripts_of_every_format_list() {
+        let session = Uuid::from_u128(3);
+        let scripts = [
+            serde_json::json!({
+                "format": "huddle-transcript/1",
+                "session_ids": [session],
+                "segments": [{ "start_ms": 1, "end_ms": 2, "speaker": "ab", "text": "네" }]
+            }),
+            serde_json::json!({
+                "format": "huddle-transcript/2",
+                "session_ids": [session],
+                "segments": [{
+                    "start_ms": 1, "end_ms": 2, "device": "ab", "speaker": null,
+                    "speaker_label": "회의실 화자 1", "speaker_confidence": null, "text": "네"
+                }]
+            }),
+            serde_json::json!({
+                "format": "huddle-transcript/9",
+                "session_ids": [session],
+                "segments": [{ "something": "else" }]
+            }),
+        ];
+        for script in scripts {
+            let bytes = serde_json::to_vec(&script).unwrap();
+            let info = script_info("s.json".into(), &bytes).unwrap();
+            assert_eq!(info.session_ids, vec![session], "{script}");
+            assert_eq!(info.sha256, sha256_hex(&bytes));
+        }
+        assert!(script_info("s.json".into(), b"{}").is_err());
+    }
 }

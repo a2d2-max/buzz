@@ -25,7 +25,8 @@ use buzz_huddle_minutes::followup::{
 use buzz_huddle_minutes::gcs_minutes::GcsMinutes;
 use buzz_huddle_minutes::ledger::LEDGER_KEY_FORMAT;
 use buzz_huddle_minutes::models::{
-    ensure_silero_vad, sha256_hex, silero_vad_path, SILERO_VAD_SHA256,
+    ensure_model, ensure_silero_vad, sha256_hex, silero_vad_path, SILERO_VAD_SHA256,
+    SPEAKER_EMBEDDING, SPEAKER_SEGMENTATION,
 };
 use buzz_huddle_minutes::pipeline::{MinutesSettings, SttPolicy};
 use buzz_huddle_minutes::runner::{
@@ -35,6 +36,7 @@ use buzz_huddle_minutes::runner::{
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Truth, SENTENCES,
 };
+use buzz_huddle_minutes::speakers::{report_line, SpeakerArgs};
 use buzz_huddle_minutes::store::{
     GcsStore, LocalStore, ObjectInfo, PutNew, RecordingStore, StoreError,
 };
@@ -43,6 +45,7 @@ use buzz_huddle_minutes::stt::{
 };
 use buzz_huddle_minutes::transcript::{SttInfo, Transcript};
 use buzz_huddle_minutes::vad::{SegmentPlan, SileroSettings, SileroVad};
+use buzz_huddle_minutes::voices::{run_command as run_voices, VoicesCommand};
 use buzz_huddle_minutes::{notion, summary};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
@@ -58,7 +61,8 @@ struct Cli {
 // Parsed once at start; the size of the biggest variant does not matter.
 #[allow(clippy::large_enum_variant)]
 enum Command {
-    /// Download the Silero VAD model into the cache and check its sha256.
+    /// Download the Silero VAD and speaker models into the cache and check
+    /// their sha256.
     FetchModels {
         /// Cache folder (default: this crate's .cache).
         #[arg(long)]
@@ -128,11 +132,20 @@ enum Command {
         #[arg(long, env = "BUZZ_MINUTES_BUCKET", conflicts_with = "out")]
         minutes_bucket: Option<String>,
         /// Answer sheet for the fake transcriber.
-        #[arg(long, required_unless_present = "chirp_project")]
+        #[arg(long, required_unless_present_any = ["chirp_project", "stt_placeholder"])]
         stt_truth: Option<PathBuf>,
         /// Transcribe with Chirp 3 in this Google Cloud project instead.
         #[arg(long, env = "BUZZ_MINUTES_CHIRP_PROJECT", conflicts_with = "stt_truth")]
         chirp_project: Option<String>,
+        /// (Development) No transcriber: every piece gets placeholder text
+        /// with its length, so speakers and pieces can be checked on a real
+        /// recording. Only with `--out` for one channel; refused with `--all`
+        /// or the minutes bucket, and never read from the environment.
+        #[arg(
+            long,
+            conflicts_with_all = ["stt_truth", "chirp_project", "all", "minutes_bucket"]
+        )]
+        stt_placeholder: bool,
         /// Where Google access tokens come from.
         #[arg(long, env = "BUZZ_MINUTES_GCP_AUTH", value_enum, default_value_t = GcpAuth::Metadata)]
         gcp_auth: GcpAuth,
@@ -186,6 +199,14 @@ enum Command {
         /// The script keeps the unpadded speech times.
         #[arg(long, default_value_t = SegmentPlan::default().pad_ms)]
         pad_ms: u64,
+        /// Speakers inside a track, naming, voice profiles.
+        #[command(flatten)]
+        speaker_args: SpeakerArgs,
+    },
+    /// Stored voice profiles: list them or forget one person's.
+    Voices {
+        #[command(subcommand)]
+        command: VoicesCommand,
     },
     /// Compare a script with an answer sheet; exit 1 if it does not pass.
     Check {
@@ -422,8 +443,13 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::FetchModels { cache } => {
-            let path = ensure_silero_vad(&cache.unwrap_or_else(default_cache)).await?;
+            let cache = cache.unwrap_or_else(default_cache);
+            let path = ensure_silero_vad(&cache).await?;
             eprintln!("silero vad: {}", path.display());
+            for model in [SPEAKER_SEGMENTATION, SPEAKER_EMBEDDING] {
+                let path = ensure_model(&cache, &model).await?;
+                eprintln!("speaker model: {}", path.display());
+            }
         }
         Command::FakeMeeting {
             clips,
@@ -473,6 +499,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             minutes_bucket,
             stt_truth,
             chirp_project,
+            stt_placeholder,
             gcp_auth,
             vad_model,
             time_limit_minutes,
@@ -489,10 +516,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             now_ms,
             max_segment_ms,
             pad_ms,
+            speaker_args,
         } => {
             // Before anything else: the exact model the ledger keys assume.
-            let model =
-                vad_model.unwrap_or_else(|| silero_vad_path(&cache.unwrap_or_else(default_cache)));
+            let cache = cache.unwrap_or_else(default_cache);
+            let model = vad_model.unwrap_or_else(|| silero_vad_path(&cache));
             let model_digest = verified_model(&model)?;
             let token_source = || gcp_token_source(gcp_auth);
             let gcs = if recordings_bucket.is_some() || minutes_bucket.is_some() {
@@ -517,8 +545,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let now = now_ms.unwrap_or_else(now_unix_ms);
             let mut detector = SileroVad::new(&model, SileroSettings::default())
                 .context("run `buzz-huddle-minutes fetch-models` first")?;
-            let stt = match (stt_truth, chirp_project) {
-                (Some(stt_truth), _) => {
+            let stt = match (stt_truth, chirp_project, stt_placeholder) {
+                (Some(stt_truth), _, _) => {
                     let truth: Truth = serde_json::from_slice(
                         &std::fs::read(&stt_truth)
                             .with_context(|| format!("read {}", stt_truth.display()))?,
@@ -534,7 +562,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     }
                     AnyStt::Truth(stt)
                 }
-                (None, Some(project)) => {
+                (None, Some(project), _) => {
                     // A developer's gcloud login has no project of its own:
                     // bill this one.
                     let quota = matches!(gcp_auth, GcpAuth::Gcloud).then(|| project.clone());
@@ -543,7 +571,16 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                             .map_err(anyhow::Error::msg)?,
                     )
                 }
-                (None, None) => anyhow::bail!("give --stt-truth or --chirp-project"),
+                (None, None, true) => {
+                    placeholder_allowed(
+                        all,
+                        minutes_bucket.as_deref(),
+                        summary_switch,
+                        notion_switch,
+                    )?;
+                    AnyStt::Placeholder
+                }
+                (None, None, false) => anyhow::bail!("give --stt-truth or --chirp-project"),
             };
             let plan = SegmentPlan {
                 max_segment_ms,
@@ -555,6 +592,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 ledger_version: ledger_version(&plan, &model_digest, &stt.info()),
                 audio_key: String::new(),
                 now_unix_ms: now,
+                speakers: speaker_args.settings(&cache)?,
             };
             let options = RunOptions {
                 prefix: prefix.clone(),
@@ -631,6 +669,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             };
             return Ok(code);
         }
+        Command::Voices { command } => run_voices(command).await?,
         Command::Check {
             transcript,
             truth,
@@ -1046,6 +1085,7 @@ async fn process_channels<H: MinutesHome>(
             report.ledger_unreadable_lines,
             output.transcript.stt.billed_seconds
         );
+            eprintln!("  {}", report_line(&report.speakers_split));
             for (i, speaker) in report.speakers.iter().enumerate() {
                 eprintln!(
                 "  person {i}: frames {} decoded {} concealed {} lost-silent {} spurts {} out-of-order {} undecodable {} | regions {} speech spans {} pieces {} stt failures {}",
@@ -1181,6 +1221,10 @@ enum Switch {
 enum AnyStt {
     Truth(TruthStt),
     Chirp(ChirpStt),
+    /// Development only ([`placeholder_allowed`]): text with each piece's
+    /// length instead of a transcript. Its own engine name keeps its text
+    /// out of every other engine's ledger.
+    Placeholder,
 }
 
 impl SpeechToText for AnyStt {
@@ -1188,6 +1232,12 @@ impl SpeechToText for AnyStt {
         match self {
             Self::Truth(stt) => stt.info(),
             Self::Chirp(stt) => stt.info(),
+            Self::Placeholder => SttInfo {
+                engine: "placeholder".into(),
+                region: "local".into(),
+                language: "ko-KR".into(),
+                billed_seconds: 0,
+            },
         }
     }
 
@@ -1195,8 +1245,37 @@ impl SpeechToText for AnyStt {
         match self {
             Self::Truth(stt) => stt.transcribe(request).await,
             Self::Chirp(stt) => stt.transcribe(request).await,
+            Self::Placeholder => Ok(SttOutput {
+                text: format!(
+                    "(받아쓰기 대역 {:.1}초)",
+                    (request.end_ms - request.start_ms) as f64 / 1_000.0
+                ),
+                billed_seconds: 0,
+            }),
         }
     }
+}
+
+/// Placeholder text must never reach a real store: only a local `--out`
+/// folder, one channel at a time, and never the summary or the Notion page
+/// (a page is found by its huddle id, so it would overwrite the real one).
+fn placeholder_allowed(
+    all: bool,
+    minutes_bucket: Option<&str>,
+    summary: Switch,
+    notion: Switch,
+) -> anyhow::Result<()> {
+    if all || minutes_bucket.is_some() {
+        anyhow::bail!(
+            "--stt-placeholder is for development only: not with --all or --minutes-bucket"
+        );
+    }
+    if matches!(summary, Switch::On) || matches!(notion, Switch::On) {
+        anyhow::bail!(
+            "--stt-placeholder is for development only: not with --summary or --notion on"
+        );
+    }
+    Ok(())
 }
 
 /// Where the recordings are.
@@ -1246,5 +1325,50 @@ impl RecordingStore for AnyStore {
             Self::Local(store) => store.folders(prefix).await,
             Self::Gcs(store) => store.folders(prefix).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut all = vec!["buzz-huddle-minutes", "process", "--recordings", "r"];
+        all.extend_from_slice(args);
+        Cli::try_parse_from(all)
+    }
+
+    /// Placeholder text never reaches a real script store: `--stt-placeholder`
+    /// only goes with a local `--out` for one channel.
+    #[test]
+    fn placeholder_transcription_is_for_development_only() {
+        let channel = [
+            "--community",
+            "00000000-0000-0000-0000-000000000001",
+            "--channel",
+            "00000000-0000-0000-0000-000000000002",
+        ];
+        let mut dev = vec!["--out", "o", "--stt-placeholder"];
+        dev.extend_from_slice(&channel);
+        assert!(parse(&dev).is_ok());
+        assert!(placeholder_allowed(false, None, Switch::Off, Switch::Off).is_ok());
+
+        assert!(parse(&["--all", "--out", "o", "--stt-placeholder"]).is_err());
+        let mut bucket = vec!["--minutes-bucket", "m", "--stt-placeholder"];
+        bucket.extend_from_slice(&channel);
+        assert!(parse(&bucket).is_err());
+        let mut with_chirp = vec!["--out", "o", "--stt-placeholder", "--chirp-project", "p"];
+        with_chirp.extend_from_slice(&channel);
+        assert!(parse(&with_chirp).is_err());
+        // Even when the command line lets it through (say from the
+        // environment), the run refuses it.
+        assert!(placeholder_allowed(true, None, Switch::Off, Switch::Off).is_err());
+        assert!(placeholder_allowed(false, Some("m"), Switch::Off, Switch::Off).is_err());
+        // Nor the summary or the Notion page: a page found by its huddle id
+        // would be overwritten with placeholder text.
+        assert!(placeholder_allowed(false, None, Switch::On, Switch::Off).is_err());
+        assert!(placeholder_allowed(false, None, Switch::Off, Switch::On).is_err());
     }
 }

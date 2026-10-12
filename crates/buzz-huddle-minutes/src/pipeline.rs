@@ -12,6 +12,7 @@ use crate::collect::Meeting;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::ledger::{piece_key, Ledger, Outcome};
+use crate::speakers::{MeetingSpeakers, SpeakerSettings, SpeakersError, SpeakersReport};
 use crate::stt::{SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, FAILED_TEXT};
 use crate::tracks::{demux, DecodeStats, DemuxStats, REGION_GAP_MS, SAMPLE_RATE};
 use crate::transcript::{AudioRef, Participant, Segment, Transcript, TRANSCRIPT_FORMAT};
@@ -72,6 +73,9 @@ pub struct MinutesSettings {
     pub audio_key: String,
     /// When the mixed audio is written, UTC ms (for `audio.expires_at`).
     pub now_unix_ms: u64,
+    /// Telling speakers apart inside a track and naming them (see
+    /// [`crate::speakers`]). The default is one person per track.
+    pub speakers: SpeakerSettings,
 }
 
 /// Why a run failed.
@@ -112,6 +116,9 @@ pub enum MinutesError {
     /// The ledger could not be read or written.
     #[error("stt ledger: {0}")]
     Ledger(#[from] std::io::Error),
+    /// Telling speakers apart failed.
+    #[error(transparent)]
+    Speakers(#[from] SpeakersError),
 }
 
 impl MinutesError {
@@ -141,8 +148,12 @@ pub struct SpeakerReport {
     pub stt_failures: usize,
 }
 
-/// Counters for the whole run (no audio, no text, no keys).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Counters for the whole run: no audio, no text, no secrets. Pubkeys: per
+/// person and per track rows keep the device pubkey (people of this meeting,
+/// for tests); room-speaker candidates, which can include stored profiles of
+/// people not in the meeting, keep only the first 8 hex characters. The CLI
+/// prints counts and row numbers only, never a pubkey.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunReport {
     /// Frame routing counters.
     pub demux: DemuxStats,
@@ -164,6 +175,8 @@ pub struct RunReport {
     pub stt_retries: u64,
     /// Pieces given up on, by failure kind.
     pub stt_failures_by_kind: Vec<(SttErrorKind, u64)>,
+    /// Who spoke inside each track, room speakers, voice profiles.
+    pub speakers_split: SpeakersReport,
 }
 
 /// Script, mixed audio and counters.
@@ -200,6 +213,12 @@ where
     let duration_ms = ended_at - started_at;
 
     let routed = demux(meeting);
+    let mut speakers_stage = MeetingSpeakers::start(
+        &settings.speakers,
+        meeting.community_id,
+        &routed,
+        settings.now_unix_ms,
+    )?;
     let mut mixer = Mixer::new(MIX_SAMPLE_RATE, duration_ms);
     let mut participants = Vec::with_capacity(routed.speakers.len());
     let mut segments = Vec::new();
@@ -271,6 +290,9 @@ where
                         .collect())
                 },
             )?;
+            // Speakers inside the track: cut at changes of speaker, drop
+            // sound that leaked in from another track.
+            let pieces = speakers_stage.split(&person.pubkey, track_start_ms, &pcm, pieces)?;
             report.segments = pieces.len();
             // One piece = one request. The script gets the speech times; the
             // transcriber gets the padded audio. A piece already in the
@@ -375,12 +397,12 @@ where
                 texts[index] = Some(text);
             }
             for ((start_ms, end_ms), text) in times.into_iter().zip(texts) {
-                segments.push(Segment {
+                segments.push(Segment::own(
+                    person.pubkey.clone(),
                     start_ms,
                     end_ms,
-                    speaker: person.pubkey.clone(),
-                    text: text.unwrap_or_else(|| FAILED_TEXT.to_string()),
-                });
+                    text.unwrap_or_else(|| FAILED_TEXT.to_string()),
+                ));
             }
         }
         participants.push(Participant {
@@ -389,7 +411,10 @@ where
         });
         speakers.push(report);
     }
-    segments.sort_by(|a, b| (a.start_ms, &a.speaker).cmp(&(b.start_ms, &b.speaker)));
+    // Room speakers get "회의실 화자 N" and, when their voice matches, a pubkey.
+    let speakers_split = speakers_stage.finish(&mut segments).await;
+    segments.sort_by(|a, b| (a.start_ms, &a.device).cmp(&(b.start_ms, &b.device)));
+    speakers_split.update_participants(&mut participants, &segments);
 
     ledger.finish_run(run).await?;
     // Refused pieces never hold a meeting back. Transient ones do, until
@@ -444,6 +469,7 @@ where
             stt_reused,
             stt_retries,
             stt_failures_by_kind: failures_by_kind.into_iter().collect(),
+            speakers_split,
         },
     })
 }

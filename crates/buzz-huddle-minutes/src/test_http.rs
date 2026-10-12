@@ -31,11 +31,13 @@ pub(crate) fn transcript_with(lines: &[(u64, &str, &str)]) -> Transcript {
         participants,
         segments: lines
             .iter()
-            .map(|(start_ms, speaker, text)| Segment {
-                start_ms: *start_ms,
-                end_ms: start_ms + 2_000,
-                speaker: (*speaker).to_string(),
-                text: (*text).to_string(),
+            .map(|(start_ms, speaker, text)| {
+                Segment::own(
+                    (*speaker).to_string(),
+                    *start_ms,
+                    start_ms + 2_000,
+                    (*text).to_string(),
+                )
             })
             .collect(),
         audio: AudioRef {
