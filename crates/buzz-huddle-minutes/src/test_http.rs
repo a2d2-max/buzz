@@ -8,12 +8,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use crate::transcript::{
-    AudioRef, Losses, Participant, Segment, SttInfo, Transcript, TRANSCRIPT_FORMAT,
-};
+use crate::transcript::{AudioRef, Participant, Segment, Transcript};
 
 /// 시험용 스크립트. 회의는 2026-10-12(월) 14:00 KST 에 시작한다.
-/// `lines` 는 (start_ms, 화자 pubkey, 글).
+/// `lines` 는 (start_ms, 화자 pubkey, 글). 요약·노션이 쓰는 칸만 채운다.
 pub(crate) fn transcript_with(lines: &[(u64, &str, &str)]) -> Transcript {
     let mut participants: Vec<Participant> = Vec::new();
     for (_, speaker, _) in lines {
@@ -25,10 +23,7 @@ pub(crate) fn transcript_with(lines: &[(u64, &str, &str)]) -> Transcript {
         }
     }
     Transcript {
-        format: TRANSCRIPT_FORMAT.into(),
-        community_id: Uuid::from_u128(1),
         channel_id: Uuid::from_u128(2),
-        parent_channel_id: None,
         session_ids: vec![Uuid::from_u128(3), Uuid::from_u128(4)],
         started_at: "2026-10-12T05:00:00.000Z".into(),
         ended_at: "2026-10-12T05:42:10.120Z".into(),
@@ -44,16 +39,10 @@ pub(crate) fn transcript_with(lines: &[(u64, &str, &str)]) -> Transcript {
             })
             .collect(),
         audio: AudioRef {
-            key: "huddles/test.wav".into(),
             expires_at: "2026-10-27T05:42:10.120Z".into(),
+            ..AudioRef::default()
         },
-        stt: SttInfo {
-            engine: "fake".into(),
-            region: "local".into(),
-            language: "ko-KR".into(),
-            billed_seconds: 0,
-        },
-        losses: Losses::default(),
+        ..Transcript::default()
     }
 }
 
@@ -92,6 +81,8 @@ pub(crate) struct Reply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// 본문 길이를 실제보다 길게 알려 주고 끊는다(본문 읽기 실패 흉내).
+    pub cut_off: bool,
 }
 
 impl Reply {
@@ -101,12 +92,19 @@ impl Reply {
             status,
             headers: vec![("content-type".into(), "application/json".into())],
             body: body.to_string(),
+            cut_off: false,
         }
     }
 
     /// 헤더 하나를 더 붙인다.
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// 본문 중간에 연결을 끊는다.
+    pub fn cut_off(mut self) -> Self {
+        self.cut_off = true;
         self
     }
 }
@@ -138,10 +136,10 @@ impl FakeServer {
                     };
                     let reply = handler(&request);
                     seen.lock().expect("lock").push(request);
+                    let declared = reply.body.len() + if reply.cut_off { 1_000 } else { 0 };
                     let mut head = format!(
-                        "HTTP/1.1 {} X\r\ncontent-length: {}\r\nconnection: close\r\n",
-                        reply.status,
-                        reply.body.len()
+                        "HTTP/1.1 {} X\r\ncontent-length: {declared}\r\nconnection: close\r\n",
+                        reply.status
                     );
                     for (name, value) in &reply.headers {
                         head.push_str(&format!("{name}: {value}\r\n"));

@@ -1,24 +1,41 @@
 //! 노션 회의록 페이지 쓰기(설계 8번). 노션 API 를 직접 부른다(`Notion-Version`
 //! 2026-03-11, 2026-10-12 공식 문서로 확인).
 //!
-//! - "허들 회의록" DB 에 회의마다 페이지 하나. "허들 ID"(`{channel_id}:{첫 세션 id}`)로
-//!   찾아서 있으면 고치고 없으면 만든다. 같은 회의를 두 번 만들지 않는다.
-//! - 본문은 요약 → 결정사항 → 할 일 → 주제별 정리 → 전체 스크립트. 다시 쓸 때는
-//!   본문을 통째로 지우고(`erase_content`) 새로 넣는다.
+//! - "허들 회의록" DB 에 회의마다 페이지 하나. "허들 ID" 칸에
+//!   `{channel_id}:{세션 id,세션 id,…}`([`huddle_key`])를 남기고, 세션이 하나라도
+//!   겹치면 같은 회의로 본다. 늦게 올라온 앞 세션 때문에 첫 세션이 바뀌어도 같은
+//!   페이지를 찾는다.
+//! - 만든 page id 는 작업기 저장소의 스크립트 옆(`{첫 세션}.notion.json`)에 남기고
+//!   다음엔 그 id 부터 쓴다. 회의 단위 잠금(작업기의 hold) 안에서 부른다
+//!   ([`publish_held`], [`publish_meeting`]).
+//! - 같은 회의 페이지가 두 장 생기지 않게: 만들다 503 이 나면 노션이 알려 주는
+//!   `committed_resource_id` 를 쓰고, 만든 뒤 다시 찾아 두 장 이상이면 늦게 만든
+//!   쪽을 휴지통으로 보낸다. 요청 시간 제한은 노션의 60초보다 길게 둔다.
+//! - 본문 순서: 요약 → 결정사항 → 할 일 → 주제별 정리 → 전체 스크립트. 다시 쓸 때는
+//!   새 본문을 먼저 다 붙인 뒤 옛 블록을 지운다(중간에 끊겨도 빈 페이지가 안 된다).
+//!   같은 글의 할 일은 체크 상태를 이어받는다.
+//! - 처음 만들 때만 기본 알림, 다시 게시·다시 쓰기는 조용히(`notifications.mode = silent`).
 //! - "허들 담당자 연결" DB 에 참석자를 pubkey 로 넣는다. 없으면 한 줄 더하고,
-//!   있는 줄은 **절대 고치지 않는다**("노션 사용자"·"확인됨"은 사람이 채운다).
+//!   있는 줄은 **절대 고치지 않는다**. 사람 멘션은 "확인됨"이 체크된 줄의
+//!   "노션 사용자"만 쓰고, 나머지는 이름 글자로. 이 DB 를 못 읽어도(403 등)
+//!   회의록은 쓴다(멘션만 빠진다).
 //! - 노션 한도: 요청당 블록 100개, 글 조각 하나에 2000자, 배열 100개,
-//!   요청 500KB, 연결마다 평균 초당 3번. 429 는 `Retry-After` 를 지켜 다시 한다.
+//!   요청 500KB, 연결마다 평균 초당 3번. 429·529 는 `Retry-After` 를 지켜 다시 한다.
 //! - 녹음 파일은 올리지 않는다. 링크만 건다.
 //!
-//! 토큰은 밖에서 받는다. 토큰 값과 회의 내용은 로그·오류에 남기지 않는다.
+//! 토큰은 밖에서 받는다(Cloud Run 은 Secret Manager 를 환경 변수로 붙인다).
+//! 토큰 값과 회의 내용은 로그·오류에 남기지 않는다.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{DateTime, SecondsFormat};
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use uuid::Uuid;
 
+use crate::collect::MeetingPlan;
+use crate::runner::{MeetingError, MinutesHome};
 use crate::summary::{huddle_id, kst, DisplayNames, ItemStatus, RetryPolicy, Summary};
 use crate::transcript::Transcript;
 
@@ -33,16 +50,24 @@ pub const PEOPLE_DATA_SOURCE_ID: &str = "f7ffbc2e-5f69-4dcd-928d-c16a50641b44";
 /// 스크립트 시각에 거는 앱 재생 링크의 기본 모양.
 /// `{channel_id}`·`{start_ms}` 를 바꿔 넣는다.
 pub const DEFAULT_PLAYBACK_LINK: &str = "buzz://huddle/{channel_id}?t={start_ms}";
+/// 노션은 60초 넘는 요청을 503 으로 끊는다. 그 답을 받을 수 있게 더 길게 기다린다.
+pub const NOTION_TIMEOUT: Duration = Duration::from_secs(120);
 /// 요청 하나에 넣는 블록 수 한도.
 pub const MAX_BLOCKS_PER_REQUEST: usize = 100;
-/// 글 조각(`text.content`) 하나의 길이 한도(UTF-16 단위로 센다).
+/// 글 조각(`text.content`)·링크 주소 하나의 길이 한도(UTF-16 단위로 센다).
 pub const MAX_TEXT_UNITS: usize = 2000;
 /// 블록 하나의 `rich_text` 조각 수 한도.
 pub const MAX_RICH_TEXT_ITEMS: usize = 100;
+/// [`NotionRecord::format`] 값.
+pub const RECORD_FORMAT: &str = "huddle-notion/1";
 /// 요청 하나 크기. 노션 한도 500KB 보다 넉넉히 작게 자른다.
 const MAX_REQUEST_BYTES: usize = 400_000;
 /// 오류 메시지는 이만큼(글자)만 남긴다.
 const MAX_ERROR_MESSAGE: usize = 300;
+/// "실패" 표시를 해 보는 횟수.
+const FAILED_MARK_ATTEMPTS: u32 = 4;
+/// 할 일 블록에서 할 일 글과 덧붙인 글을 가르는 말.
+const TASK_SEPARATOR: &str = " · 담당:";
 
 /// "허들 회의록" 칸 이름.
 pub mod minutes_property {
@@ -62,7 +87,7 @@ pub mod minutes_property {
     pub const RECORDING_EXPIRES: &str = "녹음 만료일";
     /// url
     pub const APP_LINK: &str = "앱에서 열기";
-    /// text
+    /// text: [`super::huddle_key`]
     pub const HUDDLE_ID: &str = "허들 ID";
     /// select: 처리 중|완료|실패
     pub const STATUS: &str = "처리 상태";
@@ -76,7 +101,7 @@ pub mod people_property {
     pub const PUBKEY: &str = "Buzz pubkey";
     /// people. 사람이 채운다. 이 코드는 읽기만 한다.
     pub const NOTION_USER: &str = "노션 사용자";
-    /// checkbox. 사람이 채운다. 이 코드는 건드리지 않는다.
+    /// checkbox. 사람이 채운다. 이 코드는 읽기만 한다(체크된 줄만 멘션).
     pub const CONFIRMED: &str = "확인됨";
 }
 
@@ -138,8 +163,10 @@ pub struct NotionSettings {
     pub min_interval: Duration,
     /// 요청 하나를 다시 하는 법.
     pub retry: RetryPolicy,
-    /// 본문 쓰기(지우기 + 넣기)를 처음부터 다시 해 보는 최대 횟수(첫 번 포함).
+    /// 본문 쓰기를 처음부터 다시 해 보는 최대 횟수(첫 번 포함).
     pub body_attempts: u32,
+    /// "실패" 표시가 안 될 때 첫 기다림. 다시 할 때마다 두 배.
+    pub failed_mark_wait: Duration,
 }
 
 impl Default for NotionSettings {
@@ -153,6 +180,7 @@ impl Default for NotionSettings {
             min_interval: Duration::from_millis(350),
             retry: RetryPolicy::default(),
             body_attempts: 3,
+            failed_mark_wait: Duration::from_secs(2),
         }
     }
 }
@@ -168,9 +196,9 @@ pub enum NotionErrorKind {
     NotFound,
     /// 429·529. 다시 해 보고도 안 됐을 때.
     RateLimited,
-    /// 409·5xx·연결 끊김. 다시 해 보고도 안 됐을 때.
+    /// 409·5xx·연결 끊김·본문 읽다 끊김. 다시 해 보고도 안 됐을 때.
     Transient,
-    /// 요청이 잘못됨(400, 예: 칸 이름이 다름, 링크 주소를 안 받음).
+    /// 요청이 잘못됨(400, 예: 칸 이름이 다름, 링크 주소를 안 받음, 한도 넘는 블록).
     BadRequest,
     /// 답 형식이 예상과 다름.
     BadResponse,
@@ -188,6 +216,11 @@ impl NotionErrorKind {
             Self::BadRequest => "bad-request",
             Self::BadResponse => "bad-response",
         }
+    }
+
+    /// 처음부터 다시 해 볼 만한 실패인가.
+    fn passes(self) -> bool {
+        matches!(self, Self::Transient | Self::RateLimited)
     }
 }
 
@@ -226,6 +259,22 @@ enum Replay {
     RejectedOnly,
 }
 
+/// 쓰기 요청이 사람들에게 알림을 보내는지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notify {
+    /// 노션 기본 알림(처음 만들 때).
+    Default,
+    /// 알림 없이(다시 게시·다시 쓰기).
+    Silent,
+}
+
+fn with_notify(mut body: Value, notify: Notify) -> Value {
+    if notify == Notify::Silent {
+        body["notifications"] = json!({ "mode": "silent" });
+    }
+    body
+}
+
 /// 노션 요청을 보내는 곳. 요청 사이 간격을 지키고, 보낸 수를 센다.
 pub struct NotionClient<'a> {
     http: &'a reqwest::Client,
@@ -236,21 +285,10 @@ pub struct NotionClient<'a> {
     pub requests: u64,
 }
 
-fn header_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-/// 노션 오류 본문(`{"code":…,"message":…}`)에서 코드와 짧은 메시지.
-fn error_code(body: &str) -> String {
-    let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-    let code = value["code"].as_str().unwrap_or("");
-    let message: String = value["message"]
+/// 노션 오류 본문에서 코드와 짧은 메시지.
+fn error_code(body: &Value) -> String {
+    let code = body["code"].as_str().unwrap_or("");
+    let message: String = body["message"]
         .as_str()
         .unwrap_or("")
         .chars()
@@ -258,6 +296,22 @@ fn error_code(body: &str) -> String {
         .collect();
     format!("{code}: {message}")
 }
+
+/// `Retry-After` 헤더, 없으면 본문의 `additional_data.retry_after`(초).
+fn retry_after(headers: &reqwest::header::HeaderMap, body: &Value) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+        .or_else(|| {
+            body["additional_data"]["retry_after"]
+                .as_str()
+                .and_then(|value| value.trim().parse().ok())
+        })
+}
+
+/// 실패 한 번: 종류, 코드, 서버가 준 기다림(초).
+type Failure = (NotionErrorKind, String, Option<u64>);
 
 impl<'a> NotionClient<'a> {
     /// `token` 은 노션 통합 토큰(밖에서 받는다).
@@ -280,6 +334,80 @@ impl<'a> NotionClient<'a> {
         })
     }
 
+    async fn send_once(
+        &mut self,
+        method: &reqwest::Method,
+        url: &str,
+        body: &Value,
+    ) -> Result<Value, Failure> {
+        if let Some(last) = self.last_sent {
+            tokio::time::sleep_until(last + self.settings.min_interval).await;
+        }
+        self.last_sent = Some(tokio::time::Instant::now());
+        self.requests += 1;
+        let mut request = self
+            .http
+            .request(method.clone(), url)
+            .header(reqwest::header::AUTHORIZATION, self.auth.clone())
+            .header("Notion-Version", &self.settings.version);
+        if !body.is_null() {
+            request = request.json(body);
+        }
+        let response = request.send().await.map_err(|error| {
+            let code = if error.is_timeout() {
+                "timeout"
+            } else {
+                "connection failed"
+            };
+            (NotionErrorKind::Transient, code.to_string(), None)
+        })?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        // 2xx 라도 본문을 다 못 읽으면 결과를 모른다: 일시 오류로 친다.
+        let text = response.text().await.map_err(|_| {
+            (
+                NotionErrorKind::Transient,
+                format!("HTTP {status} body cut off"),
+                None,
+            )
+        })?;
+        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if (200..300).contains(&status) {
+            if value.is_null() {
+                return Err((
+                    NotionErrorKind::BadResponse,
+                    "response is not JSON".into(),
+                    None,
+                ));
+            }
+            return Ok(value);
+        }
+        // 만들기·붙이기가 저장은 됐는데 답을 제때 못 만든 503: 노션이 만든 것의
+        // id 를 알려 준다. 다시 보내면 두 장이 되니 그 id 를 쓴다.
+        if status == 503 {
+            if let Some(id) = value["additional_data"]["committed_resource_id"].as_str() {
+                return Ok(json!({
+                    "object": "committed",
+                    "id": id,
+                    "committed_child_ids": value["additional_data"]["committed_child_ids"]
+                }));
+            }
+        }
+        let kind = match status {
+            401 => NotionErrorKind::Auth,
+            403 => NotionErrorKind::Permission,
+            404 => NotionErrorKind::NotFound,
+            429 | 529 => NotionErrorKind::RateLimited,
+            409 | 500..=599 => NotionErrorKind::Transient,
+            _ => NotionErrorKind::BadRequest,
+        };
+        Err((
+            kind,
+            format!("HTTP {status} {}", error_code(&value)),
+            retry_after(&headers, &value),
+        ))
+    }
+
     async fn call(
         &mut self,
         method: reqwest::Method,
@@ -290,53 +418,9 @@ impl<'a> NotionClient<'a> {
         let url = format!("{}{path}", self.settings.base_url.trim_end_matches('/'));
         let mut retry = 0u32;
         loop {
-            if let Some(last) = self.last_sent {
-                tokio::time::sleep_until(last + self.settings.min_interval).await;
-            }
-            self.last_sent = Some(tokio::time::Instant::now());
-            self.requests += 1;
-            let mut request = self
-                .http
-                .request(method.clone(), &url)
-                .header(reqwest::header::AUTHORIZATION, self.auth.clone())
-                .header("Notion-Version", &self.settings.version);
-            if !body.is_null() {
-                request = request.json(body);
-            }
-            let (kind, code, retry_after) = match request.send().await {
-                Err(error) => (
-                    NotionErrorKind::Transient,
-                    if error.is_timeout() {
-                        "timeout"
-                    } else {
-                        "connection failed"
-                    }
-                    .to_string(),
-                    None,
-                ),
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let retry_after = header_seconds(response.headers());
-                    let text = response.text().await.unwrap_or_default();
-                    if (200..300).contains(&status) {
-                        return serde_json::from_str(&text).map_err(|_| {
-                            NotionError::new(NotionErrorKind::BadResponse, "response is not JSON")
-                        });
-                    }
-                    let kind = match status {
-                        401 => NotionErrorKind::Auth,
-                        403 => NotionErrorKind::Permission,
-                        404 => NotionErrorKind::NotFound,
-                        429 | 529 => NotionErrorKind::RateLimited,
-                        409 | 500..=599 => NotionErrorKind::Transient,
-                        _ => NotionErrorKind::BadRequest,
-                    };
-                    (
-                        kind,
-                        format!("HTTP {status} {}", error_code(&text)),
-                        retry_after,
-                    )
-                }
+            let (kind, code, retry_after) = match self.send_once(&method, &url, body).await {
+                Ok(value) => return Ok(value),
+                Err(failure) => failure,
             };
             let again = match kind {
                 NotionErrorKind::RateLimited => true,
@@ -355,8 +439,13 @@ impl<'a> NotionClient<'a> {
         }
     }
 
-    /// `data_source` 에서 글 칸 `property` 가 `value` 와 같은 페이지들(휴지통 뺌),
-    /// 만든 순서대로.
+    async fn query(&mut self, data_source: &str, body: Value) -> Result<Value, NotionError> {
+        let path = format!("/v1/data_sources/{data_source}/query");
+        self.call(reqwest::Method::POST, &path, &body, Replay::Safe)
+            .await
+    }
+
+    /// `data_source` 에서 글 칸 `property` 가 `value` 와 같은 페이지들(휴지통 뺌).
     async fn find_by_text(
         &mut self,
         data_source: &str,
@@ -368,99 +457,164 @@ impl<'a> NotionClient<'a> {
             "sorts": [{ "timestamp": "created_time", "direction": "ascending" }],
             "page_size": 10
         });
-        let path = format!("/v1/data_sources/{data_source}/query");
-        let result = self
-            .call(reqwest::Method::POST, &path, &body, Replay::Safe)
-            .await?;
-        let results = result["results"].as_array().ok_or_else(|| {
-            NotionError::new(NotionErrorKind::BadResponse, "query answer has no results")
-        })?;
-        Ok(results
+        let result = self.query(data_source, body).await?;
+        live_results(&result)
+    }
+
+    /// 이 채널에서 `sessions` 와 세션이 하나라도 겹치는 회의 페이지들(휴지통 뺌).
+    async fn find_meeting_pages(
+        &mut self,
+        channel: Uuid,
+        sessions: &[Uuid],
+    ) -> Result<Vec<Value>, NotionError> {
+        use minutes_property::HUDDLE_ID;
+        let any_session: Vec<Value> = sessions
             .iter()
-            .filter(|page| page["in_trash"] != Value::Bool(true))
-            .cloned()
+            .map(|session| {
+                json!({ "property": HUDDLE_ID, "rich_text": { "contains": session.to_string() } })
+            })
+            .collect();
+        let body = json!({
+            "filter": { "and": [
+                { "property": HUDDLE_ID, "rich_text": { "starts_with": format!("{channel}:") } },
+                { "or": any_session }
+            ] },
+            "sorts": [{ "timestamp": "created_time", "direction": "ascending" }],
+            "page_size": 100
+        });
+        let data_source = self.settings.minutes_data_source_id.clone();
+        let result = self.query(&data_source, body).await?;
+        Ok(live_results(&result)?
+            .into_iter()
+            .filter(|page| same_meeting(page, channel, sessions))
             .collect())
     }
 
-    /// 페이지를 만든다. 일시 오류로 답을 못 받으면 만들어졌는지 `key` 로 다시
-    /// 찾아보고, 없을 때만 한 번 더 만든다(두 번 만들지 않으려고).
-    async fn create_unless_exists(
+    /// 페이지 하나. 없으면 `None`.
+    async fn get_page(&mut self, page_id: &str) -> Result<Option<Value>, NotionError> {
+        match self
+            .call(
+                reqwest::Method::GET,
+                &format!("/v1/pages/{page_id}"),
+                &Value::Null,
+                Replay::Safe,
+            )
+            .await
+        {
+            Ok(page) => Ok(Some(page)),
+            Err(error) if error.kind == NotionErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 페이지를 만든다(다시 보내지 않음). 503 이면서 노션이 만든 id 를 알려 주면 그 id.
+    async fn create_page(
         &mut self,
         data_source: &str,
-        key_property: &str,
-        key: &str,
-        properties: Map<String, Value>,
+        properties: &Map<String, Value>,
     ) -> Result<String, NotionError> {
         let body = json!({
             "parent": { "type": "data_source_id", "data_source_id": data_source },
             "properties": properties
         });
-        let mut checked = false;
-        loop {
-            match self
-                .call(
-                    reqwest::Method::POST,
-                    "/v1/pages",
-                    &body,
-                    Replay::RejectedOnly,
-                )
-                .await
-            {
-                Ok(page) => return page_id(&page),
-                Err(error) if error.kind == NotionErrorKind::Transient && !checked => {
-                    checked = true;
-                    if let Some(page) = self
-                        .find_by_text(data_source, key_property, key)
-                        .await?
-                        .first()
-                    {
-                        return page_id(page);
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let page = self
+            .call(
+                reqwest::Method::POST,
+                "/v1/pages",
+                &body,
+                Replay::RejectedOnly,
+            )
+            .await?;
+        page_id(&page)
     }
 
-    async fn update_properties(
+    async fn update_page(
         &mut self,
         page_id: &str,
-        properties: Map<String, Value>,
+        body: Value,
+        notify: Notify,
     ) -> Result<(), NotionError> {
-        let body = json!({ "properties": properties });
         self.call(
             reqwest::Method::PATCH,
             &format!("/v1/pages/{page_id}"),
-            &body,
+            &with_notify(body, notify),
             Replay::Safe,
         )
         .await
         .map(drop)
     }
 
-    /// 본문을 통째로 지우고 `chunks` 를 차례로 붙인다. 붙인 요청 수를 돌려준다.
-    async fn replace_body(
+    async fn set_status(
         &mut self,
         page_id: &str,
-        chunks: &[Vec<Value>],
-    ) -> Result<usize, NotionError> {
+        status: ProcessingStatus,
+        notify: Notify,
+    ) -> Result<(), NotionError> {
+        let body = json!({ "properties": {
+            minutes_property::STATUS: { "select": { "name": status.as_str() } }
+        } });
+        self.update_page(page_id, body, notify).await
+    }
+
+    async fn trash_page(&mut self, page_id: &str) -> Result<(), NotionError> {
+        self.update_page(page_id, json!({ "in_trash": true }), Notify::Silent)
+            .await
+    }
+
+    /// 페이지 바로 아래 블록 전부(차례대로).
+    async fn list_children(&mut self, block_id: &str) -> Result<Vec<Value>, NotionError> {
+        let mut blocks = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut path = format!("/v1/blocks/{block_id}/children?page_size=100");
+            if let Some(cursor) = &cursor {
+                path.push_str(&format!("&start_cursor={cursor}"));
+            }
+            let page = self
+                .call(reqwest::Method::GET, &path, &Value::Null, Replay::Safe)
+                .await?;
+            let results = page["results"].as_array().ok_or_else(|| {
+                NotionError::new(NotionErrorKind::BadResponse, "children have no results")
+            })?;
+            blocks.extend(results.iter().cloned());
+            match (page["has_more"].as_bool(), page["next_cursor"].as_str()) {
+                (Some(true), Some(next)) => cursor = Some(next.to_string()),
+                _ => return Ok(blocks),
+            }
+        }
+    }
+
+    async fn append_children(
+        &mut self,
+        block_id: &str,
+        children: &[Value],
+        notify: Notify,
+    ) -> Result<(), NotionError> {
         self.call(
             reqwest::Method::PATCH,
-            &format!("/v1/pages/{page_id}"),
-            &json!({ "erase_content": true }),
-            Replay::Safe,
+            &format!("/v1/blocks/{block_id}/children"),
+            &with_notify(json!({ "children": children }), notify),
+            Replay::RejectedOnly,
         )
-        .await?;
-        for chunk in chunks {
-            self.call(
-                reqwest::Method::PATCH,
-                &format!("/v1/blocks/{page_id}/children"),
-                &json!({ "children": chunk }),
-                Replay::RejectedOnly,
+        .await
+        .map(drop)
+    }
+
+    /// 블록 하나를 지운다. 이미 없으면 된 것으로 본다.
+    async fn delete_block(&mut self, block_id: &str) -> Result<(), NotionError> {
+        match self
+            .call(
+                reqwest::Method::DELETE,
+                &format!("/v1/blocks/{block_id}"),
+                &Value::Null,
+                Replay::Safe,
             )
-            .await?;
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind == NotionErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
-        Ok(chunks.len())
     }
 }
 
@@ -469,6 +623,57 @@ fn page_id(page: &Value) -> Result<String, NotionError> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| NotionError::new(NotionErrorKind::BadResponse, "page has no id"))
+}
+
+/// query 결과에서 휴지통에 없는 페이지들.
+fn live_results(result: &Value) -> Result<Vec<Value>, NotionError> {
+    let results = result["results"].as_array().ok_or_else(|| {
+        NotionError::new(NotionErrorKind::BadResponse, "query answer has no results")
+    })?;
+    Ok(results
+        .iter()
+        .filter(|page| page["in_trash"] != Value::Bool(true))
+        .cloned()
+        .collect())
+}
+
+/// 칸 값의 글(`title`·`rich_text` 조각의 `plain_text` 를 이은 것).
+fn property_text(value: &Value) -> String {
+    ["title", "rich_text"]
+        .iter()
+        .filter_map(|key| value[*key].as_array())
+        .flatten()
+        .filter_map(|run| run["plain_text"].as_str())
+        .collect()
+}
+
+/// "허들 ID" 칸 값: `{channel_id}:{세션 id,세션 id,…}`(세션은 시작 순).
+pub fn huddle_key(transcript: &Transcript) -> String {
+    let sessions: Vec<String> = transcript
+        .session_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    format!("{}:{}", transcript.channel_id, sessions.join(","))
+}
+
+/// "허들 ID" 칸 값을 채널과 세션들로.
+pub fn parse_huddle_key(key: &str) -> Option<(Uuid, Vec<Uuid>)> {
+    let (channel, sessions) = key.split_once(':')?;
+    let channel = channel.trim().parse().ok()?;
+    let sessions = sessions
+        .split(',')
+        .filter_map(|session| session.trim().parse().ok())
+        .collect();
+    Some((channel, sessions))
+}
+
+/// 같은 채널이고 세션이 하나라도 겹치는 회의 페이지인가.
+fn same_meeting(page: &Value, channel: Uuid, sessions: &[Uuid]) -> bool {
+    let key = property_text(&page["properties"][minutes_property::HUDDLE_ID]);
+    parse_huddle_key(&key).is_some_and(|(page_channel, page_sessions)| {
+        page_channel == channel && page_sessions.iter().any(|s| sessions.contains(s))
+    })
 }
 
 /// 노션에 올릴 회의 하나.
@@ -489,25 +694,34 @@ pub struct MeetingPage<'a> {
     pub status: ProcessingStatus,
 }
 
-/// 노션 쓰기 결과(개수와 page id 만).
+/// 노션 쓰기 결과(개수와 page id 만). 하는 대로 채워서, 중간에 실패해도 그때까지
+/// 만든 것이 남는다.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PublishReport {
     /// 회의 페이지 id.
     pub page_id: String,
     /// 이번에 새로 만들었나(아니면 있던 것을 고침).
     pub created: bool,
-    /// 같은 허들 ID 로 이미 여러 장 있던 경우, 가장 먼저 만든 것 말고 남은 수.
-    pub duplicates: usize,
+    /// 같은 회의 페이지가 여러 장이라 휴지통으로 보낸 페이지 id.
+    pub trashed_duplicates: Vec<String>,
     /// 본문 블록 수.
     pub blocks: usize,
     /// 본문 붙이기 요청 수(마지막 시도).
     pub append_requests: usize,
+    /// 새 본문을 붙인 뒤 지운 옛 블록 수(마지막 시도).
+    pub deleted_old_blocks: usize,
+    /// 체크 상태를 이어받은 할 일 수.
+    pub kept_checked: usize,
     /// 본문 쓰기를 처음부터 한 횟수.
     pub body_attempts: u32,
     /// 담당자 연결 DB 에 새로 더한 줄 id.
     pub people_rows_added: Vec<String>,
-    /// 노션 사용자가 연결돼 있어 멘션할 수 있는 참석자 수.
+    /// "확인됨" 줄에 노션 사용자가 있어 멘션할 수 있는 참석자 수.
     pub people_linked: usize,
+    /// 담당자 연결 DB 를 못 다뤘을 때 그 까닭(회의록은 그래도 쓴다).
+    pub people_error: Option<String>,
+    /// 본문 쓰기에 실패했는데 "실패" 표시까지 못 해서 "처리 중"으로 남았을 수 있다.
+    pub stuck_in_progress: bool,
 }
 
 /// 참석자 pubkey: 참석자 목록 순서, 그다음 목록에 없는 화자.
@@ -553,11 +767,12 @@ pub fn text_runs(content: &str, link: Option<&str>) -> Vec<Value> {
 }
 
 /// `kind` 블록. 조각이 100개를 넘으면 같은 종류 블록 여러 개로 나눈다.
-fn blocks(kind: &str, runs: Vec<Value>) -> Vec<Value> {
+/// 할 일(`to_do`)이면 `checked` 를 넣는다.
+fn blocks(kind: &str, runs: Vec<Value>, checked: bool) -> Vec<Value> {
     let make = |rich_text: &[Value]| {
         let mut inner = json!({ "rich_text": rich_text });
         if kind == "to_do" {
-            inner["checked"] = Value::Bool(false);
+            inner["checked"] = Value::Bool(checked);
         }
         json!({ "object": "block", "type": kind, kind: inner })
     };
@@ -565,6 +780,10 @@ fn blocks(kind: &str, runs: Vec<Value>) -> Vec<Value> {
         return vec![make(&[])];
     }
     runs.chunks(MAX_RICH_TEXT_ITEMS).map(make).collect()
+}
+
+fn paragraph(text: &str) -> Vec<Value> {
+    blocks("paragraph", text_runs(text, None), false)
 }
 
 fn heading(text: &str) -> Value {
@@ -585,6 +804,13 @@ pub fn playback_link(template: &str, transcript: &Transcript, start_ms: u64) -> 
     template
         .replace("{channel_id}", &transcript.channel_id.to_string())
         .replace("{start_ms}", &start_ms.to_string())
+}
+
+/// 노션 본문 글에 걸 수 있는 링크 모양인가. 2026-10-12 실제 시험에서 노션은
+/// 본문 링크로 `buzz://`(어느 경로든)를 "Invalid URL for link" 로 거절했고
+/// `https://` 는 받았다. ("앱에서 열기" url 칸은 `buzz://` 도 받는다.)
+pub fn linkable_in_body(link_template: &str) -> bool {
+    link_template.starts_with("https://") || link_template.starts_with("http://")
 }
 
 /// UTC 시각 글을 KST 로(`2026-10-12T14:00:00.000+09:00`). 못 읽으면 그대로.
@@ -659,26 +885,51 @@ pub fn page_properties(
     );
     put(
         p::HUDDLE_ID,
-        json!({ "rich_text": text_runs(&huddle_id(transcript), None) }),
+        json!({ "rich_text": text_runs(&huddle_key(transcript), None) }),
     );
     put(p::STATUS, json!({ "select": { "name": status.as_str() } }));
     properties
 }
 
-/// 노션 본문 글에 걸 수 있는 링크 모양인가. 2026-10-12 실제 시험에서 노션은
-/// 본문 링크로 `buzz://`(어느 경로든)를 "Invalid URL for link" 로 거절했고
-/// `https://` 는 받았다. ("앱에서 열기" url 칸은 `buzz://` 도 받는다.)
-pub fn linkable_in_body(link_template: &str) -> bool {
-    link_template.starts_with("https://") || link_template.starts_with("http://")
+/// 할 일 글을 비교용으로(글자·숫자만, 소문자).
+fn todo_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// 옛 본문에서 체크된 할 일의 글(비교용).
+fn checked_todos(old: &[Value]) -> HashSet<String> {
+    old.iter()
+        .filter(|block| block["type"] == "to_do" && block["to_do"]["checked"] == true)
+        .map(|block| {
+            let text: String = block["to_do"]["rich_text"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|run| {
+                    run["plain_text"]
+                        .as_str()
+                        .or_else(|| run["text"]["content"].as_str())
+                        .unwrap_or("")
+                })
+                .collect();
+            let task = text.split(TASK_SEPARATOR).next().unwrap_or("");
+            todo_key(task)
+        })
+        .collect()
 }
 
 /// 회의 페이지 본문 블록, 순서대로.
-/// `people` 은 pubkey → 노션 사용자 id(연결된 사람만).
-/// 링크 모양이 본문에 걸 수 없는 것([`linkable_in_body`])이면 시각은 링크 없는 글로 넣는다.
+/// `people` 은 pubkey → 노션 사용자 id("확인됨" 줄만). `checked` 는 옛 본문에서
+/// 체크돼 있던 할 일 글([`todo_key`]). 링크 모양이 본문에 걸 수 없는 것
+/// ([`linkable_in_body`])이면 시각은 링크 없는 글로 넣는다.
 pub fn body_blocks(
     page: &MeetingPage<'_>,
     people: &HashMap<String, String>,
     link_template: &str,
+    checked: &HashSet<String>,
 ) -> Vec<Value> {
     let transcript = page.transcript;
     let linkable = linkable_in_body(link_template);
@@ -697,15 +948,15 @@ pub fn body_blocks(
             .filter(|line| !line.is_empty())
             .collect();
         if paragraphs.is_empty() {
-            out.extend(blocks("paragraph", text_runs("없음", None)));
+            out.extend(paragraph("없음"));
         }
-        for paragraph in paragraphs {
-            out.extend(blocks("paragraph", text_runs(paragraph, None)));
+        for text in paragraphs {
+            out.extend(paragraph(text));
         }
 
         out.push(heading("결정사항"));
         if summary.decisions.is_empty() {
-            out.extend(blocks("paragraph", text_runs("없음", None)));
+            out.extend(paragraph("없음"));
         }
         for decision in &summary.decisions {
             let mut runs = text_runs(&decision.text, None);
@@ -713,16 +964,17 @@ pub fn body_blocks(
                 runs.extend(text_runs(" ", None));
                 runs.extend(time_link(ms));
             }
-            out.extend(blocks("bulleted_list_item", runs));
+            out.extend(blocks("bulleted_list_item", runs, false));
         }
 
         out.push(heading("할 일"));
         if summary.action_items.is_empty() {
-            out.extend(blocks("paragraph", text_runs("없음", None)));
+            out.extend(paragraph("없음"));
         }
         for item in &summary.action_items {
             let mut runs = text_runs(&item.text, None);
-            runs.extend(text_runs(" · 담당: ", None));
+            runs.extend(text_runs(TASK_SEPARATOR, None));
+            runs.extend(text_runs(" ", None));
             match item.assignee_pubkey.as_deref() {
                 Some(pubkey) => match people.get(pubkey) {
                     Some(user) => runs.push(json!({
@@ -733,15 +985,22 @@ pub fn body_blocks(
                 },
                 None => runs.extend(text_runs("미정", None)),
             }
+            // 검사를 통과한 근거 글만 따옴표로 보여 준다.
+            if let Some(quote) = item.assignee_quote.as_deref() {
+                runs.extend(text_runs(&format!(" (“{quote}”)"), None));
+            }
             runs.extend(text_runs(" · 기한: ", None));
-            match (&item.due, &item.due_quote) {
-                (Some(due), _) => runs.push(json!({
+            match &item.due {
+                Some(due) => runs.push(json!({
                     "type": "mention",
                     "mention": { "type": "date", "date": { "start": due } }
                 })),
-                // 기한 말은 있었는데 날짜로 못 풀었으면 그 말을 그대로 보여 준다.
-                (None, Some(quote)) => runs.extend(text_runs(&format!("“{quote}”"), None)),
-                (None, None) => runs.extend(text_runs("없음", None)),
+                None if item.due_quote.is_some() => {}
+                None => runs.extend(text_runs("없음", None)),
+            }
+            if let Some(quote) = item.due_quote.as_deref() {
+                let space = if item.due.is_some() { " " } else { "" };
+                runs.extend(text_runs(&format!("{space}(“{quote}”)"), None));
             }
             if item.status == ItemStatus::Unsure {
                 runs.extend(text_runs(" · 애매", None));
@@ -750,12 +1009,13 @@ pub fn body_blocks(
                 runs.extend(text_runs(" ", None));
                 runs.extend(time_link(ms));
             }
-            out.extend(blocks("to_do", runs));
+            let done = checked.contains(&todo_key(&item.text));
+            out.extend(blocks("to_do", runs, done));
         }
 
         out.push(heading("주제별 정리"));
         if summary.topics.is_empty() {
-            out.extend(blocks("paragraph", text_runs("없음", None)));
+            out.extend(paragraph("없음"));
         }
         for topic in &summary.topics {
             let mut runs = text_runs(&topic.title, None);
@@ -763,9 +1023,9 @@ pub fn body_blocks(
                 runs.extend(text_runs(" ", None));
                 runs.extend(time_link(ms));
             }
-            out.extend(blocks("heading_3", runs));
+            out.extend(blocks("heading_3", runs, false));
             for point in &topic.points {
-                out.extend(blocks("bulleted_list_item", text_runs(point, None)));
+                out.extend(blocks("bulleted_list_item", text_runs(point, None), false));
             }
         }
     }
@@ -774,7 +1034,7 @@ pub fn body_blocks(
     let mut segments: Vec<_> = transcript.segments.iter().collect();
     segments.sort_by_key(|segment| segment.start_ms);
     if segments.is_empty() {
-        out.extend(blocks("paragraph", text_runs("없음", None)));
+        out.extend(paragraph("없음"));
     }
     for segment in segments {
         let mut runs = time_link(segment.start_ms);
@@ -783,9 +1043,42 @@ pub fn body_blocks(
             &format!(" {name}: {}", segment.text.trim()),
             None,
         ));
-        out.extend(blocks("paragraph", runs));
+        out.extend(blocks("paragraph", runs, false));
     }
     out
+}
+
+/// 새 본문을 붙이기 전에 노션 한도를 넘는 블록이 없는지 본다(조각 100개,
+/// 글 2000자, 링크 2000자·http(s) 만).
+pub fn validate_blocks(blocks: &[Value]) -> Result<(), NotionError> {
+    let bad = |index: usize, what: &str| {
+        Err(NotionError::new(
+            NotionErrorKind::BadRequest,
+            format!("block {index}: {what}"),
+        ))
+    };
+    for (index, block) in blocks.iter().enumerate() {
+        let kind = block["type"].as_str().unwrap_or("");
+        let runs = block[kind]["rich_text"].as_array();
+        let Some(runs) = runs else {
+            return bad(index, "no rich_text");
+        };
+        if runs.len() > MAX_RICH_TEXT_ITEMS {
+            return bad(index, "more than 100 text pieces");
+        }
+        for run in runs {
+            let text = run["text"]["content"].as_str().unwrap_or("");
+            if text.encode_utf16().count() > MAX_TEXT_UNITS {
+                return bad(index, "text piece over 2000");
+            }
+            if let Some(url) = run["text"]["link"]["url"].as_str() {
+                if url.encode_utf16().count() > MAX_TEXT_UNITS || !linkable_in_body(url) {
+                    return bad(index, "link Notion will not take");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 블록을 요청 단위로 나눈다: 100개, 그리고 요청 크기 한도 안.
@@ -811,8 +1104,9 @@ pub fn chunk_blocks(blocks: Vec<Value>) -> Vec<Vec<Value>> {
 }
 
 /// 참석자마다 "허들 담당자 연결" 줄을 찾고, 없으면 이름과 pubkey 만 넣어 한 줄
-/// 만든다. 있는 줄은 읽기만 한다. pubkey → 노션 사용자 id(연결된 사람만)를
-/// 돌려주고, 새로 만든 줄 id 는 만들 때마다 `added` 에 더한다(중간에 실패해도 남게).
+/// 만든다. 있는 줄은 읽기만 한다. "확인됨"이 체크되고 "노션 사용자"가 있는 줄만
+/// pubkey → 노션 사용자 id 로 돌려준다. 새로 만든 줄 id 는 만들 때마다 `added`
+/// 에 더한다(중간에 실패해도 남게).
 pub async fn link_people(
     client: &mut NotionClient<'_>,
     transcript: &Transcript,
@@ -825,8 +1119,9 @@ pub async fn link_people(
     for pubkey in attendee_pubkeys(transcript) {
         let rows = client.find_by_text(&data_source, p::PUBKEY, pubkey).await?;
         if let Some(row) = rows.first() {
+            let confirmed = row["properties"][p::CONFIRMED]["checkbox"] == Value::Bool(true);
             let user = row["properties"][p::NOTION_USER]["people"][0]["id"].as_str();
-            if let Some(user) = user {
+            if let (true, Some(user)) = (confirmed, user) {
                 linked.insert(pubkey.to_string(), user.to_string());
             }
             continue;
@@ -840,27 +1135,153 @@ pub async fn link_people(
             p::PUBKEY.into(),
             json!({ "rich_text": text_runs(pubkey, None) }),
         );
-        let id = client
-            .create_unless_exists(&data_source, p::PUBKEY, pubkey, properties)
-            .await?;
+        let id = match client.create_page(&data_source, &properties).await {
+            Ok(id) => id,
+            // 만들어졌는데 답만 못 받았을 수 있으니 다시 찾아보고, 없을 때만 한 번 더.
+            Err(error) if error.kind == NotionErrorKind::Transient => {
+                match client
+                    .find_by_text(&data_source, p::PUBKEY, pubkey)
+                    .await?
+                    .first()
+                {
+                    Some(row) => page_id(row)?,
+                    None => client.create_page(&data_source, &properties).await?,
+                }
+            }
+            Err(error) => return Err(error),
+        };
         added.push(id);
     }
     Ok(linked)
 }
 
-/// 회의 하나를 노션에 쓴다. 허들 ID 로 찾아 있으면 고치고, 없으면 만든다.
-/// 쓰는 동안 "처리 상태"는 "처리 중", 다 쓰면 `page.status`, 본문 쓰기에
-/// 실패하면 "실패"로 둔다. `report` 는 하는 대로 채워서, 중간에 실패해도
-/// 만든 페이지·줄 id 가 남는다.
+/// 같은 회의 페이지들 가운데 가장 먼저 만든 것(만든 시각, 그다음 id 순)만 남기고
+/// 나머지는 휴지통으로. 남긴 id 를 돌려준다. 두 작업기가 같은 목록을 보면 같은
+/// 것을 남긴다.
+async fn keep_earliest(
+    client: &mut NotionClient<'_>,
+    mut pages: Vec<(String, String)>,
+    report: &mut PublishReport,
+) -> Result<Option<String>, NotionError> {
+    pages.sort();
+    pages.dedup_by(|a, b| a.1 == b.1);
+    let mut pages = pages.into_iter();
+    let Some((_, keep)) = pages.next() else {
+        return Ok(None);
+    };
+    for (_, extra) in pages {
+        client.trash_page(&extra).await?;
+        report.trashed_duplicates.push(extra);
+    }
+    Ok(Some(keep))
+}
+
+/// (만든 시각, id) 목록.
+fn created_and_ids(pages: &[Value]) -> Vec<(String, String)> {
+    pages
+        .iter()
+        .filter_map(|page| {
+            let id = page["id"].as_str()?.to_string();
+            let created = page["created_time"].as_str().unwrap_or("").to_string();
+            Some((created, id))
+        })
+        .collect()
+}
+
+/// 회의 페이지를 만든다. 일시 오류로 답을 못 받으면 만들어졌는지 다시 찾아보고,
+/// 없을 때만 한 번 더 만든다.
+async fn create_meeting_page(
+    client: &mut NotionClient<'_>,
+    transcript: &Transcript,
+    properties: &Map<String, Value>,
+) -> Result<String, NotionError> {
+    let data_source = client.settings.minutes_data_source_id.clone();
+    match client.create_page(&data_source, properties).await {
+        Ok(id) => Ok(id),
+        Err(error) if error.kind == NotionErrorKind::Transient => {
+            let found = client
+                .find_meeting_pages(transcript.channel_id, &transcript.session_ids)
+                .await?;
+            match found.first() {
+                Some(page) => page_id(page),
+                None => client.create_page(&data_source, properties).await,
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 본문 한 번 쓰기: 옛 블록을 읽고(체크 상태도), 새 본문을 만들어 한도를 확인한
+/// 뒤 다 붙이고, 그다음에 옛 블록을 지운다.
+async fn write_body(
+    client: &mut NotionClient<'_>,
+    page_id: &str,
+    page: &MeetingPage<'_>,
+    people: &HashMap<String, String>,
+    notify: Notify,
+    report: &mut PublishReport,
+) -> Result<(), NotionError> {
+    let old = client.list_children(page_id).await?;
+    let checked = checked_todos(&old);
+    let link = client.settings.playback_link.clone();
+    let body = body_blocks(page, people, &link, &checked);
+    validate_blocks(&body)?;
+    report.blocks = body.len();
+    report.kept_checked = body
+        .iter()
+        .filter(|block| block["to_do"]["checked"] == true)
+        .count();
+    let chunks = chunk_blocks(body);
+    report.append_requests = 0;
+    for chunk in &chunks {
+        client.append_children(page_id, chunk, notify).await?;
+        report.append_requests += 1;
+    }
+    report.deleted_old_blocks = 0;
+    for block in &old {
+        if let Some(id) = block["id"].as_str() {
+            client.delete_block(id).await?;
+            report.deleted_old_blocks += 1;
+        }
+    }
+    Ok(())
+}
+
+/// "실패" 표시를 기다렸다가 여러 번 해 본다. 끝내 못 하면 `false`.
+async fn mark_failed(client: &mut NotionClient<'_>, page_id: &str) -> bool {
+    let mut wait = client.settings.failed_mark_wait;
+    for attempt in 0..FAILED_MARK_ATTEMPTS {
+        if client
+            .set_status(page_id, ProcessingStatus::Failed, Notify::Silent)
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        if attempt + 1 < FAILED_MARK_ATTEMPTS {
+            tokio::time::sleep(wait).await;
+            wait *= 2;
+        }
+    }
+    false
+}
+
+/// 회의 하나를 노션에 쓴다. `known_page_id` 는 지난번에 남긴 page id(있으면 그것부터).
+/// 없거나 맞지 않으면 세션이 겹치는 페이지를 찾고, 그래도 없으면 만든다.
+/// 쓰는 동안 "처리 상태"는 "처리 중", 다 쓰면 `page.status`, 본문 쓰기에 실패하면
+/// "실패"로 둔다. `report` 는 하는 대로 채운다.
+///
+/// 같은 회의를 동시에 두 번 쓰지 않도록 작업기의 회의 잠금 안에서 부른다
+/// ([`publish_held`]).
 pub async fn publish(
     client: &mut NotionClient<'_>,
     page: &MeetingPage<'_>,
+    known_page_id: Option<&str>,
     report: &mut PublishReport,
 ) -> Result<(), NotionError> {
     let transcript = page.transcript;
-    let key = huddle_id(transcript);
     if let Some(summary) = page.summary {
-        if summary.huddle_id != key {
+        if summary.huddle_id != huddle_id(transcript) {
             return Err(NotionError::new(
                 NotionErrorKind::BadRequest,
                 "summary belongs to another huddle",
@@ -868,79 +1289,223 @@ pub async fn publish(
         }
     }
     let settings = client.settings;
-    let people = link_people(
+    let (channel, sessions) = (transcript.channel_id, &transcript.session_ids);
+
+    // 담당자 연결 DB 를 못 다뤄도 회의록은 쓴다(멘션만 빠진다).
+    let people = match link_people(
         client,
         transcript,
         page.names,
         &mut report.people_rows_added,
     )
-    .await?;
+    .await
+    {
+        Ok(people) => people,
+        Err(error) => {
+            report.people_error = Some(error.to_string());
+            HashMap::new()
+        }
+    };
     report.people_linked = people.len();
 
-    let found = client
-        .find_by_text(
-            &settings.minutes_data_source_id,
-            minutes_property::HUDDLE_ID,
-            &key,
-        )
-        .await?;
-    report.duplicates = found.len().saturating_sub(1);
+    // 1) 지난번에 남긴 page id. 2) 세션이 겹치는 페이지. 3) 새로 만든다.
+    let mut found_id = None;
+    if let Some(id) = known_page_id {
+        if let Some(existing) = client.get_page(id).await? {
+            if existing["in_trash"] != Value::Bool(true)
+                && same_meeting(&existing, channel, sessions)
+            {
+                found_id = Some(id.to_string());
+            }
+        }
+    }
+    if found_id.is_none() {
+        let found = client.find_meeting_pages(channel, sessions).await?;
+        found_id = keep_earliest(client, created_and_ids(&found), report).await?;
+    }
     let working = page_properties(page, ProcessingStatus::InProgress, &settings.playback_link);
-    let page_id = match found.first() {
-        Some(existing) => {
-            let id = page_id(existing)?;
+    let page_id = match found_id {
+        Some(id) => {
             report.page_id = id.clone();
-            client.update_properties(&id, working).await?;
+            client
+                .update_page(&id, json!({ "properties": working }), Notify::Silent)
+                .await?;
             id
         }
         None => {
-            let id = client
-                .create_unless_exists(
-                    &settings.minutes_data_source_id,
-                    minutes_property::HUDDLE_ID,
-                    &key,
-                    working,
-                )
-                .await?;
+            let id = create_meeting_page(client, transcript, &working).await?;
             report.page_id = id.clone();
             report.created = true;
-            id
+            // 만든 뒤 다시 찾아 두 장 이상이면 늦게 만든 쪽을 휴지통으로. 방금 만든
+            // 것이 아직 안 보이면 가장 늦게 만든 것으로 끼워 넣는다.
+            let found = client.find_meeting_pages(channel, sessions).await?;
+            let mut pages = created_and_ids(&found);
+            if !pages.iter().any(|(_, page)| *page == id) {
+                pages.push(("~".to_string(), id.clone()));
+            }
+            let keep = keep_earliest(client, pages, report)
+                .await?
+                .unwrap_or_else(|| id.clone());
+            if keep != id {
+                report.page_id = keep.clone();
+                report.created = false;
+            }
+            keep
         }
     };
+    let notify = if report.created {
+        Notify::Default
+    } else {
+        Notify::Silent
+    };
 
-    let body = body_blocks(page, &people, &settings.playback_link);
-    report.blocks = body.len();
-    let chunks = chunk_blocks(body);
     let mut attempts = 0;
-    let append_requests = loop {
+    loop {
         attempts += 1;
         report.body_attempts = attempts;
-        match client.replace_body(&page_id, &chunks).await {
-            Ok(requests) => break requests,
-            // 붙이다 끊기면 일부만 들어갔을 수 있으니, 처음부터(지우기부터) 다시 한다.
-            Err(error)
-                if error.kind == NotionErrorKind::Transient
-                    && attempts < settings.body_attempts => {}
+        match write_body(client, &page_id, page, &people, notify, report).await {
+            Ok(()) => break,
+            // 붙이다 끊기면(429 포함) 처음부터: 지금 있는 블록을 다 옛 것으로 보고
+            // 새 본문을 다시 붙인 뒤 지운다.
+            Err(error) if error.kind.passes() && attempts < settings.body_attempts => {}
             Err(error) => {
-                let mut failed = Map::new();
-                failed.insert(
-                    minutes_property::STATUS.into(),
-                    json!({ "select": { "name": ProcessingStatus::Failed.as_str() } }),
-                );
-                // 실패 표시도 못 하면 처음 오류를 알리는 게 더 중요하다.
-                let _ = client.update_properties(&page_id, failed).await;
+                if !mark_failed(client, &page_id).await {
+                    report.stuck_in_progress = true;
+                }
                 return Err(error);
             }
         }
-    };
-    report.append_requests = append_requests;
+    }
+    client.set_status(&page_id, page.status, notify).await
+}
 
-    let mut done = Map::new();
-    done.insert(
-        minutes_property::STATUS.into(),
-        json!({ "select": { "name": page.status.as_str() } }),
-    );
-    client.update_properties(&page_id, done).await
+/// 작업기 저장소에 남기는 노션 기록(`huddle-notion/1`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotionRecord {
+    /// 늘 [`RECORD_FORMAT`].
+    pub format: String,
+    /// 회의 페이지 id.
+    pub page_id: String,
+    /// "허들 ID" 칸에 쓴 값.
+    pub huddle_key: String,
+}
+
+impl NotionRecord {
+    /// `transcript` 회의의 `page_id` 기록.
+    pub fn new(transcript: &Transcript, page_id: &str) -> Self {
+        Self {
+            format: RECORD_FORMAT.into(),
+            page_id: page_id.into(),
+            huddle_key: huddle_key(transcript),
+        }
+    }
+}
+
+/// [`publish_held`]·[`publish_meeting`] 실패.
+#[derive(Debug, thiserror::Error)]
+pub enum PublishMeetingError {
+    /// 작업기 저장소(잠금·기록)가 실패.
+    #[error(transparent)]
+    Home(#[from] MeetingError),
+    /// 노션이 실패.
+    #[error(transparent)]
+    Notion(#[from] NotionError),
+}
+
+/// 회의를 잡은(hold) 채로 부른다: 기록에서 page id 를 읽어 [`publish`] 하고,
+/// 페이지가 생겼으면(실패했어도) 기록을 남긴다. 기록을 못 읽으면 없는 것으로 친다.
+pub async fn publish_held<H: MinutesHome>(
+    home: &H,
+    meeting: &MeetingPlan,
+    client: &mut NotionClient<'_>,
+    page: &MeetingPage<'_>,
+    report: &mut PublishReport,
+) -> Result<(), PublishMeetingError> {
+    let known = home
+        .read_notion_record(meeting)
+        .await?
+        .and_then(|bytes| serde_json::from_slice::<NotionRecord>(&bytes).ok())
+        .map(|record| record.page_id);
+    let result = publish(client, page, known.as_deref(), report).await;
+    if !report.page_id.is_empty() {
+        let record = NotionRecord::new(page.transcript, &report.page_id);
+        let json = serde_json::to_vec_pretty(&record)
+            .map_err(|error| MeetingError::Io(std::io::Error::other(error)))?;
+        home.write_notion_record(meeting, json)
+            .await
+            .map_err(PublishMeetingError::Home)?;
+    }
+    result.map_err(PublishMeetingError::Notion)
+}
+
+/// 회의를 잡고 [`publish_held`] 를 한 뒤 놓는다. 다른 작업기가 잡고 있으면
+/// `Ok(false)`(다음 실행에 다시).
+pub async fn publish_meeting<H: MinutesHome>(
+    home: &H,
+    meeting: &MeetingPlan,
+    client: &mut NotionClient<'_>,
+    page: &MeetingPage<'_>,
+    report: &mut PublishReport,
+) -> Result<bool, PublishMeetingError> {
+    let Some(hold) = home.hold(meeting).await? else {
+        return Ok(false);
+    };
+    let done = publish_held(home, meeting, client, page, report).await;
+    let released = home.release(hold).await;
+    done?;
+    released?;
+    Ok(true)
+}
+
+/// 오래 "처리 중"으로 남은 페이지.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalePage {
+    /// 페이지 id.
+    pub page_id: String,
+    /// "허들 ID" 칸 값.
+    pub huddle_key: String,
+    /// 마지막으로 고친 때(UTC).
+    pub last_edited_time: String,
+}
+
+/// "처리 상태"가 "처리 중"이면서 `now` 보다 `older_than` 넘게 안 고친 페이지들
+/// (작업기가 쓰다 죽었을 수 있는 것).
+pub async fn find_stale(
+    client: &mut NotionClient<'_>,
+    older_than: Duration,
+    now: DateTime<Utc>,
+) -> Result<Vec<StalePage>, NotionError> {
+    let older = chrono::Duration::from_std(older_than).unwrap_or(chrono::Duration::zero());
+    let cutoff = (now - older).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let data_source = client.settings.minutes_data_source_id.clone();
+    let mut stale = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut body = json!({
+            "filter": { "and": [
+                { "property": minutes_property::STATUS,
+                  "select": { "equals": ProcessingStatus::InProgress.as_str() } },
+                { "timestamp": "last_edited_time", "last_edited_time": { "before": cutoff } }
+            ] },
+            "sorts": [{ "timestamp": "last_edited_time", "direction": "ascending" }],
+            "page_size": 100
+        });
+        if let Some(cursor) = &cursor {
+            body["start_cursor"] = json!(cursor);
+        }
+        let result = client.query(&data_source, body).await?;
+        for page in live_results(&result)? {
+            stale.push(StalePage {
+                page_id: page_id(&page)?,
+                huddle_key: property_text(&page["properties"][minutes_property::HUDDLE_ID]),
+                last_edited_time: page["last_edited_time"].as_str().unwrap_or("").into(),
+            });
+        }
+        match (result["has_more"].as_bool(), result["next_cursor"].as_str()) {
+            (Some(true), Some(next)) => cursor = Some(next.to_string()),
+            _ => return Ok(stale),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -949,6 +1514,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::runner::LocalMinutes;
     use crate::summary::{
         check_answer, ActionItem, Corrections, Decision, PubkeyPrefixNames, Topic, Usage,
         SUMMARY_FORMAT,
@@ -958,19 +1524,32 @@ mod tests {
     const A: &str = "aaaaaaaa00000000000000000000000000000000000000000000000000000001";
     const B: &str = "bbbbbbbb00000000000000000000000000000000000000000000000000000002";
 
-    /// 노션을 흉내 내는 상태: data source 별 페이지와 본문.
+    /// 노션을 흉내 내는 상태.
     #[derive(Default)]
     struct FakeNotion {
         pages: Vec<FakePage>,
-        /// 401·429 같은 걸 앞에서부터 하나씩 꺼내 답한다.
-        queued_errors: Vec<Reply>,
-        /// 붙이기 요청을 이 상태로 거절한다.
-        refuse_appends: Option<u16>,
+        /// 어느 요청이든 앞에서부터 하나씩 꺼내 답한다.
+        queued: Vec<Reply>,
+        /// 붙이기 요청에만 앞에서부터 꺼내 답한다.
+        append_failures: Vec<Reply>,
+        /// 페이지 고치기(PATCH /v1/pages)에만 앞에서부터 꺼내 답한다.
+        page_patch_failures: Vec<Reply>,
+        /// 회의 페이지를 만들기 바로 전에 다른 작업기가 먼저 한 장 만든다(한 번).
+        race_create: bool,
+        /// 회의 페이지를 만들고 503 + committed_resource_id 로 답한다(한 번).
+        commit_then_503: bool,
+        /// 회의 페이지를 만들고 답 본문을 중간에 끊는다(한 번).
+        cut_off_create: bool,
+        /// 담당자 연결 DB 를 403 으로 막는다.
+        people_forbidden: bool,
+        next_id: usize,
     }
 
     struct FakePage {
         id: String,
         data_source: String,
+        created_time: String,
+        last_edited_time: String,
         properties: Map<String, Value>,
         children: Vec<Value>,
         in_trash: bool,
@@ -988,19 +1567,12 @@ mod tests {
         value
     }
 
-    fn plain_text(value: &Value) -> String {
-        ["title", "rich_text"]
-            .iter()
-            .filter_map(|key| value[*key].as_array())
-            .flatten()
-            .filter_map(|run| run["plain_text"].as_str())
-            .collect()
-    }
-
     fn page_json(page: &FakePage) -> Value {
         json!({
             "object": "page",
             "id": page.id,
+            "created_time": page.created_time,
+            "last_edited_time": page.last_edited_time,
             "in_trash": page.in_trash,
             "properties": page.properties
         })
@@ -1020,26 +1592,94 @@ mod tests {
             })
     }
 
+    /// 노션 query filter 를 흉내 낸다(이 모듈이 쓰는 모양만).
+    fn matches(filter: &Value, page: &FakePage) -> bool {
+        if let Some(all) = filter["and"].as_array() {
+            return all.iter().all(|f| matches(f, page));
+        }
+        if let Some(any) = filter["or"].as_array() {
+            return any.iter().any(|f| matches(f, page));
+        }
+        if filter["timestamp"] == "last_edited_time" {
+            let before = filter["last_edited_time"]["before"].as_str().unwrap();
+            return page.last_edited_time.as_str() < before;
+        }
+        let property = filter["property"].as_str().unwrap();
+        let value = page
+            .properties
+            .get(property)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Some(select) = filter.get("select") {
+            return value["select"]["name"] == select["equals"];
+        }
+        let text = property_text(&value);
+        let condition = &filter["rich_text"];
+        if let Some(wanted) = condition["equals"].as_str() {
+            text == wanted
+        } else if let Some(part) = condition["contains"].as_str() {
+            text.contains(part)
+        } else if let Some(start) = condition["starts_with"].as_str() {
+            text.starts_with(start)
+        } else {
+            panic!("filter not faked: {filter}")
+        }
+    }
+
     impl FakeNotion {
+        fn stamp(&mut self) -> String {
+            self.next_id += 1;
+            format!(
+                "2026-10-12T07:{:02}:{:02}.000Z",
+                self.next_id / 60,
+                self.next_id % 60
+            )
+        }
+
+        fn new_page(&mut self, data_source: &str, properties: &Value) -> String {
+            let stamp = self.stamp();
+            let id = format!("page-{}", self.next_id);
+            let properties = properties
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), as_response(value.clone())))
+                .collect();
+            self.pages.push(FakePage {
+                id: id.clone(),
+                data_source: data_source.into(),
+                created_time: stamp.clone(),
+                last_edited_time: stamp,
+                properties,
+                children: Vec::new(),
+                in_trash: false,
+            });
+            id
+        }
+
+        fn page_mut(&mut self, id: &str) -> Option<&mut FakePage> {
+            self.pages.iter_mut().find(|page| page.id == id)
+        }
+
         fn answer(&mut self, request: &Recorded) -> Reply {
-            if !self.queued_errors.is_empty() {
-                return self.queued_errors.remove(0);
+            if !self.queued.is_empty() {
+                return self.queued.remove(0);
             }
             let body = request.json();
-            let path: Vec<&str> = request.path.trim_start_matches('/').split('/').collect();
-            match (request.method.as_str(), &path[..]) {
+            let path = request.path.split('?').next().unwrap_or("");
+            let query = request.path.split_once('?').map_or("", |(_, q)| q);
+            let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            let not_found = || Reply::json(404, &json!({ "code": "object_not_found" }));
+            match (request.method.as_str(), &parts[..]) {
                 ("POST", ["v1", "data_sources", source, "query"]) => {
-                    let property = body["filter"]["property"].as_str().unwrap();
-                    let wanted = body["filter"]["rich_text"]["equals"].as_str().unwrap();
+                    if self.people_forbidden && *source == PEOPLE_DATA_SOURCE_ID {
+                        return Reply::json(403, &json!({ "code": "restricted_resource" }));
+                    }
                     let results: Vec<Value> = self
                         .pages
                         .iter()
                         .filter(|page| page.data_source == *source)
-                        .filter(|page| {
-                            page.properties
-                                .get(property)
-                                .is_some_and(|value| plain_text(value) == wanted)
-                        })
+                        .filter(|page| matches(&body["filter"], page))
                         .map(page_json)
                         .collect();
                     Reply::json(
@@ -1048,29 +1688,49 @@ mod tests {
                     )
                 }
                 ("POST", ["v1", "pages"]) => {
-                    let id = format!("page-{}", self.pages.len() + 1);
-                    let properties = body["properties"]
-                        .as_object()
+                    let source = body["parent"]["data_source_id"]
+                        .as_str()
                         .unwrap()
-                        .iter()
-                        .map(|(key, value)| (key.clone(), as_response(value.clone())))
-                        .collect();
-                    self.pages.push(FakePage {
-                        id: id.clone(),
-                        data_source: body["parent"]["data_source_id"].as_str().unwrap().into(),
-                        properties,
-                        children: Vec::new(),
-                        in_trash: false,
-                    });
-                    Reply::json(200, &json!({ "object": "page", "id": id }))
-                }
-                ("PATCH", ["v1", "pages", id]) => {
-                    let Some(page) = self.pages.iter_mut().find(|page| page.id == *id) else {
-                        return Reply::json(404, &json!({ "code": "object_not_found" }));
-                    };
-                    if body["erase_content"] == Value::Bool(true) {
-                        page.children.clear();
+                        .to_string();
+                    if self.people_forbidden && source == PEOPLE_DATA_SOURCE_ID {
+                        return Reply::json(403, &json!({ "code": "restricted_resource" }));
                     }
+                    let minutes = source == MINUTES_DATA_SOURCE_ID;
+                    if minutes && std::mem::take(&mut self.race_create) {
+                        self.new_page(&source, &body["properties"]);
+                    }
+                    let id = self.new_page(&source, &body["properties"]);
+                    if minutes && std::mem::take(&mut self.commit_then_503) {
+                        return Reply::json(
+                            503,
+                            &json!({
+                                "object": "error", "status": 503, "code": "service_unavailable",
+                                "additional_data": {
+                                    "committed_resource_id": id,
+                                    "retry_guidance": "Read the object again to confirm the saved change."
+                                }
+                            }),
+                        );
+                    }
+                    let reply = Reply::json(200, &json!({ "object": "page", "id": id }));
+                    if minutes && std::mem::take(&mut self.cut_off_create) {
+                        return reply.cut_off();
+                    }
+                    reply
+                }
+                ("GET", ["v1", "pages", id]) => match self.page_mut(id) {
+                    Some(page) => Reply::json(200, &page_json(page)),
+                    None => not_found(),
+                },
+                ("PATCH", ["v1", "pages", id]) => {
+                    if !self.page_patch_failures.is_empty() {
+                        return self.page_patch_failures.remove(0);
+                    }
+                    let stamp = self.stamp();
+                    let Some(page) = self.page_mut(id) else {
+                        return not_found();
+                    };
+                    page.last_edited_time = stamp;
                     if let Some(properties) = body["properties"].as_object() {
                         for (key, value) in properties {
                             page.properties
@@ -1082,25 +1742,65 @@ mod tests {
                     }
                     Reply::json(200, &page_json(page))
                 }
+                ("GET", ["v1", "blocks", id, "children"]) => {
+                    let Some(page) = self.page_mut(id) else {
+                        return not_found();
+                    };
+                    let start: usize = query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("start_cursor="))
+                        .and_then(|cursor| cursor.parse().ok())
+                        .unwrap_or(0);
+                    let end = (start + 100).min(page.children.len());
+                    let more = end < page.children.len();
+                    Reply::json(
+                        200,
+                        &json!({
+                            "object": "list",
+                            "results": page.children[start..end],
+                            "has_more": more,
+                            "next_cursor": if more { json!(end.to_string()) } else { Value::Null }
+                        }),
+                    )
+                }
                 ("PATCH", ["v1", "blocks", id, "children"]) => {
-                    if let Some(status) = self.refuse_appends {
-                        return Reply::json(
-                            status,
-                            &json!({ "code": "validation_error", "message": "refused" }),
-                        );
+                    if !self.append_failures.is_empty() {
+                        return self.append_failures.remove(0);
                     }
-                    let children = body["children"].as_array().unwrap();
+                    let children = body["children"].as_array().unwrap().clone();
                     if children.len() > MAX_BLOCKS_PER_REQUEST || children.iter().any(too_long) {
                         return Reply::json(
                             400,
                             &json!({ "code": "validation_error", "message": "too big" }),
                         );
                     }
-                    let Some(page) = self.pages.iter_mut().find(|page| page.id == *id) else {
-                        return Reply::json(404, &json!({ "code": "object_not_found" }));
+                    let mut added = Vec::new();
+                    for mut child in children {
+                        self.next_id += 1;
+                        child["id"] = json!(format!("block-{}", self.next_id));
+                        // 응답처럼 글 조각에 plain_text 를 붙인다.
+                        let kind = child["type"].as_str().unwrap_or("").to_string();
+                        if let Some(runs) = child[&kind]["rich_text"].as_array_mut() {
+                            for run in runs {
+                                run["plain_text"] = run["text"]["content"].clone();
+                            }
+                        }
+                        added.push(child);
+                    }
+                    let Some(page) = self.page_mut(id) else {
+                        return not_found();
                     };
-                    page.children.extend(children.iter().cloned());
-                    Reply::json(200, &json!({ "object": "list", "results": children }))
+                    page.children.extend(added.iter().cloned());
+                    Reply::json(200, &json!({ "object": "list", "results": added }))
+                }
+                ("DELETE", ["v1", "blocks", id]) => {
+                    for page in &mut self.pages {
+                        if let Some(at) = page.children.iter().position(|b| b["id"] == *id) {
+                            let block = page.children.remove(at);
+                            return Reply::json(200, &block);
+                        }
+                    }
+                    not_found()
                 }
                 _ => Reply::json(404, &json!({ "code": "invalid_request_url" })),
             }
@@ -1123,12 +1823,13 @@ mod tests {
                 retry_delay_ms: 1,
                 rate_limit_delay_ms: 1,
             },
+            failed_mark_wait: Duration::from_millis(1),
             ..NotionSettings::default()
         }
     }
 
-    /// A 는 노션 사용자 user-1 로 이미 연결돼 있고, B 는 줄이 없다.
-    fn people_seed() -> FakePage {
+    /// A 의 담당자 줄: 노션 사용자 user-1, "확인됨"은 `confirmed`.
+    fn person_a(confirmed: bool) -> FakePage {
         let mut properties = Map::new();
         properties.insert(
             people_property::NAME.into(),
@@ -1144,11 +1845,13 @@ mod tests {
         );
         properties.insert(
             people_property::CONFIRMED.into(),
-            json!({ "checkbox": true }),
+            json!({ "checkbox": confirmed }),
         );
         FakePage {
             id: "person-a".into(),
             data_source: PEOPLE_DATA_SOURCE_ID.into(),
+            created_time: "2026-10-01T00:00:00.000Z".into(),
+            last_edited_time: "2026-10-01T00:00:00.000Z".into(),
             properties,
             children: Vec::new(),
             in_trash: false,
@@ -1175,9 +1878,9 @@ mod tests {
             }],
             action_items: vec![
                 ActionItem {
-                    text: "견적서 보내기".into(),
+                    text: "고객사에 견적서 보내기".into(),
                     assignee_pubkey: Some(A.into()),
-                    assignee_quote: Some("q".into()),
+                    assignee_quote: Some("제가 보낼게요".into()),
                     due: Some("2026-10-16".into()),
                     due_quote: Some("금요일까지".into()),
                     status: ItemStatus::Firm,
@@ -1186,9 +1889,9 @@ mod tests {
                 ActionItem {
                     text: "서버 비용 알아보기".into(),
                     assignee_pubkey: Some(B.into()),
-                    assignee_quote: Some("q".into()),
+                    assignee_quote: None,
                     due: None,
-                    due_quote: None,
+                    due_quote: Some("다음 주까지".into()),
                     status: ItemStatus::Unsure,
                     evidence_start_ms: None,
                 },
@@ -1225,6 +1928,46 @@ mod tests {
             .collect()
     }
 
+    fn minutes_pages(state: &FakeNotion) -> Vec<&FakePage> {
+        state
+            .pages
+            .iter()
+            .filter(|page| page.data_source == MINUTES_DATA_SOURCE_ID && !page.in_trash)
+            .collect()
+    }
+
+    async fn run(
+        client: &mut NotionClient<'_>,
+        page: &MeetingPage<'_>,
+    ) -> Result<PublishReport, NotionError> {
+        let mut report = PublishReport::default();
+        publish(client, page, None, &mut report)
+            .await
+            .map(|()| report)
+    }
+
+    /// 한 번 게시해 두고 그 서버·상태를 돌려준다.
+    async fn published(state: FakeNotion) -> (FakeServer, Arc<Mutex<FakeNotion>>, PublishReport) {
+        let (server, state) = fake_notion(state).await;
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let transcript = meeting();
+        let summary = summary_of(&transcript);
+        let report = run(&mut client, &page(&transcript, &summary))
+            .await
+            .unwrap();
+        (server, state, report)
+    }
+
+    fn silent(request: &Recorded) -> bool {
+        request.json()["notifications"]["mode"] == "silent"
+    }
+
+    fn is_write(request: &Recorded) -> bool {
+        (request.method == "PATCH" || request.method == "POST") && !request.path.ends_with("/query")
+    }
+
     #[test]
     fn long_text_is_split_into_runs_and_blocks() {
         let korean = "가".repeat(4_500);
@@ -1238,7 +1981,12 @@ mod tests {
         let emoji = "😀".repeat(1_001);
         assert_eq!(text_runs(&emoji, None).len(), 2);
         assert_eq!(
-            blocks("paragraph", text_runs(&"나".repeat(2_000 * 250), None)).len(),
+            blocks(
+                "paragraph",
+                text_runs(&"나".repeat(2_000 * 250), None),
+                false
+            )
+            .len(),
             3
         );
     }
@@ -1249,7 +1997,11 @@ mod tests {
         let sizes: Vec<usize> = chunk_blocks(small).iter().map(Vec::len).collect();
         assert_eq!(sizes, [100, 100, 50]);
         // 블록 하나가 큰 경우(조각 100개 × 2000자)는 크기로도 자른다.
-        let big = blocks("paragraph", text_runs(&"나".repeat(2_000 * 100), None));
+        let big = blocks(
+            "paragraph",
+            text_runs(&"나".repeat(2_000 * 100), None),
+            false,
+        );
         let many: Vec<Value> = std::iter::repeat_n(big[0].clone(), 5).collect();
         for chunk in chunk_blocks(many) {
             let bytes: usize = chunk.iter().map(|block| block.to_string().len()).sum();
@@ -1258,11 +2010,16 @@ mod tests {
     }
 
     #[test]
-    fn body_has_sections_in_order_with_links_and_mentions() {
+    fn body_has_sections_in_order_with_checked_quotes_and_mentions() {
         let transcript = meeting();
         let summary = summary_of(&transcript);
         let people = HashMap::from([(A.to_string(), "user-1".to_string())]);
-        let body = body_blocks(&page(&transcript, &summary), &people, DEFAULT_PLAYBACK_LINK);
+        let body = body_blocks(
+            &page(&transcript, &summary),
+            &people,
+            DEFAULT_PLAYBACK_LINK,
+            &HashSet::new(),
+        );
         let headings: Vec<String> = body
             .iter()
             .filter(|block| block["type"] == "heading_2")
@@ -1285,12 +2042,18 @@ mod tests {
         assert!(first.contains(&json!({
             "type": "mention", "mention": { "type": "date", "date": { "start": "2026-10-16" } }
         })));
-        // 연결 안 된 사람은 이름 글자로, 애매 표시.
+        // 검사를 통과한 근거 글은 따옴표로.
+        let first_text = block_text(todos[0]);
+        assert!(first_text.contains("(“제가 보낼게요”)"), "{first_text}");
+        assert!(first_text.contains("@ (“금요일까지”)"), "{first_text}");
+        // 연결 안 된 사람은 이름 글자로, 날짜를 못 읽은 기한 말은 그 말만, 애매 표시.
         let second = block_text(todos[1]);
-        assert!(second.contains("담당: bbbbbbbb"), "{second}");
-        assert!(second.contains("애매"), "{second}");
-        // 스크립트 줄: [mm:ss] 이름: 글. 기본 buzz:// 모양은 노션 본문이 안 받아서
-        // 링크 없이 글로만 넣는다.
+        assert!(
+            second.contains("담당: bbbbbbbb · 기한: (“다음 주까지”)"),
+            "{second}"
+        );
+        assert!(second.ends_with(" · 애매"), "{second}");
+        // 기본 buzz:// 모양은 노션 본문이 안 받아서 링크 없이 글로만.
         let last = body.last().unwrap();
         assert_eq!(
             block_text(last),
@@ -1299,19 +2062,54 @@ mod tests {
         assert!(!body
             .iter()
             .any(|block| block.to_string().contains("\"link\"")));
-        // https 모양이면 시각마다 재생 링크를 건다.
+        // https 모양이면 시각마다 재생 링크를 걸고, 체크돼 있던 할 일은 체크한 채로.
         let https = "https://buzz.example.com/huddle/{channel_id}?t={start_ms}";
-        let body = body_blocks(&page(&transcript, &summary), &people, https);
+        let checked = HashSet::from([todo_key("고객사에 견적서 보내기")]);
+        let body = body_blocks(&page(&transcript, &summary), &people, https, &checked);
         assert_eq!(
             body.last().unwrap()["paragraph"]["rich_text"][0]["text"]["link"]["url"],
             "https://buzz.example.com/huddle/00000000-0000-0000-0000-000000000002?t=65000"
         );
+        let checks: Vec<bool> = body
+            .iter()
+            .filter(|block| block["type"] == "to_do")
+            .map(|block| block["to_do"]["checked"] == true)
+            .collect();
+        assert_eq!(checks, [true, false]);
+        assert!(validate_blocks(&body).is_ok());
     }
 
     #[test]
-    fn app_link_property_keeps_the_buzz_link() {
-        let transcript = meeting();
-        let summary = summary_of(&transcript);
+    fn blocks_notion_would_refuse_are_caught_before_writing() {
+        let too_many = json!({ "type": "paragraph", "paragraph": {
+            "rich_text": vec![json!({ "type": "text", "text": { "content": "x" } }); 101]
+        } });
+        let too_long = json!({ "type": "paragraph", "paragraph": {
+            "rich_text": [{ "type": "text", "text": { "content": "가".repeat(2_001) } }]
+        } });
+        let buzz_link = json!({ "type": "paragraph", "paragraph": {
+            "rich_text": [{ "type": "text", "text": { "content": "[00:01]",
+                "link": { "url": "buzz://huddle/x?t=1" } } }]
+        } });
+        for block in [too_many, too_long, buzz_link] {
+            let error = validate_blocks(&[heading("ok"), block]).unwrap_err();
+            assert_eq!(error.kind, NotionErrorKind::BadRequest);
+            assert!(error.code.starts_with("block 1:"), "{}", error.code);
+        }
+    }
+
+    #[test]
+    fn huddle_key_lists_every_session_and_app_link_keeps_buzz() {
+        let mut transcript = meeting();
+        assert_eq!(
+            huddle_key(&transcript),
+            "00000000-0000-0000-0000-000000000002:00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004"
+        );
+        let (channel, sessions) = parse_huddle_key(&huddle_key(&transcript)).unwrap();
+        assert_eq!(channel, transcript.channel_id);
+        assert_eq!(sessions, transcript.session_ids);
+        transcript.session_ids.clear();
+        let summary = summary_of(&meeting());
         let properties = page_properties(
             &page(&transcript, &summary),
             ProcessingStatus::InProgress,
@@ -1327,47 +2125,28 @@ mod tests {
         );
     }
 
-    async fn run(
-        client: &mut NotionClient<'_>,
-        page: &MeetingPage<'_>,
-    ) -> Result<PublishReport, NotionError> {
-        let mut report = PublishReport::default();
-        publish(client, page, &mut report).await.map(|()| report)
-    }
-
     #[tokio::test]
     async fn first_publish_creates_page_and_missing_people_rows() {
-        let (server, state) = fake_notion(FakeNotion {
-            pages: vec![people_seed()],
+        let (server, state, report) = published(FakeNotion {
+            pages: vec![person_a(true)],
             ..FakeNotion::default()
         })
         .await;
-        let settings = settings_for(&server);
-        let http = reqwest::Client::new();
-        let mut client = NotionClient::new(&http, &settings, "notion-test-token").unwrap();
-        let transcript = meeting();
-        let summary = summary_of(&transcript);
-        let report = run(&mut client, &page(&transcript, &summary))
-            .await
-            .unwrap();
         assert!(report.created);
         assert_eq!(report.people_linked, 1);
         assert_eq!(report.people_rows_added.len(), 1);
+        assert_eq!(report.deleted_old_blocks, 0);
 
         let state = state.lock().unwrap();
-        let minutes: Vec<&FakePage> = state
-            .pages
-            .iter()
-            .filter(|page| page.data_source == MINUTES_DATA_SOURCE_ID)
-            .collect();
+        let minutes = minutes_pages(&state);
         assert_eq!(minutes.len(), 1);
         let props = &minutes[0].properties;
         assert_eq!(
-            plain_text(&props[minutes_property::HUDDLE_ID]),
-            "00000000-0000-0000-0000-000000000002:00000000-0000-0000-0000-000000000003"
+            property_text(&props[minutes_property::HUDDLE_ID]),
+            huddle_key(&meeting())
         );
         assert_eq!(
-            plain_text(&props[minutes_property::TITLE]),
+            property_text(&props[minutes_property::TITLE]),
             "[시험] 견적서 회의"
         );
         assert_eq!(props[minutes_property::STATUS]["select"]["name"], "완료");
@@ -1393,27 +2172,46 @@ mod tests {
         let mut keys: Vec<&String> = added.properties.keys().collect();
         keys.sort();
         assert_eq!(keys, [people_property::PUBKEY, people_property::NAME]);
-        assert_eq!(plain_text(&added.properties[people_property::PUBKEY]), B);
+        assert_eq!(property_text(&added.properties[people_property::PUBKEY]), B);
 
-        // 요청 모양: 버전·토큰 헤더, data source 부모.
+        // 요청 모양: 버전·토큰 헤더, data source 부모, 처음 만들 때는 기본 알림.
         let requests = server.requests();
         assert!(requests
             .iter()
             .all(|r| r.header("notion-version") == Some(NOTION_VERSION)));
         assert!(requests
             .iter()
-            .all(|r| r.header("authorization") == Some("Bearer notion-test-token")));
+            .all(|r| r.header("authorization") == Some("Bearer t")));
         let create = requests
             .iter()
             .find(|r| r.method == "POST" && r.path == "/v1/pages")
             .unwrap();
         assert_eq!(create.json()["parent"]["type"], "data_source_id");
+        assert!(!requests.iter().filter(|r| is_write(r)).any(silent));
+    }
+
+    #[tokio::test]
+    async fn only_confirmed_people_are_mentioned() {
+        for confirmed in [false, true] {
+            let (_server, state, report) = published(FakeNotion {
+                pages: vec![person_a(confirmed)],
+                ..FakeNotion::default()
+            })
+            .await;
+            assert_eq!(report.people_linked, usize::from(confirmed));
+            let state = state.lock().unwrap();
+            let body = &minutes_pages(&state)[0].children;
+            let mentioned = body
+                .iter()
+                .any(|block| block.to_string().contains("\"user\":{\"id\":\"user-1\"}"));
+            assert_eq!(mentioned, confirmed);
+        }
     }
 
     #[tokio::test]
     async fn existing_people_rows_are_never_touched() {
-        let (server, state) = fake_notion(FakeNotion {
-            pages: vec![people_seed()],
+        let (server, state, _) = published(FakeNotion {
+            pages: vec![person_a(true)],
             ..FakeNotion::default()
         })
         .await;
@@ -1422,9 +2220,6 @@ mod tests {
         let mut client = NotionClient::new(&http, &settings, "t").unwrap();
         let transcript = meeting();
         let summary = summary_of(&transcript);
-        run(&mut client, &page(&transcript, &summary))
-            .await
-            .unwrap();
         run(&mut client, &page(&transcript, &summary))
             .await
             .unwrap();
@@ -1440,52 +2235,435 @@ mod tests {
         // A 하나(원래 있던 것), B 하나(첫 번에 만든 것). 두 번째는 아무것도 안 만든다.
         assert_eq!(rows.len(), 2);
         let seeded = rows.iter().find(|row| row.id == "person-a").unwrap();
-        assert_eq!(seeded.properties, people_seed().properties);
+        assert_eq!(seeded.properties, person_a(true).properties);
     }
 
     #[tokio::test]
-    async fn same_huddle_id_updates_the_same_page() {
-        let (server, state) = fake_notion(FakeNotion::default()).await;
+    async fn republish_is_silent_keeps_the_page_and_swaps_the_body_safely() {
+        let (server, state, first) = published(FakeNotion::default()).await;
+        let before = server.requests().len();
+        let old_blocks = state
+            .lock()
+            .unwrap()
+            .pages
+            .iter()
+            .find(|p| p.id == first.page_id)
+            .unwrap()
+            .children
+            .len();
         let settings = settings_for(&server);
         let http = reqwest::Client::new();
         let mut client = NotionClient::new(&http, &settings, "t").unwrap();
         let transcript = meeting();
         let mut summary = summary_of(&transcript);
-        let first = run(&mut client, &page(&transcript, &summary))
-            .await
-            .unwrap();
         summary.title = "고친 제목".into();
-        summary.action_items.clear();
+        summary.action_items.truncate(1);
         let second = run(&mut client, &page(&transcript, &summary))
             .await
             .unwrap();
-        assert!(first.created);
         assert!(!second.created);
-        assert_eq!(first.page_id, second.page_id);
+        assert_eq!(second.page_id, first.page_id);
+        assert_eq!(second.deleted_old_blocks, old_blocks);
+
+        let requests = server.requests()[before..].to_vec();
+        // 다시 게시할 때는 쓰기마다 조용히.
+        let writes: Vec<&Recorded> = requests.iter().filter(|r| is_write(r)).collect();
+        assert!(!writes.is_empty());
+        assert!(writes.iter().all(|r| silent(r)), "every rewrite is silent");
+        // 새 본문을 다 붙인 뒤에야 옛 블록을 지운다.
+        let last_append = requests
+            .iter()
+            .rposition(|r| r.method == "PATCH" && r.path.ends_with("/children"))
+            .unwrap();
+        let first_delete = requests.iter().position(|r| r.method == "DELETE").unwrap();
+        assert!(last_append < first_delete);
 
         let state = state.lock().unwrap();
-        let minutes: Vec<&FakePage> = state
-            .pages
-            .iter()
-            .filter(|page| page.data_source == MINUTES_DATA_SOURCE_ID)
-            .collect();
+        let minutes = minutes_pages(&state);
         assert_eq!(minutes.len(), 1);
         assert_eq!(
-            plain_text(&minutes[0].properties[minutes_property::TITLE]),
+            property_text(&minutes[0].properties[minutes_property::TITLE]),
             "[시험] 고친 제목"
         );
-        // 본문은 통째로 갈아끼운다: 두 번 쌓이지 않는다.
+        // 본문은 새 것만 남는다.
         assert_eq!(minutes[0].children.len(), second.blocks);
-        assert!(!minutes[0]
+        let todos = minutes[0]
             .children
             .iter()
-            .any(|block| block["type"] == "to_do"));
-        let erases = server
+            .filter(|block| block["type"] == "to_do")
+            .count();
+        assert_eq!(todos, 1);
+    }
+
+    #[tokio::test]
+    async fn checked_todos_stay_checked_on_republish() {
+        let (server, state, first) = published(FakeNotion::default()).await;
+        {
+            let mut state = state.lock().unwrap();
+            let page = state.page_mut(&first.page_id).unwrap();
+            let todo = page
+                .children
+                .iter_mut()
+                .find(|block| block["type"] == "to_do")
+                .unwrap();
+            todo["to_do"]["checked"] = Value::Bool(true);
+        }
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let transcript = meeting();
+        let summary = summary_of(&transcript);
+        let second = run(&mut client, &page(&transcript, &summary))
+            .await
+            .unwrap();
+        assert_eq!(second.kept_checked, 1);
+        let state = state.lock().unwrap();
+        let checks: Vec<bool> = minutes_pages(&state)[0]
+            .children
+            .iter()
+            .filter(|block| block["type"] == "to_do")
+            .map(|block| block["to_do"]["checked"] == true)
+            .collect();
+        assert_eq!(checks, [true, false]);
+    }
+
+    #[tokio::test]
+    async fn an_earlier_session_arriving_late_finds_the_same_page() {
+        let (server, state, first) = published(FakeNotion::default()).await;
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        // 늦게 올라온 앞 세션 때문에 첫 세션이 바뀌었다.
+        let mut transcript = meeting();
+        transcript.session_ids.insert(0, Uuid::from_u128(1));
+        let summary = summary_of(&transcript);
+        let second = run(&mut client, &page(&transcript, &summary))
+            .await
+            .unwrap();
+        assert!(!second.created);
+        assert_eq!(second.page_id, first.page_id);
+        let state = state.lock().unwrap();
+        let minutes = minutes_pages(&state);
+        assert_eq!(minutes.len(), 1);
+        assert_eq!(
+            property_text(&minutes[0].properties[minutes_property::HUDDLE_ID]),
+            huddle_key(&transcript)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_503_that_saved_the_page_does_not_make_a_second_one() {
+        let (server, state, report) = published(FakeNotion {
+            commit_then_503: true,
+            ..FakeNotion::default()
+        })
+        .await;
+        let state = state.lock().unwrap();
+        let minutes = minutes_pages(&state);
+        assert_eq!(minutes.len(), 1);
+        assert_eq!(minutes[0].id, report.page_id);
+        assert_eq!(minutes[0].children.len(), report.blocks);
+        // 노션이 알려 준 id 를 바로 썼다: 만들기 전·후 한 번씩만 찾았다
+        // (다시 찾아 확인하는 길로 가면 한 번 더 찾는다).
+        let minutes_queries = server
             .requests()
             .iter()
-            .filter(|r| r.json()["erase_content"] == Value::Bool(true))
+            .filter(|r| r.path == format!("/v1/data_sources/{MINUTES_DATA_SOURCE_ID}/query"))
             .count();
-        assert_eq!(erases, 2);
+        assert_eq!(minutes_queries, 2);
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_create_answer_is_checked_before_creating_again() {
+        let (_server, state, report) = published(FakeNotion {
+            cut_off_create: true,
+            ..FakeNotion::default()
+        })
+        .await;
+        let state = state.lock().unwrap();
+        let minutes = minutes_pages(&state);
+        assert_eq!(minutes.len(), 1);
+        assert_eq!(minutes[0].id, report.page_id);
+    }
+
+    #[tokio::test]
+    async fn a_racing_duplicate_is_trashed_and_the_earlier_page_kept() {
+        let (_server, state, report) = published(FakeNotion {
+            race_create: true,
+            ..FakeNotion::default()
+        })
+        .await;
+        let state = state.lock().unwrap();
+        let minutes = minutes_pages(&state);
+        assert_eq!(minutes.len(), 1, "one live meeting page");
+        // 먼저 만들어진(다른 작업기의) 페이지를 남기고 내 것을 버렸다.
+        assert_eq!(report.page_id, minutes[0].id);
+        assert_eq!(report.trashed_duplicates.len(), 1);
+        assert_ne!(report.trashed_duplicates[0], report.page_id);
+        assert!(!report.created);
+        assert_eq!(minutes[0].children.len(), report.blocks);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_appends_restart_the_body_without_doubling_it() {
+        let limited =
+            || Reply::json(429, &json!({ "code": "rate_limited" })).with_header("retry-after", "0");
+        let (_server, state, report) = published(FakeNotion {
+            // 한 요청의 다시 하기(3번)를 다 쓰도록 4번 연달아.
+            append_failures: (0..4).map(|_| limited()).collect(),
+            ..FakeNotion::default()
+        })
+        .await;
+        assert_eq!(report.body_attempts, 2);
+        let state = state.lock().unwrap();
+        assert_eq!(minutes_pages(&state)[0].children.len(), report.blocks);
+    }
+
+    #[tokio::test]
+    async fn failed_body_marks_the_page_failed_after_retrying_the_mark() {
+        let refused = || {
+            Reply::json(
+                400,
+                &json!({ "code": "validation_error", "message": "refused" }),
+            )
+        };
+        // "실패" 표시가 두 번 막혔다가 세 번째에 된다.
+        let (server, state) = fake_notion(FakeNotion {
+            append_failures: vec![refused()],
+            page_patch_failures: vec![refused(), refused()],
+            ..FakeNotion::default()
+        })
+        .await;
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let transcript = meeting();
+        let summary = summary_of(&transcript);
+        let mut report = PublishReport::default();
+        let error = publish(&mut client, &page(&transcript, &summary), None, &mut report)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, NotionErrorKind::BadRequest);
+        assert!(!report.stuck_in_progress);
+        {
+            let state = state.lock().unwrap();
+            let minutes = minutes_pages(&state);
+            assert_eq!(
+                minutes[0].properties[minutes_property::STATUS]["select"]["name"],
+                "실패"
+            );
+            // 실패해도 만든 페이지와 줄의 id 는 알려 준다.
+            assert_eq!(report.page_id, minutes[0].id);
+            assert_eq!(report.people_rows_added.len(), 2);
+        }
+
+        // 끝내 "실패" 표시를 못 하면 처리 중으로 남았다고 알린다.
+        let (server, _state) = fake_notion(FakeNotion {
+            append_failures: vec![refused()],
+            page_patch_failures: (0..FAILED_MARK_ATTEMPTS).map(|_| refused()).collect(),
+            ..FakeNotion::default()
+        })
+        .await;
+        let settings = settings_for(&server);
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let mut report = PublishReport::default();
+        publish(&mut client, &page(&transcript, &summary), None, &mut report)
+            .await
+            .unwrap_err();
+        assert!(report.stuck_in_progress);
+    }
+
+    #[tokio::test]
+    async fn refused_people_db_does_not_block_the_minutes() {
+        let (_server, state, report) = published(FakeNotion {
+            people_forbidden: true,
+            ..FakeNotion::default()
+        })
+        .await;
+        assert!(report
+            .people_error
+            .as_deref()
+            .is_some_and(|error| error.contains("permission")));
+        assert_eq!(report.people_linked, 0);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            minutes_pages(&state)[0].properties[minutes_property::STATUS]["select"]["name"],
+            "완료"
+        );
+    }
+
+    /// `channel` 의 회의 하나(첫 세션 3)를 시험용 녹음 폴더에 두고 계획을 세운다.
+    async fn plan_for(dir: &std::path::Path) -> MeetingPlan {
+        use crate::store::{LocalStore, RecordingStore};
+        use buzz_huddle_recording::{chunk_key, ChunkHeader, Record};
+        let store = LocalStore::new(dir);
+        let (community, channel, session) =
+            (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let mut bytes = ChunkHeader {
+            protocol_version: 2,
+            session_id: session,
+            chunk_seq: 0,
+            session_start_unix_ms: 1_791_781_200_000,
+        }
+        .encode()
+        .to_vec();
+        Record::Join {
+            t_ms: 0,
+            peer_index: 0,
+            epoch: 1,
+            pubkey: [7; 32],
+        }
+        .encode_into(&mut bytes)
+        .unwrap();
+        store
+            .put(&chunk_key("h", community, channel, session, 0), bytes)
+            .await
+            .unwrap();
+        crate::collect::plan_meetings(&store, "h", community, channel, 10 * 60_000)
+            .await
+            .unwrap()
+            .meetings
+            .remove(0)
+    }
+
+    #[tokio::test]
+    async fn the_record_keeps_the_page_id_for_next_time() {
+        let recordings = tempfile::tempdir().unwrap();
+        let minutes_dir = tempfile::tempdir().unwrap();
+        let meeting_plan = plan_for(recordings.path()).await;
+        let home = LocalMinutes::open(minutes_dir.path()).unwrap();
+        let (server, state) = fake_notion(FakeNotion::default()).await;
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let transcript = meeting();
+        let summary = summary_of(&transcript);
+        let mut first = PublishReport::default();
+        assert!(publish_meeting(
+            &home,
+            &meeting_plan,
+            &mut client,
+            &page(&transcript, &summary),
+            &mut first
+        )
+        .await
+        .unwrap());
+        let record: NotionRecord = serde_json::from_slice(
+            &std::fs::read(home.notion_record_path(Uuid::from_u128(3))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.page_id, first.page_id);
+
+        // 다음엔 기록된 id 부터: 회의 페이지를 찾는 query 없이 그 페이지를 읽는다.
+        let before = server.requests().len();
+        let mut second = PublishReport::default();
+        publish_meeting(
+            &home,
+            &meeting_plan,
+            &mut client,
+            &page(&transcript, &summary),
+            &mut second,
+        )
+        .await
+        .unwrap();
+        let requests = server.requests()[before..].to_vec();
+        assert!(requests
+            .iter()
+            .any(|r| r.method == "GET" && r.path == format!("/v1/pages/{}", first.page_id)));
+        let minutes_queries = requests
+            .iter()
+            .filter(|r| r.path == format!("/v1/data_sources/{MINUTES_DATA_SOURCE_ID}/query"))
+            .count();
+        assert_eq!(minutes_queries, 0);
+        assert_eq!(second.page_id, first.page_id);
+
+        // 기록된 페이지가 휴지통에 있으면 세션으로 다시 찾는다(없으니 새로 만든다).
+        state
+            .lock()
+            .unwrap()
+            .page_mut(&first.page_id)
+            .unwrap()
+            .in_trash = true;
+        let mut third = PublishReport::default();
+        publish_meeting(
+            &home,
+            &meeting_plan,
+            &mut client,
+            &page(&transcript, &summary),
+            &mut third,
+        )
+        .await
+        .unwrap();
+        assert!(third.created);
+        assert_ne!(third.page_id, first.page_id);
+    }
+
+    #[tokio::test]
+    async fn the_record_sits_beside_the_script_in_the_minutes_bucket() {
+        use buzz_gcp::fake::FakeGcs;
+        use buzz_gcp::gcs::Gcs;
+        use buzz_gcp::token::{AccessToken, TokenSource, Tokens};
+
+        use crate::gcs_minutes::GcsMinutes;
+
+        let recordings = tempfile::tempdir().unwrap();
+        let meeting_plan = plan_for(recordings.path()).await;
+        let fake = FakeGcs::start(3_600).await;
+        fake.accept_token("t");
+        let tokens = Tokens::new(TokenSource::Static(AccessToken::new("t"))).unwrap();
+        let gcs = Arc::new(Gcs::with_base_url(tokens, fake.url()).unwrap());
+        let home = GcsMinutes::new(gcs, "minutes");
+        assert_eq!(home.read_notion_record(&meeting_plan).await.unwrap(), None);
+
+        let script = serde_json::to_vec(&meeting()).unwrap();
+        home.write_script(&meeting_plan, script, false)
+            .await
+            .unwrap();
+        let record = br#"{"page_id":"p"}"#.to_vec();
+        home.write_notion_record(&meeting_plan, record.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            home.read_notion_record(&meeting_plan).await.unwrap(),
+            Some(record)
+        );
+        let names: Vec<String> = fake.objects("minutes").into_keys().collect();
+        assert!(names.contains(&GcsMinutes::notion_record_key(&meeting_plan)));
+        assert!(GcsMinutes::notion_record_key(&meeting_plan)
+            .ends_with("/00000000-0000-0000-0000-000000000003.notion.json"));
+        // 스크립트를 읽을 때 기록은 스크립트가 아니니 뺀다.
+        let processed = home.processed_sessions(&meeting_plan).await.unwrap();
+        assert_eq!(processed.len(), meeting().session_ids.len());
+    }
+
+    #[tokio::test]
+    async fn a_held_meeting_is_left_for_the_next_run() {
+        let recordings = tempfile::tempdir().unwrap();
+        let minutes_dir = tempfile::tempdir().unwrap();
+        let meeting_plan = plan_for(recordings.path()).await;
+        let home = LocalMinutes::open(minutes_dir.path()).unwrap();
+        let (server, _state) = fake_notion(FakeNotion::default()).await;
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let transcript = meeting();
+        let summary = summary_of(&transcript);
+        // 다른 작업기(여기서는 같은 시험)가 이 회의를 잡고 있다.
+        let other = LocalMinutes::open(minutes_dir.path()).unwrap();
+        let hold = other.hold(&meeting_plan).await.unwrap().expect("hold");
+        let mut report = PublishReport::default();
+        let done = publish_meeting(
+            &home,
+            &meeting_plan,
+            &mut client,
+            &page(&transcript, &summary),
+            &mut report,
+        )
+        .await
+        .unwrap();
+        assert!(!done);
+        assert!(server.requests().is_empty());
+        other.release(hold).await.unwrap();
     }
 
     #[tokio::test]
@@ -1501,7 +2679,7 @@ mod tests {
         })
         .to_string();
         let summary = check_answer(&answer, &transcript, &PubkeyPrefixNames).unwrap();
-        let (server, state) = fake_notion(FakeNotion::default()).await;
+        let (server, shared) = fake_notion(FakeNotion::default()).await;
         let settings = settings_for(&server);
         let http = reqwest::Client::new();
         let mut client = NotionClient::new(&http, &settings, "t").unwrap();
@@ -1511,22 +2689,28 @@ mod tests {
         // 요약 2 + 결정 2 + 할 일 2 + 주제 2 + 스크립트 머리 1 + 줄 451
         assert_eq!(report.blocks, 460);
         assert_eq!(report.append_requests, 5);
-        let state = state.lock().unwrap();
-        let page = state
-            .pages
-            .iter()
-            .find(|page| page.id == report.page_id)
+        {
+            let state = shared.lock().unwrap();
+            let written = minutes_pages(&state)[0];
+            assert_eq!(written.children.len(), 460);
+            let last = written.children.last().unwrap();
+            assert_eq!(last["paragraph"]["rich_text"].as_array().unwrap().len(), 4);
+            assert!(block_text(last).starts_with("[60:00] aaaaaaaa: 가"));
+        }
+
+        // 다시 쓰면 옛 블록 460개를 다 지우고(목록은 100개씩 넘겨 읽는다) 새 것만 남는다.
+        let report = run(&mut client, &page(&transcript, &summary))
+            .await
             .unwrap();
-        assert_eq!(page.children.len(), 460);
-        let last = page.children.last().unwrap();
-        assert_eq!(last["paragraph"]["rich_text"].as_array().unwrap().len(), 4);
-        assert!(block_text(last).starts_with("[60:00] aaaaaaaa: 가"));
+        assert_eq!(report.deleted_old_blocks, 460);
+        let state = shared.lock().unwrap();
+        assert_eq!(minutes_pages(&state)[0].children.len(), 460);
     }
 
     #[tokio::test]
     async fn rate_limit_waits_for_retry_after() {
         let (server, _state) = fake_notion(FakeNotion {
-            queued_errors: vec![Reply::json(429, &json!({ "code": "rate_limited" }))
+            queued: vec![Reply::json(429, &json!({ "code": "rate_limited" }))
                 .with_header("retry-after", "1")],
             ..FakeNotion::default()
         })
@@ -1546,7 +2730,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn errors_are_classified_and_hide_the_token() {
+    async fn stale_pages_are_found_and_errors_are_classified() {
+        let mut state = FakeNotion::default();
+        for (status, edited) in [
+            ("처리 중", "2026-10-12T05:00:00.000Z"),
+            ("처리 중", "2026-10-12T09:30:00.000Z"),
+            ("완료", "2026-10-12T05:00:00.000Z"),
+        ] {
+            let id = state.new_page(
+                MINUTES_DATA_SOURCE_ID,
+                &json!({
+                    minutes_property::STATUS: { "select": { "name": status } },
+                    minutes_property::HUDDLE_ID: { "rich_text": text_runs("c:s", None) }
+                }),
+            );
+            state.page_mut(&id).unwrap().last_edited_time = edited.into();
+        }
+        let (server, _state) = fake_notion(state).await;
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-12T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let stale = find_stale(&mut client, Duration::from_secs(3_600), now)
+            .await
+            .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].page_id, "page-1");
+        assert_eq!(stale[0].huddle_key, "c:s");
+
         for (status, kind) in [
             (401, NotionErrorKind::Auth),
             (403, NotionErrorKind::Permission),
@@ -1554,55 +2767,19 @@ mod tests {
             (400, NotionErrorKind::BadRequest),
         ] {
             let (server, _state) = fake_notion(FakeNotion {
-                queued_errors: vec![Reply::json(status, &json!({ "code": "x", "message": "m" }))],
+                queued: vec![Reply::json(status, &json!({ "code": "x", "message": "m" }))],
                 ..FakeNotion::default()
             })
             .await;
             let settings = settings_for(&server);
-            let http = reqwest::Client::new();
             let mut client = NotionClient::new(&http, &settings, "secret-notion-token").unwrap();
-            let transcript = meeting();
-            let summary = summary_of(&transcript);
-            let error = run(&mut client, &page(&transcript, &summary))
+            let error = find_stale(&mut client, Duration::from_secs(60), now)
                 .await
                 .unwrap_err();
             assert_eq!(error.kind, kind);
             assert_eq!(server.requests().len(), 1);
             assert!(!format!("{error} {error:?}").contains("secret-notion-token"));
         }
-    }
-
-    #[tokio::test]
-    async fn failed_body_marks_the_page_failed() {
-        let (server, state) = fake_notion(FakeNotion {
-            refuse_appends: Some(400),
-            ..FakeNotion::default()
-        })
-        .await;
-        let settings = settings_for(&server);
-        let http = reqwest::Client::new();
-        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
-        let transcript = meeting();
-        let summary = summary_of(&transcript);
-        let mut report = PublishReport::default();
-        let error = publish(&mut client, &page(&transcript, &summary), &mut report)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind, NotionErrorKind::BadRequest);
-        let state = state.lock().unwrap();
-        let minutes = state
-            .pages
-            .iter()
-            .find(|page| page.data_source == MINUTES_DATA_SOURCE_ID)
-            .unwrap();
-        assert_eq!(
-            minutes.properties[minutes_property::STATUS]["select"]["name"],
-            "실패"
-        );
-        // 실패해도 만든 페이지와 줄의 id 는 알려 준다.
-        assert_eq!(report.page_id, minutes.id);
-        assert!(report.created);
-        assert_eq!(report.people_rows_added.len(), 2);
     }
 
     #[tokio::test]

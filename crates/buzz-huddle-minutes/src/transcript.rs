@@ -7,8 +7,9 @@ use uuid::Uuid;
 /// Value of [`Transcript::format`].
 pub const TRANSCRIPT_FORMAT: &str = "huddle-transcript/1";
 
-/// One meeting's script.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One meeting's script. `Default` is for tests that fill only a few
+/// fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transcript {
     /// Always [`TRANSCRIPT_FORMAT`].
     pub format: String,
@@ -100,7 +101,7 @@ pub struct Segment {
 }
 
 /// Where the mixed audio is stored.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioRef {
     /// Object key of the mixed audio.
     pub key: String,
@@ -109,7 +110,7 @@ pub struct AudioRef {
 }
 
 /// Transcriber identity and billing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SttInfo {
     /// Engine name, e.g. `google-chirp_3`.
     pub engine: String,

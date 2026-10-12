@@ -24,7 +24,9 @@ use buzz_huddle_minutes::models::{
     ensure_silero_vad, sha256_hex, silero_vad_path, SILERO_VAD_SHA256,
 };
 use buzz_huddle_minutes::pipeline::{MinutesSettings, SttPolicy};
-use buzz_huddle_minutes::runner::{run_meeting, Done, LocalMinutes, MinutesHome, RunOptions};
+use buzz_huddle_minutes::runner::{
+    create_private_dir, run_meeting, write_private, Done, LocalMinutes, MinutesHome, RunOptions,
+};
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Truth, SENTENCES,
 };
@@ -169,7 +171,6 @@ enum Command {
         mix: Option<PathBuf>,
     },
     /// 스크립트를 Gemini 로 요약해 `huddle-summary/1` JSON(0600)으로 쓴다.
-    /// 접근 토큰은 환경 변수 GOOGLE_ACCESS_TOKEN 으로 받는다.
     Summarize {
         /// transcript.json.
         #[arg(long)]
@@ -186,6 +187,15 @@ enum Command {
         /// Vertex AI 위치.
         #[arg(long, default_value = summary::DEFAULT_LOCATION)]
         location: String,
+        /// Google 접근 토큰을 어디서 받나(Cloud Run 은 metadata, 개발 맥은 gcloud).
+        #[arg(long, value_enum, default_value_t = GcpAuth::Metadata)]
+        gcp_auth: GcpAuth,
+        /// 생각 수준. 안 주면 medium.
+        #[arg(long, value_enum, default_value_t = ThinkingArg::Medium)]
+        thinking_level: ThinkingArg,
+        /// 답(생각 포함) 토큰 상한.
+        #[arg(long, default_value_t = summary::DEFAULT_MAX_OUTPUT_TOKENS)]
+        max_output_tokens: u32,
         /// 입력 단가(100만 토큰당 달러). 출력 단가와 같이 주면 아는 단가 대신 쓴다.
         #[arg(long, requires = "output_usd_per_mtok")]
         input_usd_per_mtok: Option<f64>,
@@ -193,8 +203,10 @@ enum Command {
         #[arg(long, requires = "input_usd_per_mtok")]
         output_usd_per_mtok: Option<f64>,
     },
-    /// 스크립트와 요약을 노션 "허들 회의록" DB 에 쓴다(허들 ID 로 찾아 고치거나 만든다).
-    /// 노션 토큰은 환경 변수 NOTION_TOKEN 으로 받는다.
+    /// 스크립트와 요약을 노션 "허들 회의록" DB 에 쓴다(세션이 겹치는 페이지를 찾아
+    /// 고치거나 만든다). 손으로 시험할 때 쓰는 명령이라 회의 잠금은 잡지 않는다
+    /// (작업기 안에서는 `notion::publish_held`). 노션 토큰은 환경 변수
+    /// NOTION_TOKEN 으로 받는다(Cloud Run 은 Secret Manager 를 이 변수로 붙인다).
     PublishNotion {
         /// transcript.json.
         #[arg(long)]
@@ -202,6 +214,9 @@ enum Command {
         /// summarize 가 쓴 요약.
         #[arg(long)]
         summary: PathBuf,
+        /// 노션 기록 파일(page id). 있으면 그 id 부터 쓰고, 쓴 뒤 남긴다.
+        #[arg(long)]
+        record: Option<PathBuf>,
         /// 제목 앞에 붙일 말(예: "[시험] ").
         #[arg(long, default_value = "")]
         title_prefix: String,
@@ -218,6 +233,31 @@ enum Command {
         #[arg(long, default_value = notion::DEFAULT_PLAYBACK_LINK)]
         playback_link: String,
     },
+    /// 오래 "처리 중"으로 남은 노션 회의 페이지를 찾는다(있으면 1 로 끝남).
+    /// 노션 토큰은 환경 변수 NOTION_TOKEN 으로 받는다.
+    NotionStale {
+        /// 이만큼(분) 넘게 안 고친 "처리 중" 페이지.
+        #[arg(long, default_value_t = 60)]
+        older_than_minutes: u64,
+    },
+}
+
+/// `--thinking-level` 값.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ThinkingArg {
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+        }
+    }
 }
 
 /// `--status` 값.
@@ -554,10 +594,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             model,
             project,
             location,
+            gcp_auth,
+            thinking_level,
+            max_output_tokens,
             input_usd_per_mtok,
             output_usd_per_mtok,
         } => {
-            let token = token_from_env("GOOGLE_ACCESS_TOKEN")?;
+            let tokens = Tokens::new(gcp_token_source(gcp_auth)?)?;
             let transcript: Transcript = serde_json::from_slice(
                 &std::fs::read(&transcript)
                     .with_context(|| format!("read {}", transcript.display()))?,
@@ -565,6 +608,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let mut settings = summary::GeminiSettings::new(&model);
             settings.project = project;
             settings.location = location;
+            settings.thinking_level = Some(thinking_level.as_str().to_string());
+            settings.max_output_tokens = max_output_tokens;
             if let (Some(input), Some(output)) = (input_usd_per_mtok, output_usd_per_mtok) {
                 settings.price = Some(summary::Price {
                     input_usd_per_mtok: input,
@@ -575,7 +620,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()?;
             let names = summary::PubkeyPrefixNames;
-            let result = summary::summarize(&http, &settings, &token, &transcript, &names).await?;
+            let result = summary::summarize(&http, &settings, &tokens, &transcript, &names).await?;
             if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
                 create_private_dir(parent)?;
             }
@@ -587,12 +632,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 .filter(|item| item.status == summary::ItemStatus::Firm)
                 .count();
             eprintln!(
-                "summary: model {} ({}) | input {} output {} thinking {} tokens | cost {}",
+                "summary: model {} ({}) | input {} output {} thinking {} tokens in {} call(s){} | cost {}",
                 result.model,
                 usage.model_version.as_deref().unwrap_or("?"),
                 usage.input_tokens,
                 usage.output_tokens,
                 usage.thinking_tokens,
+                usage.calls,
+                if usage.compact { ", asked again shorter" } else { "" },
                 usage
                     .cost_usd
                     .map_or("unknown price".to_string(), |usd| format!("${usd:.6}"))
@@ -605,13 +652,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 result.topics.len()
             );
             eprintln!(
-                "  corrections {}: evidence snapped {} dropped {} | assignee cleared {} | due cleared {} fixed {} time dropped {} | firm→unsure {}",
+                "  corrections {}: evidence snapped {} dropped {} | assignee cleared {} | due cleared {} disagreed {} time dropped {} | firm→unsure {}",
                 fixed.total(),
                 fixed.evidence_snapped,
                 fixed.evidence_dropped,
                 fixed.assignee_cleared,
                 fixed.due_cleared,
-                fixed.due_fixed,
+                fixed.due_disagreed,
                 fixed.due_time_dropped,
                 fixed.status_downgraded
             );
@@ -620,6 +667,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::PublishNotion {
             transcript,
             summary: summary_path,
+            record,
             title_prefix,
             status,
             kind,
@@ -635,12 +683,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 &std::fs::read(&summary_path)
                     .with_context(|| format!("read {}", summary_path.display()))?,
             )?;
+            // 지난번에 남긴 page id(있으면 그것부터). 못 읽으면 없는 것으로.
+            let known = record
+                .as_ref()
+                .and_then(|path| std::fs::read(path).ok())
+                .and_then(|bytes| serde_json::from_slice::<notion::NotionRecord>(&bytes).ok())
+                .map(|record| record.page_id);
             let settings = notion::NotionSettings {
                 playback_link,
                 ..notion::NotionSettings::default()
             };
             let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
+                .timeout(notion::NOTION_TIMEOUT)
                 .build()?;
             let mut client = notion::NotionClient::new(&http, &settings, &token)?;
             let names = summary::PubkeyPrefixNames;
@@ -662,29 +716,93 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             };
             // 실패해도 그때까지 만든 페이지·줄 id 를 찍는다.
             let mut report = notion::PublishReport::default();
-            let result = notion::publish(&mut client, &page, &mut report).await;
+            let result = notion::publish(&mut client, &page, known.as_deref(), &mut report).await;
             eprintln!(
-                "notion: page {} ({}) | other pages with this huddle id {} | blocks {} in {} requests, body attempts {} | people rows added {} linked {} | requests {}",
+                "notion: page {} ({}) | duplicates trashed {} | blocks {} in {} requests, old blocks deleted {}, checks kept {}, body attempts {} | people rows added {} linked {} | requests {}",
                 if report.page_id.is_empty() { "-" } else { &report.page_id },
                 if report.created { "created" } else { "found" },
-                report.duplicates,
+                report.trashed_duplicates.len(),
                 report.blocks,
                 report.append_requests,
+                report.deleted_old_blocks,
+                report.kept_checked,
                 report.body_attempts,
                 report.people_rows_added.len(),
                 report.people_linked,
                 client.requests
             );
+            for page_id in &report.trashed_duplicates {
+                eprintln!("  duplicate page trashed: {page_id}");
+            }
             for row in &report.people_rows_added {
                 eprintln!("  people row added: {row}");
+            }
+            if let Some(error) = &report.people_error {
+                eprintln!("  people db skipped (no mentions this time): {error}");
             }
             if !notion::linkable_in_body(&settings.playback_link) {
                 eprintln!("  script times are plain text: Notion only links http(s) in page text");
             }
+            if let (Some(path), false) = (&record, report.page_id.is_empty()) {
+                let json = serde_json::to_vec_pretty(&notion::NotionRecord::new(
+                    &transcript,
+                    &report.page_id,
+                ))?;
+                write_private(path, &json)?;
+            }
+            if report.stuck_in_progress {
+                eprintln!(
+                    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                );
+                eprintln!(
+                    "!!! notion page {} could not be marked 실패 and may stay 처리 중: check it by hand",
+                    report.page_id
+                );
+                eprintln!(
+                    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                );
+            }
             result?;
+        }
+        Command::NotionStale { older_than_minutes } => {
+            let token = token_from_env("NOTION_TOKEN")?;
+            let settings = notion::NotionSettings::default();
+            let http = reqwest::Client::builder()
+                .timeout(notion::NOTION_TIMEOUT)
+                .build()?;
+            let mut client = notion::NotionClient::new(&http, &settings, &token)?;
+            let stale = notion::find_stale(
+                &mut client,
+                std::time::Duration::from_secs(older_than_minutes * 60),
+                chrono::Utc::now(),
+            )
+            .await?;
+            eprintln!(
+                "pages still 처리 중 after {older_than_minutes} minutes: {}",
+                stale.len()
+            );
+            for page in &stale {
+                println!(
+                    "{}\t{}\t{}",
+                    page.page_id, page.last_edited_time, page.huddle_key
+                );
+            }
+            if !stale.is_empty() {
+                return Ok(ExitCode::FAILURE);
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `--gcp-auth` 에 맞는 토큰 출처.
+fn gcp_token_source(auth: GcpAuth) -> anyhow::Result<TokenSource> {
+    Ok(match auth {
+        GcpAuth::Metadata => TokenSource::metadata_server(),
+        GcpAuth::Gcloud => TokenSource::gcloud(),
+        GcpAuth::Env => TokenSource::static_from_env()
+            .with_context(|| format!("{STATIC_TOKEN_ENV} is not set"))?,
+    })
 }
 
 /// Run every planned meeting of a channel. The exit code says whether all

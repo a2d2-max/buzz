@@ -68,6 +68,18 @@ pub trait MinutesHome {
         json: Vec<u8>,
         overwrite: bool,
     ) -> impl Future<Output = Result<String, MeetingError>>;
+    /// 이 회의의 노션 기록(스크립트 옆 `{첫 세션}.notion.json`: 만든 page id).
+    /// 아직 없으면 `None`.
+    fn read_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, MeetingError>>;
+    /// 이 회의의 노션 기록을 쓴다(있으면 바꿔 쓴다). 쓴 곳을 돌려준다.
+    fn write_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> impl Future<Output = Result<String, MeetingError>>;
 }
 
 /// The local folder where scripts, ledgers and locks live.
@@ -97,6 +109,11 @@ impl LocalMinutes {
 
     fn lock_path(&self, first: Uuid) -> PathBuf {
         self.dir.join(format!("{first}.lock"))
+    }
+
+    /// 첫 세션이 `first` 인 회의의 노션 기록.
+    pub fn notion_record_path(&self, first: Uuid) -> PathBuf {
+        self.dir.join(format!("{first}.notion.json"))
     }
 }
 
@@ -156,6 +173,27 @@ impl MinutesHome for LocalMinutes {
         _overwrite: bool,
     ) -> Result<String, MeetingError> {
         let path = self.transcript_path(meeting.first_session_id());
+        write_private(&path, &json)?;
+        Ok(path.display().to_string())
+    }
+
+    async fn read_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> Result<Option<Vec<u8>>, MeetingError> {
+        match std::fs::read(self.notion_record_path(meeting.first_session_id())) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(MeetingError::Io(error)),
+        }
+    }
+
+    async fn write_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> Result<String, MeetingError> {
+        let path = self.notion_record_path(meeting.first_session_id());
         write_private(&path, &json)?;
         Ok(path.display().to_string())
     }

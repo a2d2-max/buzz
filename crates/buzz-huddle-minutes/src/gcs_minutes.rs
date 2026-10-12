@@ -38,6 +38,9 @@ pub const LEASE_FORMAT: &str = "huddle-minutes-lease/1";
 
 const JSON: &str = "application/json";
 
+/// 노션 기록 이름 끝. 스크립트와 같은 곳에 있어서 스크립트를 읽을 때 뺀다.
+const NOTION_RECORD_SUFFIX: &str = ".notion.json";
+
 /// The minutes bucket as a [`MinutesHome`].
 #[derive(Debug, Clone)]
 pub struct GcsMinutes {
@@ -76,6 +79,16 @@ impl GcsMinutes {
     pub fn script_key(meeting: &MeetingPlan) -> String {
         format!(
             "transcripts/{}/{}/{}.json",
+            meeting.community_id,
+            meeting.channel_id,
+            meeting.first_session_id()
+        )
+    }
+
+    /// 회의의 노션 기록이 있는 곳(스크립트 옆).
+    pub fn notion_record_key(meeting: &MeetingPlan) -> String {
+        format!(
+            "transcripts/{}/{}/{}{NOTION_RECORD_SUFFIX}",
             meeting.community_id,
             meeting.channel_id,
             meeting.first_session_id()
@@ -212,6 +225,9 @@ impl MinutesHome for GcsMinutes {
         );
         let mut processed = Vec::new();
         for object in self.gcs.list(&self.bucket, &prefix).await? {
+            if object.name.ends_with(NOTION_RECORD_SUFFIX) {
+                continue;
+            }
             let bytes = self.gcs.get(&self.bucket, &object.name).await?;
             let transcript: Transcript = serde_json::from_slice(&bytes)
                 .map_err(|e| MeetingError::Scripts(format!("{}: {e}", object.name)))?;
@@ -248,6 +264,33 @@ impl MinutesHome for GcsMinutes {
             Write::IfAbsent
         };
         self.gcs.put(&self.bucket, &key, json, JSON, write).await?;
+        Ok(format!("gs://{}/{key}", self.bucket))
+    }
+
+    async fn read_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> Result<Option<Vec<u8>>, MeetingError> {
+        match self
+            .gcs
+            .get(&self.bucket, &Self::notion_record_key(meeting))
+            .await
+        {
+            Ok(bytes) => Ok(Some(bytes.to_vec())),
+            Err(error) if error.kind == GcsErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn write_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> Result<String, MeetingError> {
+        let key = Self::notion_record_key(meeting);
+        self.gcs
+            .put(&self.bucket, &key, json, JSON, Write::Overwrite)
+            .await?;
         Ok(format!("gs://{}/{key}", self.bucket))
     }
 }
