@@ -1196,6 +1196,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-gcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "chrono",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-huddle-minutes"
 version = "0.1.0"
 dependencies = [
@@ -1203,6 +1219,7 @@ dependencies = [
  "buzz-huddle-recording",
  "chrono",
  "clap",
+ "fs2",
  "hex",
  "opus",
  "reqwest 0.13.4",

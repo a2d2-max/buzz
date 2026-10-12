@@ -381,6 +381,9 @@ test-unit:
         # audio and an energy detector — no network, no model download (the
         # FLEURS + Silero test is #[ignore]d).
         cargo nextest run -p buzz-huddle-minutes
+        # Shared GCP access (tokens, Cloud Storage): against a fake server on
+        # 127.0.0.1 — the real-bucket round trip is #[ignore]d.
+        cargo nextest run -p buzz-gcp
         cargo nextest run -p buzz-cli
         # buzz-acp owns the relay-to-agent trust boundary. Run its tests here so
         # forged relay events cannot regain a path into agent routing unnoticed.

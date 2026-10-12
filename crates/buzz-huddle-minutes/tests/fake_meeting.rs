@@ -6,29 +6,32 @@
 //! same flow with FLEURS speech and Silero runs from the command line
 //! (`fake-meeting` → `process` → `check`) and in the ignored test below.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use buzz_huddle_minutes::audio::read_wav_mono_i16;
 use buzz_huddle_minutes::check::{audio_match, check, check_mix, Tolerance};
-use buzz_huddle_minutes::collect::{collect_meetings, Meeting};
+use buzz_huddle_minutes::collect::{collect_meetings, Meeting, Skip};
 use buzz_huddle_minutes::ledger::SttLedger;
-use buzz_huddle_minutes::media::{level_dbov, MediaHeader, FLAG_DTX};
+use buzz_huddle_minutes::media::{level_dbov, split_frame, MediaHeader, FLAG_DTX};
 use buzz_huddle_minutes::models::silero_vad_path;
 use buzz_huddle_minutes::pipeline::{
     build_minutes, MinutesError, MinutesOutput, MinutesSettings, SttPolicy,
 };
+use buzz_huddle_minutes::runner::{run_meeting, Done, LocalMinutes, MeetingError, RunOptions};
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Clip, FakeMeeting,
-    BASE_UNIX_MS, SENTENCES,
+    Truth, BASE_UNIX_MS, SENTENCES,
 };
 use buzz_huddle_minutes::store::{LocalStore, RecordingStore};
 use buzz_huddle_minutes::stt::{
     Fault, SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, TruthStt, FAILED_TEXT,
 };
-use buzz_huddle_minutes::transcript::SttInfo;
+use buzz_huddle_minutes::transcript::{SttInfo, Transcript};
 use buzz_huddle_minutes::vad::{
     SegmentPlan, SileroSettings, SileroVad, SpeechDetector, SpeechSpan, VadError,
 };
@@ -110,6 +113,7 @@ fn settings() -> MinutesSettings {
             rate_limit_delay_ms: 0,
             ..SttPolicy::default()
         },
+        ledger_version: "test".into(),
         audio_key: "mixed.wav".into(),
         now_unix_ms: 0,
     }
@@ -577,6 +581,13 @@ async fn padding_reaches_the_transcriber_but_not_the_script() {
     let clean = clean_tracks(&meeting);
     let pad = SegmentPlan::default().pad_ms;
     let mut full_pad = 0;
+    // Limits = what this meeting measures (seed 7: weakest own 0.985,
+    // smallest lead 0.371, latest 60 ms) with a little room for another
+    // CPU's Opus decoder. The measured values are printed on every run.
+    const MIN_OWN: f64 = 0.95;
+    const MIN_LEAD: f64 = 0.3;
+    const MAX_LATE_MS: i64 = 100;
+    let (mut min_own, mut min_lead, mut max_late) = (f64::MAX, f64::MAX, 0);
     for segment in &output.transcript.segments {
         let n: usize = segment.text[1..].parse().expect("request number");
         let (speaker, start, end, audio) = &seen[n];
@@ -602,23 +613,29 @@ async fn padding_reaches_the_transcriber_but_not_the_script() {
 
         let (late_ms, own) = audio_match(audio, &clean[speaker], start, 200)
             .unwrap_or_else(|| panic!("no match for {segment:?}"));
+        min_own = min_own.min(own);
+        max_late = max_late.max(late_ms);
         assert!(
-            own >= 0.8,
-            "{segment:?}: correlation {own:.2} with its own speech"
+            own >= MIN_OWN,
+            "{segment:?}: correlation {own:.3} with its own speech"
         );
         assert!(
-            (0..=150).contains(&late_ms),
+            (0..=MAX_LATE_MS).contains(&late_ms),
             "{segment:?}: {late_ms} ms off its own speech"
         );
         for (other, track) in clean.iter().filter(|(who, _)| *who != speaker) {
             if let Some((_, theirs)) = audio_match(audio, track, start, 200) {
+                min_lead = min_lead.min(own - theirs);
                 assert!(
-                    own > theirs + 0.2,
-                    "{segment:?}: {own:.2} vs {theirs:.2} with {other}"
+                    own > theirs + MIN_LEAD,
+                    "{segment:?}: {own:.3} vs {theirs:.3} with {other}"
                 );
             }
         }
     }
+    eprintln!(
+        "audio match: weakest own {min_own:.3}, smallest lead {min_lead:.3}, latest {max_late} ms"
+    );
     let lines = output.transcript.segments.len();
     assert!(
         full_pad * 10 >= lines * 9,
@@ -1295,4 +1312,371 @@ async fn fleurs_meeting_with_silero() {
         out_of_limits <= 1,
         "{out_of_limits} groups outside the time limits"
     );
+}
+
+/// Runner options for a meeting of [`fake_meeting`]: an hour after it
+/// started, no waiting for quiet (its files were written just now).
+fn run_options(truth: &Truth) -> RunOptions {
+    RunOptions {
+        prefix: truth.prefix.clone(),
+        now_unix_ms: BASE_UNIX_MS + 3_600_000,
+        quiet_ms: 0,
+        overwrite: false,
+    }
+}
+
+/// Which of the two workers a child process of
+/// [`two_workers_at_once_pay_for_one_run`] is ("0" or "1").
+const LOCK_CHILD: &str = "BUZZ_MINUTES_TEST_LOCK_CHILD";
+/// The folder the two workers share.
+const LOCK_DIR: &str = "BUZZ_MINUTES_TEST_LOCK_DIR";
+
+/// Test double wrapper: the first request waits (up to 20 s) until `file`
+/// exists. The worker holding the meeting is then still in the middle of
+/// transcribing when the other worker reaches the meeting, without relying
+/// on timing.
+struct WaitsForFile<'a, T> {
+    inner: Counting<'a, T>,
+    file: PathBuf,
+    waited: AtomicBool,
+}
+
+impl<T: SpeechToText + Sync> SpeechToText for WaitsForFile<'_, T> {
+    fn info(&self) -> SttInfo {
+        self.inner.info()
+    }
+
+    async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
+        if !self.waited.swap(true, Ordering::Relaxed) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !self.file.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.inner.transcribe(request).await
+    }
+}
+
+/// One of the two workers of [`two_workers_at_once_pay_for_one_run`]. Does
+/// nothing when run on its own.
+#[tokio::test]
+async fn lock_child() {
+    let Ok(n) = std::env::var(LOCK_CHILD) else {
+        return;
+    };
+    let n: usize = n.parse().expect("child number");
+    let dir = PathBuf::from(std::env::var(LOCK_DIR).expect("shared folder"));
+    let truth: Truth =
+        serde_json::from_slice(&std::fs::read(dir.join("truth.json")).expect("truth"))
+            .expect("truth json");
+    let store = LocalStore::new(dir.join("recordings"));
+    let meeting = collect_meetings(
+        &store,
+        &truth.prefix,
+        truth.community_id,
+        truth.channel_id,
+        10 * 60_000,
+    )
+    .await
+    .expect("collect")
+    .meetings
+    .remove(0);
+    let truth_stt = TruthStt::new(&truth);
+    let stt = WaitsForFile {
+        inner: Counting::new(&truth_stt),
+        file: dir.join(format!("child-{}.txt", 1 - n)),
+        waited: AtomicBool::new(false),
+    };
+    let minutes = LocalMinutes::open(&dir.join("minutes")).expect("minutes folder");
+    let done = run_meeting(
+        &minutes,
+        &store,
+        &meeting,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &run_options(&truth),
+    )
+    .await
+    .expect("run");
+    let outcome = match done {
+        Done::Written { .. } => "written".to_string(),
+        Done::Locked => "locked".to_string(),
+        Done::Skipped(skip) => format!("skipped-{skip:?}"),
+    };
+    std::fs::write(
+        dir.join(format!("child-{n}.txt")),
+        format!("{outcome} {}", stt.inner.sent()),
+    )
+    .expect("result");
+}
+
+/// Two workers on the same meeting at the same time, as two processes: one
+/// transcribes it, the other finds it locked and sends nothing, so the
+/// requests add up to one run.
+#[test]
+fn two_workers_at_once_pay_for_one_run() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fake_meeting(dir.path(), &meeting).expect("write fake meeting");
+    let exe = std::env::current_exe().expect("test binary");
+    let children: Vec<_> = (0..2)
+        .map(|n| {
+            Command::new(&exe)
+                .args(["lock_child", "--exact", "--nocapture"])
+                .env(LOCK_CHILD, n.to_string())
+                .env(LOCK_DIR, dir.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start worker")
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().expect("worker");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut results: Vec<(String, usize)> = (0..2)
+        .map(|n| {
+            let text = std::fs::read_to_string(dir.path().join(format!("child-{n}.txt")))
+                .expect("worker result");
+            let (outcome, sent) = text.split_once(' ').expect("outcome and count");
+            (outcome.to_string(), sent.parse().expect("count"))
+        })
+        .collect();
+    results.sort();
+
+    let minutes = dir.path().join("minutes");
+    let scripts: Vec<PathBuf> = std::fs::read_dir(&minutes)
+        .expect("minutes folder")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.to_string_lossy().ends_with(".transcript.json"))
+        .collect();
+    assert_eq!(scripts.len(), 1);
+    let transcript: Transcript =
+        serde_json::from_slice(&std::fs::read(&scripts[0]).expect("script")).expect("json");
+    let pieces = transcript.segments.len();
+    assert!(pieces > 0);
+    assert_eq!(
+        results,
+        vec![("locked".to_string(), 0), ("written".to_string(), pieces)]
+    );
+}
+
+/// Test double: speech detection that always fails.
+struct FailingDetector;
+
+impl SpeechDetector for FailingDetector {
+    fn detect(&mut self, _: &[f32]) -> Result<Vec<SpeechSpan>, VadError> {
+        Err(VadError::CreateFailed)
+    }
+}
+
+/// A ledger that cannot be opened fails that meeting before anything is
+/// sent (going on without it could pay twice), without stopping the run.
+#[tokio::test]
+async fn an_unopenable_ledger_fails_the_meeting_before_sending() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gathered = gather(dir.path(), &meeting).await;
+    let first = gathered.sessions[0].session_id;
+    let minutes = LocalMinutes::open(&dir.path().join("minutes")).expect("minutes folder");
+    // A folder where the ledger file should be.
+    std::fs::create_dir(minutes.ledger_path(first)).expect("folder");
+    let store = LocalStore::new(dir.path().join("recordings"));
+    let truth_stt = TruthStt::new(&meeting.truth);
+    let stt = Counting::new(&truth_stt);
+    let result = run_meeting(
+        &minutes,
+        &store,
+        &gathered,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &run_options(&meeting.truth),
+    )
+    .await;
+    match result {
+        Err(error @ MeetingError::Ledger(_)) => assert!(!error.stops_the_run()),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(stt.sent(), 0);
+    assert!(!minutes.transcript_path(first).exists());
+}
+
+/// The runner on one meeting with a ledger file:
+/// - a run that stopped before transcribing (speech detection failed) or
+///   in the middle (credentials refused) is not counted as a run;
+/// - a torn line left by a crash is counted in the report;
+/// - once written, the meeting is skipped and nothing is sent again.
+#[tokio::test]
+async fn only_finished_runs_count_and_torn_ledger_lines_are_reported() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gathered = gather(dir.path(), &meeting).await;
+    let first = gathered.sessions[0].session_id;
+    let minutes = LocalMinutes::open(&dir.path().join("minutes")).expect("minutes folder");
+    let store = LocalStore::new(dir.path().join("recordings"));
+    let options = run_options(&meeting.truth);
+    // A crash in an earlier process left half a line.
+    std::fs::write(minutes.ledger_path(first), b"{\"kind\":\"done\",\"ke").expect("torn line");
+
+    let truth_stt = TruthStt::new(&meeting.truth);
+    let stt = Counting::new(&truth_stt);
+    let result = run_meeting(
+        &minutes,
+        &store,
+        &gathered,
+        &mut FailingDetector,
+        &stt,
+        &settings(),
+        &options,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(MeetingError::Minutes(MinutesError::Vad(_)))),
+        "{result:?}"
+    );
+    assert_eq!(stt.sent(), 0);
+
+    // The 3rd piece's first attempt is refused credentials.
+    let refusing = TruthStt::new(&meeting.truth).with_fault(Fault {
+        last_piece: 3,
+        ..fault(SttErrorKind::Auth, 3, 1)
+    });
+    let stt = Counting::new(&refusing);
+    let result = run_meeting(
+        &minutes,
+        &store,
+        &gathered,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &options,
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(MeetingError::Minutes(MinutesError::SttStopped(
+                SttErrorKind::Auth
+            )))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(stt.sent(), 3);
+
+    let stt = Counting::new(&truth_stt);
+    let done = run_meeting(
+        &minutes,
+        &store,
+        &gathered,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &options,
+    )
+    .await
+    .expect("written");
+    let Done::Written { output, .. } = done else {
+        panic!("{done:?}");
+    };
+    assert_eq!(output.report.run, 1, "the two stopped runs do not count");
+    assert_eq!(output.report.stt_reused, 2);
+    assert_eq!(stt.sent(), output.transcript.segments.len() - 2);
+    assert_eq!(output.report.ledger_unreadable_lines, 1);
+
+    let stt = Counting::new(&truth_stt);
+    let done = run_meeting(
+        &minutes,
+        &store,
+        &gathered,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &options,
+    )
+    .await
+    .expect("skipped");
+    assert!(
+        matches!(done, Done::Skipped(Skip::AlreadyProcessed)),
+        "{done:?}"
+    );
+    assert_eq!(stt.sent(), 0);
+}
+
+/// Flip the lowest bit of the last Opus byte of the loudest recorded frame
+/// (the middle of a word, so speech detection cuts the same).
+fn flip_loudest_frame(meeting: &mut Meeting) {
+    // (level, session, chunk, byte to flip)
+    let mut loudest: Option<(i8, usize, usize, usize)> = None;
+    for (s, session) in meeting.sessions.iter().enumerate() {
+        for (c, chunk) in session.chunks.iter().enumerate() {
+            let (_, records) = decode_chunk(&chunk.bytes).expect("chunk");
+            for record in records {
+                let Record::Frame { payload, .. } = record.expect("record") else {
+                    continue;
+                };
+                let Some((Some(header), _)) = split_frame(session.protocol_version, payload) else {
+                    continue;
+                };
+                let at =
+                    payload.as_ptr() as usize - chunk.bytes.as_ptr() as usize + payload.len() - 1;
+                if loudest.is_none_or(|(level, ..)| header.level_dbov > level) {
+                    loudest = Some((header.level_dbov, s, c, at));
+                }
+            }
+        }
+    }
+    let (_, s, c, at) = loudest.expect("a frame");
+    meeting.sessions[s].chunks[c].bytes[at] ^= 1;
+}
+
+/// The ledger key is made from the recorded frames, the cut and the
+/// settings version:
+/// - one recorded frame changed by one bit: only the piece holding it is
+///   sent again, and the cuts stay the same;
+/// - another settings version: every piece is sent again.
+#[tokio::test]
+async fn the_ledger_key_follows_recorded_frames_and_settings() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut gathered = gather(dir.path(), &meeting).await;
+    let truth_stt = TruthStt::new(&meeting.truth);
+    let stt = Counting::new(&truth_stt);
+    let mut ledger = SttLedger::in_memory();
+    let before = run_again(&gathered, &stt, &mut ledger)
+        .await
+        .expect("first run");
+    let pieces = stt.sent();
+    assert_eq!(pieces, before.transcript.segments.len());
+
+    flip_loudest_frame(&mut gathered);
+    let after = run_again(&gathered, &stt, &mut ledger)
+        .await
+        .expect("changed frame");
+    assert_eq!(stt.sent() - pieces, 1, "only the piece holding the frame");
+    let cuts = |output: &MinutesOutput| -> Vec<(String, u64, u64)> {
+        output
+            .transcript
+            .segments
+            .iter()
+            .map(|s| (s.speaker.clone(), s.start_ms, s.end_ms))
+            .collect()
+    };
+    assert_eq!(cuts(&after), cuts(&before));
+
+    let sent = stt.sent();
+    let other = MinutesSettings {
+        ledger_version: "test-2".into(),
+        ..settings()
+    };
+    build_minutes(&gathered, &mut EnergyDetector, &stt, &mut ledger, &other)
+        .await
+        .expect("new settings");
+    assert_eq!(stt.sent() - sent, pieces);
 }

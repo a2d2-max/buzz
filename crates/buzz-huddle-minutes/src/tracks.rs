@@ -140,6 +140,10 @@ pub struct SpeakerTrack {
     pub pcm: Vec<f32>,
     /// One hint per written frame.
     pub hints: Vec<FrameHint>,
+    /// Every received frame as `(meeting ms where it was placed, digest of
+    /// its recorded bytes)`, in time order. What a piece is made of, without
+    /// depending on how the audio decodes.
+    pub frame_digests: Vec<(u64, [u8; 16])>,
     /// Decode counters.
     pub stats: DecodeStats,
 }
@@ -267,8 +271,14 @@ fn note_person<'a>(
 /// What one placed step of a stream decodes.
 #[derive(Clone, Copy)]
 enum Step<'a> {
-    /// A received Opus packet, with its level and DTX hint.
-    Packet(&'a [u8], Option<i8>, bool),
+    /// A received frame: the recorded bytes, the Opus packet in them, and
+    /// the level and DTX hints.
+    Packet {
+        frame: &'a [u8],
+        packet: &'a [u8],
+        level_dbov: Option<i8>,
+        dtx: bool,
+    },
     /// One concealed (lost or undecodable) frame.
     Conceal,
 }
@@ -308,12 +318,19 @@ impl SpeakerFrames<'_> {
         let base = start_ms * SAMPLES_PER_MS;
         let mut pcm: Vec<f32> = Vec::new();
         let mut hints = Vec::with_capacity(self.frames.len());
+        let mut frame_digests = Vec::with_capacity(self.frames.len());
         let mut buf = vec![0f32; MAX_FRAME_SAMPLES];
         for plan in &plans {
             let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)?;
             for planned in plan {
                 let n = match planned.step {
-                    Step::Packet(packet, level_dbov, dtx) => {
+                    Step::Packet {
+                        frame,
+                        packet,
+                        level_dbov,
+                        dtx,
+                    } => {
+                        frame_digests.push((planned.at / SAMPLES_PER_MS, frame_digest(frame)));
                         match decoder.decode_float(packet, &mut buf, false) {
                             Ok(n) => {
                                 stats.decoded += 1;
@@ -340,11 +357,13 @@ impl SpeakerFrames<'_> {
             }
         }
         hints.sort_by_key(|hint| hint.t_ms);
+        frame_digests.sort_unstable();
         Ok(SpeakerTrack {
             pubkey: self.pubkey.clone(),
             start_ms,
             pcm,
             hints,
+            frame_digests,
             stats,
         })
     }
@@ -419,11 +438,12 @@ fn plan_stream<'a>(frames: &[&SpeakerFrame<'a>], stats: &mut DecodeStats) -> Vec
         }
         let (step, len) = match opus::packet::get_nb_samples(packet, SAMPLE_RATE) {
             Ok(len) => (
-                Step::Packet(
+                Step::Packet {
+                    frame: frame.frame,
                     packet,
-                    header.map(|h| h.level_dbov),
-                    header.is_some_and(|h| h.is_dtx()),
-                ),
+                    level_dbov: header.map(|h| h.level_dbov),
+                    dtx: header.is_some_and(|h| h.is_dtx()),
+                },
                 len as u64,
             ),
             Err(_) => (Step::Conceal, CONCEAL_SAMPLES as u64),
@@ -498,6 +518,15 @@ impl SpeakerTrack {
         }
         regions
     }
+}
+
+/// First 16 bytes of the sha256 of a recorded frame.
+fn frame_digest(frame: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(frame);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hash[..16]);
+    out
 }
 
 /// Add `samples` into the track at `offset`. Added, not copied: the same

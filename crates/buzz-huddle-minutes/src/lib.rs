@@ -23,6 +23,7 @@ pub mod ledger;
 pub mod media;
 pub mod models;
 pub mod pipeline;
+pub mod runner;
 pub mod sim;
 pub mod store;
 pub mod stt;

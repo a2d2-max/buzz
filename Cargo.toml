@@ -31,6 +31,7 @@ members = [
     "crates/buzz-voice",
     "crates/buzz-huddle-recording",
     "crates/buzz-huddle-minutes",
+    "crates/buzz-gcp",
     "crates/buzz-backend-kubernetes",
     "crates/buzz-datastore-tracing",
     "examples/countdown-bot",
@@ -150,6 +151,7 @@ buzz-audit = { path = "crates/buzz-audit" }
 buzz-workflow = { path = "crates/buzz-workflow" }
 buzz-media = { path = "crates/buzz-media" }
 buzz-huddle-recording = { path = "crates/buzz-huddle-recording" }
+buzz-gcp = { path = "crates/buzz-gcp" }
 buzz-sdk = { path = "crates/buzz-sdk" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }

@@ -7,20 +7,23 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::Context;
 
 use buzz_huddle_minutes::audio::read_wav_mono_i16;
 use buzz_huddle_minutes::check::{check, check_mix, Tolerance};
 use buzz_huddle_minutes::collect::collect_meetings;
-use buzz_huddle_minutes::ledger::SttLedger;
-use buzz_huddle_minutes::models::{ensure_silero_vad, silero_vad_path};
-use buzz_huddle_minutes::pipeline::{build_minutes, mixed_audio_key, MinutesSettings, SttPolicy};
+use buzz_huddle_minutes::ledger::LEDGER_KEY_FORMAT;
+use buzz_huddle_minutes::models::{
+    ensure_silero_vad, sha256_hex, silero_vad_path, SILERO_VAD_SHA256,
+};
+use buzz_huddle_minutes::pipeline::{mixed_audio_key, MinutesSettings, SttPolicy};
+use buzz_huddle_minutes::runner::{run_meeting, Done, LocalMinutes, RunOptions};
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Truth, SENTENCES,
 };
-use buzz_huddle_minutes::store::{LocalStore, RecordingStore};
+use buzz_huddle_minutes::store::LocalStore;
 use buzz_huddle_minutes::stt::{Fault, SttErrorKind, TruthStt};
 use buzz_huddle_minutes::transcript::Transcript;
 use buzz_huddle_minutes::vad::{SegmentPlan, SileroSettings, SileroVad};
@@ -167,60 +170,29 @@ impl From<FailKind> for SttErrorKind {
     }
 }
 
-/// Every session id already in a script under `out`, with its file name.
-/// An unreadable script is an error: skipping it could process a meeting
-/// twice.
-fn processed_sessions(out: &Path) -> anyhow::Result<Vec<(Uuid, String)>> {
-    let mut processed = Vec::new();
-    for entry in std::fs::read_dir(out)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".transcript.json") {
-            continue;
-        }
-        let transcript: Transcript = serde_json::from_slice(&std::fs::read(entry.path())?)
-            .with_context(|| format!("read {}", entry.path().display()))?;
-        for session in transcript.session_ids {
-            processed.push((session, name.clone()));
-        }
+/// Settings version for ledger keys: the key format, how pieces are cut
+/// and the exact VAD model. The model's sha256 is checked here too, so a
+/// changed or broken model file is refused instead of silently re-cutting.
+fn ledger_version(plan: &SegmentPlan, model: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(model).with_context(|| format!("read {}", model.display()))?;
+    let digest = sha256_hex(&bytes);
+    if digest != SILERO_VAD_SHA256 {
+        anyhow::bail!(
+            "{} has sha256 {digest}, expected {SILERO_VAD_SHA256}; run `buzz-huddle-minutes fetch-models`",
+            model.display()
+        );
     }
-    Ok(processed)
-}
-
-/// Create `dir` (and missing parents) readable by its owner only (0700).
-/// An existing folder is left as it is.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(dir)
-}
-
-/// Write a file readable by its owner only (0600), atomically.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let partial = path.with_extension("partial");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&partial)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&partial, path)
+    let vad = SileroSettings::default();
+    Ok(format!(
+        "{LEDGER_KEY_FORMAT};max={};pad={};vad={},{},{},{},{};model={digest}",
+        plan.max_segment_ms,
+        plan.pad_ms,
+        vad.threshold,
+        vad.min_silence_s,
+        vad.cut_silence_s,
+        vad.min_speech_s,
+        vad.max_speech_s
+    ))
 }
 
 fn default_cache() -> PathBuf {
@@ -328,52 +300,57 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     last_piece: usize::MAX,
                 });
             }
-            create_private_dir(&out)?;
-            let processed = processed_sessions(&out)?;
+            let minutes = LocalMinutes::open(&out)?;
+            let plan = SegmentPlan {
+                max_segment_ms,
+                pad_ms,
+            };
+            let settings = MinutesSettings {
+                segment_plan: plan,
+                stt: SttPolicy::default(),
+                ledger_version: ledger_version(&plan, &model)?,
+                audio_key: String::new(),
+                now_unix_ms: now,
+            };
+            let options = RunOptions {
+                prefix: prefix.clone(),
+                now_unix_ms: now,
+                quiet_ms,
+                overwrite,
+            };
             eprintln!(
                 "meetings in this channel: {} | sessions with nothing readable outside any meeting: {}",
                 collected.meetings.len(),
                 collected.unplaced_sessions.len()
             );
-            let mut failed_meetings = 0usize;
+            let (mut failed, mut locked) = (0usize, 0usize);
             for (m, meeting) in collected.meetings.iter().enumerate() {
-                let first = meeting
-                    .sessions
-                    .first()
-                    .map(|session| session.session_id)
-                    .unwrap_or_default();
-                // One script per meeting, named after its first session.
-                let name = format!("{first}.transcript.json");
-                let transcript_path = out.join(&name);
-                // `--overwrite` may replace this meeting's own script, never
-                // another script that shares a session with it.
-                let already: HashSet<Uuid> = processed
-                    .iter()
-                    .filter(|(_, file)| !(overwrite && **file == name))
-                    .map(|(session, _)| *session)
-                    .collect();
-                if let Some(skip) = meeting.skip_reason(&already, now, quiet_ms) {
-                    eprintln!("meeting {m}: skipped ({})", skip.as_str());
-                    continue;
-                }
-                let audio_key = mixed_audio_key(&prefix, meeting);
-                let settings = MinutesSettings {
-                    segment_plan: SegmentPlan {
-                        max_segment_ms,
-                        pad_ms,
-                    },
-                    stt: SttPolicy::default(),
-                    audio_key: audio_key.clone(),
-                    now_unix_ms: now,
-                };
-                // Outcomes already paid for, kept beside the script (0600).
-                let mut ledger = SttLedger::open(&out.join(format!("{first}.stt.jsonl")))?;
-                let built =
-                    build_minutes(meeting, &mut detector, &stt, &mut ledger, &settings).await;
-                let output = match built {
-                    Ok(output) => output,
+                let done = run_meeting(
+                    &minutes,
+                    &store,
+                    meeting,
+                    &mut detector,
+                    &stt,
+                    &settings,
+                    &options,
+                )
+                .await;
+                let (output, transcript_path) = match done {
+                    Ok(Done::Written {
+                        output,
+                        transcript_path,
+                    }) => (output, transcript_path),
+                    Ok(Done::Skipped(skip)) => {
+                        eprintln!("meeting {m}: skipped ({})", skip.as_str());
+                        continue;
+                    }
+                    Ok(Done::Locked) => {
+                        locked += 1;
+                        eprintln!("meeting {m}: skipped (another worker holds it)");
+                        continue;
+                    }
                     Err(error) => {
-                        failed_meetings += 1;
+                        failed += 1;
                         eprintln!("meeting {m}: not written: {error}");
                         if error.stops_the_run() {
                             eprintln!("stopping: later meetings would fail the same way");
@@ -382,12 +359,6 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         continue;
                     }
                 };
-                store.put(&audio_key, output.mixed_audio).await?;
-                write_private(
-                    &transcript_path,
-                    &serde_json::to_vec_pretty(&output.transcript)?,
-                )?;
-
                 let report = &output.report;
                 let losses = &report.losses;
                 eprintln!(
@@ -415,12 +386,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     report.unplaced_sessions_in_channel
                 );
                 eprintln!(
-                    "  stt run {} | requests {} reused from ledger {} retries {} gave up [{}]",
+                    "  stt run {} | requests {} reused from ledger {} retries {} gave up [{}] | unreadable ledger lines {}",
                     report.run,
                     report.stt_requests,
                     report.stt_reused,
                     report.stt_retries,
-                    by_kind.join(", ")
+                    by_kind.join(", "),
+                    report.ledger_unreadable_lines
                 );
                 for (i, speaker) in report.speakers.iter().enumerate() {
                     eprintln!(
@@ -439,10 +411,16 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     );
                 }
                 eprintln!("  transcript: {}", transcript_path.display());
-                eprintln!("  mixed audio: {}", recordings.join(&audio_key).display());
+                eprintln!(
+                    "  mixed audio: {}",
+                    recordings.join(mixed_audio_key(&prefix, meeting)).display()
+                );
             }
-            if failed_meetings > 0 {
-                eprintln!("{failed_meetings} meeting(s) not written");
+            if locked > 0 {
+                eprintln!("{locked} meeting(s) held by another worker");
+            }
+            if failed > 0 {
+                eprintln!("{failed} meeting(s) not written");
                 return Ok(ExitCode::FAILURE);
             }
         }

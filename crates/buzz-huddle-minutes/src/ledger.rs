@@ -5,7 +5,7 @@
 //! an auth error keeps everything before it:
 //!
 //! ```text
-//! {"kind":"run","number":2}
+//! {"kind":"run","number":2}       (written when run 2 finished transcribing)
 //! {"kind":"done","key":"…","text":"…","billed_seconds":3}
 //! {"kind":"rejected","key":"…","code":"…"}
 //! ```
@@ -133,7 +133,9 @@ impl SttLedger {
         Ok(())
     }
 
-    /// Runs so far (including the current one once started).
+    /// Runs that went through the whole transcription step. A run that
+    /// stopped on an auth error, crashed, or failed before transcribing is
+    /// not counted.
     pub fn runs(&self) -> u32 {
         self.runs
     }
@@ -143,12 +145,11 @@ impl SttLedger {
         self.unreadable_lines
     }
 
-    /// Note the start of a run; returns its number (1 for the first).
-    pub fn start_run(&mut self) -> std::io::Result<u32> {
-        let number = self.runs + 1;
+    /// Note that run `number` went through the whole transcription step.
+    pub fn finish_run(&mut self, number: u32) -> std::io::Result<()> {
         self.append(&Line::Run { number })?;
-        self.runs = number;
-        Ok(number)
+        self.runs = self.runs.max(number);
+        Ok(())
     }
 
     /// What is known about the piece with `key`.
@@ -178,33 +179,51 @@ impl SttLedger {
     }
 }
 
-/// Key of one piece: who, which stretch of the meeting, and a hash of the
-/// exact audio sent — if the audio changes (another decoder, other cuts),
-/// it is a different piece.
-pub fn piece_key(speaker: &str, start_ms: u64, end_ms: u64, pcm_16k: &[f32]) -> String {
+/// Format of [`piece_key`]; part of every settings version.
+pub const LEDGER_KEY_FORMAT: &str = "huddle-minutes-ledger-key/1";
+
+/// Key of one piece (hex sha256): the settings version, who, where it was
+/// cut (the audio sent, ms on the meeting clock), and the recorded Opus
+/// frames inside that stretch with their places. It is made from what was
+/// recorded, not from decoded audio, so another CPU, decoder or resampler
+/// gives the same key; other settings or other cuts give another one.
+pub fn piece_key(
+    version: &str,
+    speaker: &str,
+    start_ms: u64,
+    end_ms: u64,
+    frames: &[(u64, [u8; 16])],
+) -> String {
     let mut hasher = Sha256::new();
-    for sample in pcm_16k {
-        hasher.update(sample.to_le_bytes());
+    for part in [version, speaker] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
     }
-    format!(
-        "{speaker}:{start_ms}:{end_ms}:{}",
-        hex::encode(hasher.finalize())
-    )
+    hasher.update(start_ms.to_be_bytes());
+    hasher.update(end_ms.to_be_bytes());
+    hasher.update((frames.len() as u64).to_be_bytes());
+    for (t_ms, digest) in frames {
+        hasher.update(t_ms.to_be_bytes());
+        hasher.update(digest);
+    }
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const FRAMES: [(u64, [u8; 16]); 2] = [(0, [1; 16]), (20, [2; 16])];
+
     #[test]
     fn a_reopened_ledger_remembers_runs_and_outcomes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("m.stt.jsonl");
-        let done = piece_key("aa", 0, 1_000, &[0.1, 0.2]);
-        let refused = piece_key("aa", 2_000, 3_000, &[0.3]);
+        let done = piece_key("v1", "aa", 0, 1_000, &FRAMES);
+        let refused = piece_key("v1", "aa", 2_000, 3_000, &FRAMES);
         {
             let mut ledger = SttLedger::open(&path).expect("open");
-            assert_eq!(ledger.start_run().expect("run"), 1);
+            assert_eq!(ledger.runs(), 0);
             ledger
                 .record(
                     &done,
@@ -222,6 +241,7 @@ mod tests {
                     },
                 )
                 .expect("record");
+            ledger.finish_run(1).expect("run");
         }
         // A torn last line from a crash is skipped, not fatal.
         let mut file = std::fs::OpenOptions::new()
@@ -245,7 +265,7 @@ mod tests {
             ledger.outcome(&refused),
             Some(Outcome::Rejected { .. })
         ));
-        assert_eq!(ledger.start_run().expect("run"), 2);
+        ledger.finish_run(2).expect("run");
         drop(ledger);
         // The run after the torn line is on a line of its own.
         let ledger = SttLedger::open(&path).expect("reopen");
@@ -259,12 +279,27 @@ mod tests {
         }
     }
 
+    /// The key is made of settings, speaker, cut and recorded frames —
+    /// there is no audio input to change with a CPU or a library — and
+    /// changes when any of those change.
     #[test]
-    fn the_key_changes_with_the_audio() {
-        let a = piece_key("aa", 0, 1_000, &[0.1, 0.2]);
-        assert_eq!(a, piece_key("aa", 0, 1_000, &[0.1, 0.2]));
-        assert_ne!(a, piece_key("aa", 0, 1_000, &[0.1, 0.21]));
-        assert_ne!(a, piece_key("bb", 0, 1_000, &[0.1, 0.2]));
-        assert_ne!(a, piece_key("aa", 0, 1_001, &[0.1, 0.2]));
+    fn the_key_follows_settings_cut_and_recorded_frames() {
+        let key = piece_key("v1", "aa", 0, 1_000, &FRAMES);
+        assert_eq!(key, piece_key("v1", "aa", 0, 1_000, &FRAMES));
+        // A hash: the pubkey is not readable in it.
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(key, piece_key("v2", "aa", 0, 1_000, &FRAMES));
+        assert_ne!(key, piece_key("v1", "bb", 0, 1_000, &FRAMES));
+        assert_ne!(key, piece_key("v1", "aa", 0, 1_001, &FRAMES));
+        assert_ne!(key, piece_key("v1", "aa", 0, 1_000, &FRAMES[..1]));
+        let mut other = FRAMES;
+        other[1].1[0] ^= 1;
+        assert_ne!(key, piece_key("v1", "aa", 0, 1_000, &other));
+        // Version and speaker are length-prefixed: no ambiguity.
+        assert_ne!(
+            piece_key("v1a", "a", 0, 1_000, &FRAMES),
+            piece_key("v1", "aa", 0, 1_000, &FRAMES)
+        );
     }
 }

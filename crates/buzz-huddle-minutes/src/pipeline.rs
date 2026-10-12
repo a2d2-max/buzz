@@ -60,6 +60,9 @@ pub struct MinutesSettings {
     pub segment_plan: SegmentPlan,
     /// How transcription failures are handled.
     pub stt: SttPolicy,
+    /// Settings version for ledger keys: anything that changes how pieces
+    /// are cut (segment plan, VAD model and settings) must change it.
+    pub ledger_version: String,
     /// Object key the mixed audio will be stored under.
     pub audio_key: String,
     /// When the mixed audio is written, UTC ms (for `audio.expires_at`).
@@ -146,6 +149,8 @@ pub struct RunReport {
     pub unplaced_sessions_in_channel: u64,
     /// This run's number for the meeting (1 for the first).
     pub run: u32,
+    /// Ledger lines that could not be read back (a torn write).
+    pub ledger_unreadable_lines: u64,
     /// Requests sent to the transcriber (retries included).
     pub stt_requests: u64,
     /// Pieces taken from the ledger instead of being sent again.
@@ -195,7 +200,8 @@ where
     let mut speakers = Vec::with_capacity(routed.speakers.len());
     let mut stt_info = stt.info();
     stt_info.billed_seconds = 0;
-    let run = ledger.start_run()?;
+    // This run counts only once it has gone through transcription.
+    let run = ledger.runs() + 1;
     let mut stt_requests = 0u64;
     let mut stt_reused = 0u64;
     let mut transient_failed = 0usize;
@@ -215,7 +221,8 @@ where
         };
         let mut speech_ms = 0;
         if person.frame_count() > 0 {
-            let track = person.decode()?;
+            let mut track = person.decode()?;
+            let frame_digests = std::mem::take(&mut track.frame_digests);
             report.decode = track.stats.clone();
             let regions = track.sounding_regions(REGION_GAP_MS);
             let track_start_ms = track.start_ms;
@@ -272,11 +279,14 @@ where
                     end_ms: track_start_ms + samples_to_ms(piece.audio.end),
                     pcm_16k: &pcm[piece.audio.start..piece.audio.end],
                 };
+                let first = frame_digests.partition_point(|(t, _)| *t < request.start_ms);
+                let last = frame_digests.partition_point(|(t, _)| *t < request.end_ms);
                 let key = piece_key(
+                    &settings.ledger_version,
                     &person.pubkey,
                     request.start_ms,
                     request.end_ms,
-                    request.pcm_16k,
+                    &frame_digests[first..last],
                 );
                 // Finished on an earlier run: never sent (or paid for) again.
                 let known = ledger.outcome(&key).cloned();
@@ -370,6 +380,7 @@ where
     }
     segments.sort_by(|a, b| (a.start_ms, &a.speaker).cmp(&(b.start_ms, &b.speaker)));
 
+    ledger.finish_run(run)?;
     // Refused pieces never hold a meeting back. Transient ones do, until
     // the meeting's last run.
     if transient_failed > 0 && run < settings.stt.max_runs {
@@ -417,6 +428,7 @@ where
             losses,
             unplaced_sessions_in_channel: meeting.unplaced_in_channel.len() as u64,
             run,
+            ledger_unreadable_lines: ledger.unreadable_lines(),
             stt_requests,
             stt_reused,
             stt_retries,
