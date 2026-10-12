@@ -443,6 +443,27 @@ pub async fn plan_meetings<S: RecordingStore>(
     })
 }
 
+/// Every huddle channel with recordings under `{prefix}/`, as (community,
+/// channel) from the folder names, in name order. Folders that are not
+/// UUIDs are skipped.
+pub async fn find_channels<S: RecordingStore>(
+    store: &S,
+    prefix: &str,
+) -> Result<Vec<(Uuid, Uuid)>, StoreError> {
+    let mut channels = Vec::new();
+    for community in store.folders(&format!("{prefix}/")).await? {
+        let Ok(community_id) = Uuid::parse_str(&community) else {
+            continue;
+        };
+        for channel in store.folders(&format!("{prefix}/{community}/")).await? {
+            if let Ok(channel_id) = Uuid::parse_str(&channel) {
+                channels.push((community_id, channel_id));
+            }
+        }
+    }
+    Ok(channels)
+}
+
 /// [`plan_meetings`], then load every meeting. Nothing broken is fatal: an
 /// unreadable chunk is skipped, an unreadable manifest leaves a chunk-only
 /// session, a session with nothing readable is placed by its write time —
@@ -1021,6 +1042,18 @@ mod tests {
         async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
             self.inner.put(key, bytes).await
         }
+
+        async fn put_new(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::store::PutNew, StoreError> {
+            self.inner.put_new(key, bytes).await
+        }
+
+        async fn folders(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.inner.folders(prefix).await
+        }
     }
 
     /// Planning reads manifests and the first bytes of chunks only; loading
@@ -1096,6 +1129,37 @@ mod tests {
                 chunk_key("h", community, channel, wednesday, 1),
             ]
         );
+    }
+
+    /// Channels are found from the folder names; other folders are skipped.
+    #[tokio::test]
+    async fn channels_are_found_under_the_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalStore::new(dir.path());
+        let ids = |n: u128| Uuid::from_u128(n);
+        for (community, channel, session) in [(1, 2, 10), (1, 3, 11), (4, 5, 12)] {
+            let key = chunk_key("h", ids(community), ids(channel), ids(session), 0);
+            store
+                .put(&key, chunk(ids(session), 0, 0, 0))
+                .await
+                .expect("put");
+        }
+        store
+            .put("h/not-a-community/x/y", b"x".to_vec())
+            .await
+            .expect("put");
+        store
+            .put(&format!("h/{}/mixed/a.wav", ids(1)), b"x".to_vec())
+            .await
+            .expect("put");
+        assert_eq!(
+            find_channels(&store, "h").await.expect("channels"),
+            [(ids(1), ids(2)), (ids(1), ids(3)), (ids(4), ids(5))]
+        );
+        assert!(find_channels(&store, "none")
+            .await
+            .expect("none")
+            .is_empty());
     }
 
     #[test]

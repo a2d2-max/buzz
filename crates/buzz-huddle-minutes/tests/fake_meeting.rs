@@ -32,7 +32,7 @@ use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Clip, FakeMeeting,
     Truth, BASE_UNIX_MS, SENTENCES,
 };
-use buzz_huddle_minutes::store::{LocalStore, RecordingStore};
+use buzz_huddle_minutes::store::{LocalStore, PutNew, RecordingStore};
 use buzz_huddle_minutes::stt::{
     Fault, SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, TruthStt, FAILED_TEXT,
 };
@@ -1849,11 +1849,17 @@ async fn a_meeting_goes_through_the_minutes_bucket() {
     )
     .await
     .expect("written");
-    let Done::Written { output, script } = done else {
+    let Done::Written {
+        output,
+        script,
+        audio,
+    } = done
+    else {
         panic!("{done:?}");
     };
     let pieces = output.transcript.segments.len();
     assert_eq!(stt.sent(), pieces);
+    assert_eq!(audio, PutNew::Written);
     let ledger = GcsMinutes::ledger_prefix(&plan);
     assert_eq!(
         script,
@@ -1895,9 +1901,11 @@ async fn a_meeting_goes_through_the_minutes_bucket() {
     )
     .await
     .expect("written again");
-    let Done::Written { output, .. } = again else {
+    let Done::Written { output, audio, .. } = again else {
         panic!("{again:?}");
     };
+    // The same mix again: found, not written (no overwriting needed).
+    assert_eq!(audio, PutNew::Same);
     assert_eq!(stt.sent(), 0);
     assert_eq!(output.report.stt_reused, pieces as u64);
     assert_eq!(output.report.run, 2);

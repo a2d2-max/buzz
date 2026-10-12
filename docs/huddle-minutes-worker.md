@@ -80,11 +80,39 @@
      실행 횟수는 **받아쓰기를 끝까지 돈 실행만** 센다. 인증·한도 오류로 멈춘 실행, 중간에 죽은 실행, 받아쓰기 전에 실패한 실행은 세지 않는다.
 5. **스크립트 만들기**: 덩어리를 시작 시각 순으로 늘어놓아 `huddle-transcript/1` JSON을 만든다.
 6. **섞은 오디오**: 모든 사람 소리를 같은 시간축에 섞어 재생용 파일 하나를 만든다. a2d2 데스크톱 앱(macOS WKWebView)의 `<audio>`로 틀 수 있는 형식이어야 한다.
+   녹음 버킷 `{prefix}/{community}/{channel}/mixed/{첫 세션 id}.wav`에 **없을 때만** 쓴다(작업기 계정에 덮어쓰기·지우기 권한이 필요 없게).
+   이미 있으면 같은 바이트인지 비교한다. 같으면 그대로 쓰고, 다르면(코드가 바뀐 뒤 다시 만든 경우) 있는 파일을 그대로 두고 개수를 남긴다.
 7. **요약**(뒤에 붙임): LLM으로 요약·결정사항·할 일(담당자)·주제별 정리.
    할 일은 글뿐 아니라 **구조화된 목록**으로도 낸다. 노션 기획 "노션<>허들 기반 업무 자동화" 1단계(허들 → task 생성)가 이걸 그대로 받는다.
    항목마다: 할 일 내용, 담당자 pubkey(말로 정해졌으면), 기한(말로 정해졌으면, KST), **확정/애매** 구분(담당자나 기한이 불분명하면 애매),
    근거가 된 스크립트 구간(`start_ms`). 회의 주최자는 부모 채널 48100에 서명한 사람으로 정한다. AI가 기한을 지어내지 않는다.
 8. **노션 페이지**(뒤에 붙임): "허들 ID"로 같은 회의를 두 번 만들지 않는다.
+
+## 실행 (Cloud Run 작업)
+
+`buzz-huddle-minutes process --all`을 10분마다 돌린다. 녹음 접두사 아래의 community/channel 폴더(UUID인 것만)를 스스로 찾아 채널마다 회의를 처리한다.
+채널 하나를 못 읽어도 다음 채널은 계속하고, 인증·권한·한도 오류만 실행 전체를 멈춘다. 실패가 하나라도 있으면 0이 아닌 값으로 끝난다.
+한 실행은 시간 상한(기본 50분)이 지나면 새 회의를 시작하지 않고 남은 것은 다음 실행에 넘긴다(lease 2시간보다 짧게).
+
+플래그 대신 환경 변수로도 준다.
+
+| 환경 변수 | 플래그 | 값 |
+|---|---|---|
+| `BUZZ_MINUTES_ALL` | `--all` | `true`면 모든 채널 |
+| `BUZZ_MINUTES_RECORDINGS_BUCKET` | `--recordings-bucket` | 녹음 버킷 이름 |
+| `BUZZ_MINUTES_RECORDINGS_DIR` | `--recordings` | (개발) 녹음 폴더 |
+| `BUZZ_MINUTES_PREFIX` | `--prefix` | 기본 `huddles` |
+| `BUZZ_MINUTES_COMMUNITY`, `BUZZ_MINUTES_CHANNEL` | `--community`, `--channel` | 채널 하나만 할 때 |
+| `BUZZ_MINUTES_BUCKET` | `--minutes-bucket` | 분 버킷(`a2d2-huddle-minutes`) |
+| `BUZZ_MINUTES_OUT_DIR` | `--out` | (개발) 스크립트·장부 폴더 |
+| `BUZZ_MINUTES_CHIRP_PROJECT` | `--chirp-project` | Chirp 3를 부를 프로젝트(`a2d2-lab`) |
+| `BUZZ_MINUTES_GCP_AUTH` | `--gcp-auth` | `metadata`(기본)·`gcloud`·`env` |
+| `BUZZ_MINUTES_VAD_MODEL` | `--vad-model` | Silero 모델 파일. 시작하자마자 sha256을 확인하고 다르면 멈춘다 |
+| `BUZZ_MINUTES_CACHE` | `--cache` | 모델 경로를 안 주면 `<cache>/models/silero_vad.onnx` |
+| `BUZZ_MINUTES_TIME_LIMIT_MINUTES` | `--time-limit-minutes` | 기본 50 |
+| `BUZZ_MINUTES_QUIET_MINUTES` | `--quiet-minutes` | 기본 10 |
+| `BUZZ_MINUTES_MEETING_GAP_MINUTES` | `--meeting-gap-minutes` | 기본 10 |
+| `BUZZ_GCP_ACCESS_TOKEN` | (`--gcp-auth env`) | 시험용 고정 토큰 |
 
 ## 스크립트 JSON `huddle-transcript/1`
 
@@ -142,6 +170,7 @@
 ## 알려진 한계 (아직 안 고침)
 
 - 세션이 겹칠 때 사람별로 앞 세션 마지막 프레임 시각 하나만 보고 뒤 세션 프레임을 버려서, 길게 겹치면 소리가 빠질 수 있다. 메시 주인 바뀜을 실측한 뒤 고친다.
+- 시간 상한은 회의를 시작하기 전에만 본다. 처리 중인 회의는 끝까지 하므로, 실행은 상한보다 회의 하나 처리 시간만큼 늦게 끝날 수 있다(Cloud Run 작업 제한 시간은 그만큼 여유 있게).
 - 로컬 폴더 모드(`--out`)의 잠금·장부·스크립트는 그 기계 안에서만 보인다. Cloud Run처럼 실행마다 디스크가 사라지거나
   인스턴스가 여럿 도는 곳에서는 분 버킷(`--minutes-bucket`)을 쓴다.
 - 잠금과 lease의 이름은 회의의 첫 세션 id다. 두 워커가 같은 때 회의를 다르게 묶으면(한쪽만 더 이른 세션을 봄) 서로 다른 잠금을 잡아

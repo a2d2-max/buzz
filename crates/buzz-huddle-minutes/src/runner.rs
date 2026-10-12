@@ -26,7 +26,7 @@ use crate::ledger::{Ledger, SttLedger};
 use crate::pipeline::{
     build_minutes, mixed_audio_key, MinutesError, MinutesOutput, MinutesSettings,
 };
-use crate::store::{RecordingStore, StoreError};
+use crate::store::{PutNew, RecordingStore, StoreError};
 use crate::stt::SpeechToText;
 use crate::transcript::Transcript;
 use crate::vad::SpeechDetector;
@@ -170,6 +170,10 @@ pub enum Done {
         output: Box<MinutesOutput>,
         /// Where the script went.
         script: String,
+        /// The mixed audio: written now, or already there (from an earlier
+        /// run; with other bytes it is kept — the worker never overwrites
+        /// in the recording bucket).
+        audio: PutNew,
     },
     /// Left alone this run.
     Skipped(Skip),
@@ -308,14 +312,15 @@ where
     settings.now_unix_ms = options.now_unix_ms;
     let mut output = build_minutes(&loaded, detector, stt, &mut ledger, &settings).await?;
 
-    store
-        .put(&settings.audio_key, std::mem::take(&mut output.mixed_audio))
+    let audio = store
+        .put_new(&settings.audio_key, std::mem::take(&mut output.mixed_audio))
         .await?;
     let json = serde_json::to_vec_pretty(&output.transcript).map_err(std::io::Error::other)?;
     let script = home.write_script(meeting, json, options.overwrite).await?;
     Ok(Done::Written {
         output: Box::new(output),
         script,
+        audio,
     })
 }
 

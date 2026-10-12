@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,18 +17,22 @@ use buzz_gcp::token::{TokenSource, Tokens, STATIC_TOKEN_ENV};
 use buzz_huddle_minutes::audio::read_wav_mono_i16;
 use buzz_huddle_minutes::check::{cer, check, check_mix, Tolerance};
 use buzz_huddle_minutes::chirp::ChirpStt;
-use buzz_huddle_minutes::collect::{plan_meetings, Planned};
+use buzz_huddle_minutes::collect::{find_channels, plan_meetings, CollectError};
 use buzz_huddle_minutes::gcs_minutes::GcsMinutes;
 use buzz_huddle_minutes::ledger::LEDGER_KEY_FORMAT;
 use buzz_huddle_minutes::models::{
     ensure_silero_vad, sha256_hex, silero_vad_path, SILERO_VAD_SHA256,
 };
 use buzz_huddle_minutes::pipeline::{MinutesSettings, SttPolicy};
-use buzz_huddle_minutes::runner::{run_meeting, Done, LocalMinutes, MinutesHome, RunOptions};
+use buzz_huddle_minutes::runner::{
+    run_meeting, Done, LocalMinutes, MeetingError, MinutesHome, RunOptions,
+};
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Truth, SENTENCES,
 };
-use buzz_huddle_minutes::store::{GcsStore, LocalStore, ObjectInfo, RecordingStore, StoreError};
+use buzz_huddle_minutes::store::{
+    GcsStore, LocalStore, ObjectInfo, PutNew, RecordingStore, StoreError,
+};
 use buzz_huddle_minutes::stt::{
     Fault, SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, TruthStt,
 };
@@ -45,6 +49,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at start; the size of the biggest variant does not matter.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Download the Silero VAD model into the cache and check its sha256.
     FetchModels {
@@ -73,41 +79,65 @@ enum Command {
         #[arg(long)]
         start_ms: Option<u64>,
     },
-    /// Make the script and mixed audio of each finished meeting in a huddle
-    /// channel (`<first session id>.transcript.json` per meeting).
+    /// Make the script and mixed audio of each finished meeting of one huddle
+    /// channel, or of every channel (`--all`). Settings can also come from
+    /// `BUZZ_MINUTES_*` environment variables (Cloud Run).
     Process {
         /// Folder laid out like the recording bucket.
-        #[arg(long, required_unless_present = "recordings_bucket")]
+        #[arg(
+            long,
+            env = "BUZZ_MINUTES_RECORDINGS_DIR",
+            required_unless_present = "recordings_bucket"
+        )]
         recordings: Option<PathBuf>,
         /// The recording bucket on Cloud Storage, instead of a folder.
-        #[arg(long, conflicts_with = "recordings")]
+        #[arg(
+            long,
+            env = "BUZZ_MINUTES_RECORDINGS_BUCKET",
+            conflicts_with = "recordings"
+        )]
         recordings_bucket: Option<String>,
         /// Storage prefix.
-        #[arg(long, default_value = "huddles")]
+        #[arg(long, env = "BUZZ_MINUTES_PREFIX", default_value = "huddles")]
         prefix: String,
+        /// Every community and channel found under the prefix.
+        #[arg(long, env = "BUZZ_MINUTES_ALL", conflicts_with_all = ["community", "channel"])]
+        all: bool,
         /// Community id.
-        #[arg(long)]
-        community: Uuid,
+        #[arg(long, env = "BUZZ_MINUTES_COMMUNITY", required_unless_present = "all")]
+        community: Option<Uuid>,
         /// Huddle channel id.
-        #[arg(long)]
-        channel: Uuid,
+        #[arg(long, env = "BUZZ_MINUTES_CHANNEL", required_unless_present = "all")]
+        channel: Option<Uuid>,
         /// Folder for scripts, ledgers and locks (never the recording
         /// bucket).
-        #[arg(long, required_unless_present = "minutes_bucket")]
+        #[arg(
+            long,
+            env = "BUZZ_MINUTES_OUT_DIR",
+            required_unless_present = "minutes_bucket"
+        )]
         out: Option<PathBuf>,
         /// The minutes bucket (e.g. a2d2-huddle-minutes) for scripts,
         /// ledgers and holds, instead of a folder.
-        #[arg(long, conflicts_with = "out")]
+        #[arg(long, env = "BUZZ_MINUTES_BUCKET", conflicts_with = "out")]
         minutes_bucket: Option<String>,
         /// Answer sheet for the fake transcriber.
         #[arg(long, required_unless_present = "chirp_project")]
         stt_truth: Option<PathBuf>,
         /// Transcribe with Chirp 3 in this Google Cloud project instead.
-        #[arg(long, conflicts_with = "stt_truth")]
+        #[arg(long, env = "BUZZ_MINUTES_CHIRP_PROJECT", conflicts_with = "stt_truth")]
         chirp_project: Option<String>,
         /// Where Google access tokens come from.
-        #[arg(long, value_enum, default_value_t = GcpAuth::Metadata)]
+        #[arg(long, env = "BUZZ_MINUTES_GCP_AUTH", value_enum, default_value_t = GcpAuth::Metadata)]
         gcp_auth: GcpAuth,
+        /// The Silero VAD model file (default: models/silero_vad.onnx in
+        /// the cache). Its sha256 is checked before anything else.
+        #[arg(long, env = "BUZZ_MINUTES_VAD_MODEL")]
+        vad_model: Option<PathBuf>,
+        /// Start no new meeting after this many minutes; the rest waits for
+        /// the next run. Keep it well under the 2-hour hold.
+        #[arg(long, env = "BUZZ_MINUTES_TIME_LIMIT_MINUTES", default_value_t = 50)]
+        time_limit_minutes: u64,
         /// Make every N-th piece fail transcription (fake transcriber).
         #[arg(long)]
         stt_fail_every: Option<usize>,
@@ -118,14 +148,14 @@ enum Command {
         #[arg(long, default_value_t = u32::MAX)]
         stt_fail_attempts: u32,
         /// Cache folder holding models/silero_vad.onnx.
-        #[arg(long)]
+        #[arg(long, env = "BUZZ_MINUTES_CACHE")]
         cache: Option<PathBuf>,
         /// A meeting is over after this many minutes with nothing written.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, env = "BUZZ_MINUTES_QUIET_MINUTES", default_value_t = 10)]
         quiet_minutes: u64,
         /// Sessions further apart than this many minutes are separate
         /// meetings.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, env = "BUZZ_MINUTES_MEETING_GAP_MINUTES", default_value_t = 10)]
         meeting_gap_minutes: u64,
         /// Replace existing scripts.
         #[arg(long)]
@@ -202,10 +232,10 @@ impl From<FailKind> for SttErrorKind {
     }
 }
 
-/// Settings version for ledger keys: the key format, how pieces are cut,
-/// the exact VAD model and the transcriber (engine, region, language). The model's sha256 is checked here too, so a
-/// changed or broken model file is refused instead of silently re-cutting.
-fn ledger_version(plan: &SegmentPlan, model: &Path, stt: &SttInfo) -> anyhow::Result<String> {
+/// The VAD model's sha256, when it is the exact model the ledger keys
+/// assume; a changed or broken file is refused instead of silently
+/// re-cutting (and paying for) every piece.
+fn verified_model(model: &Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(model).with_context(|| format!("read {}", model.display()))?;
     let digest = sha256_hex(&bytes);
     if digest != SILERO_VAD_SHA256 {
@@ -214,9 +244,16 @@ fn ledger_version(plan: &SegmentPlan, model: &Path, stt: &SttInfo) -> anyhow::Re
             model.display()
         );
     }
+    Ok(digest)
+}
+
+/// Settings version for ledger keys: the key format, how pieces are cut,
+/// the exact VAD model and the transcriber (engine, region, language). The model's sha256 is checked here too, so a
+/// changed or broken model file is refused instead of silently re-cutting.
+fn ledger_version(plan: &SegmentPlan, model_digest: &str, stt: &SttInfo) -> String {
     let vad = SileroSettings::default();
-    Ok(format!(
-        "{LEDGER_KEY_FORMAT};max={};pad={};vad={},{},{},{},{};model={digest};stt={},{},{}",
+    format!(
+        "{LEDGER_KEY_FORMAT};max={};pad={};vad={},{},{},{},{};model={model_digest};stt={},{},{}",
         plan.max_segment_ms,
         plan.pad_ms,
         vad.threshold,
@@ -227,7 +264,7 @@ fn ledger_version(plan: &SegmentPlan, model: &Path, stt: &SttInfo) -> anyhow::Re
         stt.engine,
         stt.region,
         stt.language
-    ))
+    )
 }
 
 fn default_cache() -> PathBuf {
@@ -300,6 +337,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             recordings,
             recordings_bucket,
             prefix,
+            all,
             community,
             channel,
             out,
@@ -307,6 +345,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             stt_truth,
             chirp_project,
             gcp_auth,
+            vad_model,
+            time_limit_minutes,
             stt_fail_every,
             stt_fail_kind,
             stt_fail_attempts,
@@ -318,6 +358,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             max_segment_ms,
             pad_ms,
         } => {
+            // Before anything else: the exact model the ledger keys assume.
+            let model =
+                vad_model.unwrap_or_else(|| silero_vad_path(&cache.unwrap_or_else(default_cache)));
+            let model_digest = verified_model(&model)?;
             let token_source = || -> anyhow::Result<TokenSource> {
                 Ok(match gcp_auth {
                     GcpAuth::Metadata => TokenSource::metadata_server(),
@@ -344,9 +388,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             };
             let quiet_ms = quiet_minutes * 60_000;
             let gap_ms = meeting_gap_minutes * 60_000;
-            let planned = plan_meetings(&store, &prefix, community, channel, gap_ms).await?;
+            let deadline = Instant::now() + Duration::from_secs(time_limit_minutes * 60);
             let now = now_ms.unwrap_or_else(now_unix_ms);
-            let model = silero_vad_path(&cache.unwrap_or_else(default_cache));
             let mut detector = SileroVad::new(&model, SileroSettings::default())
                 .context("run `buzz-huddle-minutes fetch-models` first")?;
             let stt = match (stt_truth, chirp_project) {
@@ -384,7 +427,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let settings = MinutesSettings {
                 segment_plan: plan,
                 stt: SttPolicy::default(),
-                ledger_version: ledger_version(&plan, &model, &stt.info())?,
+                ledger_version: ledger_version(&plan, &model_digest, &stt.info()),
                 audio_key: String::new(),
                 now_unix_ms: now,
             };
@@ -394,39 +437,30 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 quiet_ms,
                 overwrite,
             };
-            eprintln!(
-                "meetings in this channel: {} | sessions with nothing readable outside any meeting: {}",
-                planned.meetings.len(),
-                planned.unplaced_sessions.len()
-            );
+            let channels = match (all, community, channel) {
+                (true, _, _) => find_channels(&store, &prefix).await?,
+                (false, Some(community), Some(channel)) => vec![(community, channel)],
+                _ => anyhow::bail!("give --all, or --community and --channel"),
+            };
+            eprintln!("channels: {}", channels.len());
+            let run = Run {
+                store: &store,
+                channels: &channels,
+                gap_ms,
+                stt: &stt,
+                settings: &settings,
+                options: &options,
+                audio_home: &audio_home,
+                deadline,
+            };
             let code = match (out, minutes_bucket, &gcs) {
                 (Some(out), _, _) => {
                     let home = LocalMinutes::open(&out)?;
-                    process_channel(
-                        &home,
-                        &store,
-                        &planned,
-                        &mut detector,
-                        &stt,
-                        &settings,
-                        &options,
-                        &audio_home,
-                    )
-                    .await
+                    process_channels(&home, &run, &mut detector).await
                 }
                 (None, Some(bucket), Some(gcs)) => {
                     let home = GcsMinutes::new(gcs.clone(), bucket);
-                    process_channel(
-                        &home,
-                        &store,
-                        &planned,
-                        &mut detector,
-                        &stt,
-                        &settings,
-                        &options,
-                        &audio_home,
-                    )
-                    .await
+                    process_channels(&home, &run, &mut detector).await
                 }
                 _ => anyhow::bail!("give --out or --minutes-bucket"),
             };
@@ -478,47 +512,110 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Run every planned meeting of a channel. The exit code says whether all
-/// of them went through.
-#[allow(clippy::too_many_arguments)]
-async fn process_channel<H: MinutesHome>(
+/// What one `process` run works through.
+struct Run<'a> {
+    store: &'a AnyStore,
+    channels: &'a [(Uuid, Uuid)],
+    gap_ms: u64,
+    stt: &'a AnyStt,
+    settings: &'a MinutesSettings,
+    options: &'a RunOptions,
+    audio_home: &'a str,
+    /// No new meeting is started after this.
+    deadline: Instant,
+}
+
+/// Run every meeting of every channel of `run`. A channel that cannot be
+/// read is counted and the next one goes on; credentials, permission or
+/// quota refused stop everything. Past the deadline nothing new starts and
+/// what is left waits for the next run. The exit code says whether every
+/// meeting tried went through.
+async fn process_channels<H: MinutesHome>(
     home: &H,
-    store: &AnyStore,
-    planned: &Planned,
+    run: &Run<'_>,
     detector: &mut SileroVad,
-    stt: &AnyStt,
-    settings: &MinutesSettings,
-    options: &RunOptions,
-    audio_home: &str,
 ) -> ExitCode {
-    let (mut failed, mut locked) = (0usize, 0usize);
-    for (m, meeting) in planned.meetings.iter().enumerate() {
-        let done = run_meeting(home, store, meeting, detector, stt, settings, options).await;
-        let (output, script) = match done {
-            Ok(Done::Written { output, script }) => (output, script),
-            Ok(Done::Skipped(skip)) => {
-                eprintln!("meeting {m}: skipped ({})", skip.as_str());
-                continue;
-            }
-            Ok(Done::Locked) => {
-                locked += 1;
-                eprintln!("meeting {m}: skipped (another worker holds it)");
-                continue;
-            }
+    let (mut failed, mut locked, mut unreadable_channels) = (0usize, 0usize, 0usize);
+    let mut audio_kept = 0usize;
+    let mut left: Option<(usize, usize)> = None;
+    'channels: for (c, &(community, channel)) in run.channels.iter().enumerate() {
+        let channel_id = format!("{community}/{channel}");
+        if Instant::now() >= run.deadline {
+            left = Some((run.channels.len() - c, 0));
+            break;
+        }
+        let planned = match plan_meetings(
+            run.store,
+            &run.options.prefix,
+            community,
+            channel,
+            run.gap_ms,
+        )
+        .await
+        {
+            Ok(planned) => planned,
+            // A channel folder with no session (only mixed audio left).
+            Err(CollectError::NoSessions(_)) => continue,
             Err(error) => {
-                failed += 1;
-                eprintln!("meeting {m}: not written: {error}");
+                let error = MeetingError::from(error);
+                unreadable_channels += 1;
+                eprintln!("{channel_id}: not read: {error}");
                 if error.stops_the_run() {
-                    eprintln!("stopping: later meetings would fail the same way");
+                    eprintln!("stopping: later channels would fail the same way");
                     return ExitCode::FAILURE;
                 }
                 continue;
             }
         };
-        let report = &output.report;
-        let losses = &report.losses;
         eprintln!(
-            "meeting {m}: sessions {} | lost chunks {} missing chunks {} unreadable chunks {} unreadable manifests {} unreadable sessions {} dropped frames {} failed pieces {}",
+            "{channel_id}: meetings {} | sessions with nothing readable outside any meeting: {}",
+            planned.meetings.len(),
+            planned.unplaced_sessions.len()
+        );
+        for (m, meeting) in planned.meetings.iter().enumerate() {
+            if Instant::now() >= run.deadline {
+                left = Some((run.channels.len() - c - 1, planned.meetings.len() - m));
+                break 'channels;
+            }
+            let done = run_meeting(
+                home,
+                run.store,
+                meeting,
+                detector,
+                run.stt,
+                run.settings,
+                run.options,
+            )
+            .await;
+            let (output, script, audio) = match done {
+                Ok(Done::Written {
+                    output,
+                    script,
+                    audio,
+                }) => (output, script, audio),
+                Ok(Done::Skipped(skip)) => {
+                    eprintln!("{channel_id} meeting {m}: skipped ({})", skip.as_str());
+                    continue;
+                }
+                Ok(Done::Locked) => {
+                    locked += 1;
+                    eprintln!("{channel_id} meeting {m}: skipped (another worker holds it)");
+                    continue;
+                }
+                Err(error) => {
+                    failed += 1;
+                    eprintln!("{channel_id} meeting {m}: not written: {error}");
+                    if error.stops_the_run() {
+                        eprintln!("stopping: later meetings would fail the same way");
+                        return ExitCode::FAILURE;
+                    }
+                    continue;
+                }
+            };
+            let report = &output.report;
+            let losses = &report.losses;
+            eprintln!(
+            "{channel_id} meeting {m}: sessions {} | lost chunks {} missing chunks {} unreadable chunks {} unreadable manifests {} unreadable sessions {} dropped frames {} failed pieces {}",
             meeting.sessions.len(),
             losses.lost_chunks,
             losses.missing_chunks,
@@ -528,12 +625,12 @@ async fn process_channel<H: MinutesHome>(
             losses.dropped_frames,
             losses.failed_segments
         );
-        let by_kind: Vec<String> = report
-            .stt_failures_by_kind
-            .iter()
-            .map(|(kind, count)| format!("{kind} {count}"))
-            .collect();
-        eprintln!(
+            let by_kind: Vec<String> = report
+                .stt_failures_by_kind
+                .iter()
+                .map(|(kind, count)| format!("{kind} {count}"))
+                .collect();
+            eprintln!(
             "  frames {} unknown {} overlap-skipped {} broken-chunks {} | unplaced unreadable sessions in channel {}",
             report.demux.frames,
             report.demux.unknown_sender,
@@ -541,7 +638,7 @@ async fn process_channel<H: MinutesHome>(
             report.demux.broken_chunks,
             report.unplaced_sessions_in_channel
         );
-        eprintln!(
+            eprintln!(
             "  stt run {} | requests {} reused from ledger {} retries {} gave up [{}] | unreadable ledger lines {}",
             report.run,
             report.stt_requests,
@@ -550,8 +647,8 @@ async fn process_channel<H: MinutesHome>(
             by_kind.join(", "),
             report.ledger_unreadable_lines
         );
-        for (i, speaker) in report.speakers.iter().enumerate() {
-            eprintln!(
+            for (i, speaker) in report.speakers.iter().enumerate() {
+                eprintln!(
                 "  person {i}: frames {} decoded {} concealed {} lost-silent {} spurts {} out-of-order {} undecodable {} | regions {} speech spans {} pieces {} stt failures {}",
                 speaker.frames,
                 speaker.decode.decoded,
@@ -565,15 +662,40 @@ async fn process_channel<H: MinutesHome>(
                 speaker.segments,
                 speaker.stt_failures
             );
+            }
+            eprintln!("  transcript: {script}");
+            let audio = match audio {
+                PutNew::Written => "written",
+                PutNew::Same => "already there",
+                PutNew::Other => {
+                    audio_kept += 1;
+                    "already there with other bytes, kept"
+                }
+            };
+            eprintln!(
+                "  mixed audio: {}{} ({audio})",
+                run.audio_home, output.transcript.audio.key
+            );
         }
-        eprintln!("  transcript: {script}");
-        eprintln!("  mixed audio: {audio_home}{}", output.transcript.audio.key);
+    }
+    if let Some((channels, meetings)) = left {
+        eprintln!(
+            "time limit reached: {meetings} meeting(s) of this channel and {channels} channel(s) left for the next run"
+        );
+    }
+    if audio_kept > 0 {
+        eprintln!("{audio_kept} mixed audio file(s) already there with other bytes, kept");
     }
     if locked > 0 {
         eprintln!("{locked} meeting(s) held by another worker");
     }
+    if unreadable_channels > 0 {
+        eprintln!("{unreadable_channels} channel(s) not read");
+    }
     if failed > 0 {
         eprintln!("{failed} meeting(s) not written");
+    }
+    if failed > 0 || unreadable_channels > 0 {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -633,6 +755,20 @@ impl RecordingStore for AnyStore {
         match self {
             Self::Local(store) => store.put(key, bytes).await,
             Self::Gcs(store) => store.put(key, bytes).await,
+        }
+    }
+
+    async fn put_new(&self, key: &str, bytes: Vec<u8>) -> Result<PutNew, StoreError> {
+        match self {
+            Self::Local(store) => store.put_new(key, bytes).await,
+            Self::Gcs(store) => store.put_new(key, bytes).await,
+        }
+    }
+
+    async fn folders(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        match self {
+            Self::Local(store) => store.folders(prefix).await,
+            Self::Gcs(store) => store.folders(prefix).await,
         }
     }
 }

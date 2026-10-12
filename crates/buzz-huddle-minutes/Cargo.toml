@@ -17,7 +17,7 @@ base64 = { workspace = true }
 buzz-gcp = { workspace = true }
 buzz-huddle-recording = { workspace = true }
 chrono = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 futures-util = { workspace = true }
 hex = { workspace = true }

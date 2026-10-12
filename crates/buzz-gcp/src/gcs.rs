@@ -139,6 +139,14 @@ struct Listing {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderListing {
+    #[serde(default)]
+    prefixes: Vec<String>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ErrorEnvelope {
     error: ErrorBody,
 }
@@ -245,6 +253,46 @@ impl Gcs {
             .await
             .map_err(transport)?;
         Ok((response, token))
+    }
+
+    /// The "folders" right under `prefix` (which should end with `/`): each
+    /// distinct `prefix` + next name part + `/` (JSON API `delimiter=/`),
+    /// following page tokens to the end. Objects themselves are not listed.
+    pub async fn list_folders(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, GcsError> {
+        let mut folders = Vec::new();
+        let mut page: Option<String> = None;
+        loop {
+            let mut url = self.url(&["storage", "v1", "b", bucket, "o"]);
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("prefix", prefix);
+                query.append_pair("delimiter", "/");
+                query.append_pair("fields", "prefixes,nextPageToken");
+                if let Some(page) = &page {
+                    query.append_pair("pageToken", page);
+                }
+            }
+            let response = success(self.send(|http| http.get(url.clone())).await?).await?;
+            let listing: FolderListing = read_json(response).await?;
+            folders.extend(listing.prefixes);
+            match listing.next_page_token {
+                Some(next) if !next.is_empty() => {
+                    if page.as_deref() == Some(next.as_str()) {
+                        return Err(GcsError::new(
+                            GcsErrorKind::Other,
+                            None,
+                            "the same page token twice",
+                        ));
+                    }
+                    page = Some(next);
+                }
+                _ => {
+                    folders.sort();
+                    folders.dedup();
+                    return Ok(folders);
+                }
+            }
+        }
     }
 
     /// Every object whose name starts with `prefix`, following page tokens

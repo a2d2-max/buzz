@@ -539,3 +539,41 @@ async fn the_same_bytes_written_again_only_if_absent_count_as_done() {
         (GcsErrorKind::AlreadyExists, Some(412))
     );
 }
+
+/// Folders right under a prefix, over several pages; objects are not
+/// listed as folders.
+#[tokio::test]
+async fn folders_under_a_prefix_are_listed_once_each() {
+    let (gcs, _fake) = client(3_600).await;
+    for name in [
+        "huddles/c1/ch1/s1/chunk-000000.bhr",
+        "huddles/c1/ch1/s1/chunk-000001.bhr",
+        "huddles/c1/ch2/s2/chunk-000000.bhr",
+        "huddles/c2/ch3/s3/chunk-000000.bhr",
+        "huddles/c3/ch4/s4/chunk-000000.bhr",
+        "huddles/loose.txt",
+        "other/c9/x",
+    ] {
+        gcs.put(BUCKET, name, b"x".to_vec(), "text/plain", Write::IfAbsent)
+            .await
+            .expect("put");
+    }
+    assert_eq!(
+        gcs.list_folders(BUCKET, "huddles/")
+            .await
+            .expect("communities"),
+        // Pages of two entries: c1, c2 | c3, loose.txt.
+        ["huddles/c1/", "huddles/c2/", "huddles/c3/"]
+    );
+    assert_eq!(
+        gcs.list_folders(BUCKET, "huddles/c1/")
+            .await
+            .expect("channels"),
+        ["huddles/c1/ch1/", "huddles/c1/ch2/"]
+    );
+    assert!(gcs
+        .list_folders(BUCKET, "huddles/c1/ch1/s1/")
+        .await
+        .expect("no folders")
+        .is_empty());
+}

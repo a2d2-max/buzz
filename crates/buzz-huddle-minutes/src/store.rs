@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use buzz_gcp::gcs::{Gcs, GcsError, Write};
+use buzz_gcp::gcs::{Gcs, GcsError, GcsErrorKind, Write};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// One stored object.
@@ -49,6 +49,17 @@ pub enum StoreError {
     },
 }
 
+/// What [`RecordingStore::put_new`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutNew {
+    /// Written now.
+    Written,
+    /// Already there with exactly these bytes (an earlier run wrote it).
+    Same,
+    /// Already there with other bytes, and left as it is.
+    Other,
+}
+
 /// Object storage the worker reads recordings from and writes the mixed
 /// audio to.
 pub trait RecordingStore {
@@ -68,6 +79,17 @@ pub trait RecordingStore {
     /// Create or replace one object.
     fn put(&self, key: &str, bytes: Vec<u8>)
         -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Create one object only if nothing is stored under `key`; never
+    /// replaces (the worker needs no right to overwrite or delete).
+    fn put_new(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+    ) -> impl Future<Output = Result<PutNew, StoreError>> + Send;
+    /// Names of the folders right under `prefix` (which ends with `/`),
+    /// sorted.
+    fn folders(&self, prefix: &str)
+        -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
 }
 
 /// A folder laid out like the bucket (`BUZZ_HUDDLE_RECORDING=local`).
@@ -176,6 +198,54 @@ impl RecordingStore for LocalStore {
         let mut bytes = Vec::new();
         file.take(len).read_to_end(&mut bytes).await.map_err(wrap)?;
         Ok(bytes)
+    }
+
+    async fn put_new(&self, key: &str, bytes: Vec<u8>) -> Result<PutNew, StoreError> {
+        let path = self.path_of(key)?;
+        match tokio::fs::read(&path).await {
+            Ok(stored) if stored == bytes => Ok(PutNew::Same),
+            Ok(_) => Ok(PutNew::Other),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.put(key, bytes).await?;
+                Ok(PutNew::Written)
+            }
+            Err(source) => Err(StoreError::Io {
+                op: "read",
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
+    async fn folders(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let folder = prefix.trim_end_matches('/');
+        let dir = if folder.is_empty() {
+            self.root.clone()
+        } else {
+            self.path_of(folder)?
+        };
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(io_error("list", &dir, source)),
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| io_error("list", &dir, source))?
+        {
+            let is_dir = entry
+                .file_type()
+                .await
+                .map_err(|source| io_error("stat", &entry.path(), source))?
+                .is_dir();
+            if let (true, Some(name)) = (is_dir, entry.file_name().to_str()) {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
@@ -302,6 +372,54 @@ impl RecordingStore for GcsStore {
             .map_err(gcs_error("write", key))?;
         Ok(())
     }
+
+    async fn put_new(&self, key: &str, bytes: Vec<u8>) -> Result<PutNew, StoreError> {
+        let read = gcs_error("read", key);
+        match self.gcs.stat(&self.bucket, key).await {
+            Ok(object) => {
+                if object.size != bytes.len() as u64 {
+                    return Ok(PutNew::Other);
+                }
+                let stored = self
+                    .gcs
+                    .get_generation(&self.bucket, key, object.generation, object.size)
+                    .await
+                    .map_err(read)?;
+                Ok(if stored == bytes {
+                    PutNew::Same
+                } else {
+                    PutNew::Other
+                })
+            }
+            Err(error) if error.kind == GcsErrorKind::NotFound => {
+                match self
+                    .gcs
+                    .put(&self.bucket, key, bytes, content_type(key), Write::IfAbsent)
+                    .await
+                {
+                    Ok(_) => Ok(PutNew::Written),
+                    // Someone wrote other bytes in between.
+                    Err(error) if error.kind == GcsErrorKind::AlreadyExists => Ok(PutNew::Other),
+                    Err(error) => Err(gcs_error("write", key)(error)),
+                }
+            }
+            Err(error) => Err(read(error)),
+        }
+    }
+
+    async fn folders(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let folders = self
+            .gcs
+            .list_folders(&self.bucket, prefix)
+            .await
+            .map_err(gcs_error("list", prefix))?;
+        Ok(folders
+            .iter()
+            .filter_map(|folder| folder.strip_prefix(prefix))
+            .map(|name| name.trim_end_matches('/').to_string())
+            .filter(|name| !name.is_empty())
+            .collect())
+    }
 }
 
 fn key_of(root: &Path, path: &Path) -> Option<String> {
@@ -327,6 +445,70 @@ fn io_error(op: &'static str, path: &Path, source: std::io::Error) -> StoreError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bucket store writes new objects only (no overwrite or delete
+    /// right needed) and lists folders.
+    #[tokio::test]
+    async fn gcs_store_writes_new_objects_only_and_lists_folders() {
+        use buzz_gcp::token::{AccessToken, TokenSource, Tokens};
+        let fake = buzz_gcp::fake::FakeGcs::start(3_600).await;
+        fake.accept_token("t");
+        let tokens = Tokens::new(TokenSource::Static(AccessToken::new("t"))).expect("tokens");
+        let gcs = Gcs::with_base_url(tokens, fake.url()).expect("client");
+        let store = GcsStore::new(Arc::new(gcs), "rec");
+        let key = "h/c/ch/mixed/a.wav";
+        assert_eq!(
+            store.put_new(key, b"abc".to_vec()).await.expect("new"),
+            PutNew::Written
+        );
+        let written = fake.objects("rec")[key].clone();
+        assert_eq!(written.content_type, "audio/wav");
+        assert_eq!(
+            store.put_new(key, b"abc".to_vec()).await.expect("same"),
+            PutNew::Same
+        );
+        assert_eq!(
+            store.put_new(key, b"abd".to_vec()).await.expect("other"),
+            PutNew::Other
+        );
+        assert_eq!(fake.objects("rec")[key], written, "never overwritten");
+        store.put("h/d/x", b"x".to_vec()).await.expect("put");
+        assert_eq!(store.folders("h/").await.expect("folders"), ["c", "d"]);
+        assert_eq!(store.folders("h/c/").await.expect("folders"), ["ch"]);
+    }
+
+    #[tokio::test]
+    async fn local_store_writes_new_objects_only_and_lists_folders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalStore::new(dir.path());
+        assert_eq!(
+            store
+                .put_new("h/c/mixed/a.wav", b"abc".to_vec())
+                .await
+                .expect("new"),
+            PutNew::Written
+        );
+        assert_eq!(
+            store
+                .put_new("h/c/mixed/a.wav", b"abc".to_vec())
+                .await
+                .expect("same"),
+            PutNew::Same
+        );
+        assert_eq!(
+            store
+                .put_new("h/c/mixed/a.wav", b"abd".to_vec())
+                .await
+                .expect("other"),
+            PutNew::Other
+        );
+        assert_eq!(store.get("h/c/mixed/a.wav").await.expect("kept"), b"abc");
+        store.put("h/d/x", b"x".to_vec()).await.expect("put");
+        store.put("h/file", b"x".to_vec()).await.expect("put");
+        assert_eq!(store.folders("h/").await.expect("folders"), ["c", "d"]);
+        assert_eq!(store.folders("h/c/").await.expect("folders"), ["mixed"]);
+        assert!(store.folders("none/").await.expect("none").is_empty());
+    }
 
     #[tokio::test]
     async fn local_store_lists_by_key_prefix_and_refuses_escapes() {

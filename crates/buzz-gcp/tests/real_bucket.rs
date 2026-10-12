@@ -1,6 +1,6 @@
 //! One round trip on the real bucket with the developer machine's gcloud
-//! token. Writes one `test/<uuid>.txt`, deletes exactly that name, and
-//! checks `test/` is empty afterwards.
+//! token. Writes one `test/<uuid>/round-trip.txt`, deletes exactly that
+//! name, and checks `test/` is empty afterwards.
 //!
 //! `cargo test -p buzz-gcp --test real_bucket -- --ignored --nocapture`
 
@@ -13,7 +13,8 @@ const BUCKET: &str = "a2d2-huddle-minutes";
 #[ignore = "needs network and a gcloud login that can write gs://a2d2-huddle-minutes/test/"]
 async fn real_bucket_round_trip() {
     let gcs = Gcs::new(Tokens::new(TokenSource::gcloud()).expect("tokens")).expect("client");
-    let name = format!("test/{}.txt", uuid::Uuid::new_v4());
+    let folder = format!("test/{}/", uuid::Uuid::new_v4());
+    let name = format!("{folder}round-trip.txt");
     let body = format!("buzz-gcp round trip {name}").into_bytes();
     let max = 4_096;
 
@@ -53,6 +54,17 @@ async fn real_bucket_round_trip() {
         eprintln!(
             "list test/: {} object(s), ours with the same generation",
             listed.len()
+        );
+        let folders = gcs
+            .list_folders(BUCKET, "test/")
+            .await
+            .map_err(|e| format!("list folders: {e}"))?;
+        if !folders.contains(&folder) {
+            return Err("list folders: ours missing".to_string());
+        }
+        eprintln!(
+            "list folders test/: {} folder(s), ours there",
+            folders.len()
         );
         // The same bytes again only-if-absent: done, nothing written.
         let again = gcs

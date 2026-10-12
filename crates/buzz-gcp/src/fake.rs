@@ -240,6 +240,9 @@ async fn list(
     }
     fake.list_calls.fetch_add(1, Ordering::Relaxed);
     let prefix = query.get("prefix").cloned().unwrap_or_default();
+    if query.get("delimiter").map(String::as_str) == Some("/") {
+        return list_folders(&fake, &bucket, &prefix, &query);
+    }
     let start: usize = query
         .get("pageToken")
         .and_then(|token| token.parse().ok())
@@ -260,6 +263,41 @@ async fn list(
         body["items"] = json!(items);
     }
     if start + PAGE < matching.len() {
+        body["nextPageToken"] = json!((start + PAGE).to_string());
+    }
+    Json(body).into_response()
+}
+
+/// A `delimiter=/` listing: entries (folders and objects right under the
+/// prefix) in name order, pages of [`PAGE`] entries; only folders are
+/// returned.
+fn list_folders(
+    fake: &Inner,
+    bucket: &str,
+    prefix: &str,
+    query: &HashMap<String, String>,
+) -> Response {
+    let start: usize = query
+        .get("pageToken")
+        .and_then(|token| token.parse().ok())
+        .unwrap_or(0);
+    let objects = fake.objects.lock().expect("lock");
+    let mut entries: Vec<String> = objects
+        .keys()
+        .filter(|(b, name)| b == bucket && name.starts_with(prefix))
+        .map(|(_, name)| match name[prefix.len()..].find('/') {
+            Some(cut) => name[..prefix.len() + cut + 1].to_string(),
+            None => name.clone(),
+        })
+        .collect();
+    entries.dedup();
+    let page: Vec<&String> = entries.iter().skip(start).take(PAGE).collect();
+    let prefixes: Vec<&String> = page.iter().copied().filter(|e| e.ends_with('/')).collect();
+    let mut body = json!({ "kind": "storage#objects" });
+    if !prefixes.is_empty() {
+        body["prefixes"] = json!(prefixes);
+    }
+    if start + PAGE < entries.len() {
         body["nextPageToken"] = json!((start + PAGE).to_string());
     }
     Json(body).into_response()
