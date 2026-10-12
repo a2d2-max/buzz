@@ -1,14 +1,18 @@
-//! `huddle-transcript/1`, field for field as in
-//! `docs/huddle-minutes-worker.md`.
+//! `huddle-transcript/2`, field for field as in
+//! `docs/huddle-minutes-worker.md`. Scripts written as `huddle-transcript/1`
+//! (one person per track, `speaker` = the track's pubkey) still read: their
+//! lines get `device` = `speaker` and confidence 1.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Value of [`Transcript::format`].
-pub const TRANSCRIPT_FORMAT: &str = "huddle-transcript/1";
+pub const TRANSCRIPT_FORMAT: &str = "huddle-transcript/2";
+/// The format before speakers were told apart inside a track.
+pub const TRANSCRIPT_FORMAT_V1: &str = "huddle-transcript/1";
 
 /// One meeting's script.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transcript {
     /// Always [`TRANSCRIPT_FORMAT`].
     pub format: String,
@@ -87,16 +91,85 @@ pub struct Participant {
 }
 
 /// One transcribed speech piece. Times are ms from the meeting start.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 사람 식별은 하나로 통일한다: `speaker` 는 어느 경우든 그 사람의 pubkey 다.
+/// - 자기 기기로 혼자 말한 트랙: `speaker` = 트랙 주인, `speaker_confidence` = 1.
+/// - 회의실 마이크에 섞인 화자: `speaker_label` = "회의실 화자 N". 목소리로 맞으면
+///   `speaker` = 그 사람, `speaker_confidence` = 코사인 유사도. 못 맞추면 `speaker` 와
+///   `speaker_confidence` 는 null. 회의실 기기 주인이라고 그 pubkey 를 자동으로 주지 않는다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SegmentWire")]
 pub struct Segment {
     /// Start, ms from the meeting start.
     pub start_ms: u64,
     /// End, ms from the meeting start.
     pub end_ms: u64,
-    /// Hex x-only pubkey of the speaker.
-    pub speaker: String,
+    /// Hex x-only pubkey of the track (device) the audio came from.
+    pub device: String,
+    /// Hex x-only pubkey of who spoke, or `None` when not known.
+    pub speaker: Option<String>,
+    /// "회의실 화자 N" for a speaker found inside a shared (room) track,
+    /// numbered in order of first speech across the meeting; `None` for a
+    /// track with one speaker.
+    pub speaker_label: Option<String>,
+    /// How sure `speaker` is: 1 for the owner of a one-speaker track, the
+    /// voice similarity for a room speaker matched by voice, `None` when
+    /// `speaker` is `None`.
+    pub speaker_confidence: Option<f32>,
     /// Transcribed text, or [`crate::stt::FAILED_TEXT`].
     pub text: String,
+}
+
+impl Segment {
+    /// A line from a one-speaker track: the owner spoke, for sure.
+    pub fn own(device: String, start_ms: u64, end_ms: u64, text: String) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            speaker: Some(device.clone()),
+            device,
+            speaker_label: None,
+            speaker_confidence: Some(1.0),
+            text,
+        }
+    }
+}
+
+/// A line as stored, old (`/1`) or new (`/2`).
+#[derive(Deserialize)]
+struct SegmentWire {
+    start_ms: u64,
+    end_ms: u64,
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    speaker: Option<String>,
+    #[serde(default)]
+    speaker_label: Option<String>,
+    #[serde(default)]
+    speaker_confidence: Option<f32>,
+    text: String,
+}
+
+impl TryFrom<SegmentWire> for Segment {
+    type Error = &'static str;
+
+    fn try_from(wire: SegmentWire) -> Result<Self, Self::Error> {
+        match (wire.device, wire.speaker) {
+            (Some(device), speaker) => Ok(Self {
+                start_ms: wire.start_ms,
+                end_ms: wire.end_ms,
+                device,
+                speaker,
+                speaker_label: wire.speaker_label,
+                speaker_confidence: wire.speaker_confidence,
+                text: wire.text,
+            }),
+            // `/1`: the speaker was the track.
+            (None, Some(speaker)) => Ok(Self::own(speaker, wire.start_ms, wire.end_ms, wire.text)),
+            (None, None) => Err("a segment needs `device` or `speaker`"),
+        }
+    }
 }
 
 /// Where the mixed audio is stored.
@@ -119,4 +192,56 @@ pub struct SttInfo {
     pub language: String,
     /// Seconds the engine billed for.
     pub billed_seconds: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_v1_script_still_reads_with_the_track_as_the_speaker() {
+        let pubkey = "ab".repeat(32);
+        let json = format!(
+            r#"{{"format":"huddle-transcript/1","community_id":"00000000-0000-0000-0000-000000000001",
+            "channel_id":"00000000-0000-0000-0000-000000000002","parent_channel_id":null,"session_ids":[],
+            "started_at":"","ended_at":"","duration_ms":10,"participants":[],
+            "segments":[{{"start_ms":1,"end_ms":2,"speaker":"{pubkey}","text":"네"}}],
+            "audio":{{"key":"","expires_at":""}},
+            "stt":{{"engine":"","region":"","language":"","billed_seconds":0}}}}"#
+        );
+        let transcript: Transcript = serde_json::from_str(&json).expect("v1 reads");
+        assert_eq!(transcript.format, TRANSCRIPT_FORMAT_V1);
+        let line = &transcript.segments[0];
+        assert_eq!(line.device, pubkey);
+        assert_eq!(line.speaker.as_deref(), Some(pubkey.as_str()));
+        assert_eq!(line.speaker_label, None);
+        assert_eq!(line.speaker_confidence, Some(1.0));
+    }
+
+    #[test]
+    fn a_room_line_round_trips_with_nulls() {
+        let line = Segment {
+            start_ms: 5,
+            end_ms: 9,
+            device: "dd".repeat(32),
+            speaker: None,
+            speaker_label: Some("회의실 화자 2".into()),
+            speaker_confidence: None,
+            text: "말".into(),
+        };
+        let json = serde_json::to_value(&line).expect("json");
+        assert_eq!(json["speaker"], serde_json::Value::Null);
+        assert_eq!(json["speaker_confidence"], serde_json::Value::Null);
+        assert_eq!(json["speaker_label"], "회의실 화자 2");
+        let back: Segment = serde_json::from_value(json).expect("back");
+        assert_eq!(back, line);
+    }
+
+    #[test]
+    fn a_line_with_neither_device_nor_speaker_does_not_read() {
+        let json = r#"{"start_ms":1,"end_ms":2,"text":"네"}"#;
+        assert!(serde_json::from_str::<Segment>(json).is_err());
+        let json = r#"{"start_ms":1,"end_ms":2,"speaker":null,"text":"네"}"#;
+        assert!(serde_json::from_str::<Segment>(json).is_err());
+    }
 }

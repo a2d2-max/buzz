@@ -16,17 +16,22 @@ use buzz_huddle_minutes::check::{check, check_mix, Tolerance};
 use buzz_huddle_minutes::collect::collect_meetings;
 use buzz_huddle_minutes::ledger::LEDGER_KEY_FORMAT;
 use buzz_huddle_minutes::models::{
-    ensure_silero_vad, sha256_hex, silero_vad_path, SILERO_VAD_SHA256,
+    ensure_model, ensure_silero_vad, sha256_hex, silero_vad_path, SILERO_VAD_SHA256,
+    SPEAKER_EMBEDDING, SPEAKER_SEGMENTATION,
 };
 use buzz_huddle_minutes::pipeline::{mixed_audio_key, MinutesSettings, SttPolicy};
 use buzz_huddle_minutes::runner::{run_meeting, Done, LocalMinutes, RunOptions};
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Truth, SENTENCES,
 };
+use buzz_huddle_minutes::speakers::{report_line, SpeakerArgs};
 use buzz_huddle_minutes::store::LocalStore;
-use buzz_huddle_minutes::stt::{Fault, SttErrorKind, TruthStt};
-use buzz_huddle_minutes::transcript::Transcript;
+use buzz_huddle_minutes::stt::{
+    Fault, SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, TruthStt,
+};
+use buzz_huddle_minutes::transcript::{SttInfo, Transcript};
 use buzz_huddle_minutes::vad::{SegmentPlan, SileroSettings, SileroVad};
+use buzz_huddle_minutes::voices::{run_command as run_voices, VoicesCommand};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
@@ -39,7 +44,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Download the Silero VAD model into the cache and check its sha256.
+    /// Download the Silero VAD and speaker models into the cache and check
+    /// their sha256.
     FetchModels {
         /// Cache folder (default: this crate's .cache).
         #[arg(long)]
@@ -84,9 +90,11 @@ enum Command {
         /// Where the scripts go (never the recording bucket).
         #[arg(long)]
         out: PathBuf,
-        /// Answer sheet for the fake transcriber (the only engine so far).
+        /// Answer sheet for the fake transcriber. Without it (a real
+        /// recording) every piece gets placeholder text with its length, so
+        /// speakers and pieces can be checked before a real engine is wired.
         #[arg(long)]
-        stt_truth: PathBuf,
+        stt_truth: Option<PathBuf>,
         /// Make every N-th piece fail transcription (fake transcriber).
         #[arg(long)]
         stt_fail_every: Option<usize>,
@@ -120,6 +128,14 @@ enum Command {
         /// The script keeps the unpadded speech times.
         #[arg(long, default_value_t = SegmentPlan::default().pad_ms)]
         pad_ms: u64,
+        /// Speakers inside a track, naming, voice profiles.
+        #[command(flatten)]
+        speaker_args: SpeakerArgs,
+    },
+    /// Stored voice profiles: list them or forget one person's.
+    Voices {
+        #[command(subcommand)]
+        command: VoicesCommand,
     },
     /// Compare a script with an answer sheet; exit 1 if it does not pass.
     Check {
@@ -207,6 +223,40 @@ fn now_unix_ms() -> u64 {
         })
 }
 
+/// The transcriber of `process`: the answer sheet of a fake meeting, or
+/// placeholder text for a real recording until a real engine is wired.
+enum CliStt {
+    Truth(TruthStt),
+    Placeholder,
+}
+
+impl SpeechToText for CliStt {
+    fn info(&self) -> SttInfo {
+        match self {
+            Self::Truth(stt) => stt.info(),
+            Self::Placeholder => SttInfo {
+                engine: "placeholder".into(),
+                region: "local".into(),
+                language: "ko-KR".into(),
+                billed_seconds: 0,
+            },
+        }
+    }
+
+    async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
+        match self {
+            Self::Truth(stt) => stt.transcribe(request).await,
+            Self::Placeholder => Ok(SttOutput {
+                text: format!(
+                    "(받아쓰기 대역 {:.1}초)",
+                    (request.end_ms - request.start_ms) as f64 / 1_000.0
+                ),
+                billed_seconds: 0,
+            }),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
@@ -221,8 +271,13 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::FetchModels { cache } => {
-            let path = ensure_silero_vad(&cache.unwrap_or_else(default_cache)).await?;
+            let cache = cache.unwrap_or_else(default_cache);
+            let path = ensure_silero_vad(&cache).await?;
             eprintln!("silero vad: {}", path.display());
+            for model in [SPEAKER_SEGMENTATION, SPEAKER_EMBEDDING] {
+                let path = ensure_model(&cache, &model).await?;
+                eprintln!("speaker model: {}", path.display());
+            }
         }
         Command::FakeMeeting {
             clips,
@@ -278,28 +333,35 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             now_ms,
             max_segment_ms,
             pad_ms,
+            speaker_args,
         } => {
             let store = LocalStore::new(&recordings);
             let quiet_ms = quiet_minutes * 60_000;
             let gap_ms = meeting_gap_minutes * 60_000;
             let collected = collect_meetings(&store, &prefix, community, channel, gap_ms).await?;
             let now = now_ms.unwrap_or_else(now_unix_ms);
-            let model = silero_vad_path(&cache.unwrap_or_else(default_cache));
+            let cache = cache.unwrap_or_else(default_cache);
+            let model = silero_vad_path(&cache);
             let mut detector = SileroVad::new(&model, SileroSettings::default())
                 .context("run `buzz-huddle-minutes fetch-models` first")?;
-            let truth: Truth = serde_json::from_slice(
-                &std::fs::read(&stt_truth)
-                    .with_context(|| format!("read {}", stt_truth.display()))?,
-            )?;
-            let mut stt = TruthStt::new(&truth);
-            if let Some(every) = stt_fail_every {
-                stt = stt.with_fault(Fault {
-                    kind: stt_fail_kind.into(),
-                    every,
-                    failing_attempts: stt_fail_attempts,
-                    last_piece: usize::MAX,
-                });
-            }
+            let stt = match &stt_truth {
+                Some(path) => {
+                    let truth: Truth = serde_json::from_slice(
+                        &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+                    )?;
+                    let mut stt = TruthStt::new(&truth);
+                    if let Some(every) = stt_fail_every {
+                        stt = stt.with_fault(Fault {
+                            kind: stt_fail_kind.into(),
+                            every,
+                            failing_attempts: stt_fail_attempts,
+                            last_piece: usize::MAX,
+                        });
+                    }
+                    CliStt::Truth(stt)
+                }
+                None => CliStt::Placeholder,
+            };
             let minutes = LocalMinutes::open(&out)?;
             let plan = SegmentPlan {
                 max_segment_ms,
@@ -308,9 +370,16 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let settings = MinutesSettings {
                 segment_plan: plan,
                 stt: SttPolicy::default(),
-                ledger_version: ledger_version(&plan, &model)?,
+                // Placeholder text must never be reused for a real engine.
+                ledger_version: match &stt {
+                    CliStt::Truth(_) => ledger_version(&plan, &model)?,
+                    CliStt::Placeholder => {
+                        format!("{};stt=placeholder", ledger_version(&plan, &model)?)
+                    }
+                },
                 audio_key: String::new(),
                 now_unix_ms: now,
+                speakers: speaker_args.settings(&cache)?,
             };
             let options = RunOptions {
                 prefix: prefix.clone(),
@@ -394,6 +463,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     by_kind.join(", "),
                     report.ledger_unreadable_lines
                 );
+                eprintln!("  {}", report_line(&report.speakers_split));
                 for (i, speaker) in report.speakers.iter().enumerate() {
                     eprintln!(
                         "  person {i}: frames {} decoded {} concealed {} lost-silent {} spurts {} out-of-order {} undecodable {} | regions {} speech spans {} pieces {} stt failures {}",
@@ -424,6 +494,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
+        Command::Voices { command } => run_voices(command).await?,
         Command::Check {
             transcript,
             truth,

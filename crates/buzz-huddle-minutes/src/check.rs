@@ -161,7 +161,7 @@ pub fn check(transcript: &Transcript, truth: &Truth, tolerance: Tolerance) -> Ch
         let span = (segment.start_ms, segment.end_ms);
         let own: u64 = sentences
             .iter()
-            .filter(|s| s.speaker == segment.speaker)
+            .filter(|s| segment.speaker.as_deref() == Some(s.speaker.as_str()))
             .map(|s| overlap_ms(span, (s.start_ms, s.end_ms)))
             .sum();
         let any = sentences
@@ -187,7 +187,7 @@ pub fn check(transcript: &Transcript, truth: &Truth, tolerance: Tolerance) -> Ch
             }
             let covered: u64 = segments
                 .iter()
-                .filter(|seg| seg.speaker == sentence.speaker)
+                .filter(|seg| seg.speaker.as_deref() == Some(sentence.speaker.as_str()))
                 .map(|seg| overlap_ms((seg.start_ms, seg.end_ms), (from, to)))
                 .sum();
             let coverage = covered.min(to - from) as f64 / (to - from) as f64;
@@ -211,7 +211,7 @@ pub fn check(transcript: &Transcript, truth: &Truth, tolerance: Tolerance) -> Ch
             .collect();
         let found = holders.len() == 1 && {
             let seg = &segments[holders[0]];
-            seg.speaker == sentence.speaker
+            seg.speaker.as_deref() == Some(sentence.speaker.as_str())
                 && overlaps(
                     (seg.start_ms, seg.end_ms),
                     (sentence.start_ms, sentence.end_ms),
@@ -259,7 +259,7 @@ pub fn check(transcript: &Transcript, truth: &Truth, tolerance: Tolerance) -> Ch
         while changed {
             changed = false;
             for (j, seg) in segments.iter().enumerate() {
-                if &seg.speaker != speaker || group_segments.contains(&j) {
+                if seg.speaker.as_deref() != Some(speaker.as_str()) || group_segments.contains(&j) {
                     continue;
                 }
                 let touches = group_sentences.iter().any(|&i| {
@@ -576,12 +576,7 @@ mod tests {
     }
 
     fn line(start_ms: u64, end_ms: u64, text: &str) -> Segment {
-        Segment {
-            start_ms,
-            end_ms,
-            speaker: "aa".into(),
-            text: text.into(),
-        }
+        Segment::own("aa".into(), start_ms, end_ms, text.into())
     }
 
     /// One piece reaching across the pause between two sentences fails the

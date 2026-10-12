@@ -27,6 +27,7 @@ use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Clip, FakeMeeting,
     Truth, BASE_UNIX_MS, SENTENCES,
 };
+use buzz_huddle_minutes::speakers::SpeakerSettings;
 use buzz_huddle_minutes::store::{LocalStore, RecordingStore};
 use buzz_huddle_minutes::stt::{
     Fault, SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, TruthStt, FAILED_TEXT,
@@ -116,6 +117,7 @@ fn settings() -> MinutesSettings {
         ledger_version: "test".into(),
         audio_key: "mixed.wav".into(),
         now_unix_ms: 0,
+        speakers: SpeakerSettings::default(),
     }
 }
 
@@ -592,7 +594,8 @@ async fn padding_reaches_the_transcriber_but_not_the_script() {
         let n: usize = segment.text[1..].parse().expect("request number");
         let (speaker, start, end, audio) = &seen[n];
         let (start, end) = (*start, *end);
-        assert_eq!(speaker, &segment.speaker);
+        assert_eq!(speaker, &segment.device);
+        assert_eq!(segment.speaker.as_ref(), Some(speaker));
         assert!(
             start <= segment.start_ms && segment.start_ms - start <= pad,
             "{segment:?}"
@@ -1257,7 +1260,10 @@ async fn an_eleven_minute_mute_with_keepalives_stays_one_live_meeting() {
     assert_eq!(segments.iter().filter(in_mute).count(), 0, "{segments:#?}");
     for pubkey in &people {
         let who = hex::encode(pubkey);
-        assert!(segments.iter().any(|s| s.speaker == who), "{who} talked");
+        assert!(
+            segments.iter().any(|s| s.speaker.as_ref() == Some(&who)),
+            "{who} talked"
+        );
     }
     assert_eq!(output.transcript.duration_ms, 667_000 + 12_000);
 }
@@ -1665,7 +1671,7 @@ async fn the_ledger_key_follows_recorded_frames_and_settings() {
             .transcript
             .segments
             .iter()
-            .map(|s| (s.speaker.clone(), s.start_ms, s.end_ms))
+            .map(|s| (s.device.clone(), s.start_ms, s.end_ms))
             .collect()
     };
     assert_eq!(cuts(&after), cuts(&before));

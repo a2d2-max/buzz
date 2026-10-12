@@ -40,7 +40,7 @@ pub const SENTENCES: usize = 19;
 /// meeting is never "older than 14 days".
 pub const BASE_UNIX_MS: u64 = 1_791_781_200_000;
 /// Background noise every client adds (uniform, about -71 dBFS RMS).
-const NOISE_FLOOR: f32 = 0.000_5;
+pub(crate) const NOISE_FLOOR: f32 = 0.000_5;
 /// Chunk length, as the relay's default `BUZZ_HUDDLE_RECORDING_CHUNK_SECS`.
 const CHUNK_MS: u64 = 30_000;
 const LABELS: [&str; 3] = ["A", "B", "C"];
@@ -258,7 +258,7 @@ pub fn load_bench_clips(manifest: &Path, count: usize) -> anyhow::Result<Vec<Cli
     Ok(clips)
 }
 
-fn level_and_trim(pcm: &[f32]) -> Vec<f32> {
+pub(crate) fn level_and_trim(pcm: &[f32]) -> Vec<f32> {
     const FRAME: usize = 160;
     let rms: Vec<f32> = pcm
         .chunks(FRAME)
@@ -280,10 +280,10 @@ fn level_and_trim(pcm: &[f32]) -> Vec<f32> {
 
 /// Deterministic random numbers (splitmix64), so a seed always gives the
 /// same meeting.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -292,17 +292,17 @@ impl Rng {
     }
 
     /// Uniform in `[0, n)`.
-    fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n.max(1)
     }
 
     /// Uniform in `[-1, 1)`.
-    fn signed_unit(&mut self) -> f32 {
+    pub(crate) fn signed_unit(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u64 << 23) as f32 - 1.0
     }
 }
 
-fn digest(parts: &[&str]) -> [u8; 32] {
+pub(crate) fn digest(parts: &[&str]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part.as_bytes());
@@ -311,7 +311,7 @@ fn digest(parts: &[&str]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn uuid_from(parts: &[&str]) -> Uuid {
+pub(crate) fn uuid_from(parts: &[&str]) -> Uuid {
     let hash = digest(parts);
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&hash[..16]);
@@ -320,16 +320,16 @@ fn uuid_from(parts: &[&str]) -> Uuid {
 
 /// One stay of one person in one session's room.
 #[derive(Debug, Clone, Copy)]
-struct Occupancy {
-    session: usize,
-    speaker: usize,
-    peer_index: u8,
-    epoch: u8,
-    join_ms: u64,
-    leave_ms: u64,
+pub(crate) struct Occupancy {
+    pub(crate) session: usize,
+    pub(crate) speaker: usize,
+    pub(crate) peer_index: u8,
+    pub(crate) epoch: u8,
+    pub(crate) join_ms: u64,
+    pub(crate) leave_ms: u64,
 }
 
-enum Event {
+pub(crate) enum Event {
     Join(Occupancy),
     Leave(Occupancy),
     Frame {
@@ -625,7 +625,7 @@ pub fn build_fake_meeting(
     Ok(FakeMeeting { truth, files })
 }
 
-fn occ(
+pub(crate) fn occ(
     session: usize,
     speaker: usize,
     peer_index: u8,
@@ -643,14 +643,14 @@ fn occ(
     }
 }
 
-fn ms_u32(ms: u64) -> u32 {
+pub(crate) fn ms_u32(ms: u64) -> u32 {
     u32::try_from(ms).unwrap_or(u32::MAX)
 }
 
 /// What one client sends during one stay, as the relay receives it:
 /// `(receive time on the meeting clock, v2 frame)`. Encoder settings and
 /// header fields follow `desktop/src-tauri/src/huddle/relay_api.rs`.
-fn client_frames(
+pub(crate) fn client_frames(
     occupancy: &Occupancy,
     signal: &[f32],
     mutes: &[(u64, u64)],
@@ -722,7 +722,7 @@ fn client_frames(
 /// Cut one session's events into `.bhr` chunks the way the recorder does:
 /// a new chunk every [`CHUNK_MS`], each opening with the current roster.
 #[allow(clippy::too_many_arguments)]
-fn write_chunks(
+pub(crate) fn write_chunks(
     events: &[(u64, u8, u64, Event)],
     pubkeys: &[[u8; 32]],
     prefix: &str,

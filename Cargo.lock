@@ -1216,6 +1216,7 @@ name = "buzz-huddle-minutes"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buzz-gcp",
  "buzz-huddle-recording",
  "chrono",
  "clap",

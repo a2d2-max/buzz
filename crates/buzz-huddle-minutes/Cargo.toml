@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Huddle minutes worker: rebuilds per-speaker audio from huddle recordings, cuts speech segments, transcribes them and writes huddle-transcript/1"
+description = "Huddle minutes worker: rebuilds per-speaker audio from huddle recordings, cuts speech segments, splits shared (room) tracks by speaker, transcribes them and writes huddle-transcript/2"
 
 [[bin]]
 name = "buzz-huddle-minutes"
@@ -13,9 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+buzz-gcp = { workspace = true }
 buzz-huddle-recording = { workspace = true }
 chrono = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 hex = { workspace = true }
 opus = "0.3"
