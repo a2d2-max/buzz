@@ -21,10 +21,12 @@
 //!   request was sent and then timed out or the connection closed — is not
 //!   sent again in the run and counts as a paid try; after
 //!   [`PAID_SUMMARY_TRIES`] of them the summary is given up.
-//! - A failure that cost nothing (no connection, 5xx, 429, 400) counts as a
-//!   free failure and that meeting waits ([`backoff`]) before its next try;
-//!   other meetings go on. After more than [`FREE_SUMMARY_FAILS`] the summary
-//!   is given up; the Notion page keeps trying.
+//! - A failure that cost nothing (no connection, 5xx) counts as a free
+//!   failure and that meeting waits ([`backoff`]) before its next try; other
+//!   meetings go on. After more than [`FREE_SUMMARY_FAILS`] the summary is
+//!   given up; the Notion page keeps trying. A 429 only waits. A bad request
+//!   (400·404) counts only after another meeting succeeded earlier in the
+//!   run; otherwise it is counted apart ([`UNCOUNTED_BAD_REQUESTS`]).
 //! - A given-up summary leaves the page written with [`SUMMARY_GIVEN_UP`] in
 //!   its place, and the meeting is finished.
 //! - A step is off for the rest of the run only on what the service says:
@@ -74,6 +76,18 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
 /// Trouble (unavailable, timed out, cut off) on this many meetings in a row
 /// turns the step off for the rest of the run.
 pub const TROUBLE_IN_A_ROW: u32 = 2;
+/// Requests refused as bad (400·404) on this many meetings in a row look
+/// like a setting, not the meetings: the step is off for the rest of the
+/// run, and from this one on they do not count for their meeting.
+pub const BAD_REQUESTS_IN_A_ROW: u32 = 2;
+/// A bad request (400·404) counts for its meeting only when another
+/// meeting's summary succeeded earlier in the same run; otherwise it may be
+/// a setting and is counted apart. This many of those for one script give
+/// its summary up anyway: with the waits (10, 20, 40, 80, 160, 320 minutes,
+/// then 6 hours) the 11th comes about 34.5 hours after the first, so a
+/// wrong setting has a day and a half to be noticed and fixed, and a
+/// meeting that always comes first still gets its page in the end.
+pub const UNCOUNTED_BAD_REQUESTS: u32 = 11;
 /// Nothing after the script starts with less than this left before the
 /// run's deadline; the next run does it.
 pub const FOLLOW_UP_MIN_LEFT: Duration = Duration::from_secs(10 * 60);
@@ -122,6 +136,10 @@ pub struct StepFailures {
     /// Failures that cost nothing.
     #[serde(default)]
     pub free_fails: u32,
+    /// Bad requests (400·404) not counted as the meeting's own: no other
+    /// meeting's step had succeeded before it in the run.
+    #[serde(default)]
+    pub uncounted_bad_requests: u32,
     /// Kind of the last failure, e.g. `transient`.
     #[serde(default, alias = "kind")]
     pub last_kind: String,
@@ -144,7 +162,18 @@ impl StepFailures {
 
     /// The summary is given up for this script.
     pub fn summary_given_up(&self) -> bool {
-        self.paid_tries >= PAID_SUMMARY_TRIES || self.free_fails > FREE_SUMMARY_FAILS
+        self.paid_tries >= PAID_SUMMARY_TRIES
+            || self.free_fails > FREE_SUMMARY_FAILS
+            || self.uncounted_bad_requests >= UNCOUNTED_BAD_REQUESTS
+    }
+
+    /// The step waits at `now`. A next try further off than [`MAX_BACKOFF`]
+    /// was never written by this worker (a wrong clock, a damaged record):
+    /// it is not waited for.
+    fn waiting(&self, now: u64) -> bool {
+        let longest = u64::try_from(MAX_BACKOFF.as_millis()).unwrap_or(u64::MAX);
+        now < self.next_try_after_unix_ms
+            && self.next_try_after_unix_ms <= now.saturating_add(longest)
     }
 
     /// Count one failure at `now` (UTC ms); a free one sets the next try.
@@ -153,9 +182,18 @@ impl StepFailures {
         self.last_code = code.into();
         match cost {
             Cost::Paid => self.paid_tries += 1,
-            Cost::Free => {
-                self.free_fails += 1;
-                let wait = u64::try_from(backoff(self.free_fails).as_millis()).unwrap_or(u64::MAX);
+            Cost::Free | Cost::WaitOnly => {
+                if cost == Cost::Free {
+                    self.free_fails += 1;
+                }
+                let n = self.free_fails.max(1);
+                let wait = u64::try_from(backoff(n).as_millis()).unwrap_or(u64::MAX);
+                self.next_try_after_unix_ms = now.saturating_add(wait);
+            }
+            Cost::UncountedBadRequest => {
+                self.uncounted_bad_requests += 1;
+                let n = self.uncounted_bad_requests;
+                let wait = u64::try_from(backoff(n).as_millis()).unwrap_or(u64::MAX);
                 self.next_try_after_unix_ms = now.saturating_add(wait);
             }
             Cost::Uncounted => {}
@@ -178,6 +216,23 @@ impl StepFailures {
                     .saturating_sub(now)
                     .div_ceil(60_000)
             ),
+            Cost::UncountedBadRequest if given_up => format!(
+                " (bad request not counted {}{end})",
+                self.uncounted_bad_requests
+            ),
+            Cost::UncountedBadRequest => format!(
+                " (bad request not counted {}, next try in {} min)",
+                self.uncounted_bad_requests,
+                self.next_try_after_unix_ms
+                    .saturating_sub(now)
+                    .div_ceil(60_000)
+            ),
+            Cost::WaitOnly => format!(
+                " (not counted, next try in {} min)",
+                self.next_try_after_unix_ms
+                    .saturating_sub(now)
+                    .div_ceil(60_000)
+            ),
             Cost::Uncounted => String::new(),
         }
     }
@@ -190,7 +245,13 @@ enum Cost {
     Paid,
     /// Cost nothing: wait, then try again.
     Free,
-    /// Not the meeting's doing (refused credentials or permission).
+    /// Not the meeting's doing, but wait before trying it again (429).
+    WaitOnly,
+    /// A bad request that may be a setting: counted apart, and wait
+    /// ([`UNCOUNTED_BAD_REQUESTS`]).
+    UncountedBadRequest,
+    /// Not the meeting's doing (refused credentials or permission, no
+    /// token).
     Uncounted,
 }
 
@@ -201,6 +262,9 @@ enum Signal {
     Refused,
     /// Unavailable, timed out or cut off: off after [`TROUBLE_IN_A_ROW`].
     Trouble,
+    /// Refused as a bad request (400·404): off after
+    /// [`BAD_REQUESTS_IN_A_ROW`].
+    BadRequest,
     /// The service answered.
     Answered,
 }
@@ -209,13 +273,15 @@ fn summary_class(error: &SummaryError) -> (Cost, Signal) {
     use SummaryErrorKind as Kind;
     let cost = match error.kind {
         _ if error.may_have_cost() => Cost::Paid,
-        Kind::Auth | Kind::Permission => Cost::Uncounted,
+        Kind::Auth | Kind::Permission | Kind::NoToken => Cost::Uncounted,
+        Kind::RateLimited => Cost::WaitOnly,
         _ => Cost::Free,
     };
     let signal = match error.kind {
         Kind::Auth | Kind::Permission | Kind::RateLimited => Signal::Refused,
-        Kind::Transient => Signal::Trouble,
-        Kind::BadRequest | Kind::BadResponse | Kind::OutOfTime => Signal::Answered,
+        Kind::Transient | Kind::NoToken => Signal::Trouble,
+        Kind::BadRequest => Signal::BadRequest,
+        Kind::BadResponse | Kind::OutOfTime => Signal::Answered,
     };
     (cost, signal)
 }
@@ -224,9 +290,10 @@ fn notion_class(kind: NotionErrorKind) -> (Cost, Signal) {
     use NotionErrorKind as Kind;
     match kind {
         Kind::Auth | Kind::Permission => (Cost::Uncounted, Signal::Refused),
-        Kind::RateLimited => (Cost::Free, Signal::Refused),
+        Kind::RateLimited => (Cost::WaitOnly, Signal::Refused),
         Kind::Transient => (Cost::Free, Signal::Trouble),
-        Kind::NotFound | Kind::BadRequest | Kind::BadResponse => (Cost::Free, Signal::Answered),
+        Kind::NotFound | Kind::BadRequest => (Cost::Free, Signal::BadRequest),
+        Kind::BadResponse => (Cost::Free, Signal::Answered),
     }
 }
 
@@ -234,19 +301,52 @@ fn notion_class(kind: NotionErrorKind) -> (Cost, Signal) {
 #[derive(Debug, Default)]
 struct ForRun {
     off: bool,
+    /// The step succeeded for some meeting earlier in this run.
+    succeeded: bool,
     trouble_in_a_row: u32,
+    bad_requests_in_a_row: u32,
 }
 
 impl ForRun {
-    fn heard(&mut self, signal: Signal) {
+    /// How a failure of this kind counts for its meeting, after taking it
+    /// in: a free bad request counts only after a success earlier in this
+    /// run, and never when it looks like a setting
+    /// ([`BAD_REQUESTS_IN_A_ROW`] in a row). A paid try stays paid (the
+    /// shorter ask after a paid answer can get the 400).
+    fn count_as(&mut self, cost: Cost, signal: Signal) -> Cost {
+        let setting = self.heard(signal);
+        match signal {
+            Signal::BadRequest if cost == Cost::Free && (setting || !self.succeeded) => {
+                Cost::UncountedBadRequest
+            }
+            _ => cost,
+        }
+    }
+
+    /// Take in one result; `true` for bad requests on
+    /// [`BAD_REQUESTS_IN_A_ROW`] meetings in a row.
+    fn heard(&mut self, signal: Signal) -> bool {
         match signal {
             Signal::Refused => self.off = true,
             Signal::Trouble => {
+                self.bad_requests_in_a_row = 0;
                 self.trouble_in_a_row += 1;
                 self.off |= self.trouble_in_a_row >= TROUBLE_IN_A_ROW;
             }
-            Signal::Answered => self.trouble_in_a_row = 0,
+            Signal::BadRequest => {
+                self.trouble_in_a_row = 0;
+                self.bad_requests_in_a_row += 1;
+                if self.bad_requests_in_a_row >= BAD_REQUESTS_IN_A_ROW {
+                    self.off = true;
+                    return true;
+                }
+            }
+            Signal::Answered => {
+                self.trouble_in_a_row = 0;
+                self.bad_requests_in_a_row = 0;
+            }
         }
+        false
     }
 }
 
@@ -608,7 +708,7 @@ async fn summary_step<H: MinutesHome>(
     if failures.summary_given_up() {
         return Ok((Step::GaveUp, ForPage::GivenUp));
     }
-    if steps.now() < failures.next_try_after_unix_ms {
+    if failures.waiting(steps.now()) {
         return Ok((Step::Later(Later::Backoff), ForPage::Missing));
     }
     if steps.summary_run.off {
@@ -629,6 +729,7 @@ async fn summary_step<H: MinutesHome>(
     let error = match asked {
         Ok(mut made) => {
             steps.summary_run.heard(Signal::Answered);
+            steps.summary_run.succeeded = true;
             made.script_sha256 = held.script_sha256.to_string();
             let json = serde_json::to_vec_pretty(&made).map_err(io)?;
             let sha = sha256_hex(&json);
@@ -642,7 +743,7 @@ async fn summary_step<H: MinutesHome>(
         return Ok((Step::Later(Later::TimeLimit), ForPage::Missing));
     }
     let (cost, signal) = summary_class(&error);
-    steps.summary_run.heard(signal);
+    let cost = steps.summary_run.count_as(cost, signal);
     let now = steps.now();
     failures.count(cost, error.kind.as_str(), &error.code, now);
     if cost != Cost::Uncounted {
@@ -701,7 +802,7 @@ async fn notion_step<H: MinutesHome>(
         .failures(Beside::NotionFailed)
         .await?
         .unwrap_or_else(|()| StepFailures::new(held.script_sha256));
-    if steps.now() < failures.next_try_after_unix_ms {
+    if failures.waiting(steps.now()) {
         return Ok(Step::Later(Later::Backoff));
     }
     if steps.notion_run.off {
@@ -744,6 +845,7 @@ async fn notion_step<H: MinutesHome>(
     let error = match published {
         Ok(()) => {
             steps.notion_run.heard(Signal::Answered);
+            steps.notion_run.succeeded = true;
             return Ok(Step::Done);
         }
         Err(PublishMeetingError::Home(error)) => return Err(error),
@@ -751,7 +853,7 @@ async fn notion_step<H: MinutesHome>(
         Err(PublishMeetingError::Notion(error)) => error,
     };
     let (cost, signal) = notion_class(error.kind);
-    steps.notion_run.heard(signal);
+    let cost = steps.notion_run.count_as(cost, signal);
     let now = steps.now();
     // Only the kind and codes: Notion's message can quote the page.
     failures.count(cost, error.kind.as_str(), error.short_code(), now);
@@ -1055,7 +1157,7 @@ mod tests {
         assert!(
             failed_with(
                 &first.summary,
-                "bad-request HTTP 400 INVALID_ARGUMENT (free failure 1, next try in 10 min)"
+                "bad-request HTTP 400 INVALID_ARGUMENT (bad request not counted 1, next try in 10 min)"
             ),
             "{first:?}"
         );
@@ -1063,7 +1165,14 @@ mod tests {
         assert!(first.left_for_next_run());
         assert!(!world.home.summary_path(FIRST).exists());
         let failures = world.failures();
-        assert_eq!((failures.paid_tries, failures.free_fails), (0, 1));
+        assert_eq!(
+            (
+                failures.paid_tries,
+                failures.free_fails,
+                failures.uncounted_bad_requests
+            ),
+            (0, 0, 1)
+        );
         assert_eq!(failures.next_try_after_unix_ms, world.now() + 600_000);
         assert!(world.notion.requests().is_empty(), "no page yet");
 
@@ -1097,14 +1206,14 @@ mod tests {
         assert!(
             failed_with(
                 &first.notion,
-                "validation_error (free failure 1, next try in 10 min)"
+                "validation_error (bad request not counted 1, next try in 10 min)"
             ),
             "{first:?}"
         );
         let record = world.record().unwrap();
         assert!(!record.done);
         assert_eq!(world.page().0, "실패");
-        assert_eq!(world.notion_failures().free_fails, 1);
+        assert_eq!(world.notion_failures().uncounted_bad_requests, 1);
 
         let gemini = world.gemini.requests().len();
         assert_eq!(
@@ -1920,6 +2029,13 @@ mod tests {
         let second = world.follow_with(&other_script(), &mut run).await;
         assert_eq!(pair(&second), (Step::Off, Step::Later(Later::OffForRun)));
         assert_eq!(world.notion.requests().len(), notion);
+        // Not counted against the meeting; it only waits.
+        let failures = world.notion_failures();
+        assert_eq!(
+            (failures.free_fails, failures.uncounted_bad_requests),
+            (0, 0)
+        );
+        assert!(failures.next_try_after_unix_ms > 0, "{failures:?}");
     }
 
     /// A Gemini that hangs while `slow` is set and answers well otherwise.
@@ -2297,11 +2413,20 @@ mod tests {
             let mut run = world.run(None, true);
             let tried = world.follow_with(&script(), &mut run).await;
             assert!(
-                failed_with(&tried.notion, &format!("free failure {n}, next try in")),
+                failed_with(
+                    &tried.notion,
+                    &format!("bad request not counted {}, next try in", n - 1)
+                ),
                 "{tried:?}"
             );
         }
-        assert_eq!(world.notion_failures().free_fails, 9);
+        assert_eq!(
+            (
+                world.notion_failures().free_fails,
+                world.notion_failures().uncounted_bad_requests
+            ),
+            (1, 8)
+        );
     }
 
     /// A record from before (`huddle-summary-failed/1`: `kind`, `code`,
@@ -2331,5 +2456,396 @@ mod tests {
             failed_with(&last.summary, "paid try 3 of 3, given up)"),
             "{last:?}"
         );
+    }
+
+    // ---- review round 4 (r4_*) and the rules after it ----
+
+    fn failures_of(world: &World, first: u128, beside: Beside) -> Option<StepFailures> {
+        std::fs::read(world.home.beside_path(Uuid::from_u128(first), beside))
+            .ok()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// 429: off for the run at once; the meeting waits but it is not
+    /// counted against it.
+    #[tokio::test]
+    async fn rate_limits_are_not_counted_but_wait() {
+        let world = world().await;
+        let limited = FakeServer::start(|_| {
+            Reply::json(429, &json!({ "error": { "status": "RESOURCE_EXHAUSTED" } }))
+        })
+        .await;
+        let settings = gemini_settings(&limited);
+        let a = world
+            .follow_with(&script(), &mut world.run(Some(&settings), false))
+            .await;
+        assert!(
+            failed_with(&a.summary, "(not counted, next try in 10 min)"),
+            "{a:?}"
+        );
+        let failures = world.failures();
+        assert_eq!((failures.free_fails, failures.paid_tries), (0, 0));
+        assert_eq!(failures.next_try_after_unix_ms, world.now() + 600_000);
+        assert_eq!(failures.last_kind, "rate-limited");
+    }
+
+    /// The token source not answering is not the meeting's doing: not
+    /// counted, no record; on two meetings in a row the summary is off.
+    #[tokio::test]
+    async fn r4_no_token_is_not_counted() {
+        let world = world().await;
+        let tokens = Tokens::new(TokenSource::MetadataServer {
+            base_url: "http://127.0.0.1:1".into(),
+        })
+        .unwrap();
+        let step = SummaryStep {
+            http: &world.http,
+            settings: &world.gemini_settings,
+            tokens: &tokens,
+        };
+        let mut run =
+            FollowUps::new(Some(step), None, &PubkeyPrefixNames).with_clock(&*world.clock_fn);
+        let a = world.follow_with(&script(), &mut run).await;
+        assert!(failed_with(&a.summary, "no-token token: "), "{a:?}");
+        assert!(failures_of(&world, 3, Beside::SummaryFailed).is_none());
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert!(failed_with(&b.summary, "no-token"), "{b:?}");
+        let third = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(third.summary, Step::Later(Later::OffForRun));
+        assert_eq!(world.gemini.requests().len(), 0);
+    }
+
+    /// Bad requests (400) on two meetings in a row look like a setting: off
+    /// for the run, and the second is not counted for its meeting (it only
+    /// waits).
+    #[tokio::test]
+    async fn bad_requests_on_two_meetings_in_a_row_turn_the_summary_off() {
+        let world = world().await;
+        world.refuse.store(true, Ordering::SeqCst);
+        let mut run = world.steps();
+        world.follow_with(&script(), &mut run).await;
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert!(
+            failed_with(
+                &b.summary,
+                "(bad request not counted 1, next try in 10 min)"
+            ),
+            "{b:?}"
+        );
+        let b_failures = failures_of(&world, 10, Beside::SummaryFailed).unwrap();
+        assert_eq!(
+            (b_failures.free_fails, b_failures.uncounted_bad_requests),
+            (0, 1)
+        );
+        assert_eq!(b_failures.next_try_after_unix_ms, world.now() + 600_000);
+        let sent = world.gemini.requests().len();
+        let third = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(third.summary, Step::Later(Later::OffForRun));
+        assert_eq!(world.gemini.requests().len(), sent);
+    }
+
+    /// The same for the Notion page (400·404).
+    #[tokio::test]
+    async fn bad_requests_on_two_meetings_in_a_row_turn_the_page_off() {
+        let world = world().await;
+        let refused = || Reply::json(400, &json!({ "code": "validation_error", "message": "no" }));
+        world.state.lock().unwrap().append_failures = vec![refused(); 10];
+        let mut run = world.run(None, true);
+        world.follow_with(&script(), &mut run).await;
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert!(
+            failed_with(&b.notion, "(bad request not counted 1, next try in"),
+            "{b:?}"
+        );
+        assert_eq!(
+            failures_of(&world, 10, Beside::NotionFailed)
+                .unwrap()
+                .free_fails,
+            0
+        );
+        let sent = world.notion.requests().len();
+        let third = world.follow_with(&other_script(), &mut run).await;
+        assert_eq!(third.notion, Step::Later(Later::OffForRun));
+        assert_eq!(world.notion.requests().len(), sent);
+    }
+
+    /// A next try further off than the longest wait was never written by
+    /// the worker: it is not waited for.
+    #[tokio::test]
+    async fn a_next_try_too_far_off_is_not_waited_for() {
+        let world = world().await;
+        let longest = MAX_BACKOFF.as_millis() as u64;
+        let record = |next: u64| StepFailures {
+            free_fails: 1,
+            next_try_after_unix_ms: next,
+            ..StepFailures::new(&sha_of(&script()))
+        };
+        let write = |failures: StepFailures| {
+            std::fs::write(
+                world.home.beside_path(FIRST, Beside::SummaryFailed),
+                serde_json::to_vec(&failures).unwrap(),
+            )
+            .unwrap()
+        };
+        write(record(world.now() + longest));
+        assert_eq!(world.follow().await.summary, Step::Later(Later::Backoff));
+        write(record(world.now() + longest + 60_000));
+        assert_eq!(world.follow().await.summary, Step::Done);
+    }
+
+    /// Two meetings failing with 500, then a good one, every 10 minutes:
+    /// the good one waits two runs (trouble twice in a row turns the
+    /// summary off), then goes through while the two back off; each try of
+    /// those two counts against it.
+    #[tokio::test]
+    async fn r4_two_poison_then_good() {
+        let world = world().await;
+        let meeting_c = plan_in(
+            &world.dir.path().join("recordings"),
+            Uuid::from_u128(11),
+            Uuid::from_u128(12),
+        )
+        .await;
+        let server = FakeServer::start(|request| {
+            let body = String::from_utf8_lossy(&request.body).to_string();
+            if body.contains("견적서") || body.contains("다른 회의") {
+                Reply::json(500, &json!({ "error": { "status": "INTERNAL" } }))
+            } else {
+                gemini_reply(&answer(json!([])), "STOP")
+            }
+        })
+        .await;
+        let settings = gemini_settings(&server);
+        let mut good = transcript_with(&[(1_000, A, "좋은 회의예요.")]);
+        good.channel_id = Uuid::from_u128(11);
+        good.session_ids = vec![Uuid::from_u128(12)];
+        let mut c_steps = Vec::new();
+        for _ in 0..4 {
+            let mut run = world.run(Some(&settings), false);
+            world.follow_with(&script(), &mut run).await;
+            world
+                .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+                .await;
+            let c = world.follow_meeting(&meeting_c, &good, &mut run).await;
+            c_steps.push(c.summary);
+            world.advance(Duration::from_secs(600));
+        }
+        assert_eq!(
+            c_steps,
+            [
+                Step::Later(Later::OffForRun),
+                Step::Later(Later::OffForRun),
+                Step::Done,
+                Step::AlreadyDone
+            ]
+        );
+        let counted = |first| {
+            failures_of(&world, first, Beside::SummaryFailed)
+                .unwrap()
+                .free_fails
+        };
+        assert_eq!((counted(3), counted(10)), (3, 3));
+    }
+
+    /// Gemini refusing meeting A's script (`견적서`) as a bad request and
+    /// answering the others.
+    async fn refuses_a() -> FakeServer {
+        FakeServer::start(|request| {
+            if String::from_utf8_lossy(&request.body).contains("견적서") {
+                Reply::json(400, &json!({ "error": { "status": "INVALID_ARGUMENT" } }))
+            } else {
+                gemini_reply(&answer(json!([])), "STOP")
+            }
+        })
+        .await
+    }
+
+    /// A wrong setting (every meeting gets 400), runs every 10 minutes for
+    /// a day: nobody is given up, nothing counts as the meetings' own; once
+    /// fixed, the next try writes both.
+    #[tokio::test]
+    async fn r4_a_wrong_setting_gives_up_nobody_for_a_day() {
+        let world = world().await;
+        world.refuse.store(true, Ordering::SeqCst);
+        for _ in 0..(24 * 6) {
+            let mut run = world.steps();
+            for (meeting, script) in [(&world.meeting, script()), (&world.meeting_b, b_script())] {
+                let followed = world.follow_meeting(meeting, &script, &mut run).await;
+                assert!(
+                    !failed_with(&followed.summary, "given up") && followed.summary != Step::GaveUp,
+                    "{followed:?}"
+                );
+            }
+            world.advance(Duration::from_secs(600));
+        }
+        let a = failures_of(&world, 3, Beside::SummaryFailed).unwrap();
+        let b = failures_of(&world, 10, Beside::SummaryFailed).unwrap();
+        assert_eq!((a.free_fails, b.free_fails), (0, 0));
+        assert!(a.uncounted_bad_requests < UNCOUNTED_BAD_REQUESTS, "{a:?}");
+        assert!(b.uncounted_bad_requests < UNCOUNTED_BAD_REQUESTS, "{b:?}");
+        // Fixed: the next try goes through.
+        world.refuse.store(false, Ordering::SeqCst);
+        world.advance(MAX_BACKOFF);
+        let mut run = world.steps();
+        let a = world.follow_with(&script(), &mut run).await;
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert_eq!(pair(&a), (Step::Done, Step::Done));
+        assert_eq!(pair(&b), (Step::Done, Step::Done));
+    }
+
+    /// A bad request in a run where another meeting's summary succeeded
+    /// first counts as the meeting's own.
+    #[tokio::test]
+    async fn a_bad_request_after_a_success_counts() {
+        let world = world().await;
+        let server = refuses_a().await;
+        let settings = gemini_settings(&server);
+        let mut run = world.run(Some(&settings), false);
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert_eq!(b.summary, Step::Done);
+        let a = world.follow_with(&script(), &mut run).await;
+        assert!(
+            failed_with(&a.summary, "(free failure 1, next try in 10 min)"),
+            "{a:?}"
+        );
+        let failures = world.failures();
+        assert_eq!(
+            (failures.free_fails, failures.uncounted_bad_requests),
+            (1, 0)
+        );
+    }
+
+    /// A meeting that always comes first and always gets 400 is counted
+    /// apart; the 11th time (about 34.5 hours) gives its summary up.
+    #[tokio::test]
+    async fn a_bad_meeting_always_first_is_given_up_in_the_end() {
+        let world = world().await;
+        let server = refuses_a().await;
+        let settings = gemini_settings(&server);
+        let start = world.now();
+        let mut uncounted = Vec::new();
+        for _ in 0..20 {
+            let mut run = world.run(Some(&settings), false);
+            let a = world.follow_with(&script(), &mut run).await;
+            world
+                .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+                .await;
+            let failures = world.failures();
+            uncounted.push(failures.uncounted_bad_requests);
+            if failures.summary_given_up() {
+                assert!(failed_with(&a.summary, "given up"), "{a:?}");
+                break;
+            }
+            assert!(failed_with(&a.summary, "bad request not counted"), "{a:?}");
+            world.advance(Duration::from_millis(
+                failures.next_try_after_unix_ms - world.now(),
+            ));
+        }
+        assert!(world.failures().summary_given_up(), "{uncounted:?}");
+        assert_eq!(uncounted, (1..=UNCOUNTED_BAD_REQUESTS).collect::<Vec<_>>());
+        assert_eq!((world.now() - start) / 60_000, 2_070, "about 34.5 hours");
+        assert_eq!(world.failures().free_fails, 0);
+        let after = world
+            .follow_with(&script(), &mut world.run(Some(&settings), false))
+            .await;
+        assert_eq!(after.summary, Step::GaveUp);
+    }
+
+    /// The same for the Notion page: a bad request after another meeting's
+    /// page went through counts as the meeting's own.
+    #[tokio::test]
+    async fn a_bad_page_request_after_a_success_counts() {
+        let world = world().await;
+        let mut run = world.run(None, true);
+        let b = world
+            .follow_meeting(&world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert_eq!(b.notion, Step::Done);
+        world.state.lock().unwrap().append_failures = vec![Reply::json(
+            400,
+            &json!({ "code": "validation_error", "message": "no" }),
+        )];
+        let a = world.follow_with(&script(), &mut run).await;
+        assert!(
+            failed_with(&a.notion, "(free failure 1, next try in 10 min)"),
+            "{a:?}"
+        );
+        assert_eq!(world.notion_failures().uncounted_bad_requests, 0);
+    }
+
+    /// The first ask is cut off at the limit (paid), the shorter ask gets
+    /// 400: a paid try, three at most — not a bad request counted apart.
+    #[tokio::test]
+    async fn r5_paid_then_bad_request_is_a_paid_try() {
+        let world = world().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = calls.clone();
+        let server = FakeServer::start(move |_| {
+            if n.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                gemini_reply(&answer(json!([])), "MAX_TOKENS")
+            } else {
+                Reply::json(400, &json!({ "error": { "status": "INVALID_ARGUMENT" } }))
+            }
+        })
+        .await;
+        let settings = gemini_settings(&server);
+        let mut steps_seen = Vec::new();
+        for _ in 0..5 {
+            let mut run = world.run(Some(&settings), false);
+            let a = world.follow_with(&script(), &mut run).await;
+            steps_seen.push(a.summary);
+            world.advance(MAX_BACKOFF);
+        }
+        assert!(
+            failed_with(&steps_seen[0], "(paid try 1 of 3)"),
+            "{steps_seen:?}"
+        );
+        assert!(
+            failed_with(&steps_seen[2], "(paid try 3 of 3, given up)"),
+            "{steps_seen:?}"
+        );
+        assert_eq!(steps_seen[3..], [Step::GaveUp, Step::GaveUp]);
+        let failures = world.failures();
+        assert_eq!(
+            (
+                failures.paid_tries,
+                failures.free_fails,
+                failures.uncounted_bad_requests
+            ),
+            (3, 0, 0)
+        );
+        // Three paid answers (and three shorter asks), no more.
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+
+    /// A paid answer, then 429 on the shorter ask: still a paid try (the
+    /// 429 does not make it a wait-only failure).
+    #[tokio::test]
+    async fn a_paid_answer_then_429_is_a_paid_try() {
+        let world = world().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = calls.clone();
+        let server = FakeServer::start(move |_| match n.fetch_add(1, Ordering::SeqCst) {
+            0 => gemini_reply(&answer(json!([])), "MAX_TOKENS"),
+            _ => Reply::json(429, &json!({ "error": { "status": "RESOURCE_EXHAUSTED" } })),
+        })
+        .await;
+        let settings = gemini_settings(&server);
+        let a = world
+            .follow_with(&script(), &mut world.run(Some(&settings), false))
+            .await;
+        assert!(failed_with(&a.summary, "rate-limited"), "{a:?}");
+        assert!(failed_with(&a.summary, "(paid try 1 of 3)"), "{a:?}");
+        assert_eq!(world.failures().paid_tries, 1);
     }
 }

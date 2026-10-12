@@ -402,6 +402,8 @@ pub enum SummaryErrorKind {
     BadResponse,
     /// 마감([`GeminiSettings::deadline`]) 전에 요청 하나를 끝낼 시간이 없다.
     OutOfTime,
+    /// 토큰 출처가 답하지 않았다(잠깐일 수 있다). 요청은 보내지 않았다.
+    NoToken,
 }
 
 impl SummaryErrorKind {
@@ -415,6 +417,7 @@ impl SummaryErrorKind {
             Self::BadRequest => "bad-request",
             Self::BadResponse => "bad-response",
             Self::OutOfTime => "out-of-time",
+            Self::NoToken => "no-token",
         }
     }
 }
@@ -1522,7 +1525,7 @@ async fn generate(
             // A token source that did not answer is worth another try later;
             // one that said no is an authentication failure.
             let kind = if error.is_transient() {
-                SummaryErrorKind::Transient
+                SummaryErrorKind::NoToken
             } else {
                 SummaryErrorKind::Auth
             };
