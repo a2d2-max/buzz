@@ -33,7 +33,9 @@ steps:
         if grep -Eiq 'sherpa|onnxruntime' /workspace/ldd.txt; then echo 'sherpa-onnx is not static'; exit 1; fi
         grep -q 'libopus' /workspace/ldd.txt
 
-  # 모델이 제자리에 있고, 실행 사용자는 root 가 아니다.
+  # 모델 셋이 제자리에 models.rs 의 sha256 으로 있고, 실행 사용자는 root 가 아니다.
+  # 네트워크를 끄고 fetch-models 를 돌린다: 다 맞으면 아무것도 안 받고 끝나고,
+  # 하나라도 없거나 다르면 받으려다 실패한다.
   - id: smoke-model-and-user
     name: gcr.io/cloud-builders/docker
     entrypoint: bash
@@ -41,7 +43,8 @@ steps:
       - -c
       - |
         set -euo pipefail
-        docker run --rm --entrypoint sha256sum ${_IMAGE}:${_TAG} /opt/huddle-minutes/cache/models/silero_vad.onnx
+        docker run --rm --network none ${_IMAGE}:${_TAG} fetch-models --cache /opt/huddle-minutes/cache
+        docker run --rm --entrypoint ls ${_IMAGE}:${_TAG} -l /opt/huddle-minutes/cache/models
         uid="$$(docker run --rm --entrypoint id ${_IMAGE}:${_TAG} -u)"
         echo "uid=$$uid"
         test "$$uid" != 0
