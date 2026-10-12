@@ -14,7 +14,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::stt::{SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest};
+use crate::stt::{SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, Word};
 use crate::transcript::SttInfo;
 
 /// Engine name in the script's `stt` block.
@@ -114,12 +114,17 @@ impl ChirpStt {
     }
 }
 
-/// The request body for one piece.
-fn request_body(pcm_16k: &[f32]) -> serde_json::Value {
+/// The request body for one piece. Word times are asked for only when
+/// `word_times` (otherwise the body is exactly as before they existed).
+fn request_body(pcm_16k: &[f32], word_times: bool) -> serde_json::Value {
     let mut bytes = Vec::with_capacity(pcm_16k.len() * 2);
     for sample in pcm_16k {
         let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
         bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut features = json!({ "enableAutomaticPunctuation": true });
+    if word_times {
+        features["enableWordTimeOffsets"] = json!(true);
     }
     json!({
         "config": {
@@ -130,7 +135,7 @@ fn request_body(pcm_16k: &[f32]) -> serde_json::Value {
             },
             "languageCodes": [CHIRP_LANGUAGE],
             "model": "chirp_3",
-            "features": { "enableAutomaticPunctuation": true },
+            "features": features,
         },
         "content": base64::engine::general_purpose::STANDARD.encode(bytes),
     })
@@ -153,6 +158,33 @@ struct AnswerResult {
 struct Alternative {
     #[serde(default)]
     transcript: String,
+    #[serde(default)]
+    words: Vec<WordInfo>,
+}
+
+/// A word of an answer. Offsets are durations from the start of the audio
+/// (`"1.200s"`); a zero offset may be left out.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WordInfo {
+    #[serde(default)]
+    start_offset: Option<String>,
+    #[serde(default)]
+    end_offset: Option<String>,
+    #[serde(default)]
+    word: String,
+}
+
+/// `"1.2s"` → 1200 ms; left out is 0; `None` if it does not read.
+fn offset_ms(offset: Option<&str>) -> Option<u64> {
+    let Some(offset) = offset else {
+        return Some(0);
+    };
+    offset
+        .strip_suffix('s')
+        .and_then(|number| number.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds * 1_000.0).round() as u64)
 }
 
 #[derive(Deserialize)]
@@ -161,10 +193,34 @@ struct AnswerMetadata {
     total_billed_duration: Option<String>,
 }
 
+/// The words of an answer's first alternatives, or `None` if an offset does
+/// not read.
+fn read_words(answer: &Answer) -> Option<Vec<Word>> {
+    let mut words = Vec::new();
+    for alternative in answer.results.iter().filter_map(|r| r.alternatives.first()) {
+        for word in &alternative.words {
+            let text = word.word.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let start_ms = offset_ms(word.start_offset.as_deref())?;
+            words.push(Word {
+                start_ms,
+                end_ms: offset_ms(word.end_offset.as_deref())?.max(start_ms),
+                text: text.to_string(),
+            });
+        }
+    }
+    Some(words)
+}
+
 /// Text and billed seconds of an answer. The first alternative of each
 /// result, joined with spaces; `totalBilledDuration` (`"4s"`, `"4.5s"`)
-/// rounded up.
-fn read_answer(answer: Answer) -> Result<SttOutput, SttError> {
+/// rounded up. With `word_times`, also the words of those alternatives; if
+/// their times do not read, the text is kept (it was paid for) with no words
+/// (the piece then goes whole to its main speaker).
+fn read_answer(answer: Answer, word_times: bool) -> Result<SttOutput, SttError> {
+    let words = word_times.then(|| read_words(&answer).unwrap_or_default());
     let text = answer
         .results
         .iter()
@@ -185,6 +241,7 @@ fn read_answer(answer: Answer) -> Result<SttOutput, SttError> {
     Ok(SttOutput {
         text,
         billed_seconds: seconds.ceil() as u64,
+        words,
     })
 }
 
@@ -309,7 +366,7 @@ impl SpeechToText for ChirpStt {
     }
 
     async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
-        let body = request_body(request.pcm_16k);
+        let body = request_body(request.pcm_16k, request.word_times);
         let (mut response, token) = self.send(&body).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             // An expired or revoked token: once more with a new one.
@@ -323,7 +380,7 @@ impl SpeechToText for ChirpStt {
             .json()
             .await
             .map_err(|_| SttError::new(SttErrorKind::Transient, "unreadable answer"))?;
-        read_answer(answer)
+        read_answer(answer, request.word_times)
     }
 }
 
@@ -403,27 +460,77 @@ mod tests {
         }))
         .expect("answer");
         assert_eq!(
-            read_answer(answer).expect("read"),
+            read_answer(answer, false).expect("read"),
             SttOutput {
                 text: "안녕하세요 반갑습니다.".into(),
-                billed_seconds: 5
+                billed_seconds: 5,
+                words: None,
             }
         );
         let silent: Answer =
             serde_json::from_value(json!({"metadata": {"totalBilledDuration": "3s"}}))
                 .expect("answer");
         assert_eq!(
-            read_answer(silent).expect("read"),
+            read_answer(silent, false).expect("read"),
             SttOutput {
                 text: String::new(),
-                billed_seconds: 3
+                billed_seconds: 3,
+                words: None,
             }
         );
     }
 
     #[test]
+    fn words_come_with_their_offsets_when_asked() {
+        let answer = || -> Answer {
+            serde_json::from_value(json!({
+                "results": [
+                    {"alternatives": [{"transcript": "안녕하세요", "words": [
+                        {"endOffset": "0.640s", "word": "안녕하세요"}
+                    ]}]},
+                    {"alternatives": [{"transcript": "반갑습니다.", "words": [
+                        {"startOffset": "1.200s", "endOffset": "2s", "word": "반갑습니다."},
+                        {"startOffset": "2s", "endOffset": "2s", "word": " "}
+                    ]}]}
+                ],
+                "metadata": {"totalBilledDuration": "3s"}
+            }))
+            .expect("answer")
+        };
+        let read = read_answer(answer(), true).expect("read");
+        assert_eq!(read.text, "안녕하세요 반갑습니다.");
+        assert_eq!(
+            read.words,
+            Some(vec![
+                Word {
+                    start_ms: 0,
+                    end_ms: 640,
+                    text: "안녕하세요".into()
+                },
+                Word {
+                    start_ms: 1_200,
+                    end_ms: 2_000,
+                    text: "반갑습니다.".into()
+                },
+            ])
+        );
+        // Not asked: no words, even if the answer had some.
+        assert_eq!(read_answer(answer(), false).expect("read").words, None);
+        // Times that do not read: the paid-for text stays, no words.
+        let odd: Answer = serde_json::from_value(json!({
+            "results": [{"alternatives": [{"transcript": "말.", "words": [
+                {"startOffset": "soon", "word": "말."}
+            ]}]}],
+            "metadata": {"totalBilledDuration": "1s"}
+        }))
+        .expect("answer");
+        let read = read_answer(odd, true).expect("read");
+        assert_eq!((read.text.as_str(), read.words), ("말.", Some(Vec::new())));
+    }
+
+    #[test]
     fn the_audio_goes_as_16_bit_little_endian_without_a_header() {
-        let body = request_body(&[0.0, 1.0, -1.0, 0.5, 2.0]);
+        let body = request_body(&[0.0, 1.0, -1.0, 0.5, 2.0], false);
         let content = body["content"].as_str().expect("content");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(content)
@@ -451,6 +558,15 @@ mod tests {
                 "languageCodes",
                 "model"
             ]
+        );
+        assert_eq!(
+            config["features"],
+            json!({"enableAutomaticPunctuation": true})
+        );
+        let with_words = request_body(&[0.0], true);
+        assert_eq!(
+            with_words["config"]["features"],
+            json!({"enableAutomaticPunctuation": true, "enableWordTimeOffsets": true})
         );
     }
 }

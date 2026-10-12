@@ -78,6 +78,7 @@ fn request(pcm: &[f32]) -> SttRequest<'_> {
         start_ms: 0,
         end_ms: 1_000,
         pcm_16k: pcm,
+        word_times: false,
     }
 }
 
@@ -119,7 +120,8 @@ async fn chirp_sends_one_recognize_request_and_reads_the_answer() {
         output,
         SttOutput {
             text: "회의를 시작할게요".into(),
-            billed_seconds: 2
+            billed_seconds: 2,
+            words: None,
         }
     );
     let seen = fake.seen.lock().expect("lock").clone();

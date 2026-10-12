@@ -7,6 +7,7 @@
 //! ```text
 //! {"kind":"run","number":2}       (written when run 2 finished transcribing)
 //! {"kind":"done","key":"…","text":"…","billed_seconds":3}
+//! {"kind":"done","key":"…","text":"…","billed_seconds":3,"words":[{"start_ms":0,"end_ms":420,"text":"…"}]}
 //! {"kind":"rejected","key":"…","code":"…"}
 //! ```
 //!
@@ -21,6 +22,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::stt::Word;
+
 /// A finished piece.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -30,6 +33,9 @@ pub enum Outcome {
         text: String,
         /// Seconds the engine billed for it.
         billed_seconds: u64,
+        /// The words and their times, when they were asked for (a piece that
+        /// may hold several speakers); `None` when they were not.
+        words: Option<Vec<Word>>,
     },
     /// The engine refused this audio; sending it again will not help.
     Rejected {
@@ -48,6 +54,9 @@ enum Line {
         key: String,
         text: String,
         billed_seconds: u64,
+        // Older lines have none; lines without word times stay as they were.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        words: Option<Vec<Word>>,
     },
     Rejected {
         key: String,
@@ -211,12 +220,14 @@ pub(crate) fn parse_lines(text: &str) -> Parsed {
                 key,
                 text,
                 billed_seconds,
+                words,
             }) => {
                 parsed.outcomes.insert(
                     key,
                     Outcome::Done {
                         text,
                         billed_seconds,
+                        words,
                     },
                 );
             }
@@ -235,10 +246,12 @@ pub(crate) fn outcome_line(key: &str, outcome: &Outcome) -> String {
         Outcome::Done {
             text,
             billed_seconds,
+            words,
         } => Line::Done {
             key: key.to_string(),
             text: text.clone(),
             billed_seconds: *billed_seconds,
+            words: words.clone(),
         },
         Outcome::Rejected { code } => Line::Rejected {
             key: key.to_string(),
@@ -305,7 +318,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("m.stt.jsonl");
         let done = piece_key("v1", "aa", 0, 1_000, &FRAMES);
+        let with_words = piece_key("v1", "aa", 1_000, 2_000, &FRAMES);
         let refused = piece_key("v1", "aa", 2_000, 3_000, &FRAMES);
+        let words = || {
+            vec![
+                Word {
+                    start_ms: 0,
+                    end_ms: 300,
+                    text: "두".into(),
+                },
+                Word {
+                    start_ms: 300,
+                    end_ms: 800,
+                    text: "말".into(),
+                },
+            ]
+        };
         {
             let mut ledger = SttLedger::open(&path).expect("open");
             assert_eq!(ledger.runs(), 0);
@@ -315,6 +343,17 @@ mod tests {
                     Outcome::Done {
                         text: "말".into(),
                         billed_seconds: 1,
+                        words: None,
+                    },
+                )
+                .expect("record");
+            ledger
+                .record(
+                    &with_words,
+                    Outcome::Done {
+                        text: "두 말".into(),
+                        billed_seconds: 2,
+                        words: Some(words()),
                     },
                 )
                 .expect("record");
@@ -343,7 +382,16 @@ mod tests {
             ledger.outcome(&done),
             Some(&Outcome::Done {
                 text: "말".into(),
-                billed_seconds: 1
+                billed_seconds: 1,
+                words: None,
+            })
+        );
+        assert_eq!(
+            ledger.outcome(&with_words),
+            Some(&Outcome::Done {
+                text: "두 말".into(),
+                billed_seconds: 2,
+                words: Some(words()),
             })
         );
         assert!(matches!(
@@ -362,6 +410,25 @@ mod tests {
             let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// A line written before word times existed reads back with no words,
+    /// and an outcome without words is written exactly as such a line.
+    #[test]
+    fn lines_without_words_stay_as_they_were() {
+        let old = r#"{"kind":"done","key":"k","text":"말","billed_seconds":1}"#;
+        let parsed = parse_lines(old);
+        assert_eq!(parsed.unreadable_lines, 0);
+        let outcome = parsed.outcomes["k"].clone();
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "말".into(),
+                billed_seconds: 1,
+                words: None,
+            }
+        );
+        assert_eq!(outcome_line("k", &outcome), old);
     }
 
     /// The key is made of settings, speaker, cut and recorded frames —

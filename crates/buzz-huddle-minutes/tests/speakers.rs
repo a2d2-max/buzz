@@ -851,3 +851,242 @@ async fn turning_speakers_off_resends_only_pieces_whose_bounds_changed() {
     );
     assert_eq!(second.report.stt_requests as usize, sent_off.len());
 }
+
+/// [`RoomPieces::Whole`](C 방식) 설정.
+fn whole(mut settings: SpeakerSettings) -> SpeakerSettings {
+    settings.room_pieces = buzz_huddle_minutes::speakers::RoomPieces::Whole;
+    settings
+}
+
+/// C 방식(whole): 회의실 마이크 셋도 "회의실 화자 1~3" 으로 나뉘고, 단어가 화자에 나뉘어 낱말을 잃지
+/// 않고, 기기 주인 pubkey 는 아무에게도 저절로 가지 않는다.
+#[tokio::test]
+async fn whole_pieces_split_a_room_mic_by_words() {
+    let clips = voice_clips();
+    let plan = room_plan(&[(0, 0.8), (1, 1.6), (2, 2.8)], &[], Some(1));
+    let meeting = build_room_meeting(&clips, &plan, 21, "huddles", BASE_UNIX_MS).expect("meeting");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(&meeting, dir.path(), whole(speaker_settings(None))).await;
+    let report = &output.report.speakers_split;
+    assert_eq!(report.tracks[0].speakers, 3, "{report:#?}");
+    assert_eq!(report.mismatched_tracks, 0);
+    let labels: HashSet<&str> = output
+        .transcript
+        .segments
+        .iter()
+        .filter_map(|s| s.speaker_label.as_deref())
+        .collect();
+    assert_eq!(
+        labels,
+        HashSet::from(["회의실 화자 1", "회의실 화자 2", "회의실 화자 3"])
+    );
+    let score = score_room_meeting(&output.transcript, &meeting.truth, report, &HashSet::new());
+    eprintln!(
+        "whole: DER {:.3} {:?} grouped {}/{} split sentences {}",
+        score.room_der.der(),
+        score.room_der,
+        score.room_sentences_grouped_right,
+        score.room_sentences,
+        score.sentences_split
+    );
+    assert_eq!(score.room_sentences_grouped_right, score.room_sentences);
+    assert_eq!(score.room_owner_given_by_device, 0);
+    assert_eq!(score.sentences_lost, 0, "no word goes missing");
+    // Seed 21 measured: reference 22 760 ms, miss 1 420, false alarm 0,
+    // confusion 470 (2.1 %); the same limit as cut pieces (under 4 %).
+    let der = score.room_der;
+    assert!(der.confusion_ms * 25 <= der.reference_ms, "{der:?}");
+}
+
+/// C 방식(whole)의 에코: 회의실 덩어리를 자르지 않아 에코 낱말이 다른 말과 한 줄에 섞일 수 있어서
+/// "같은 글 두 번" 은 글자로 안 잡힌다 — 시간 기준(에코가 주인인 줄)으로 본다. 켜면 0, A 와 "두 번 잡힘"
+/// 검사를 끄면 남는다. 진짜 말은 지우지 않고 낱말을 잃지 않는다.
+#[tokio::test]
+async fn whole_pieces_keep_echoes_out_by_time() {
+    let clips = voice_clips();
+    let mut plan = room_plan(&[(0, 1.0), (1, 2.0)], &[2], Some(0));
+    plan.echo = Some(EchoPlan {
+        gain_db: -15.0,
+        delay_ms: 200,
+    });
+    let meeting = build_room_meeting(&clips, &plan, 41, "huddles", BASE_UNIX_MS).expect("meeting");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(&meeting, dir.path(), whole(speaker_settings(None))).await;
+    let on = score_room_meeting(
+        &output.transcript,
+        &meeting.truth,
+        &output.report.speakers_split,
+        &HashSet::new(),
+    );
+    assert_eq!(on.echoes_left_dominant, 0, "{on:#?}");
+    assert_eq!(on.removed_real_pieces, 0, "{on:#?}");
+    assert_eq!(on.sentences_lost, 0, "{on:#?}");
+    let mut off = whole(speaker_settings(None));
+    off.bleed.enabled = false;
+    off.naming.duplicate_overlap = 2.0;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(&meeting, dir.path(), off).await;
+    let score = score_room_meeting(
+        &output.transcript,
+        &meeting.truth,
+        &output.report.speakers_split,
+        &HashSet::new(),
+    );
+    assert!(score.echoes_left_dominant > 0, "{score:#?}");
+}
+
+/// C 방식(whole): 받아쓰기 조각 경계가 화자 설정과 상관없다. 다만 여럿 트랙 조각은 단어 시각을 물어서
+/// 글이 달라지므로, 화자 분리를 켜고 끌 때 그 조각들만 한 번씩 다시 보낸다(같은 자리) — 같은 설정이면
+/// 늘 같은 글이 나오게. 같은 설정으로 다시 돌리면 아무것도 안 보낸다.
+#[tokio::test]
+async fn whole_pieces_keep_their_bounds_and_resend_only_when_word_times_change() {
+    let clips = voice_clips();
+    let plan = room_plan(&[(0, 0.8), (1, 1.6), (2, 2.8)], &[], Some(1));
+    let meeting = build_room_meeting(&clips, &plan, 21, "huddles", BASE_UNIX_MS).expect("meeting");
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (relative, bytes) in &meeting.files {
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, bytes).expect("write");
+    }
+    let truth = &meeting.truth;
+    let store = LocalStore::new(dir.path().join("recordings"));
+    let planned = collect_meetings(
+        &store,
+        &truth.prefix,
+        truth.community_id,
+        truth.channel_id,
+        10 * 60_000,
+    )
+    .await
+    .expect("collect")
+    .meetings
+    .remove(0);
+    async fn go(
+        planned: &buzz_huddle_minutes::collect::Meeting,
+        meeting: &RoomMeeting,
+        ledger: &mut SttLedger,
+        speakers: SpeakerSettings,
+    ) -> (MinutesOutput, Vec<(String, u64, u64)>) {
+        let stt = Recording::new(meeting);
+        let out = build_minutes(
+            planned,
+            &mut EnergyDetector,
+            &stt,
+            ledger,
+            &settings(speakers),
+        )
+        .await
+        .expect("build minutes");
+        (out, stt.sent())
+    }
+    let on = || whole(speaker_settings(None));
+    let off = || whole(SpeakerSettings::default());
+
+    let set = |v: &[(String, u64, u64)]| v.iter().cloned().collect::<HashSet<_>>();
+    let mut ledger = SttLedger::in_memory();
+    let (first, sent_on) = go(&planned, &meeting, &mut ledger, on()).await;
+    assert_eq!(first.report.stt_reused, 0);
+    assert!(!sent_on.is_empty());
+    // Off: the same pieces (bounds do not depend on speakers), each once more
+    // without word times; on again: once more with them.
+    let (_, sent_off) = go(&planned, &meeting, &mut ledger, off()).await;
+    assert_eq!(set(&sent_off), set(&sent_on), "the same bounds either way");
+    let (_, again) = go(&planned, &meeting, &mut ledger, on()).await;
+    assert_eq!(set(&again), set(&sent_on));
+    // The same settings again: nothing.
+    let (out, sent) = go(&planned, &meeting, &mut ledger, on()).await;
+    assert!(sent.is_empty(), "{sent:?}");
+    assert_eq!(out.report.stt_requests, 0);
+}
+
+/// 같은 장부로 cut → whole → cut 을 돌려도 마지막 cut 은 새 장부로 돌린 cut 과 글이 같다: 단어 시각을
+/// 물은 결과(글이 달라진다)는 cut 에서 다시 쓰지 않고, 그 조각만 다시 보낸다(반대도 같다).
+#[tokio::test]
+async fn switching_between_cut_and_whole_never_mixes_their_text() {
+    let clips = voice_clips();
+    let plan = room_plan(&[(0, 0.8), (1, 1.6), (2, 2.8)], &[2], Some(1));
+    let meeting = build_room_meeting(&clips, &plan, 21, "huddles", BASE_UNIX_MS).expect("meeting");
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (relative, bytes) in &meeting.files {
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, bytes).expect("write");
+    }
+    let truth = &meeting.truth;
+    let store = LocalStore::new(dir.path().join("recordings"));
+    let planned = collect_meetings(
+        &store,
+        &truth.prefix,
+        truth.community_id,
+        truth.channel_id,
+        10 * 60_000,
+    )
+    .await
+    .expect("collect")
+    .meetings
+    .remove(0);
+    async fn go(
+        planned: &buzz_huddle_minutes::collect::Meeting,
+        meeting: &RoomMeeting,
+        ledger: &mut SttLedger,
+        speakers: SpeakerSettings,
+    ) -> (MinutesOutput, Vec<(String, u64, u64)>) {
+        let stt = Recording::new(meeting);
+        let out = build_minutes(
+            planned,
+            &mut EnergyDetector,
+            &stt,
+            ledger,
+            &settings(speakers),
+        )
+        .await
+        .expect("build minutes");
+        (out, stt.sent())
+    }
+    let (fresh, _) = go(
+        &planned,
+        &meeting,
+        &mut SttLedger::in_memory(),
+        speaker_settings(None),
+    )
+    .await;
+    let (fresh_whole, _) = go(
+        &planned,
+        &meeting,
+        &mut SttLedger::in_memory(),
+        whole(speaker_settings(None)),
+    )
+    .await;
+    let mut ledger = SttLedger::in_memory();
+    let (first, _) = go(&planned, &meeting, &mut ledger, speaker_settings(None)).await;
+    let (second, _) = go(
+        &planned,
+        &meeting,
+        &mut ledger,
+        whole(speaker_settings(None)),
+    )
+    .await;
+    let (third, sent) = go(&planned, &meeting, &mut ledger, speaker_settings(None)).await;
+    assert_eq!(first.transcript.segments, fresh.transcript.segments);
+    assert_eq!(second.transcript.segments, fresh_whole.transcript.segments);
+    assert_eq!(third.transcript.segments, fresh.transcript.segments);
+    // The remote person's one-speaker track needs no word times either way:
+    // never sent again.
+    let remote = meeting
+        .truth
+        .people
+        .iter()
+        .find(|p| p.seat == Seat::Remote)
+        .expect("remote")
+        .device
+        .clone();
+    assert!(
+        !sent.is_empty(),
+        "the shared track's whole pieces went again"
+    );
+    assert!(
+        sent.iter().all(|(device, _, _)| *device != remote),
+        "{sent:?}"
+    );
+}

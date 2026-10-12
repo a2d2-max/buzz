@@ -180,6 +180,11 @@ pub struct SegmentPlan {
     /// Padding on each side of the audio sent, never past half the pause to
     /// a neighbouring piece and never past the limit.
     pub pad_ms: u64,
+    /// Let speech detection hear a level-matched copy ([`level_for_vad`]) so
+    /// quiet, far voices are found. Only where pieces are cut changes: the
+    /// transcriber still gets the track as recorded (so the ledger key needs
+    /// nothing new — its bounds already say where the cut landed).
+    pub vad_level: bool,
 }
 
 impl Default for SegmentPlan {
@@ -187,8 +192,95 @@ impl Default for SegmentPlan {
         Self {
             max_segment_ms: 29_000,
             pad_ms: 200,
+            vad_level: false,
         }
     }
+}
+
+/// [`level_for_vad`] target: RMS over half a second.
+pub const VAD_LEVEL_DBFS: f32 = -25.0;
+/// [`level_for_vad`] most gain.
+pub const VAD_LEVEL_MAX_GAIN_DB: f32 = 30.0;
+/// [`level_for_vad`] floor: a half second quieter than this is left as it is
+/// (room noise is not brought up to sound like speech).
+pub const VAD_LEVEL_FLOOR_DBFS: f32 = -60.0;
+
+/// A copy of 16 kHz `pcm` for speech detection only: every half second's RMS
+/// brought up to [`VAD_LEVEL_DBFS`] (only up, at most
+/// [`VAD_LEVEL_MAX_GAIN_DB`], never under [`VAD_LEVEL_FLOOR_DBFS`]), the gain
+/// smoothed over a second, clipped to ±1 — the measurement script that found
+/// far voices (`build_agc.py`: centred windows, zero outside the track) plus
+/// the floor, worked out on 10 ms steps so an hour-long track needs no more
+/// than the copy itself. The floor sits where a real huddle's room noise was
+/// (median −60.1 dBFS) and under most far speech (docs "VAD 크기 맞춤").
+pub fn level_for_vad(pcm: &[f32]) -> Vec<f32> {
+    level_for_vad_above(pcm, VAD_LEVEL_FLOOR_DBFS)
+}
+
+/// [`level_for_vad`] with another floor (`f32::NEG_INFINITY`: none), for measuring.
+pub fn level_for_vad_above(pcm: &[f32], floor_dbfs: f32) -> Vec<f32> {
+    const HOP: usize = VAD_SAMPLE_RATE as usize / 100;
+    const RMS_FRAMES: usize = 50;
+    const GAIN_FRAMES: usize = 100;
+    let target = 10f64.powf(f64::from(VAD_LEVEL_DBFS) / 20.0);
+    let most = 10f64.powf(f64::from(VAD_LEVEL_MAX_GAIN_DB) / 20.0);
+    let floor = 10f64.powf(f64::from(floor_dbfs) / 20.0);
+    let energy: Vec<f64> = pcm
+        .chunks(HOP)
+        .map(|frame| frame.iter().map(|&x| f64::from(x) * f64::from(x)).sum())
+        .collect();
+    let gain: Vec<f64> = centred_mean(&energy, RMS_FRAMES)
+        .into_iter()
+        .map(|e| {
+            let rms = (e / HOP as f64).max(0.0).sqrt();
+            if rms < floor {
+                1.0
+            } else {
+                (target / (rms + 1e-9)).clamp(1.0, most)
+            }
+        })
+        .collect();
+    // Averaging counts zero past the track's ends: never let that bring a
+    // short answer or a track's end down (only up).
+    let gain: Vec<f64> = centred_mean(&gain, GAIN_FRAMES)
+        .into_iter()
+        .map(|g| g.max(1.0))
+        .collect();
+    // Gain between frame middles is drawn as a straight line.
+    let at = |n: usize| -> f64 {
+        let position = (n as f64 - (HOP / 2) as f64) / HOP as f64;
+        if position <= 0.0 {
+            return gain.first().copied().unwrap_or(1.0);
+        }
+        let k = position.floor() as usize;
+        match (gain.get(k), gain.get(k + 1)) {
+            (Some(&a), Some(&b)) => a + (b - a) * (position - k as f64),
+            (Some(&a), None) => a,
+            _ => gain.last().copied().unwrap_or(1.0),
+        }
+    };
+    pcm.iter()
+        .enumerate()
+        .map(|(n, &x)| (f64::from(x) * at(n)).clamp(-1.0, 1.0) as f32)
+        .collect()
+}
+
+/// `numpy.convolve(x, ones(w) / w, mode="same")`: for each item the sum of
+/// the `w` items around it (from `w / 2` before to `w - w / 2 - 1` after,
+/// zero outside) divided by `w`.
+fn centred_mean(x: &[f64], w: usize) -> Vec<f64> {
+    let mut prefix = Vec::with_capacity(x.len() + 1);
+    prefix.push(0.0);
+    for &v in x {
+        prefix.push(prefix[prefix.len() - 1] + v);
+    }
+    (0..x.len())
+        .map(|n| {
+            let from = n.saturating_sub(w / 2);
+            let to = (n + w - w / 2).min(x.len());
+            (prefix[to] - prefix[from]) / w as f64
+        })
+        .collect()
 }
 
 /// One transcription piece.
@@ -349,8 +441,75 @@ mod tests {
         SpeechSpan { start, end }
     }
 
+    fn dbfs(pcm: &[f32]) -> f32 {
+        let ms = pcm.iter().map(|x| x * x).sum::<f32>() / pcm.len() as f32;
+        10.0 * ms.max(1e-20).log10()
+    }
+
+    fn tone_ms(ms: usize, dbfs: f32) -> Vec<f32> {
+        let amplitude = 10f32.powf(dbfs / 20.0) * 2f32.sqrt();
+        (0..ms * 16)
+            .map(|i| amplitude * (std::f32::consts::TAU * 220.0 * i as f32 / 16_000.0).sin())
+            .collect()
+    }
+
+    fn tone(seconds: usize, dbfs: f32) -> Vec<f32> {
+        let amplitude = 10f32.powf(dbfs / 20.0) * 2f32.sqrt();
+        (0..seconds * 16_000)
+            .map(|i| amplitude * (std::f32::consts::TAU * 220.0 * i as f32 / 16_000.0).sin())
+            .collect()
+    }
+
+    /// Quiet sound is brought up to −25 dBFS (at most +30 dB, nothing under
+    /// the −60 dBFS floor: room noise stays noise), loud sound and silence
+    /// are left alone (the middle of a long tone, away from the ends where
+    /// the windows run out).
+    #[test]
+    fn detection_hears_quiet_sound_at_minus_25_dbfs() {
+        let middle = |pcm: &[f32]| dbfs(&pcm[3 * 16_000..7 * 16_000]);
+        // Without a floor, at most +30 dB.
+        let out = level_for_vad_above(&tone(10, -70.0), f32::NEG_INFINITY);
+        assert!((middle(&out) + 40.0).abs() < 0.2, "{}", middle(&out));
+        for (input, expected) in [
+            (-40.0, -25.0),
+            (-55.0, -25.0),
+            (-59.0, -29.0),
+            (-61.0, -61.0),
+            (-70.0, -70.0),
+            (-10.0, -10.0),
+        ] {
+            let out = level_for_vad(&tone(10, input));
+            assert!(
+                (middle(&out) - expected).abs() < 0.2,
+                "{input} dBFS → {} (expected {expected})",
+                middle(&out)
+            );
+        }
+        assert!(level_for_vad(&vec![0.0; 16_000]).iter().all(|&x| x == 0.0));
+        assert!(level_for_vad(&[]).is_empty());
+        // Only up, also where the windows run out: a short "네" (0.3 s at
+        // −20 dBFS) keeps its level, and so does every sample at a track's end.
+        let short = tone_ms(300, -20.0);
+        let out = level_for_vad(&short);
+        assert!(
+            dbfs(&out) >= dbfs(&short) - 0.01,
+            "{} → {}",
+            dbfs(&short),
+            dbfs(&out)
+        );
+        let long = tone(10, -40.0);
+        let out = level_for_vad(&long);
+        assert!(
+            long.iter()
+                .zip(&out)
+                .all(|(x, y)| y.abs() >= x.abs() - 1e-7),
+            "gain under 1 somewhere"
+        );
+    }
+
     fn plan(max: u64, pad: u64) -> SegmentPlan {
         SegmentPlan {
+            vad_level: false,
             max_segment_ms: max,
             pad_ms: pad,
         }

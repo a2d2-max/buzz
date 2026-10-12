@@ -13,11 +13,12 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::ledger::{piece_key, Ledger, Outcome};
 use crate::speakers::{MeetingSpeakers, SpeakerSettings, SpeakersError, SpeakersReport};
-use crate::stt::{SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, FAILED_TEXT};
+use crate::stt::{SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, Word, FAILED_TEXT};
 use crate::tracks::{demux, DecodeStats, DemuxStats, REGION_GAP_MS, SAMPLE_RATE};
 use crate::transcript::{AudioRef, Participant, Segment, Transcript, TRANSCRIPT_FORMAT};
 use crate::vad::{
-    plan_segments, SegmentPlan, SpeechDetector, SpeechSpan, VadError, VAD_SAMPLE_RATE,
+    level_for_vad, plan_segments, SegmentPlan, SpeechDetector, SpeechSpan, VadError,
+    VAD_SAMPLE_RATE,
 };
 
 /// Mixed audio rate. 16 kHz mono 16-bit WAV: about 115 MB per hour.
@@ -257,12 +258,16 @@ where
             mixer.add(track_start_ms, &pcm);
 
             // Detect per sounding region, never across a stretch with no frames.
+            // With `vad_level`, detection hears a level-matched copy; everything
+            // else (transcription, speakers, mix) uses the track as recorded.
+            let leveled = settings.segment_plan.vad_level.then(|| level_for_vad(&pcm));
+            let vad_pcm: &[f32] = leveled.as_deref().unwrap_or(&pcm);
             let mut spans = Vec::new();
             report.sounding_regions = regions.len();
             for (from, to) in regions {
                 let a = ms_to_samples(from - track_start_ms).min(pcm.len());
                 let b = ms_to_samples(to - track_start_ms).min(pcm.len());
-                for span in detector.detect(&pcm[a..b])? {
+                for span in detector.detect(&vad_pcm[a..b])? {
                     spans.push(SpeechSpan {
                         start: a + span.start,
                         end: a + span.end,
@@ -280,7 +285,7 @@ where
                 pcm.len(),
                 &settings.segment_plan,
                 |unit| {
-                    let inner = detector.detect_pauses(&pcm[unit.start..unit.end])?;
+                    let inner = detector.detect_pauses(&vad_pcm[unit.start..unit.end])?;
                     Ok(inner
                         .into_iter()
                         .map(|span| SpeechSpan {
@@ -290,30 +295,37 @@ where
                         .collect())
                 },
             )?;
-            // Speakers inside the track: cut at changes of speaker, drop
-            // sound that leaked in from another track.
+            // Speakers inside the track (who spoke when), sound that leaked in
+            // from another track. On a shared track the pieces are cut at
+            // changes of speaker (`cut`, the default) or stay as the VAD cut
+            // them (`whole`, shared out by word times after transcription).
+            drop(leveled);
             let pieces = speakers_stage.split(&person.pubkey, track_start_ms, &pcm, pieces)?;
+            // Only a `whole` shared track's pieces need their words' times;
+            // any other request goes out as it always did.
+            let word_times = speakers_stage.needs_words(&person.pubkey);
             report.segments = pieces.len();
             // One piece = one request. The script gets the speech times; the
             // transcriber gets the padded audio. A piece already in the
-            // ledger is never sent (or paid for) again; the rest go out up to
-            // `concurrency` at a time, and each outcome goes into the ledger
-            // as soon as it comes back.
-            let mut texts: Vec<Option<String>> = vec![None; pieces.len()];
-            let mut times = Vec::with_capacity(pieces.len());
+            // ledger is never sent (or paid for) again — unless it was
+            // transcribed the other way (with word times where none are
+            // asked now, or without where they are): asking for them changes
+            // the text, so the same settings always give the same text. The
+            // rest go out up to `concurrency` at a time, and each outcome goes
+            // into the ledger as soon as it comes back.
+            type Heard = (String, Option<Vec<Word>>);
+            let mut texts: Vec<Option<Heard>> = vec![None; pieces.len()];
+            let mut audio_starts = Vec::with_capacity(pieces.len());
             let mut jobs = Vec::new();
             for (index, piece) in pieces.iter().enumerate() {
-                // Script times end with the meeting; a frame stamped past
-                // the end cannot stretch it.
-                let end_ms = (track_start_ms + samples_to_ms(piece.speech.end)).min(duration_ms);
-                let start_ms = (track_start_ms + samples_to_ms(piece.speech.start)).min(end_ms);
-                times.push((start_ms, end_ms));
                 let request = SttRequest {
                     speaker: &person.pubkey,
                     start_ms: track_start_ms + samples_to_ms(piece.audio.start),
                     end_ms: track_start_ms + samples_to_ms(piece.audio.end),
                     pcm_16k: &pcm[piece.audio.start..piece.audio.end],
+                    word_times,
                 };
+                audio_starts.push(request.start_ms);
                 let first = frame_digests.partition_point(|(t, _)| *t < request.start_ms);
                 let last = frame_digests.partition_point(|(t, _)| *t < request.end_ms);
                 let key = piece_key(
@@ -327,18 +339,20 @@ where
                     Some(Outcome::Done {
                         text,
                         billed_seconds,
-                    }) => {
+                        words,
+                    }) if words.is_some() == word_times => {
                         stt_reused += 1;
                         stt_info.billed_seconds += billed_seconds;
-                        texts[index] = Some(text.clone());
+                        texts[index] = Some((text.clone(), words.clone()));
                     }
                     Some(Outcome::Rejected { .. }) => {
                         stt_reused += 1;
                         report.stt_failures += 1;
                         *failures_by_kind.entry(SttErrorKind::Rejected).or_default() += 1;
-                        texts[index] = Some(FAILED_TEXT.to_string());
+                        texts[index] = Some((FAILED_TEXT.to_string(), None));
                     }
-                    None => jobs.push((index, key, request)),
+                    // Not there, or transcribed the other way.
+                    _ => jobs.push((index, key, request)),
                 }
             }
             let mut jobs = jobs.into_iter();
@@ -357,7 +371,7 @@ where
                 };
                 stt_requests += sent.requests;
                 stt_retries += sent.retries;
-                let text = match sent.result {
+                let heard = match sent.result {
                     Ok(output) => {
                         stt_info.billed_seconds += output.billed_seconds;
                         ledger
@@ -366,10 +380,11 @@ where
                                 Outcome::Done {
                                     text: output.text.clone(),
                                     billed_seconds: output.billed_seconds,
+                                    words: output.words.clone(),
                                 },
                             )
                             .await?;
-                        output.text
+                        (output.text, output.words)
                     }
                     Err(error) => match error.kind {
                         SttErrorKind::Auth | SttErrorKind::Quota => {
@@ -383,26 +398,42 @@ where
                                 .await?;
                             report.stt_failures += 1;
                             *failures_by_kind.entry(SttErrorKind::Rejected).or_default() += 1;
-                            FAILED_TEXT.to_string()
+                            (FAILED_TEXT.to_string(), None)
                         }
                         kind => {
                             // Not recorded: the next run sends it again.
                             transient_failed += 1;
                             report.stt_failures += 1;
                             *failures_by_kind.entry(kind).or_default() += 1;
-                            FAILED_TEXT.to_string()
+                            (FAILED_TEXT.to_string(), None)
                         }
                     },
                 };
-                texts[index] = Some(text);
+                texts[index] = Some(heard);
             }
-            for ((start_ms, end_ms), text) in times.into_iter().zip(texts) {
-                segments.push(Segment::own(
-                    person.pubkey.clone(),
-                    start_ms,
-                    end_ms,
-                    text.unwrap_or_else(|| FAILED_TEXT.to_string()),
-                ));
+            // Lines: one per piece, or, on a shared track, one per run of
+            // words of one speaker.
+            for (index, (heard, audio_start_ms)) in texts.into_iter().zip(audio_starts).enumerate()
+            {
+                let (text, words) = heard.unwrap_or_else(|| (FAILED_TEXT.to_string(), None));
+                for line in speakers_stage.lines(
+                    &person.pubkey,
+                    index,
+                    audio_start_ms,
+                    &text,
+                    words.as_deref(),
+                ) {
+                    // Script times end with the meeting; a frame stamped past
+                    // the end cannot stretch it.
+                    let end_ms = line.end_ms.min(duration_ms);
+                    let start_ms = line.start_ms.min(end_ms);
+                    segments.push(Segment::own(
+                        person.pubkey.clone(),
+                        start_ms,
+                        end_ms,
+                        line.text,
+                    ));
+                }
             }
         }
         participants.push(Participant {

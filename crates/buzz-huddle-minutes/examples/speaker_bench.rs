@@ -981,11 +981,12 @@ fn main() -> anyhow::Result<()> {
         naming(&room.naming_unknown)
     );
     println!(
-        "room owner pubkey given to someone else: {} | duplicated sentences {} (echoes {}) | lost {} | removed pieces {} real {} ({} ms)",
+        "room owner pubkey given to someone else: {} | duplicated sentences {} (echoes {}) | lost {} split {} | removed pieces {} real {} ({} ms)",
         room.room_owner_given_by_device,
         room.duplicated_sentences,
         room.echoes,
         room.sentences_lost,
+        room.sentences_split,
         room.removed_pieces,
         room.removed_real_pieces,
         room.removed_real_ms
