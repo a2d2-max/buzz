@@ -1,0 +1,30 @@
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+//! Huddle minutes worker (stage 2, `docs/huddle-minutes-worker.md`).
+//!
+//! Reads what the relay recorder wrote (`docs/huddle-recording.md`) and
+//! produces a Korean script of who said what and when
+//! (`huddle-transcript/1`) plus one mixed audio file for playback.
+//!
+//! 1. [`collect`] gathers a huddle's sessions in `started_at` order.
+//! 2. [`tracks`] decodes each person's Opus onto one meeting clock.
+//! 3. [`vad`] finds speech and cuts it into pieces.
+//! 4. [`stt`] is where the transcriber plugs in.
+//! 5. [`transcript`] is the script format; [`pipeline`] runs 2–6.
+//! 6. [`audio`] mixes everyone into the playback file.
+//!
+//! [`sim`] builds fake recordings with an answer sheet and [`check`]
+//! compares a script against it.
+
+pub mod audio;
+pub mod check;
+pub mod collect;
+pub mod media;
+pub mod models;
+pub mod pipeline;
+pub mod sim;
+pub mod store;
+pub mod stt;
+pub mod tracks;
+pub mod transcript;
+pub mod vad;

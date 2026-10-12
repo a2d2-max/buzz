@@ -1,0 +1,31 @@
+[package]
+name = "buzz-huddle-minutes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Huddle minutes worker: rebuilds per-speaker audio from huddle recordings, cuts speech segments, transcribes them and writes huddle-transcript/1"
+
+[[bin]]
+name = "buzz-huddle-minutes"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+buzz-huddle-recording = { workspace = true }
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+hex = { workspace = true }
+opus = "0.3"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sherpa-onnx = "1.13.4"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
