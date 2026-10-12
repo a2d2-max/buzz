@@ -28,6 +28,16 @@
 //! path awaits, and the only lock taken is the room's existing admission
 //! mutex, which roster mutations already hold.
 //!
+//! # Chunks
+//!
+//! A chunk is sealed and uploaded once `CHUNK_SECS` have passed since the
+//! previous chunk was written, or before it would pass 4 MiB. When everyone is
+//! silent no record arrives (muted clients send no frames), so the room's tick
+//! writes a keep-alive chunk holding only the present roster as `type=2`
+//! records. While anyone is in the room an object therefore appears at least
+//! every `CHUNK_SECS`, which is what the minutes worker's "no new object for a
+//! long time means the pod died" rule relies on.
+//!
 //! # Ending
 //!
 //! The end condition is "the room's recorded roster is empty", never "the
@@ -66,7 +76,8 @@ const FRAME_QUEUE_CAPACITY: usize = 2048;
 const MAX_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Longest single session; a longer huddle continues in a new session.
 const MAX_SESSION: Duration = Duration::from_secs(6 * 60 * 60);
-/// How often an idle room re-checks chunk and session limits.
+/// How often a room re-checks chunk cadence and session length when no
+/// record arrives (this is what writes keep-alive chunks during silence).
 const TICK: Duration = Duration::from_secs(1);
 /// Upper bound for one storage write attempt.
 const UPLOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -612,8 +623,15 @@ impl RoomTask {
         }
         let t = millis_u32(elapsed);
         if let Some(session) = self.session.as_mut() {
-            if session.chunk_span_reached(&self.recorder, t) {
-                session.seal(&self.recorder);
+            if session.write_due(&self.recorder, t) {
+                if session.chunk.is_some() {
+                    session.seal(&self.recorder, t);
+                } else {
+                    // Everyone is silent (muted clients send no frames), so
+                    // nothing opened a chunk. Write a keep-alive chunk so the
+                    // minutes worker keeps seeing objects while people stay.
+                    session.write_keepalive(&self.recorder, t);
+                }
             }
         }
     }
@@ -670,6 +688,7 @@ impl RoomTask {
             uploaded: Vec::new(),
             lost_chunks: 0,
             last_t: 0,
+            last_sealed_t: 0,
         }
     }
 
@@ -702,7 +721,7 @@ impl RoomTask {
     /// Seal the last chunk now and write the manifest in a tracked task once
     /// every upload has settled, so this room keeps consuming events.
     fn finish(&mut self, mut session: Session, reason: EndReason, end_t: u32) {
-        session.seal(&self.recorder);
+        session.seal(&self.recorder, end_t);
         let dropped_frames = self.counters.dropped_frames.swap(0, Ordering::Relaxed);
         let recorder = Arc::clone(&self.recorder);
         self.recorder.tasks.spawn(async move {
@@ -763,6 +782,9 @@ struct Session {
     /// enqueueing, so queue order can trail stamp order by a moment; records
     /// are clamped to this so `t_ms` never goes backwards within a session.
     last_t: u32,
+    /// When the last chunk was sealed (handed to upload); session start
+    /// before the first one. Chunk cadence is measured from here.
+    last_sealed_t: u32,
 }
 
 impl Session {
@@ -817,10 +839,24 @@ impl Session {
         self.roster.is_empty()
     }
 
-    fn chunk_span_reached(&self, rec: &HuddleRecorder, t: u32) -> bool {
-        self.chunk
-            .as_ref()
-            .is_some_and(|chunk| u64::from(t.saturating_sub(chunk.first_t)) >= rec.chunk_span_ms)
+    /// `CHUNK_SECS` have passed since the last chunk was written. An open
+    /// chunk is then sealed; with none open a keep-alive chunk is written.
+    /// Measuring from the last write (not the open chunk's first record)
+    /// keeps objects at most `CHUNK_SECS` apart while anyone is present, and
+    /// a chunk still never spans more than `CHUNK_SECS`.
+    fn write_due(&self, rec: &HuddleRecorder, t: u32) -> bool {
+        u64::from(t.saturating_sub(self.last_sealed_t)) >= rec.chunk_span_ms
+    }
+
+    /// Write a chunk holding only the present roster (`type=2` records, the
+    /// same shape as a chunk's opening re-statement) and seal it at once.
+    fn write_keepalive(&mut self, rec: &HuddleRecorder, t: u32) {
+        if self.roster.is_empty() {
+            return;
+        }
+        let t = self.monotonic(t);
+        self.open_chunk(t);
+        self.seal(rec, t);
     }
 
     /// Append one record, sealing the open chunk first when the record would
@@ -831,8 +867,8 @@ impl Session {
         let too_big = self.chunk.as_ref().is_some_and(|chunk| {
             chunk.buf.len() + record.encoded_len() > rec.limits.max_chunk_bytes
         });
-        if too_big || self.chunk_span_reached(rec, t) {
-            self.seal(rec);
+        if too_big || (self.chunk.is_some() && self.write_due(rec, t)) {
+            self.seal(rec, t);
         }
         if self.chunk.is_none() {
             self.open_chunk(t);
@@ -878,14 +914,16 @@ impl Session {
         self.chunk = Some(chunk);
     }
 
-    /// Close the open chunk and upload it in the background.
-    fn seal(&mut self, rec: &HuddleRecorder) {
+    /// Close the open chunk at session time `t` and upload it in the
+    /// background.
+    fn seal(&mut self, rec: &HuddleRecorder, t: u32) {
         while let Some(result) = self.uploads.try_join_next() {
             self.settle(result);
         }
         let Some(chunk) = self.chunk.take() else {
             return;
         };
+        self.last_sealed_t = self.last_sealed_t.max(t);
         let key = format::chunk_key(
             &rec.prefix,
             self.community_id,
@@ -1918,5 +1956,120 @@ mod tests {
             b"{}"
         );
         assert!(!stale.exists(), "the .part file is renamed into place");
+    }
+    /// Everyone muted: no frames arrive, yet a roster-only chunk is written
+    /// every `CHUNK_SECS` while someone is present, so the minutes worker
+    /// never mistakes a live, silent huddle for a dead pod.
+    #[tokio::test]
+    async fn silent_room_writes_keepalive_chunks_every_chunk_span() {
+        let clock = ManualClock::new();
+        let sink = Arc::new(MemorySink::default());
+        let limits = Limits {
+            tick: Duration::from_millis(5),
+            ..limits()
+        };
+        let recorder = recorder(sink.clone(), &clock, 1, limits, &no_shutdown());
+        let rooms = manager(&recorder);
+        let room = rooms.get_or_create(community(), Uuid::from_u128(0xCA));
+        let (alice, ..) = room.add_peer(pk(0xa1), 2).expect("alice");
+        let chunk_objects = || {
+            sink.keys()
+                .iter()
+                .filter(|key| key.ends_with(".bhr"))
+                .count()
+        };
+        // Walk past 3 x CHUNK_SECS with nobody talking: the joining chunk is
+        // sealed at 1 s, then one keep-alive chunk per second.
+        for (now, objects) in [(1000, 1), (2000, 2), (3000, 3)] {
+            clock.set(now);
+            eventually(|| chunk_objects() == objects).await;
+        }
+        clock.set(3500);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(chunk_objects(), 3, "no keep-alive before the next span");
+        assert!(sink.manifests().is_empty(), "the session is still open");
+        room.remove_peer_and_check_ended(alice)
+            .expect("alice leaves");
+
+        eventually(|| !sink.manifests().is_empty()).await;
+        let manifest = &sink.manifests()[0];
+        let a = [0xa1; 32];
+        let chunks: Vec<_> = manifest
+            .chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.seq,
+                    c.first_t_ms,
+                    c.last_t_ms,
+                    decode(&sink.get(&c.key)).1,
+                )
+            })
+            .collect();
+        assert_eq!(
+            chunks,
+            vec![
+                (0, 0, 0, vec![Rec::Join(0, 0, 0, a)]),
+                (1, 2000, 2000, vec![Rec::Join(2000, 0, 0, a)]),
+                (2, 3000, 3000, vec![Rec::Join(3000, 0, 0, a)]),
+                (
+                    3,
+                    3500,
+                    3500,
+                    vec![Rec::Join(3500, 0, 0, a), Rec::Leave(3500, 0, 0, a)]
+                ),
+            ]
+        );
+        assert_eq!(manifest.duration_ms, 3500);
+    }
+
+    /// While frames keep arriving, chunks are cut by the cadence and every
+    /// one carries audio: no extra roster-only keep-alive chunk appears.
+    #[tokio::test]
+    async fn talking_room_writes_no_keepalive_chunks() {
+        let clock = ManualClock::new();
+        let sink = Arc::new(MemorySink::default());
+        let limits = Limits {
+            tick: Duration::from_millis(5),
+            ..limits()
+        };
+        let recorder = recorder(sink.clone(), &clock, 1, limits, &no_shutdown());
+        let rooms = manager(&recorder);
+        let room = rooms.get_or_create(community(), Uuid::from_u128(0xCA));
+        let (alice, ..) = room.add_peer(pk(0xa1), 2).expect("alice");
+        for step in 1..=35u8 {
+            clock.set(u64::from(step) * 100);
+            room.broadcast_frame(alice, Bytes::from(vec![step]));
+            // Let the 5 ms tick run between frames, as it would live.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        room.remove_peer_and_check_ended(alice)
+            .expect("alice leaves");
+
+        eventually(|| !sink.manifests().is_empty()).await;
+        let manifest = &sink.manifests()[0];
+        assert!(manifest.chunks.len() >= 3, "{:?}", manifest.chunks);
+        let mut frames = Vec::new();
+        for chunk in &manifest.chunks {
+            let (_, records) = decode(&sink.get(&chunk.key));
+            let audio: Vec<u8> = records
+                .iter()
+                .filter_map(|r| match r {
+                    Rec::Frame(_, _, _, payload) => payload.first().copied(),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !audio.is_empty(),
+                "chunk {} carries no audio: {records:?}",
+                chunk.seq
+            );
+            frames.extend(audio);
+        }
+        assert_eq!(
+            frames,
+            (1..=35u8).collect::<Vec<_>>(),
+            "every frame once, in order"
+        );
     }
 }
