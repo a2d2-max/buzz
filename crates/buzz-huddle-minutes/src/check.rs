@@ -406,19 +406,6 @@ pub fn check_mix(
     truth: &Truth,
     speakers: &HashMap<String, Vec<f32>>,
 ) -> MixReport {
-    const FRAME: usize = 160;
-    let envelope = |pcm: &[f32]| -> Vec<f64> {
-        pcm.chunks(FRAME)
-            .map(|frame| {
-                let energy = frame
-                    .iter()
-                    .map(|s| f64::from(*s) * f64::from(*s))
-                    .sum::<f64>()
-                    / frame.len() as f64;
-                (energy + 1e-10).log10()
-            })
-            .collect()
-    };
     // The clean meeting: every sentence's clean speech where the answer
     // sheet puts it, so overlapping talk is in the reference too.
     let mut clean_mix = vec![0f32; mix_16k.len()];
@@ -482,6 +469,46 @@ pub fn check_mix(
             && lag_max_ms <= allowed_lag_ms.1
             && lag_max_ms - lag_min_ms <= allowed_spread_ms,
     }
+}
+
+/// Loudness envelope of 16 kHz audio: log energy per 10 ms.
+fn envelope(pcm: &[f32]) -> Vec<f64> {
+    pcm.chunks(160)
+        .map(|frame| {
+            let energy = frame
+                .iter()
+                .map(|s| f64::from(*s) * f64::from(*s))
+                .sum::<f64>()
+                / frame.len() as f64;
+            (energy + 1e-10).log10()
+        })
+        .collect()
+}
+
+/// How well `sent` (16 kHz audio of one piece, starting at `start_ms` on
+/// the meeting clock) matches `clean` (16 kHz, the same clock): the best
+/// loudness-envelope correlation within ±`search_ms`, and how much later
+/// `sent` is than `clean` there, ms. `None` when nothing in reach varies
+/// (silence on one side).
+pub fn audio_match(
+    sent: &[f32],
+    clean: &[f32],
+    start_ms: u64,
+    search_ms: i64,
+) -> Option<(i64, f64)> {
+    let reference = envelope(sent);
+    let signal = envelope(clean);
+    let at = i64::try_from(start_ms / 10).ok()?;
+    let steps = search_ms / 10;
+    let mut best: Option<(i64, f64)> = None;
+    for step in -steps..=steps {
+        if let Some(r) = correlation(&reference, &signal, at + step) {
+            if best.is_none_or(|(_, c)| r > c) {
+                best = Some((-step * 10, r));
+            }
+        }
+    }
+    best
 }
 
 /// Pearson correlation of `reference` against `signal` starting at `at`.

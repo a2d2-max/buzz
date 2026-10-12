@@ -35,7 +35,9 @@ use crate::vad::SpeechDetector;
 pub const TRUTH_FORMAT: &str = "huddle-fake-meeting-truth/1";
 /// Sentences the scenario needs.
 pub const SENTENCES: usize = 19;
-/// Meeting start of every fake meeting: 2026-10-12T05:00:00.000Z.
+/// A fixed meeting start for tests: 2026-10-12T05:00:00.000Z. Callers pass
+/// the start in; the command line uses the current time so a fresh fake
+/// meeting is never "older than 14 days".
 pub const BASE_UNIX_MS: u64 = 1_791_781_200_000;
 /// Background noise every client adds (uniform, about -71 dBFS RMS).
 const NOISE_FLOOR: f32 = 0.000_5;
@@ -338,7 +340,12 @@ enum Event {
 }
 
 /// Build the fake meeting from [`SENTENCES`] clips.
-pub fn build_fake_meeting(clips: &[Clip], seed: u64, prefix: &str) -> anyhow::Result<FakeMeeting> {
+pub fn build_fake_meeting(
+    clips: &[Clip],
+    seed: u64,
+    prefix: &str,
+    start_unix_ms: u64,
+) -> anyhow::Result<FakeMeeting> {
     if clips.len() < SENTENCES {
         bail!("need {SENTENCES} clips, got {}", clips.len());
     }
@@ -481,7 +488,7 @@ pub fn build_fake_meeting(clips: &[Clip], seed: u64, prefix: &str) -> anyhow::Re
             community_id,
             channel_id,
             session_id,
-            BASE_UNIX_MS + start_ms,
+            start_unix_ms + start_ms,
             start_ms,
         )?;
         let chunk_count = chunks.len();
@@ -502,8 +509,8 @@ pub fn build_fake_meeting(clips: &[Clip], seed: u64, prefix: &str) -> anyhow::Re
                 channel_id,
                 parent_channel_id: Some(uuid_from(&["huddle-fake-meeting", &seed_text, "parent"])),
                 session_id,
-                started_at: format_utc_millis(BASE_UNIX_MS + start_ms),
-                ended_at: format_utc_millis(BASE_UNIX_MS + end_ms),
+                started_at: format_utc_millis(start_unix_ms + start_ms),
+                ended_at: format_utc_millis(start_unix_ms + end_ms),
                 duration_ms: end_ms - start_ms,
                 protocol_version: 2,
                 end_reason: EndReason::Shutdown,
@@ -608,7 +615,7 @@ pub fn build_fake_meeting(clips: &[Clip], seed: u64, prefix: &str) -> anyhow::Re
         community_id,
         channel_id,
         prefix: prefix.into(),
-        started_at: format_utc_millis(BASE_UNIX_MS),
+        started_at: format_utc_millis(start_unix_ms),
         duration_ms: s2_end,
         speakers: truth_speakers,
         sessions: truth_sessions,

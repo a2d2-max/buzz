@@ -66,6 +66,9 @@ pub struct Meeting {
     /// Sessions of this meeting with nothing readable, placed here by
     /// their write time.
     pub unreadable_sessions: Vec<Uuid>,
+    /// Sessions of the same channel with nothing readable that no meeting's
+    /// time covers (the same list on every meeting of the channel).
+    pub unplaced_in_channel: Vec<Uuid>,
 }
 
 impl Meeting {
@@ -260,6 +263,7 @@ pub async fn collect_meetings<S: RecordingStore>(
                 parent_channel_id: None,
                 sessions: Vec::new(),
                 unreadable_sessions: Vec::new(),
+                unplaced_in_channel: Vec::new(),
             });
         }
         ended = ended.max(session.ended_at_unix_ms());
@@ -286,6 +290,9 @@ pub async fn collect_meetings<S: RecordingStore>(
             Some(meeting) => meeting.unreadable_sessions.push(session_id),
             None => unplaced_sessions.push(session_id),
         }
+    }
+    for meeting in &mut meetings {
+        meeting.unplaced_in_channel.clone_from(&unplaced_sessions);
     }
     Ok(Collected {
         meetings,
@@ -339,6 +346,21 @@ async fn load_session<S: RecordingStore>(
             }
             _ => losses.unreadable_chunks += 1,
         }
+    }
+    if let Some(manifest) = &manifest {
+        // A chunk the manifest does not list but storage holds and can read
+        // was uploaded after all (e.g. the upload "failed" on a permission
+        // check after the object was written): not lost.
+        let recovered = chunks
+            .iter()
+            .filter(|chunk| {
+                !manifest
+                    .chunks
+                    .iter()
+                    .any(|m| m.seq == chunk.header.chunk_seq)
+            })
+            .count() as u64;
+        losses.lost_chunks = losses.lost_chunks.saturating_sub(recovered);
     }
     let started_at_unix_ms = match (&manifest, chunks.first()) {
         (Some(manifest), _) => match parse_utc_ms(&manifest.started_at) {
@@ -591,6 +613,26 @@ mod tests {
             serde_json::to_vec(&future).expect("json"),
         )
         .await;
+        // 25: manifest lists only 0 and says 1 was lost, but chunk 1 is in
+        //     storage and readable: it was uploaded after all, not lost.
+        put(
+            25,
+            chunk_name(0),
+            chunk(Uuid::from_u128(25), 0, start + 4_000, 60_000),
+        )
+        .await;
+        put(
+            25,
+            chunk_name(1),
+            chunk(Uuid::from_u128(25), 1, start + 4_000, 60_000),
+        )
+        .await;
+        put(
+            25,
+            "manifest.json".into(),
+            manifest(Uuid::from_u128(25), start + 4_000, &[0], 1),
+        )
+        .await;
         // 24: nothing readable at all.
         put(24, chunk_name(0), b"BHR1 broken".to_vec()).await;
 
@@ -605,7 +647,7 @@ mod tests {
             .iter()
             .map(|s| s.session_id.as_u128())
             .collect();
-        assert_eq!(ids, [20, 21, 22, 23]);
+        assert_eq!(ids, [20, 21, 22, 23, 25]);
         assert_eq!(meeting.unreadable_sessions, [Uuid::from_u128(24)]);
         assert_eq!(
             meeting.losses(),
@@ -616,49 +658,106 @@ mod tests {
                 unreadable_chunks: 0,
                 unreadable_manifests: 2,
                 unreadable_sessions: 1,
-                dropped_frames: 6,
+                dropped_frames: 9,
                 failed_segments: 0,
             }
         );
     }
 
+    /// Pin an object's write time (what the bucket would report).
+    fn set_written(dir: &std::path::Path, key: &str, unix_ms: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(key))
+            .expect("open")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(unix_ms))
+            .expect("set write time");
+    }
+
+    /// Every time here is set from the meeting's own start, never from the
+    /// clock: the same checks hold for a meeting in 2026 and for one that
+    /// starts 30 days from whenever the test runs.
     #[tokio::test]
     async fn processed_old_and_live_meetings_are_left_alone() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        for start in [1_791_781_200_000u64, now + 30 * 86_400_000] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = LocalStore::new(dir.path());
+            let (community, channel) = (Uuid::from_u128(1), Uuid::from_u128(2));
+            for session in [30u128, 31] {
+                let key = chunk_key("h", community, channel, Uuid::from_u128(session), 0);
+                let started = start + (session as u64 - 30) * 1_000;
+                store
+                    .put(&key, chunk(Uuid::from_u128(session), 0, started, 60_000))
+                    .await
+                    .expect("put");
+                set_written(dir.path(), &key, started + 61_000);
+            }
+            let meeting = collect_meetings(&store, "h", community, channel, 10 * 60_000)
+                .await
+                .expect("collect")
+                .meetings
+                .remove(0);
+            let written = start + 62_000;
+            assert_eq!(meeting.last_modified_unix_ms(), written);
+            let quiet = 10 * 60_000;
+            let later = written + quiet;
+            let nothing = HashSet::new();
+            assert_eq!(meeting.skip_reason(&nothing, later, quiet), None, "{start}");
+            let second = HashSet::from([Uuid::from_u128(31)]);
+            assert_eq!(
+                meeting.skip_reason(&second, later, quiet),
+                Some(Skip::AlreadyProcessed)
+            );
+            assert_eq!(
+                meeting.skip_reason(&nothing, written + 60_000, quiet),
+                Some(Skip::MaybeLive)
+            );
+            assert_eq!(
+                meeting.skip_reason(&nothing, start + MAX_MEETING_AGE_MS, quiet),
+                None,
+                "14 days to the ms is still in"
+            );
+            assert_eq!(
+                meeting.skip_reason(&nothing, start + MAX_MEETING_AGE_MS + 1, quiet),
+                Some(Skip::TooOld)
+            );
+        }
+    }
+
+    /// An unreadable session that no meeting's time covers is not lost
+    /// either: the channel and every meeting of it carry its id.
+    #[tokio::test]
+    async fn an_unreadable_session_outside_every_meeting_is_still_counted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = LocalStore::new(dir.path());
         let (community, channel) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        let start = 1_791_781_200_000;
-        for session in [30u128, 31] {
-            let key = chunk_key("h", community, channel, Uuid::from_u128(session), 0);
-            let started = start + (session as u64 - 30) * 1_000;
-            store
-                .put(&key, chunk(Uuid::from_u128(session), 0, started, 60_000))
-                .await
-                .expect("put");
-        }
-        let meeting = collect_meetings(&store, "h", community, channel, 10 * 60_000)
+        let start = 1_791_781_200_000u64;
+        let good = chunk_key("h", community, channel, Uuid::from_u128(40), 0);
+        store
+            .put(&good, chunk(Uuid::from_u128(40), 0, start, 60_000))
             .await
-            .expect("collect")
-            .meetings
-            .remove(0);
-        let written = meeting.last_modified_unix_ms();
-        let quiet = 10 * 60_000;
-        let later = written + quiet;
-        let nothing = HashSet::new();
-        assert_eq!(meeting.skip_reason(&nothing, later, quiet), None);
-        let second = HashSet::from([Uuid::from_u128(31)]);
+            .expect("put");
+        set_written(dir.path(), &good, start + 61_000);
+        let broken = chunk_key("h", community, channel, Uuid::from_u128(41), 0);
+        store
+            .put(&broken, b"BHR1 broken".to_vec())
+            .await
+            .expect("put");
+        set_written(dir.path(), &broken, start - 3 * 86_400_000);
+
+        let collected = collect_meetings(&store, "h", community, channel, 10 * 60_000)
+            .await
+            .expect("collect");
+        assert_eq!(collected.unplaced_sessions, [Uuid::from_u128(41)]);
+        assert_eq!(collected.meetings.len(), 1);
+        assert!(collected.meetings[0].unreadable_sessions.is_empty());
         assert_eq!(
-            meeting.skip_reason(&second, later, quiet),
-            Some(Skip::AlreadyProcessed)
-        );
-        assert_eq!(
-            meeting.skip_reason(&nothing, written + 60_000, quiet),
-            Some(Skip::MaybeLive)
-        );
-        let too_late = start + MAX_MEETING_AGE_MS + 1;
-        assert_eq!(
-            meeting.skip_reason(&nothing, too_late.max(later), quiet),
-            Some(Skip::TooOld)
+            collected.meetings[0].unplaced_in_channel,
+            [Uuid::from_u128(41)]
         );
     }
 

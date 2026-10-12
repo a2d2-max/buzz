@@ -19,6 +19,7 @@
 pub mod audio;
 pub mod check;
 pub mod collect;
+pub mod ledger;
 pub mod media;
 pub mod models;
 pub mod pipeline;

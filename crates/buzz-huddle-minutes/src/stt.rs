@@ -41,12 +41,15 @@ pub struct SttOutput {
 pub enum SttErrorKind {
     /// Credentials or permission refused. Nothing will work: stop.
     Auth,
-    /// Quota or rate limit used up. More requests make it worse: stop.
+    /// The project's quota is used up ("quota exhausted" for the day or
+    /// month), not a per-minute limit. More requests make it worse: stop.
     Quota,
+    /// A per-minute request limit (HTTP 429): wait longer, then retry.
+    RateLimited,
     /// The engine refused this audio. Retrying will not help: mark the
-    /// piece as failed.
+    /// piece as failed for good.
     Rejected,
-    /// Network trouble or a server hiccup: retry, then mark as failed.
+    /// Network trouble or a server hiccup: retry, then try again next run.
     Transient,
 }
 
@@ -56,6 +59,7 @@ impl SttErrorKind {
         match self {
             Self::Auth => "auth",
             Self::Quota => "quota",
+            Self::RateLimited => "rate-limited",
             Self::Rejected => "rejected",
             Self::Transient => "transient",
         }
@@ -106,8 +110,9 @@ pub trait SpeechToText {
 const TRUTH_MIN_OVERLAP_MS: u64 = 300;
 
 /// Failures [`TruthStt`] injects: every `every`-th distinct piece (1-based,
-/// in request order) fails its first `failing_attempts` attempts with
-/// `kind`. Retries of the same piece count as further attempts.
+/// in request order, up to piece `last_piece`) fails its first
+/// `failing_attempts` attempts with `kind`. Retries of the same piece count
+/// as further attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fault {
     /// Kind of the injected error.
@@ -116,6 +121,8 @@ pub struct Fault {
     pub every: usize,
     /// How many attempts of such a piece fail (`u32::MAX` = always).
     pub failing_attempts: u32,
+    /// No piece after this one fails (`usize::MAX` = no limit).
+    pub last_piece: usize,
 }
 
 /// Test double: returns the answer-sheet text of each sentence of the
@@ -174,7 +181,10 @@ impl SpeechToText for TruthStt {
                 .entry((request.speaker.to_string(), request.start_ms))
                 .or_insert((next, 0));
             entry.1 += 1;
-            if entry.0 % fault.every == 0 && entry.1 <= fault.failing_attempts {
+            if entry.0 % fault.every == 0
+                && entry.0 <= fault.last_piece
+                && entry.1 <= fault.failing_attempts
+            {
                 return Err(SttError::new(fault.kind, "injected"));
             }
         }

@@ -14,6 +14,7 @@ use anyhow::Context;
 use buzz_huddle_minutes::audio::read_wav_mono_i16;
 use buzz_huddle_minutes::check::{check, check_mix, Tolerance};
 use buzz_huddle_minutes::collect::collect_meetings;
+use buzz_huddle_minutes::ledger::SttLedger;
 use buzz_huddle_minutes::models::{ensure_silero_vad, silero_vad_path};
 use buzz_huddle_minutes::pipeline::{build_minutes, mixed_audio_key, MinutesSettings, SttPolicy};
 use buzz_huddle_minutes::sim::{
@@ -58,6 +59,9 @@ enum Command {
         /// Cache folder holding models/silero_vad.onnx.
         #[arg(long)]
         cache: Option<PathBuf>,
+        /// Meeting start, UTC ms (default: now, so the meeting is fresh).
+        #[arg(long)]
+        start_ms: Option<u64>,
     },
     /// Make the script and mixed audio of each finished meeting in a huddle
     /// channel (`<first session id>.transcript.json` per meeting).
@@ -102,6 +106,10 @@ enum Command {
         /// Replace existing scripts.
         #[arg(long)]
         overwrite: bool,
+        /// Take this as the current time, UTC ms (default: the clock). Every
+        /// age and quiet-time decision uses it.
+        #[arg(long)]
+        now_ms: Option<u64>,
         /// Longest piece sent to the transcriber, ms.
         #[arg(long, default_value_t = SegmentPlan::default().max_segment_ms)]
         max_segment_ms: u64,
@@ -142,6 +150,7 @@ enum Command {
 enum FailKind {
     Auth,
     Quota,
+    RateLimited,
     Rejected,
     Transient,
 }
@@ -151,6 +160,7 @@ impl From<FailKind> for SttErrorKind {
         match kind {
             FailKind::Auth => Self::Auth,
             FailKind::Quota => Self::Quota,
+            FailKind::RateLimited => Self::RateLimited,
             FailKind::Rejected => Self::Rejected,
             FailKind::Transient => Self::Transient,
         }
@@ -175,6 +185,19 @@ fn processed_sessions(out: &Path) -> anyhow::Result<Vec<(Uuid, String)>> {
         }
     }
     Ok(processed)
+}
+
+/// Create `dir` (and missing parents) readable by its owner only (0700).
+/// An existing folder is left as it is.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 /// Write a file readable by its owner only (0600), atomically.
@@ -235,6 +258,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             seed,
             prefix,
             cache,
+            start_ms,
         } => {
             let clips = clips.unwrap_or_else(|| {
                 Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -245,7 +269,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let mut detector = SileroVad::new(&model, SileroSettings::default())
                 .context("run `buzz-huddle-minutes fetch-models` first")?;
             mark_speech(&mut clips, &mut detector)?;
-            let meeting = build_fake_meeting(&clips, seed, &prefix)?;
+            let start = start_ms.unwrap_or_else(now_unix_ms);
+            let meeting = build_fake_meeting(&clips, seed, &prefix, start)?;
             write_fake_meeting(&out, &meeting)?;
             let truth = &meeting.truth;
             eprintln!(
@@ -278,6 +303,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             quiet_minutes,
             meeting_gap_minutes,
             overwrite,
+            now_ms,
             max_segment_ms,
             pad_ms,
         } => {
@@ -285,7 +311,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let quiet_ms = quiet_minutes * 60_000;
             let gap_ms = meeting_gap_minutes * 60_000;
             let collected = collect_meetings(&store, &prefix, community, channel, gap_ms).await?;
-            let now = now_unix_ms();
+            let now = now_ms.unwrap_or_else(now_unix_ms);
             let model = silero_vad_path(&cache.unwrap_or_else(default_cache));
             let mut detector = SileroVad::new(&model, SileroSettings::default())
                 .context("run `buzz-huddle-minutes fetch-models` first")?;
@@ -299,9 +325,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     kind: stt_fail_kind.into(),
                     every,
                     failing_attempts: stt_fail_attempts,
+                    last_piece: usize::MAX,
                 });
             }
-            std::fs::create_dir_all(&out)?;
+            create_private_dir(&out)?;
             let processed = processed_sessions(&out)?;
             eprintln!(
                 "meetings in this channel: {} | sessions with nothing readable outside any meeting: {}",
@@ -339,7 +366,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     audio_key: audio_key.clone(),
                     now_unix_ms: now,
                 };
-                let output = match build_minutes(meeting, &mut detector, &stt, &settings).await {
+                // Outcomes already paid for, kept beside the script (0600).
+                let mut ledger = SttLedger::open(&out.join(format!("{first}.stt.jsonl")))?;
+                let built =
+                    build_minutes(meeting, &mut detector, &stt, &mut ledger, &settings).await;
+                let output = match built {
                     Ok(output) => output,
                     Err(error) => {
                         failed_meetings += 1;
@@ -376,11 +407,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     .map(|(kind, count)| format!("{kind} {count}"))
                     .collect();
                 eprintln!(
-                    "  frames {} unknown {} overlap-skipped {} broken-chunks {} | stt retries {} gave up [{}]",
+                    "  frames {} unknown {} overlap-skipped {} broken-chunks {} | unplaced unreadable sessions in channel {}",
                     report.demux.frames,
                     report.demux.unknown_sender,
                     report.demux.overlap_skipped,
                     report.demux.broken_chunks,
+                    report.unplaced_sessions_in_channel
+                );
+                eprintln!(
+                    "  stt run {} | requests {} reused from ledger {} retries {} gave up [{}]",
+                    report.run,
+                    report.stt_requests,
+                    report.stt_reused,
                     report.stt_retries,
                     by_kind.join(", ")
                 );

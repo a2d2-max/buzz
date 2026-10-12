@@ -9,10 +9,12 @@
 use std::path::Path;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use buzz_huddle_minutes::audio::read_wav_mono_i16;
-use buzz_huddle_minutes::check::{check, check_mix, Tolerance};
-use buzz_huddle_minutes::collect::collect_meetings;
+use buzz_huddle_minutes::check::{audio_match, check, check_mix, Tolerance};
+use buzz_huddle_minutes::collect::{collect_meetings, Meeting};
+use buzz_huddle_minutes::ledger::SttLedger;
 use buzz_huddle_minutes::media::{level_dbov, MediaHeader, FLAG_DTX};
 use buzz_huddle_minutes::models::silero_vad_path;
 use buzz_huddle_minutes::pipeline::{
@@ -20,7 +22,7 @@ use buzz_huddle_minutes::pipeline::{
 };
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Clip, FakeMeeting,
-    SENTENCES,
+    BASE_UNIX_MS, SENTENCES,
 };
 use buzz_huddle_minutes::store::{LocalStore, RecordingStore};
 use buzz_huddle_minutes::stt::{
@@ -61,25 +63,31 @@ impl SpeechDetector for EnergyDetector {
     }
 }
 
-/// Nineteen "sentences": 3–5 tone "words" of 250 ms with 120 ms between
-/// them, a pitch per sentence, 300 ms of near-silence on each side.
+/// Nineteen "sentences": 3–5 tone "words" of 200–350 ms with 90–200 ms
+/// between them (lengths differ word to word, like speech, so each stretch
+/// of audio has its own loudness pattern), a pitch per sentence, 300 ms of
+/// near-silence on each side.
 fn synthetic_clips() -> Vec<Clip> {
     (0..SENTENCES)
         .map(|n| {
             let words = 3 + n % 3;
             let pitch = 150.0 + 13.0 * n as f32;
             let mut pcm = vec![0.0f32; 4_800];
-            for _ in 0..words {
-                pcm.extend((0..4_000).map(|i| {
+            for w in 0..words {
+                let word = 16 * (200 + (n * 37 + w * 53) % 151);
+                let gap = 16 * (90 + (n * 29 + w * 41) % 111);
+                pcm.extend((0..word).map(|i| {
                     let t = i as f32 / 16_000.0;
-                    let envelope = (std::f32::consts::PI * i as f32 / 4_000.0).sin();
+                    let envelope = (std::f32::consts::PI * i as f32 / word as f32).sin();
                     0.2 * envelope
                         * ((std::f32::consts::TAU * pitch * t).sin()
                             + 0.5 * (std::f32::consts::TAU * 2.0 * pitch * t).sin())
                 }));
-                pcm.extend(std::iter::repeat_n(0.0, 1_920));
+                if w + 1 < words {
+                    pcm.extend(std::iter::repeat_n(0.0, gap));
+                }
             }
-            pcm.extend(std::iter::repeat_n(0.0, 4_800 - 1_920));
+            pcm.extend(std::iter::repeat_n(0.0, 4_800));
             let len = pcm.len();
             Clip {
                 id: format!("tone-{n:02}"),
@@ -99,6 +107,7 @@ fn settings() -> MinutesSettings {
         segment_plan: SegmentPlan::default(),
         stt: SttPolicy {
             retry_delay_ms: 0,
+            rate_limit_delay_ms: 0,
             ..SttPolicy::default()
         },
         audio_key: "mixed.wav".into(),
@@ -123,6 +132,19 @@ async fn try_worker<D: SpeechDetector, T: SpeechToText>(
     detector: &mut D,
     stt: &T,
 ) -> Result<MinutesOutput, MinutesError> {
+    let gathered = gather(dir, meeting).await;
+    build_minutes(
+        &gathered,
+        detector,
+        stt,
+        &mut SttLedger::in_memory(),
+        &settings(),
+    )
+    .await
+}
+
+/// Write the fake meeting and read it back as one meeting of two sessions.
+async fn gather(dir: &Path, meeting: &FakeMeeting) -> Meeting {
     write_fake_meeting(dir, meeting).expect("write fake meeting");
     let store = LocalStore::new(dir.join("recordings"));
     let truth = &meeting.truth;
@@ -147,7 +169,7 @@ async fn try_worker<D: SpeechDetector, T: SpeechToText>(
         gathered.sessions[1].manifest.is_none(),
         "session 2 is chunks only"
     );
-    build_minutes(&gathered, detector, stt, &settings()).await
+    gathered
 }
 
 fn speaker_wavs(meeting: &FakeMeeting) -> HashMap<String, Vec<f32>> {
@@ -171,7 +193,7 @@ fn speaker_wavs(meeting: &FakeMeeting) -> HashMap<String, Vec<f32>> {
 fn fake_meeting(seed: u64) -> FakeMeeting {
     let mut clips = synthetic_clips();
     mark_speech(&mut clips, &mut EnergyDetector).expect("mark speech");
-    build_fake_meeting(&clips, seed, "huddles").expect("build fake meeting")
+    build_fake_meeting(&clips, seed, "huddles", BASE_UNIX_MS).expect("build fake meeting")
 }
 
 #[tokio::test]
@@ -234,6 +256,7 @@ fn fault(kind: SttErrorKind, every: usize, failing_attempts: u32) -> Fault {
         kind,
         every,
         failing_attempts,
+        last_piece: usize::MAX,
     }
 }
 
@@ -270,17 +293,69 @@ async fn a_few_refused_pieces_stay_in_the_script_marked() {
     );
 }
 
-/// More than one piece in ten failing: nothing is written.
+/// Test double wrapper: counts the requests that reach the engine.
+struct Counting<'a, T> {
+    inner: &'a T,
+    sent: AtomicUsize,
+}
+
+impl<'a, T> Counting<'a, T> {
+    fn new(inner: &'a T) -> Self {
+        Self {
+            inner,
+            sent: AtomicUsize::new(0),
+        }
+    }
+
+    fn sent(&self) -> usize {
+        self.sent.load(Ordering::Relaxed)
+    }
+}
+
+impl<T: SpeechToText + Sync> SpeechToText for Counting<'_, T> {
+    fn info(&self) -> SttInfo {
+        self.inner.info()
+    }
+
+    async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        self.inner.transcribe(request).await
+    }
+}
+
+/// Run the worker on an already gathered meeting with a given ledger.
+async fn run_again<T: SpeechToText>(
+    meeting: &Meeting,
+    stt: &T,
+    ledger: &mut SttLedger,
+) -> Result<MinutesOutput, MinutesError> {
+    build_minutes(meeting, &mut EnergyDetector, stt, ledger, &settings()).await
+}
+
+/// A refused piece is final: written as "받아쓰기 실패" on the first run
+/// however many there are, and never sent again.
 #[tokio::test]
-async fn too_many_failed_pieces_write_nothing() {
+async fn refused_pieces_never_hold_a_meeting_back() {
     let meeting = fake_meeting(7);
     let dir = tempfile::tempdir().expect("tempdir");
-    let stt = TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Rejected, 3, u32::MAX));
-    let result = try_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
-    assert!(
-        matches!(result, Err(MinutesError::TooManySttFailures { .. })),
-        "{result:?}"
-    );
+    let gathered = gather(dir.path(), &meeting).await;
+    let truth_stt =
+        TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Rejected, 3, u32::MAX));
+    let stt = Counting::new(&truth_stt);
+    let mut ledger = SttLedger::in_memory();
+    let first = run_again(&gathered, &stt, &mut ledger)
+        .await
+        .expect("written on the first run");
+    let pieces = first.transcript.segments.len();
+    assert_eq!(first.transcript.losses.failed_segments, (pieces / 3) as u64);
+    assert_eq!(stt.sent(), pieces, "one request per piece, no retries");
+
+    let again = run_again(&gathered, &stt, &mut ledger)
+        .await
+        .expect("rerun");
+    assert_eq!(stt.sent(), pieces, "nothing sent again");
+    assert_eq!(again.report.stt_reused, pieces as u64);
+    assert_eq!(again.transcript.segments, first.transcript.segments);
 }
 
 /// Credentials or quota refused: the meeting stops at once and the whole
@@ -302,36 +377,147 @@ async fn auth_or_quota_failure_stops_at_once() {
     }
 }
 
-/// Transient failures are retried; a piece that keeps failing is marked
-/// only after the last retry.
+/// Transient failures and per-minute rate limits are retried inside the
+/// run; a piece that recovers costs nothing more.
 #[tokio::test]
-async fn transient_failures_are_retried_before_giving_up() {
-    // Every 2nd piece fails twice, then works: retried, nothing lost.
-    let meeting = fake_meeting(7);
-    let dir = tempfile::tempdir().expect("tempdir");
-    let stt = TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Transient, 2, 2));
-    let output = run_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
-    let pieces: usize = output.report.speakers.iter().map(|s| s.segments).sum();
-    assert_eq!(output.transcript.losses.failed_segments, 0);
-    assert_eq!(output.report.stt_retries, (pieces / 2 * 2) as u64);
-    assert!(check(&output.transcript, &meeting.truth, Tolerance::default()).pass);
-
-    // Every 12th piece always fails: 3 retries each, then marked.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let stt =
-        TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Transient, 12, u32::MAX));
-    let output = run_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
-    let pieces: usize = output.report.speakers.iter().map(|s| s.segments).sum();
-    let failed = (pieces / 12) as u64;
-    assert_eq!(output.transcript.losses.failed_segments, failed);
-    assert_eq!(output.report.stt_retries, failed * 3);
+async fn transient_failures_and_rate_limits_are_retried_within_a_run() {
+    for kind in [SttErrorKind::Transient, SttErrorKind::RateLimited] {
+        // Every 2nd piece fails twice, then works.
+        let meeting = fake_meeting(7);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stt = TruthStt::new(&meeting.truth).with_fault(fault(kind, 2, 2));
+        let output = run_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
+        let pieces: usize = output.report.speakers.iter().map(|s| s.segments).sum();
+        assert_eq!(output.transcript.losses.failed_segments, 0, "{kind}");
+        assert_eq!(output.report.stt_retries, (pieces / 2 * 2) as u64, "{kind}");
+        assert!(check(&output.transcript, &meeting.truth, Tolerance::default()).pass);
+    }
 }
 
+/// Pieces still failing transiently after their retries hold the meeting
+/// back; the next run sends exactly those pieces and nothing else.
+#[tokio::test]
+async fn a_deferred_meeting_resends_only_the_failed_pieces() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gathered = gather(dir.path(), &meeting).await;
+    // Every 5th piece fails 4 attempts (1 + 3 retries), then works.
+    let truth_stt = TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Transient, 5, 4));
+    let stt = Counting::new(&truth_stt);
+    let mut ledger = SttLedger::in_memory();
+    let failed = match run_again(&gathered, &stt, &mut ledger).await {
+        Err(MinutesError::SttRetryLater {
+            failed,
+            pieces,
+            run: 1,
+            ..
+        }) => {
+            assert_eq!(failed, pieces / 5);
+            assert_eq!(stt.sent(), pieces + failed * 3);
+            failed
+        }
+        other => panic!("{other:?}"),
+    };
+    let before = stt.sent();
+    let output = run_again(&gathered, &stt, &mut ledger)
+        .await
+        .expect("written on run 2");
+    assert_eq!(stt.sent() - before, failed, "only the failed pieces");
+    assert_eq!(output.report.run, 2);
+    assert_eq!(output.transcript.losses.failed_segments, 0);
+    assert!(check(&output.transcript, &meeting.truth, Tolerance::default()).pass);
+}
+
+/// A piece that never recovers: the meeting waits for its last run, then
+/// is written with the failure marked.
+#[tokio::test]
+async fn after_the_last_run_the_meeting_is_written_with_failures_marked() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gathered = gather(dir.path(), &meeting).await;
+    let truth_stt =
+        TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Transient, 5, u32::MAX));
+    let stt = Counting::new(&truth_stt);
+    let mut ledger = SttLedger::in_memory();
+    for run in 1..SttPolicy::default().max_runs {
+        let before = stt.sent();
+        match run_again(&gathered, &stt, &mut ledger).await {
+            Err(MinutesError::SttRetryLater {
+                run: got, failed, ..
+            }) => {
+                assert_eq!(got, run);
+                if run > 1 {
+                    assert_eq!(stt.sent() - before, failed * 4, "only the failing pieces");
+                }
+            }
+            other => panic!("run {run}: {other:?}"),
+        }
+    }
+    let output = run_again(&gathered, &stt, &mut ledger)
+        .await
+        .expect("written on the last run");
+    let pieces = output.transcript.segments.len();
+    assert_eq!(output.report.run, SttPolicy::default().max_runs);
+    assert_eq!(
+        output.transcript.losses.failed_segments,
+        (pieces / 5) as u64
+    );
+    let marked = output
+        .transcript
+        .segments
+        .iter()
+        .filter(|s| s.text == FAILED_TEXT)
+        .count();
+    assert_eq!(marked, pieces / 5);
+}
+
+/// Stopping on an auth error keeps what was already paid for: the next run
+/// (a new process reading the ledger file) sends only the pieces not
+/// finished before the stop.
+#[tokio::test]
+async fn an_auth_stop_keeps_what_was_paid_for() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gathered = gather(dir.path(), &meeting).await;
+    // The 7th piece's first attempt is refused credentials (that piece only).
+    let truth_stt = TruthStt::new(&meeting.truth).with_fault(Fault {
+        last_piece: 7,
+        ..fault(SttErrorKind::Auth, 7, 1)
+    });
+    let stt = Counting::new(&truth_stt);
+    let ledger_dir = tempfile::tempdir().expect("tempdir");
+    let path = ledger_dir.path().join("meeting.stt.jsonl");
+    {
+        let mut ledger = SttLedger::open(&path).expect("ledger");
+        let result = run_again(&gathered, &stt, &mut ledger).await;
+        assert!(matches!(
+            result,
+            Err(MinutesError::SttStopped(SttErrorKind::Auth))
+        ));
+        assert_eq!(stt.sent(), 7);
+    }
+    let mut ledger = SttLedger::open(&path).expect("ledger");
+    let output = run_again(&gathered, &stt, &mut ledger)
+        .await
+        .expect("rerun");
+    let pieces = output.transcript.segments.len();
+    assert_eq!(
+        stt.sent() - 7,
+        pieces - 6,
+        "the 6 finished pieces are not sent again"
+    );
+    assert_eq!(output.report.stt_reused, 6);
+    assert!(check(&output.transcript, &meeting.truth, Tolerance::default()).pass);
+}
+
+/// One request as sent: speaker, audio start and end (ms), audio.
+type SentPiece = (String, u64, u64, Vec<f32>);
+
 /// Test double: remembers each request and answers with its number, so
-/// every script line can be matched to the audio that was sent.
+/// every script line can be matched to what was sent.
 #[derive(Default)]
 struct RecordsRequests {
-    seen: std::sync::Mutex<Vec<(u64, u64, usize)>>,
+    seen: std::sync::Mutex<Vec<SentPiece>>,
 }
 
 impl SpeechToText for RecordsRequests {
@@ -341,7 +527,12 @@ impl SpeechToText for RecordsRequests {
 
     async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
         let mut seen = self.seen.lock().expect("lock");
-        seen.push((request.start_ms, request.end_ms, request.pcm_16k.len()));
+        seen.push((
+            request.speaker.to_string(),
+            request.start_ms,
+            request.end_ms,
+            request.pcm_16k.to_vec(),
+        ));
         Ok(SttOutput {
             text: format!("#{}", seen.len() - 1),
             billed_seconds: 0,
@@ -349,9 +540,33 @@ impl SpeechToText for RecordsRequests {
     }
 }
 
-/// The padding goes on the audio sent, never into the script's times:
-/// each line starts and ends inside its request, by exactly the padding
-/// wherever there was room, and the audio sent is as long as its times say.
+/// Each person's clean speech on the meeting clock (16 kHz), from the
+/// answer sheet and the per-person WAVs, keyed by pubkey.
+fn clean_tracks(meeting: &FakeMeeting) -> HashMap<String, Vec<f32>> {
+    let wavs = speaker_wavs(meeting);
+    let len = usize::try_from(meeting.truth.duration_ms * 16).expect("len") + 16_000;
+    let mut tracks: HashMap<String, Vec<f32>> = HashMap::new();
+    for sentence in &meeting.truth.utterances {
+        let wav = &wavs[&sentence.label];
+        let from = usize::try_from(sentence.speaker_wav_start_ms * 16).expect("from");
+        let to = usize::try_from(sentence.speaker_wav_end_ms * 16).expect("to");
+        let at = usize::try_from(sentence.start_ms * 16).expect("at");
+        let track = tracks
+            .entry(sentence.speaker.clone())
+            .or_insert_with(|| vec![0.0; len]);
+        for (out, sample) in track[at..].iter_mut().zip(&wav[from..to]) {
+            *out += sample;
+        }
+    }
+    tracks
+}
+
+/// The padding goes on the audio sent, never into the script's times, and
+/// the audio sent is the right person's at the right time:
+/// - each line starts and ends inside its request, by exactly the padding
+///   wherever there was room, and the audio is as long as its times say;
+/// - the audio matches that person's clean speech at that time (loudness
+///   envelope, at the network delay) far better than anyone else's.
 #[tokio::test]
 async fn padding_reaches_the_transcriber_but_not_the_script() {
     let meeting = fake_meeting(7);
@@ -359,11 +574,14 @@ async fn padding_reaches_the_transcriber_but_not_the_script() {
     let stt = RecordsRequests::default();
     let output = run_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
     let seen = stt.seen.lock().expect("lock").clone();
+    let clean = clean_tracks(&meeting);
     let pad = SegmentPlan::default().pad_ms;
     let mut full_pad = 0;
     for segment in &output.transcript.segments {
         let n: usize = segment.text[1..].parse().expect("request number");
-        let (start, end, samples) = seen[n];
+        let (speaker, start, end, audio) = &seen[n];
+        let (start, end) = (*start, *end);
+        assert_eq!(speaker, &segment.speaker);
         assert!(
             start <= segment.start_ms && segment.start_ms - start <= pad,
             "{segment:?}"
@@ -373,9 +591,32 @@ async fn padding_reaches_the_transcriber_but_not_the_script() {
             "{segment:?}"
         );
         let expected = usize::try_from((end - start) * 16).expect("samples");
-        assert!(samples.abs_diff(expected) < 16, "{samples} vs {expected}");
+        assert!(
+            audio.len().abs_diff(expected) < 16,
+            "{} vs {expected}",
+            audio.len()
+        );
         if segment.start_ms - start == pad && end - segment.end_ms == pad {
             full_pad += 1;
+        }
+
+        let (late_ms, own) = audio_match(audio, &clean[speaker], start, 200)
+            .unwrap_or_else(|| panic!("no match for {segment:?}"));
+        assert!(
+            own >= 0.8,
+            "{segment:?}: correlation {own:.2} with its own speech"
+        );
+        assert!(
+            (0..=150).contains(&late_ms),
+            "{segment:?}: {late_ms} ms off its own speech"
+        );
+        for (other, track) in clean.iter().filter(|(who, _)| *who != speaker) {
+            if let Some((_, theirs)) = audio_match(audio, track, start, 200) {
+                assert!(
+                    own > theirs + 0.2,
+                    "{segment:?}: {own:.2} vs {theirs:.2} with {other}"
+                );
+            }
         }
     }
     let lines = output.transcript.segments.len();
@@ -981,9 +1222,15 @@ async fn an_eleven_minute_mute_with_keepalives_stays_one_live_meeting() {
     // (c) No speech pieces inside the mute, nothing broken or unknown, and
     // both people's talk is there.
     let meeting = meetings.remove(0);
-    let output = build_minutes(&meeting, &mut EnergyDetector, &SaysSomething, &settings())
-        .await
-        .expect("build minutes");
+    let output = build_minutes(
+        &meeting,
+        &mut EnergyDetector,
+        &SaysSomething,
+        &mut SttLedger::in_memory(),
+        &settings(),
+    )
+    .await
+    .expect("build minutes");
     assert_eq!(output.report.demux.broken_chunks, 0);
     assert_eq!(output.report.demux.unknown_sender, 0);
     let segments = &output.transcript.segments;
@@ -1014,7 +1261,7 @@ async fn fleurs_meeting_with_silero() {
     mark_speech(&mut clips, &mut silero).expect("mark speech");
     let mut out_of_limits = 0;
     for seed in 1..=8 {
-        let meeting = build_fake_meeting(&clips, seed, "huddles").expect("build");
+        let meeting = build_fake_meeting(&clips, seed, "huddles", BASE_UNIX_MS).expect("build");
         let dir = tempfile::tempdir().expect("tempdir");
         let stt = TruthStt::new(&meeting.truth);
         let output = run_worker(dir.path(), &meeting, &mut silero, &stt).await;

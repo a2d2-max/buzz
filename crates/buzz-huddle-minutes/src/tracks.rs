@@ -120,8 +120,11 @@ pub struct DecodeStats {
     pub seq_restarts: u64,
     /// Lost frames filled with concealment.
     pub concealed: u64,
-    /// Lost frames beyond [`MAX_CONCEALED_FRAMES`], kept as silence.
+    /// Lost frames beyond [`MAX_CONCEALED_FRAMES`], kept as silence (counted
+    /// by the silence actually filled).
     pub lost_silent: u64,
+    /// `seq` jumps larger than the time that passed (sender counter leaps).
+    pub seq_leaps: u64,
     /// Talk spurts (continuous sending stretches) across all streams.
     pub spurts: u64,
 }
@@ -401,8 +404,14 @@ fn plan_stream<'a>(frames: &[&SpeakerFrame<'a>], stats: &mut DecodeStats) -> Vec
                 let claimed = u64::from(missing) * last_len;
                 let passed = last_receive
                     .map_or(claimed, |before| receive.saturating_sub(before + last_len));
-                produced += claimed.min(passed);
-                stats.lost_silent += u64::from(missing);
+                let filled = claimed.min(passed);
+                produced += filled;
+                // Count what was actually filled, so a bare `seq` leap does
+                // not read as ten minutes of lost audio.
+                stats.lost_silent += filled / last_len.max(1);
+                if passed < claimed {
+                    stats.seq_leaps += 1;
+                }
             }
         }
         if let Some(header) = header {
@@ -661,7 +670,9 @@ mod tests {
             (0..50u16).map(|i| (i, 1_000 + 20 * u64::from(i))).collect();
         sent.extend((0..50u16).map(|i| (30_050 + i, 2_000 + 20 * u64::from(i))));
         let (positions, stats) = plan(&sent);
-        assert_eq!(stats.lost_silent, 30_000);
+        // Nothing was really lost: no time passed between the two frames.
+        assert_eq!(stats.lost_silent, 0);
+        assert_eq!(stats.seq_leaps, 1);
         // Without the cap the second half would sit 600 s away; with it,
         // every frame is where it arrived.
         let received: Vec<u64> = sent.iter().map(|&(_, t)| t).collect();

@@ -9,6 +9,7 @@ use buzz_huddle_recording::format_utc_millis;
 
 use crate::audio::{resample, write_wav_mono_i16, Mixer};
 use crate::collect::Meeting;
+use crate::ledger::{piece_key, Outcome, SttLedger};
 use crate::stt::{SpeechToText, SttErrorKind, SttRequest, FAILED_TEXT};
 use crate::tracks::{demux, DecodeStats, DemuxStats, REGION_GAP_MS, SAMPLE_RATE};
 use crate::transcript::{AudioRef, Participant, Segment, Transcript, TRANSCRIPT_FORMAT};
@@ -26,14 +27,19 @@ pub const RECORDING_RETENTION_DAYS: u64 = 15;
 /// How transcription failures are handled.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SttPolicy {
-    /// Extra attempts for a piece after a transient failure.
+    /// Extra attempts for a piece after a transient or rate-limit failure.
     pub retries: u32,
-    /// Wait before the first retry, ms; doubles on each further retry.
+    /// Wait before the first retry after a transient failure, ms; doubles
+    /// on each further retry.
     pub retry_delay_ms: u64,
-    /// More failed pieces than this share of all pieces and the meeting is
-    /// not written (the next run tries again): a script missing more than
-    /// one line in ten is not usable as minutes.
-    pub max_failed_share: f64,
+    /// Wait before the first retry after a rate limit (HTTP 429), ms;
+    /// doubles on each further retry.
+    pub rate_limit_delay_ms: u64,
+    /// Runs a meeting gets. While pieces still fail transiently after
+    /// their retries, a run before this one does not write the meeting and
+    /// the next run sends only those pieces again (finished ones come from
+    /// the ledger); this run writes it with the failures marked.
+    pub max_runs: u32,
 }
 
 impl Default for SttPolicy {
@@ -41,7 +47,8 @@ impl Default for SttPolicy {
         Self {
             retries: 3,
             retry_delay_ms: 500,
-            max_failed_share: 0.10,
+            rate_limit_delay_ms: 5_000,
+            max_runs: 3,
         }
     }
 }
@@ -75,19 +82,28 @@ pub enum MinutesError {
     #[error(transparent)]
     Resample(#[from] crate::audio::ResampleError),
     /// The transcriber refused credentials or ran out of quota; nothing
-    /// was written and nothing more should be sent.
+    /// was written and nothing more should be sent. Outcomes paid for so
+    /// far are in the ledger.
     #[error("transcription stopped: {0}")]
     SttStopped(SttErrorKind),
-    /// Too many pieces failed; nothing was written so a later run retries.
-    #[error("{failed} of {pieces} pieces failed transcription (over the {share_percent}% limit)")]
-    TooManySttFailures {
-        /// Failed pieces.
+    /// Some pieces still failed transiently after their retries; nothing
+    /// was written so the next run sends just those pieces again.
+    #[error(
+        "{failed} of {pieces} pieces failed transiently on run {run} of {max_runs}; retry later"
+    )]
+    SttRetryLater {
+        /// Pieces still failing.
         failed: usize,
         /// All pieces.
         pieces: usize,
-        /// The limit, percent.
-        share_percent: f64,
+        /// This run's number.
+        run: u32,
+        /// Runs a meeting gets.
+        max_runs: u32,
     },
+    /// The ledger could not be read or written.
+    #[error("stt ledger: {0}")]
+    Ledger(#[from] std::io::Error),
 }
 
 impl MinutesError {
@@ -126,7 +142,15 @@ pub struct RunReport {
     pub speakers: Vec<SpeakerReport>,
     /// What is known to be missing (also in the script).
     pub losses: crate::transcript::Losses,
-    /// Retries after transient transcription failures.
+    /// Unreadable sessions of this channel that no meeting's time covers.
+    pub unplaced_sessions_in_channel: u64,
+    /// This run's number for the meeting (1 for the first).
+    pub run: u32,
+    /// Requests sent to the transcriber (retries included).
+    pub stt_requests: u64,
+    /// Pieces taken from the ledger instead of being sent again.
+    pub stt_reused: u64,
+    /// Retries after transient or rate-limit failures.
     pub stt_retries: u64,
     /// Pieces given up on, by failure kind.
     pub stt_failures_by_kind: Vec<(SttErrorKind, u64)>,
@@ -143,11 +167,14 @@ pub struct MinutesOutput {
     pub report: RunReport,
 }
 
-/// Run steps 2–6 on a gathered meeting.
+/// Run steps 2–6 on a gathered meeting. `ledger` holds the meeting's
+/// earlier transcription outcomes (see [`crate::ledger`]); every outcome of
+/// this run is added to it as it happens, also when the run stops early.
 pub async fn build_minutes<D, T>(
     meeting: &Meeting,
     detector: &mut D,
     stt: &T,
+    ledger: &mut SttLedger,
     settings: &MinutesSettings,
 ) -> Result<MinutesOutput, MinutesError>
 where
@@ -168,6 +195,10 @@ where
     let mut speakers = Vec::with_capacity(routed.speakers.len());
     let mut stt_info = stt.info();
     stt_info.billed_seconds = 0;
+    let run = ledger.start_run()?;
+    let mut stt_requests = 0u64;
+    let mut stt_reused = 0u64;
+    let mut transient_failed = 0usize;
     let mut stt_retries = 0u64;
     let mut failures_by_kind: std::collections::BTreeMap<SttErrorKind, u64> =
         std::collections::BTreeMap::new();
@@ -241,33 +272,86 @@ where
                     end_ms: track_start_ms + samples_to_ms(piece.audio.end),
                     pcm_16k: &pcm[piece.audio.start..piece.audio.end],
                 };
-                let mut retries_left = settings.stt.retries;
-                let mut delay_ms = settings.stt.retry_delay_ms;
-                let text = loop {
-                    match stt.transcribe(request).await {
-                        Ok(output) => {
-                            stt_info.billed_seconds += output.billed_seconds;
-                            break output.text;
-                        }
-                        Err(error) => match error.kind {
-                            SttErrorKind::Auth | SttErrorKind::Quota => {
-                                return Err(MinutesError::SttStopped(error.kind));
-                            }
-                            SttErrorKind::Transient if retries_left > 0 => {
-                                retries_left -= 1;
-                                stt_retries += 1;
-                                if delay_ms > 0 {
-                                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
-                                        .await;
+                let key = piece_key(
+                    &person.pubkey,
+                    request.start_ms,
+                    request.end_ms,
+                    request.pcm_16k,
+                );
+                // Finished on an earlier run: never sent (or paid for) again.
+                let known = ledger.outcome(&key).cloned();
+                let text = match known {
+                    Some(Outcome::Done {
+                        text,
+                        billed_seconds,
+                    }) => {
+                        stt_reused += 1;
+                        stt_info.billed_seconds += billed_seconds;
+                        text
+                    }
+                    Some(Outcome::Rejected { .. }) => {
+                        stt_reused += 1;
+                        report.stt_failures += 1;
+                        *failures_by_kind.entry(SttErrorKind::Rejected).or_default() += 1;
+                        FAILED_TEXT.to_string()
+                    }
+                    None => {
+                        let mut retries_left = settings.stt.retries;
+                        let mut transient_wait = settings.stt.retry_delay_ms;
+                        let mut rate_limit_wait = settings.stt.rate_limit_delay_ms;
+                        loop {
+                            stt_requests += 1;
+                            match stt.transcribe(request).await {
+                                Ok(output) => {
+                                    stt_info.billed_seconds += output.billed_seconds;
+                                    ledger.record(
+                                        &key,
+                                        Outcome::Done {
+                                            text: output.text.clone(),
+                                            billed_seconds: output.billed_seconds,
+                                        },
+                                    )?;
+                                    break output.text;
                                 }
-                                delay_ms = delay_ms.saturating_mul(2);
+                                Err(error) => match error.kind {
+                                    SttErrorKind::Auth | SttErrorKind::Quota => {
+                                        return Err(MinutesError::SttStopped(error.kind));
+                                    }
+                                    SttErrorKind::Rejected => {
+                                        ledger
+                                            .record(&key, Outcome::Rejected { code: error.code })?;
+                                        report.stt_failures += 1;
+                                        *failures_by_kind
+                                            .entry(SttErrorKind::Rejected)
+                                            .or_default() += 1;
+                                        break FAILED_TEXT.to_string();
+                                    }
+                                    kind if retries_left > 0 => {
+                                        retries_left -= 1;
+                                        stt_retries += 1;
+                                        let wait = if kind == SttErrorKind::RateLimited {
+                                            &mut rate_limit_wait
+                                        } else {
+                                            &mut transient_wait
+                                        };
+                                        if *wait > 0 {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                *wait,
+                                            ))
+                                            .await;
+                                        }
+                                        *wait = wait.saturating_mul(2);
+                                    }
+                                    kind => {
+                                        // Not recorded: the next run sends it again.
+                                        transient_failed += 1;
+                                        report.stt_failures += 1;
+                                        *failures_by_kind.entry(kind).or_default() += 1;
+                                        break FAILED_TEXT.to_string();
+                                    }
+                                },
                             }
-                            kind => {
-                                report.stt_failures += 1;
-                                *failures_by_kind.entry(kind).or_default() += 1;
-                                break FAILED_TEXT.to_string();
-                            }
-                        },
+                        }
                     }
                 };
                 segments.push(Segment {
@@ -286,14 +370,17 @@ where
     }
     segments.sort_by(|a, b| (a.start_ms, &a.speaker).cmp(&(b.start_ms, &b.speaker)));
 
-    let failed: usize = speakers.iter().map(|s| s.stt_failures).sum();
-    if failed as f64 > settings.stt.max_failed_share * segments.len() as f64 {
-        return Err(MinutesError::TooManySttFailures {
-            failed,
+    // Refused pieces never hold a meeting back. Transient ones do, until
+    // the meeting's last run.
+    if transient_failed > 0 && run < settings.stt.max_runs {
+        return Err(MinutesError::SttRetryLater {
+            failed: transient_failed,
             pieces: segments.len(),
-            share_percent: settings.stt.max_failed_share * 100.0,
+            run,
+            max_runs: settings.stt.max_runs,
         });
     }
+    let failed: usize = speakers.iter().map(|s| s.stt_failures).sum();
     let mut losses = meeting.losses();
     losses.failed_segments = failed as u64;
 
@@ -328,6 +415,10 @@ where
             demux: routed.stats,
             speakers,
             losses,
+            unplaced_sessions_in_channel: meeting.unplaced_in_channel.len() as u64,
+            run,
+            stt_requests,
+            stt_reused,
             stt_retries,
             stt_failures_by_kind: failures_by_kind.into_iter().collect(),
         },
