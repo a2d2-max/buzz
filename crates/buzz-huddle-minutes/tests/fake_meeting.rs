@@ -27,7 +27,9 @@ use buzz_huddle_minutes::models::silero_vad_path;
 use buzz_huddle_minutes::pipeline::{
     build_minutes, MinutesError, MinutesOutput, MinutesSettings, SttPolicy,
 };
-use buzz_huddle_minutes::runner::{run_meeting, Done, LocalMinutes, MeetingError, RunOptions};
+use buzz_huddle_minutes::runner::{
+    run_meeting, Done, LocalMinutes, MeetingError, MinutesHome, RunOptions,
+};
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Clip, FakeMeeting,
     Truth, BASE_UNIX_MS, SENTENCES,
@@ -1442,6 +1444,7 @@ async fn lock_child() {
         Ok(Done::Written { .. }) => "written".to_string(),
         Ok(Done::Locked) => "locked".to_string(),
         Ok(Done::Skipped(skip)) => format!("skipped-{skip:?}"),
+        Ok(Done::FollowedUp(_)) => "followed-up".to_string(),
         Err(_) => "failed".to_string(),
     };
     std::fs::write(
@@ -1853,6 +1856,7 @@ async fn a_meeting_goes_through_the_minutes_bucket() {
         output,
         script,
         audio,
+        ..
     } = done
     else {
         panic!("{done:?}");
@@ -1919,6 +1923,10 @@ async fn a_meeting_goes_through_the_minutes_bucket() {
         }
     }
 
+    // A summary beside the script is not taken for a script.
+    home.write_summary(&plan, b"{}".to_vec())
+        .await
+        .expect("summary");
     // Without replacing, the meeting is done.
     let stt = Counting::new(&truth_stt);
     let skipped = run_meeting(

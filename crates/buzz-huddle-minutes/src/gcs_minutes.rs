@@ -42,6 +42,12 @@ const MAX_LEASE: u64 = 4 * 1024;
 /// Largest script, bundle or piece read.
 const MAX_READ: u64 = 64 * 1024 * 1024;
 
+/// 노션 기록 이름 끝. 스크립트와 같은 곳에 있어서 스크립트를 읽을 때 뺀다.
+const NOTION_RECORD_SUFFIX: &str = ".notion.json";
+/// Summary name end; beside the script too, so also left out when scripts
+/// are read.
+const SUMMARY_SUFFIX: &str = ".summary.json";
+
 /// The minutes bucket as a [`MinutesHome`].
 #[derive(Debug, Clone)]
 pub struct GcsMinutes {
@@ -84,6 +90,35 @@ impl GcsMinutes {
             meeting.channel_id,
             meeting.first_session_id()
         )
+    }
+
+    /// 회의의 노션 기록이 있는 곳(스크립트 옆).
+    pub fn notion_record_key(meeting: &MeetingPlan) -> String {
+        format!(
+            "transcripts/{}/{}/{}{NOTION_RECORD_SUFFIX}",
+            meeting.community_id,
+            meeting.channel_id,
+            meeting.first_session_id()
+        )
+    }
+
+    /// Where a meeting's summary lives (beside the script).
+    pub fn summary_key(meeting: &MeetingPlan) -> String {
+        format!(
+            "transcripts/{}/{}/{}{SUMMARY_SUFFIX}",
+            meeting.community_id,
+            meeting.channel_id,
+            meeting.first_session_id()
+        )
+    }
+
+    /// The object's bytes, or `None` when there is no such object.
+    async fn read_if_there(&self, key: &str) -> Result<Option<Vec<u8>>, MeetingError> {
+        match self.gcs.get(&self.bucket, key, MAX_READ).await {
+            Ok(bytes) => Ok(Some(bytes.to_vec())),
+            Err(error) if error.kind == GcsErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn lease_key(meeting: &MeetingPlan) -> String {
@@ -217,6 +252,10 @@ impl MinutesHome for GcsMinutes {
         );
         let mut processed = Vec::new();
         for object in self.gcs.list(&self.bucket, &prefix).await? {
+            if object.name.ends_with(NOTION_RECORD_SUFFIX) || object.name.ends_with(SUMMARY_SUFFIX)
+            {
+                continue;
+            }
             let bytes = self.gcs.get(&self.bucket, &object.name, MAX_READ).await?;
             let transcript: Transcript = serde_json::from_slice(&bytes)
                 .map_err(|e| MeetingError::Scripts(format!("{}: {e}", object.name)))?;
@@ -253,6 +292,45 @@ impl MinutesHome for GcsMinutes {
             Write::IfAbsent
         };
         self.gcs.put(&self.bucket, &key, json, JSON, write).await?;
+        Ok(format!("gs://{}/{key}", self.bucket))
+    }
+
+    async fn read_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> Result<Option<Vec<u8>>, MeetingError> {
+        self.read_if_there(&Self::notion_record_key(meeting)).await
+    }
+
+    async fn read_script(&self, meeting: &MeetingPlan) -> Result<Option<Vec<u8>>, MeetingError> {
+        self.read_if_there(&Self::script_key(meeting)).await
+    }
+
+    async fn read_summary(&self, meeting: &MeetingPlan) -> Result<Option<Vec<u8>>, MeetingError> {
+        self.read_if_there(&Self::summary_key(meeting)).await
+    }
+
+    async fn write_summary(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> Result<String, MeetingError> {
+        let key = Self::summary_key(meeting);
+        self.gcs
+            .put(&self.bucket, &key, json, JSON, Write::Overwrite)
+            .await?;
+        Ok(format!("gs://{}/{key}", self.bucket))
+    }
+
+    async fn write_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> Result<String, MeetingError> {
+        let key = Self::notion_record_key(meeting);
+        self.gcs
+            .put(&self.bucket, &key, json, JSON, Write::Overwrite)
+            .await?;
         Ok(format!("gs://{}/{key}", self.bucket))
     }
 }

@@ -87,12 +87,20 @@
    항목마다: 할 일 내용, 담당자 pubkey(말로 정해졌으면), 기한(말로 정해졌으면, KST), **확정/애매** 구분(담당자나 기한이 불분명하면 애매),
    근거가 된 스크립트 구간(`start_ms`). 회의 주최자는 부모 채널 48100에 서명한 사람으로 정한다. AI가 기한을 지어내지 않는다.
 8. **노션 페이지**(뒤에 붙임): "허들 ID"로 같은 회의를 두 번 만들지 않는다.
+9. **이어서 하기**: `process`는 스크립트를 쓴 다음, 회의를 잡은 채로 요약 → 노션 페이지로 이어 간다(`--summary on`, `--notion on`; 기본은 둘 다 꺼짐).
+   - 요약 결과(`huddle-summary/1`)는 스크립트 옆 `{첫 세션 id}.summary.json`(분 버킷이면 `transcripts/…/`)에 둔다. 있으면 다시 부르지 않는다(돈을 두 번 내지 않게).
+   - 노션 기록(`{첫 세션 id}.notion.json`)에는 page id와 "끝까지 썼나"(`done`)를 적는다. 성공했을 때만 `done`이다.
+   - 요약·노션이 실패해도 스크립트는 이미 써졌다. 다음 실행은 그 회의의 스크립트를 읽어 빠진 것만 한다. 요약을 켰는데 실패했으면 노션은 그다음 실행까지 기다린다.
+   - 노션이 실패하면 페이지는 "실패"로 표시되고(못 하면 `notion-stale`로 찾는다), 실패는 종료 코드 1로 알린다.
+   - `--overwrite`로 스크립트를 다시 쓰면 요약과 노션 페이지도 다시 한다.
+   - 이름표는 지금 pubkey 앞 8자(`PubkeyPrefixNames`)다. 화자 분리의 `speaker_label`은 같은 이름표 자리(`DisplayNames`)에 끼우면 된다.
 
 ## 실행 (Cloud Run 작업)
 
 `buzz-huddle-minutes process --all`을 10분마다 돌린다. 녹음 접두사 아래의 community/channel 폴더(UUID인 것만)를 스스로 찾아 채널마다 회의를 처리한다.
 채널 하나를 못 읽어도 다음 채널은 계속하고, 인증·권한·한도 오류만 실행 전체를 멈춘다. 실패가 하나라도 있으면 0이 아닌 값으로 끝난다.
 한 실행은 시간 상한(기본 50분)이 지나면 새 회의를 시작하지 않고 남은 것은 다음 실행에 넘긴다(lease 2시간보다 짧게).
+실행이 10분을 넘기면 다음 실행과 겹친다. Cloud Run 작업은 이것을 막지 않으므로, 같은 회의는 lease로 한 실행만 처리한다.
 
 플래그 대신 환경 변수로도 준다.
 
@@ -112,6 +120,10 @@
 | `BUZZ_MINUTES_TIME_LIMIT_MINUTES` | `--time-limit-minutes` | 기본 50 |
 | `BUZZ_MINUTES_QUIET_MINUTES` | `--quiet-minutes` | 기본 10 |
 | `BUZZ_MINUTES_MEETING_GAP_MINUTES` | `--meeting-gap-minutes` | 기본 10 |
+| `BUZZ_MINUTES_SUMMARY` | `--summary` | `on`이면 스크립트 뒤에 Gemini 요약(기본 `off`) |
+| `BUZZ_MINUTES_SUMMARY_MODEL` | `--summary-model` | 요약 모델(기본 `gemini-3.8-flash`, 프로젝트 `a2d2-lab`, 위치 `global`) |
+| `BUZZ_MINUTES_NOTION` | `--notion` | `on`이면 요약 뒤에 노션 페이지(기본 `off`) |
+| `NOTION_TOKEN` | — | 노션 토큰(Secret Manager를 이 변수로 붙인다, 값은 어디에도 찍지 않는다) |
 | `BUZZ_GCP_ACCESS_TOKEN` | (`--gcp-auth env`) | 시험용 고정 토큰 |
 
 ## 스크립트 JSON `huddle-transcript/1`

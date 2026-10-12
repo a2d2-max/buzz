@@ -22,6 +22,7 @@ use fs2::FileExt;
 use uuid::Uuid;
 
 use crate::collect::{CollectError, MeetingPlan, Skip};
+use crate::followup::{follow_up_held, FollowUps, FollowedUp};
 use crate::ledger::{Ledger, SttLedger};
 use crate::pipeline::{
     build_minutes, mixed_audio_key, MinutesError, MinutesOutput, MinutesSettings,
@@ -68,6 +69,37 @@ pub trait MinutesHome {
         json: Vec<u8>,
         overwrite: bool,
     ) -> impl Future<Output = Result<String, MeetingError>>;
+    /// 이 회의의 노션 기록(스크립트 옆 `{첫 세션}.notion.json`: 만든 page id).
+    /// 아직 없으면 `None`.
+    fn read_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, MeetingError>>;
+    /// 이 회의의 노션 기록을 쓴다(있으면 바꿔 쓴다). 쓴 곳을 돌려준다.
+    fn write_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> impl Future<Output = Result<String, MeetingError>>;
+    /// This meeting's own script ([`script_name`](MinutesHome::script_name)),
+    /// if it is there.
+    fn read_script(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, MeetingError>>;
+    /// This meeting's summary (`{first session}.summary.json` beside the
+    /// script), if there is one.
+    fn read_summary(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, MeetingError>>;
+    /// Store this meeting's summary (replacing an older one); returns where
+    /// it went.
+    fn write_summary(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> impl Future<Output = Result<String, MeetingError>>;
 }
 
 /// The local folder where scripts, ledgers and locks live.
@@ -97,6 +129,16 @@ impl LocalMinutes {
 
     fn lock_path(&self, first: Uuid) -> PathBuf {
         self.dir.join(format!("{first}.lock"))
+    }
+
+    /// 첫 세션이 `first` 인 회의의 노션 기록.
+    pub fn notion_record_path(&self, first: Uuid) -> PathBuf {
+        self.dir.join(format!("{first}.notion.json"))
+    }
+
+    /// Summary of the meeting whose first session is `first`.
+    pub fn summary_path(&self, first: Uuid) -> PathBuf {
+        self.dir.join(format!("{first}.summary.json"))
     }
 }
 
@@ -159,6 +201,54 @@ impl MinutesHome for LocalMinutes {
         write_private(&path, &json)?;
         Ok(path.display().to_string())
     }
+
+    async fn read_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> Result<Option<Vec<u8>>, MeetingError> {
+        match std::fs::read(self.notion_record_path(meeting.first_session_id())) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(MeetingError::Io(error)),
+        }
+    }
+
+    async fn write_notion_record(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> Result<String, MeetingError> {
+        let path = self.notion_record_path(meeting.first_session_id());
+        write_private(&path, &json)?;
+        Ok(path.display().to_string())
+    }
+
+    async fn read_script(&self, meeting: &MeetingPlan) -> Result<Option<Vec<u8>>, MeetingError> {
+        read_if_there(&self.transcript_path(meeting.first_session_id()))
+    }
+
+    async fn read_summary(&self, meeting: &MeetingPlan) -> Result<Option<Vec<u8>>, MeetingError> {
+        read_if_there(&self.summary_path(meeting.first_session_id()))
+    }
+
+    async fn write_summary(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+    ) -> Result<String, MeetingError> {
+        let path = self.summary_path(meeting.first_session_id());
+        write_private(&path, &json)?;
+        Ok(path.display().to_string())
+    }
+}
+
+/// The file's bytes, or `None` when there is no such file.
+fn read_if_there(path: &Path) -> Result<Option<Vec<u8>>, MeetingError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(MeetingError::Io(error)),
+    }
 }
 
 /// What happened to one meeting.
@@ -174,7 +264,12 @@ pub enum Done {
         /// run; with other bytes it is kept — the worker never overwrites
         /// in the recording bucket).
         audio: PutNew,
+        /// The summary and the Notion page, when they were asked for.
+        follow: Option<FollowedUp>,
     },
+    /// The script was already there; what was left after it (summary,
+    /// Notion page) was done or tried now.
+    FollowedUp(FollowedUp),
     /// Left alone this run.
     Skipped(Skip),
     /// Another worker holds the meeting.
@@ -261,10 +356,36 @@ where
     D: SpeechDetector,
     T: SpeechToText,
 {
+    run_meeting_with(home, store, meeting, detector, stt, settings, options, None).await
+}
+
+/// [`run_meeting`], then — still holding the meeting — the summary and the
+/// Notion page (see [`crate::followup`]). A meeting whose own script is
+/// already there gets only what is missing after it.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_meeting_with<H, S, D, T>(
+    home: &H,
+    store: &S,
+    meeting: &MeetingPlan,
+    detector: &mut D,
+    stt: &T,
+    settings: &MinutesSettings,
+    options: &RunOptions,
+    follow: Option<&mut FollowUps<'_>>,
+) -> Result<Done, MeetingError>
+where
+    H: MinutesHome,
+    S: RecordingStore,
+    D: SpeechDetector,
+    T: SpeechToText,
+{
     let Some(hold) = home.hold(meeting).await? else {
         return Ok(Done::Locked);
     };
-    let done = run_held(home, store, meeting, detector, stt, settings, options).await;
+    let done = run_held(
+        home, store, meeting, detector, stt, settings, options, follow,
+    )
+    .await;
     // Let go whatever happened; a failure to let go is reported only when
     // the meeting itself went well.
     let released = home.release(hold).await;
@@ -273,6 +394,7 @@ where
     Ok(done)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_held<H, S, D, T>(
     home: &H,
     store: &S,
@@ -281,6 +403,7 @@ async fn run_held<H, S, D, T>(
     stt: &T,
     settings: &MinutesSettings,
     options: &RunOptions,
+    follow: Option<&mut FollowUps<'_>>,
 ) -> Result<Done, MeetingError>
 where
     H: MinutesHome,
@@ -291,14 +414,30 @@ where
     // Checked while holding the meeting: a worker that finished just
     // before us wrote its script before letting go.
     let own = home.script_name(meeting);
-    let processed: HashSet<Uuid> = home
-        .processed_sessions(meeting)
-        .await?
+    let scripts = home.processed_sessions(meeting).await?;
+    let own_there = scripts.iter().any(|(_, script)| *script == own);
+    let processed: HashSet<Uuid> = scripts
         .into_iter()
         .filter(|(_, script)| !(options.overwrite && *script == own))
         .map(|(session, _)| session)
         .collect();
     if let Some(skip) = meeting.skip_reason(&processed, options.now_unix_ms, options.quiet_ms) {
+        // This very meeting's script is there: only what comes after it
+        // (summary, Notion page) may be left.
+        let only_follow_up = skip == Skip::AlreadyProcessed && own_there && !options.overwrite;
+        if let (true, Some(steps)) = (only_follow_up, follow) {
+            let bytes = home
+                .read_script(meeting)
+                .await?
+                .ok_or_else(|| MeetingError::Scripts(format!("{own}: gone")))?;
+            let transcript: Transcript = serde_json::from_slice(&bytes)
+                .map_err(|e| MeetingError::Scripts(format!("{own}: {e}")))?;
+            let followed = follow_up_held(home, meeting, &transcript, false, steps).await?;
+            if followed.nothing_left() {
+                return Ok(Done::Skipped(skip));
+            }
+            return Ok(Done::FollowedUp(followed));
+        }
         return Ok(Done::Skipped(skip));
     }
 
@@ -317,10 +456,15 @@ where
         .await?;
     let json = serde_json::to_vec_pretty(&output.transcript).map_err(std::io::Error::other)?;
     let script = home.write_script(meeting, json, options.overwrite).await?;
+    let follow = match follow {
+        Some(steps) => Some(follow_up_held(home, meeting, &output.transcript, true, steps).await?),
+        None => None,
+    };
     Ok(Done::Written {
         output: Box::new(output),
         script,
         audio,
+        follow,
     })
 }
 
