@@ -1,6 +1,6 @@
-//! Where the transcriber plugs in (step 4). The real engine (Chirp 3) comes
-//! later; [`TruthStt`] is a test double that answers from a fake meeting's
-//! answer sheet.
+//! Where the transcriber plugs in (step 4). The real engine is
+//! [`crate::chirp::ChirpStt`]; [`TruthStt`] is a test double that answers
+//! from a fake meeting's answer sheet.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -39,7 +39,8 @@ pub struct SttOutput {
 /// Kinds of transcription failure; each is handled differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SttErrorKind {
-    /// Credentials or permission refused. Nothing will work: stop.
+    /// Credentials, permission or setup (project, API, recognizer)
+    /// refused. Nothing will work: stop.
     Auth,
     /// The project's quota is used up ("quota exhausted" for the day or
     /// month), not a per-minute limit. More requests make it worse: stop.

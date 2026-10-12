@@ -13,5 +13,7 @@
 //! Tokens never show up in logs or errors: [`token::AccessToken`] prints as
 //! `***`, and errors carry the HTTP status and Google's message only.
 
+#[cfg(feature = "fake")]
+pub mod fake;
 pub mod gcs;
 pub mod token;

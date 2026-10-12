@@ -1,20 +1,28 @@
-//! Process one meeting into a local output folder, safely against another
-//! worker doing the same meeting at the same time.
+//! Process one meeting, safely against another worker doing the same
+//! meeting at the same time.
 //!
-//! Order: lock the meeting → check (under the lock) that no script already
-//! covers it → open its ledger → transcribe → write the mixed audio and the
-//! script. The lock is an OS advisory lock on `<first session>.lock`
-//! (`flock`), so a crashed worker never leaves the meeting locked. A meeting
-//! that is locked is skipped and counted; the next run picks it up.
+//! Order: hold the meeting → check (while holding it) that no script
+//! already covers it → open its ledger → fetch its chunks (only this
+//! meeting's) → transcribe → store the mixed audio and the script → let go.
+//! A meeting another worker holds is skipped and counted; the next run
+//! picks it up.
+//!
+//! Where scripts, ledgers and holds live is a [`MinutesHome`]: a local
+//! folder ([`LocalMinutes`], held with an OS `flock`, so a crashed worker
+//! never leaves the meeting held) or the minutes bucket
+//! ([`crate::gcs_minutes::GcsMinutes`], held with a lease object that
+//! expires).
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
+use buzz_gcp::gcs::{GcsError, GcsErrorKind};
 use fs2::FileExt;
 use uuid::Uuid;
 
-use crate::collect::{Meeting, Skip};
-use crate::ledger::SttLedger;
+use crate::collect::{CollectError, MeetingPlan, Skip};
+use crate::ledger::{Ledger, SttLedger};
 use crate::pipeline::{
     build_minutes, mixed_audio_key, MinutesError, MinutesOutput, MinutesSettings,
 };
@@ -22,6 +30,45 @@ use crate::store::{RecordingStore, StoreError};
 use crate::stt::SpeechToText;
 use crate::transcript::Transcript;
 use crate::vad::SpeechDetector;
+
+/// Where a channel's scripts, ledgers and holds live.
+pub trait MinutesHome {
+    /// A meeting's ledger.
+    type Ledger: Ledger;
+    /// Proof that this worker holds a meeting.
+    type Hold;
+
+    /// Take the meeting; `None` when another worker holds it.
+    fn hold(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> impl Future<Output = Result<Option<Self::Hold>, MeetingError>>;
+    /// Let go of the meeting.
+    fn release(&self, hold: Self::Hold) -> impl Future<Output = Result<(), MeetingError>>;
+    /// Every session id already in a script of this meeting's channel,
+    /// with the script's name. An unreadable script is an error: skipping
+    /// it could process a meeting twice.
+    fn processed_sessions(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> impl Future<Output = Result<Vec<(Uuid, String)>, MeetingError>>;
+    /// Name of this meeting's script, as [`processed_sessions`] gives it.
+    ///
+    /// [`processed_sessions`]: MinutesHome::processed_sessions
+    fn script_name(&self, meeting: &MeetingPlan) -> String;
+    /// Open the meeting's ledger.
+    fn open_ledger(
+        &self,
+        meeting: &MeetingPlan,
+    ) -> impl Future<Output = std::io::Result<Self::Ledger>>;
+    /// Store the script; returns where it went.
+    fn write_script(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+        overwrite: bool,
+    ) -> impl Future<Output = Result<String, MeetingError>>;
+}
 
 /// The local folder where scripts, ledgers and locks live.
 #[derive(Debug, Clone)]
@@ -51,11 +98,31 @@ impl LocalMinutes {
     fn lock_path(&self, first: Uuid) -> PathBuf {
         self.dir.join(format!("{first}.lock"))
     }
+}
 
-    /// Every session id already in a script here, with the script's file
-    /// name. An unreadable script is an error: skipping it could process a
-    /// meeting twice.
-    pub fn processed_sessions(&self) -> Result<Vec<(Uuid, String)>, MeetingError> {
+impl MinutesHome for LocalMinutes {
+    type Ledger = SttLedger;
+    /// The lock file, locked; dropping it lets go.
+    type Hold = std::fs::File;
+
+    async fn hold(&self, meeting: &MeetingPlan) -> Result<Option<std::fs::File>, MeetingError> {
+        let lock = open_private(&self.lock_path(meeting.first_session_id()), false)?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => Ok(Some(lock)),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+            Err(error) => Err(MeetingError::Io(error)),
+        }
+    }
+
+    async fn release(&self, hold: std::fs::File) -> Result<(), MeetingError> {
+        drop(hold);
+        Ok(())
+    }
+
+    async fn processed_sessions(
+        &self,
+        _meeting: &MeetingPlan,
+    ) -> Result<Vec<(Uuid, String)>, MeetingError> {
         let scripts = |error: &dyn std::fmt::Display| MeetingError::Scripts(error.to_string());
         let mut processed = Vec::new();
         for entry in std::fs::read_dir(&self.dir).map_err(|e| scripts(&e))? {
@@ -73,6 +140,25 @@ impl LocalMinutes {
         }
         Ok(processed)
     }
+
+    fn script_name(&self, meeting: &MeetingPlan) -> String {
+        format!("{}.transcript.json", meeting.first_session_id())
+    }
+
+    async fn open_ledger(&self, meeting: &MeetingPlan) -> std::io::Result<SttLedger> {
+        SttLedger::open(&self.ledger_path(meeting.first_session_id()))
+    }
+
+    async fn write_script(
+        &self,
+        meeting: &MeetingPlan,
+        json: Vec<u8>,
+        _overwrite: bool,
+    ) -> Result<String, MeetingError> {
+        let path = self.transcript_path(meeting.first_session_id());
+        write_private(&path, &json)?;
+        Ok(path.display().to_string())
+    }
 }
 
 /// What happened to one meeting.
@@ -83,38 +169,62 @@ pub enum Done {
         /// The run's output (mixed audio already stored).
         output: Box<MinutesOutput>,
         /// Where the script went.
-        transcript_path: PathBuf,
+        script: String,
     },
     /// Left alone this run.
     Skipped(Skip),
-    /// Another worker holds the meeting's lock.
+    /// Another worker holds the meeting.
     Locked,
 }
 
-/// Why one meeting failed. Other meetings go on.
+/// Why one meeting failed. Other meetings go on unless
+/// [`stops_the_run`](Self::stops_the_run).
 #[derive(Debug, thiserror::Error)]
 pub enum MeetingError {
     /// The meeting's ledger could not be opened.
     #[error("ledger: {0}")]
     Ledger(std::io::Error),
+    /// The meeting's chunks could not be fetched.
+    #[error(transparent)]
+    Collect(#[from] CollectError),
     /// Building the minutes failed.
     #[error(transparent)]
     Minutes(#[from] MinutesError),
     /// Storing the mixed audio failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The minutes bucket refused or failed (hold, scripts).
+    #[error("minutes bucket: {0}")]
+    Gcs(#[from] GcsError),
     /// The lock or the script file failed.
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    /// A script in the output folder could not be read.
-    #[error("scripts in the output folder: {0}")]
+    /// A script could not be read.
+    #[error("scripts: {0}")]
     Scripts(String),
 }
 
 impl MeetingError {
-    /// Whether the whole run should stop, not just this meeting.
+    /// Whether the whole run should stop, not just this meeting: the
+    /// transcriber refused credentials or quota, or Cloud Storage refused
+    /// credentials, permission or quota — later meetings would fail the
+    /// same way.
     pub fn stops_the_run(&self) -> bool {
-        matches!(self, Self::Minutes(error) if error.stops_the_run())
+        let refused = |kind: GcsErrorKind| {
+            matches!(
+                kind,
+                GcsErrorKind::Auth | GcsErrorKind::Permission | GcsErrorKind::Quota
+            )
+        };
+        match self {
+            Self::Minutes(error) => error.stops_the_run(),
+            Self::Gcs(error) => refused(error.kind),
+            Self::Store(StoreError::Gcs { source, .. })
+            | Self::Collect(CollectError::Store(StoreError::Gcs { source, .. })) => {
+                refused(source.kind)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -132,67 +242,80 @@ pub struct RunOptions {
 }
 
 /// Process one meeting (see the module docs).
-pub async fn run_meeting<S, D, T>(
-    minutes: &LocalMinutes,
+pub async fn run_meeting<H, S, D, T>(
+    home: &H,
     store: &S,
-    meeting: &Meeting,
+    meeting: &MeetingPlan,
     detector: &mut D,
     stt: &T,
     settings: &MinutesSettings,
     options: &RunOptions,
 ) -> Result<Done, MeetingError>
 where
+    H: MinutesHome,
     S: RecordingStore,
     D: SpeechDetector,
     T: SpeechToText,
 {
-    let first = meeting
-        .sessions
-        .first()
-        .map(|session| session.session_id)
-        .unwrap_or_default();
+    let Some(hold) = home.hold(meeting).await? else {
+        return Ok(Done::Locked);
+    };
+    let done = run_held(home, store, meeting, detector, stt, settings, options).await;
+    // Let go whatever happened; a failure to let go is reported only when
+    // the meeting itself went well.
+    let released = home.release(hold).await;
+    let done = done?;
+    released?;
+    Ok(done)
+}
 
-    let lock = open_private(&minutes.lock_path(first), false)?;
-    match lock.try_lock_exclusive() {
-        Ok(()) => {}
-        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
-            return Ok(Done::Locked)
-        }
-        Err(error) => return Err(MeetingError::Io(error)),
-    }
-
-    // Checked under the lock: a worker that finished just before us wrote
-    // its script before letting go.
-    let transcript_path = minutes.transcript_path(first);
-    let own_name = transcript_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let processed: HashSet<Uuid> = minutes
-        .processed_sessions()?
+async fn run_held<H, S, D, T>(
+    home: &H,
+    store: &S,
+    meeting: &MeetingPlan,
+    detector: &mut D,
+    stt: &T,
+    settings: &MinutesSettings,
+    options: &RunOptions,
+) -> Result<Done, MeetingError>
+where
+    H: MinutesHome,
+    S: RecordingStore,
+    D: SpeechDetector,
+    T: SpeechToText,
+{
+    // Checked while holding the meeting: a worker that finished just
+    // before us wrote its script before letting go.
+    let own = home.script_name(meeting);
+    let processed: HashSet<Uuid> = home
+        .processed_sessions(meeting)
+        .await?
         .into_iter()
-        .filter(|(_, file)| !(options.overwrite && *file == own_name))
+        .filter(|(_, script)| !(options.overwrite && *script == own))
         .map(|(session, _)| session)
         .collect();
     if let Some(skip) = meeting.skip_reason(&processed, options.now_unix_ms, options.quiet_ms) {
         return Ok(Done::Skipped(skip));
     }
 
-    let mut ledger = SttLedger::open(&minutes.ledger_path(first)).map_err(MeetingError::Ledger)?;
+    let mut ledger = home
+        .open_ledger(meeting)
+        .await
+        .map_err(MeetingError::Ledger)?;
+    let loaded = meeting.load(store).await?;
     let mut settings = settings.clone();
-    settings.audio_key = mixed_audio_key(&options.prefix, meeting);
+    settings.audio_key = mixed_audio_key(&options.prefix, &loaded);
     settings.now_unix_ms = options.now_unix_ms;
-    let mut output = build_minutes(meeting, detector, stt, &mut ledger, &settings).await?;
+    let mut output = build_minutes(&loaded, detector, stt, &mut ledger, &settings).await?;
 
     store
         .put(&settings.audio_key, std::mem::take(&mut output.mixed_audio))
         .await?;
     let json = serde_json::to_vec_pretty(&output.transcript).map_err(std::io::Error::other)?;
-    write_private(&transcript_path, &json)?;
-    drop(lock);
+    let script = home.write_script(meeting, json, options.overwrite).await?;
     Ok(Done::Written {
         output: Box::new(output),
-        transcript_path,
+        script,
     })
 }
 

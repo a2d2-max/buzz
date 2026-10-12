@@ -365,6 +365,85 @@ pub fn check(transcript: &Transcript, truth: &Truth, tolerance: Tolerance) -> Ch
     }
 }
 
+/// Character error rate of a script against the answer sheet.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CerReport {
+    /// Edits (insertions, deletions, substitutions) over all speakers.
+    pub edits: usize,
+    /// Characters of the answer sheet compared.
+    pub truth_chars: usize,
+    /// `edits / truth_chars`.
+    pub cer: f64,
+}
+
+/// CER per speaker, summed: each person's script lines in time order,
+/// joined, against that person's sentences in time order, joined. Spaces
+/// and punctuation are dropped and Latin letters lower-cased on both sides;
+/// "받아쓰기 실패" lines count as empty.
+pub fn cer(transcript: &Transcript, truth: &Truth) -> CerReport {
+    let normal = |text: &str| -> Vec<char> {
+        text.chars()
+            .filter(|c| {
+                !c.is_whitespace() && !c.is_ascii_punctuation() && !"…·「」『』“”‘’".contains(*c)
+            })
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let mut speakers: Vec<&str> = truth
+        .utterances
+        .iter()
+        .map(|u| u.speaker.as_str())
+        .collect();
+    speakers.extend(transcript.segments.iter().map(|s| s.speaker.as_str()));
+    speakers.sort_unstable();
+    speakers.dedup();
+    let (mut edits, mut truth_chars) = (0, 0);
+    for speaker in speakers {
+        let mut said: Vec<_> = truth
+            .utterances
+            .iter()
+            .filter(|u| u.speaker == speaker)
+            .collect();
+        said.sort_by_key(|u| u.start_ms);
+        let expected: Vec<char> = said.iter().flat_map(|u| normal(&u.text)).collect();
+        let mut lines: Vec<_> = transcript
+            .segments
+            .iter()
+            .filter(|s| s.speaker == speaker && s.text != FAILED_TEXT)
+            .collect();
+        lines.sort_by_key(|s| s.start_ms);
+        let heard: Vec<char> = lines.iter().flat_map(|s| normal(&s.text)).collect();
+        edits += edit_distance(&expected, &heard);
+        truth_chars += expected.len();
+    }
+    CerReport {
+        edits,
+        truth_chars,
+        cer: if truth_chars == 0 {
+            0.0
+        } else {
+            edits as f64 / truth_chars as f64
+        },
+    }
+}
+
+/// Levenshtein distance over characters.
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(x != y));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
 fn signed(a: u64, b: u64) -> i64 {
     i64::try_from(a).unwrap_or(i64::MAX) - i64::try_from(b).unwrap_or(i64::MAX)
 }
@@ -531,6 +610,19 @@ fn correlation(reference: &[f64], signal: &[f64], at: i64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_distance_counts_character_edits() {
+        let chars = |t: &str| t.chars().collect::<Vec<_>>();
+        assert_eq!(
+            edit_distance(&chars("회의를 시작"), &chars("회의를 시작")),
+            0
+        );
+        assert_eq!(edit_distance(&chars("회의를"), &chars("회이를")), 1);
+        assert_eq!(edit_distance(&chars("회의"), &chars("")), 2);
+        assert_eq!(edit_distance(&chars(""), &chars("네")), 1);
+        assert_eq!(edit_distance(&chars("kitten"), &chars("sitting")), 3);
+    }
     use crate::sim::{TruthUtterance, TRUTH_FORMAT};
     use crate::transcript::{AudioRef, Losses, Segment, SttInfo, TRANSCRIPT_FORMAT};
     use uuid::Uuid;

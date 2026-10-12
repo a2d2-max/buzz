@@ -9,7 +9,7 @@
 //! 1. [`collect`] gathers a huddle's sessions in `started_at` order.
 //! 2. [`tracks`] decodes each person's Opus onto one meeting clock.
 //! 3. [`vad`] finds speech and cuts it into pieces.
-//! 4. [`stt`] is where the transcriber plugs in.
+//! 4. [`stt`] is where the transcriber plugs in; [`chirp`] is Chirp 3.
 //! 5. [`transcript`] is the script format; [`pipeline`] runs 2–6.
 //! 6. [`audio`] mixes everyone into the playback file.
 //!
@@ -18,7 +18,9 @@
 
 pub mod audio;
 pub mod check;
+pub mod chirp;
 pub mod collect;
+pub mod gcs_minutes;
 pub mod ledger;
 pub mod media;
 pub mod models;

@@ -1,12 +1,14 @@
 //! Where recordings live. The worker sees an object store with `/`-separated
-//! keys, the same shape the relay writes (`docs/huddle-recording.md`). Only a
-//! local-folder implementation exists for now; GCS comes next.
+//! keys, the same shape the relay writes (`docs/huddle-recording.md`): a
+//! local folder ([`LocalStore`]) or a Cloud Storage bucket ([`GcsStore`]).
 
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use tokio::io::AsyncWriteExt;
+use buzz_gcp::gcs::{Gcs, GcsError, Write};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// One stored object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +37,16 @@ pub enum StoreError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// Cloud Storage refused or failed.
+    #[error("{op} {key}: {source}")]
+    Gcs {
+        /// What was being done.
+        op: &'static str,
+        /// The object key.
+        key: String,
+        /// The underlying error.
+        source: GcsError,
+    },
 }
 
 /// Object storage the worker reads recordings from and writes the mixed
@@ -47,6 +59,12 @@ pub trait RecordingStore {
     ) -> impl Future<Output = Result<Vec<ObjectInfo>, StoreError>> + Send;
     /// The bytes of one object.
     fn get(&self, key: &str) -> impl Future<Output = Result<Vec<u8>, StoreError>> + Send;
+    /// The first `len` bytes of one object (fewer when it is shorter).
+    fn get_start(
+        &self,
+        key: &str,
+        len: u64,
+    ) -> impl Future<Output = Result<Vec<u8>, StoreError>> + Send;
     /// Create or replace one object.
     fn put(&self, key: &str, bytes: Vec<u8>)
         -> impl Future<Output = Result<(), StoreError>> + Send;
@@ -147,6 +165,19 @@ impl RecordingStore for LocalStore {
             })
     }
 
+    async fn get_start(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
+        let path = self.path_of(key)?;
+        let wrap = |source| StoreError::Io {
+            op: "read",
+            key: key.to_string(),
+            source,
+        };
+        let file = tokio::fs::File::open(&path).await.map_err(wrap)?;
+        let mut bytes = Vec::new();
+        file.take(len).read_to_end(&mut bytes).await.map_err(wrap)?;
+        Ok(bytes)
+    }
+
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let path = self.path_of(key)?;
         let wrap = |source| StoreError::Io {
@@ -181,6 +212,91 @@ impl RecordingStore for LocalStore {
                 .map_err(wrap)?;
         }
         tokio::fs::rename(&partial, &path).await.map_err(wrap)
+    }
+}
+
+/// A Cloud Storage bucket. Keys are object names.
+#[derive(Debug, Clone)]
+pub struct GcsStore {
+    gcs: Arc<Gcs>,
+    bucket: String,
+}
+
+impl GcsStore {
+    /// Objects of `bucket` through `gcs`.
+    pub fn new(gcs: Arc<Gcs>, bucket: impl Into<String>) -> Self {
+        Self {
+            gcs,
+            bucket: bucket.into(),
+        }
+    }
+}
+
+fn gcs_error<'a>(op: &'static str, key: &'a str) -> impl FnOnce(GcsError) -> StoreError + 'a {
+    move |source| StoreError::Gcs {
+        op,
+        key: key.to_string(),
+        source,
+    }
+}
+
+/// Content type by file extension (the mixed audio is WAV).
+fn content_type(key: &str) -> &'static str {
+    match key.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("wav") => "audio/wav",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
+impl RecordingStore for GcsStore {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, StoreError> {
+        let mut out: Vec<ObjectInfo> = self
+            .gcs
+            .list(&self.bucket, prefix)
+            .await
+            .map_err(gcs_error("list", prefix))?
+            .into_iter()
+            .map(|object| ObjectInfo {
+                key: object.name,
+                size: object.size,
+                modified_unix_ms: object.updated_unix_ms,
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        let bytes = self
+            .gcs
+            .get(&self.bucket, key)
+            .await
+            .map_err(gcs_error("read", key))?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn get_start(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
+        let bytes = self
+            .gcs
+            .get_start(&self.bucket, key, len)
+            .await
+            .map_err(gcs_error("read", key))?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+        self.gcs
+            .put(
+                &self.bucket,
+                key,
+                bytes,
+                content_type(key),
+                Write::Overwrite,
+            )
+            .await
+            .map_err(gcs_error("write", key))?;
+        Ok(())
     }
 }
 

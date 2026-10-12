@@ -11,12 +11,17 @@ use std::path::{Path, PathBuf};
 use std::collections::{BTreeMap, HashMap};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use buzz_gcp::fake::FakeGcs;
+use buzz_gcp::gcs::Gcs;
+use buzz_gcp::token::{AccessToken, TokenSource, Tokens};
 use buzz_huddle_minutes::audio::read_wav_mono_i16;
-use buzz_huddle_minutes::check::{audio_match, check, check_mix, Tolerance};
-use buzz_huddle_minutes::collect::{collect_meetings, Meeting, Skip};
-use buzz_huddle_minutes::ledger::SttLedger;
+use buzz_huddle_minutes::check::{audio_match, cer, check, check_mix, Tolerance};
+use buzz_huddle_minutes::collect::{collect_meetings, plan_meetings, Meeting, MeetingPlan, Skip};
+use buzz_huddle_minutes::gcs_minutes::{GcsLedger, GcsMinutes, LEASE_FORMAT};
+use buzz_huddle_minutes::ledger::{Ledger, Outcome, SttLedger};
 use buzz_huddle_minutes::media::{level_dbov, split_frame, MediaHeader, FLAG_DTX};
 use buzz_huddle_minutes::models::silero_vad_path;
 use buzz_huddle_minutes::pipeline::{
@@ -176,6 +181,25 @@ async fn gather(dir: &Path, meeting: &FakeMeeting) -> Meeting {
     gathered
 }
 
+/// Write the fake meeting and plan it (nothing loaded yet): what the runner
+/// takes.
+async fn plan_fake(dir: &Path, meeting: &FakeMeeting) -> MeetingPlan {
+    write_fake_meeting(dir, meeting).expect("write fake meeting");
+    let truth = &meeting.truth;
+    let mut planned = plan_meetings(
+        &LocalStore::new(dir.join("recordings")),
+        &truth.prefix,
+        truth.community_id,
+        truth.channel_id,
+        10 * 60_000,
+    )
+    .await
+    .expect("plan")
+    .meetings;
+    assert_eq!(planned.len(), 1);
+    planned.remove(0)
+}
+
 fn speaker_wavs(meeting: &FakeMeeting) -> HashMap<String, Vec<f32>> {
     meeting
         .truth
@@ -216,6 +240,21 @@ async fn script_matches_the_answer_sheet() {
     );
 
     let report = check(&output.transcript, &meeting.truth, Tolerance::default());
+    // The answer-sheet transcriber hears every sentence once, word for word.
+    let rate = cer(&output.transcript, &meeting.truth);
+    assert_eq!((rate.edits, rate.cer), (0, 0.0), "{rate:?}");
+    assert!(rate.truth_chars > 0);
+    // One character heard wrong is one edit.
+    let mut misheard = output.transcript.clone();
+    let line = misheard
+        .segments
+        .iter_mut()
+        .find(|segment| !segment.text.is_empty())
+        .expect("a line with text");
+    line.text = std::iter::once('갑')
+        .chain(line.text.chars().skip(1))
+        .collect();
+    assert_eq!(cer(&misheard, &meeting.truth).edits, 1);
     assert!(report.pass, "{report:#?}");
     assert_eq!(report.sentences_found, SENTENCES);
 
@@ -1370,7 +1409,7 @@ async fn lock_child() {
         serde_json::from_slice(&std::fs::read(dir.join("truth.json")).expect("truth"))
             .expect("truth json");
     let store = LocalStore::new(dir.join("recordings"));
-    let meeting = collect_meetings(
+    let meeting = plan_meetings(
         &store,
         &truth.prefix,
         truth.community_id,
@@ -1378,7 +1417,7 @@ async fn lock_child() {
         10 * 60_000,
     )
     .await
-    .expect("collect")
+    .expect("plan")
     .meetings
     .remove(0);
     let truth_stt = TruthStt::new(&truth);
@@ -1482,8 +1521,8 @@ impl SpeechDetector for FailingDetector {
 async fn an_unopenable_ledger_fails_the_meeting_before_sending() {
     let meeting = fake_meeting(7);
     let dir = tempfile::tempdir().expect("tempdir");
-    let gathered = gather(dir.path(), &meeting).await;
-    let first = gathered.sessions[0].session_id;
+    let plan = plan_fake(dir.path(), &meeting).await;
+    let first = plan.first_session_id();
     let minutes = LocalMinutes::open(&dir.path().join("minutes")).expect("minutes folder");
     // A folder where the ledger file should be.
     std::fs::create_dir(minutes.ledger_path(first)).expect("folder");
@@ -1493,7 +1532,7 @@ async fn an_unopenable_ledger_fails_the_meeting_before_sending() {
     let result = run_meeting(
         &minutes,
         &store,
-        &gathered,
+        &plan,
         &mut EnergyDetector,
         &stt,
         &settings(),
@@ -1517,8 +1556,8 @@ async fn an_unopenable_ledger_fails_the_meeting_before_sending() {
 async fn only_finished_runs_count_and_torn_ledger_lines_are_reported() {
     let meeting = fake_meeting(7);
     let dir = tempfile::tempdir().expect("tempdir");
-    let gathered = gather(dir.path(), &meeting).await;
-    let first = gathered.sessions[0].session_id;
+    let plan = plan_fake(dir.path(), &meeting).await;
+    let first = plan.first_session_id();
     let minutes = LocalMinutes::open(&dir.path().join("minutes")).expect("minutes folder");
     let store = LocalStore::new(dir.path().join("recordings"));
     let options = run_options(&meeting.truth);
@@ -1530,7 +1569,7 @@ async fn only_finished_runs_count_and_torn_ledger_lines_are_reported() {
     let result = run_meeting(
         &minutes,
         &store,
-        &gathered,
+        &plan,
         &mut FailingDetector,
         &stt,
         &settings(),
@@ -1552,7 +1591,7 @@ async fn only_finished_runs_count_and_torn_ledger_lines_are_reported() {
     let result = run_meeting(
         &minutes,
         &store,
-        &gathered,
+        &plan,
         &mut EnergyDetector,
         &stt,
         &settings(),
@@ -1574,7 +1613,7 @@ async fn only_finished_runs_count_and_torn_ledger_lines_are_reported() {
     let done = run_meeting(
         &minutes,
         &store,
-        &gathered,
+        &plan,
         &mut EnergyDetector,
         &stt,
         &settings(),
@@ -1594,7 +1633,7 @@ async fn only_finished_runs_count_and_torn_ledger_lines_are_reported() {
     let done = run_meeting(
         &minutes,
         &store,
-        &gathered,
+        &plan,
         &mut EnergyDetector,
         &stt,
         &settings(),
@@ -1679,4 +1718,368 @@ async fn the_ledger_key_follows_recorded_frames_and_settings() {
         .await
         .expect("new settings");
     assert_eq!(stt.sent() - sent, pieces);
+}
+
+/// Test double wrapper: each request lets the runtime turn a few times
+/// before answering, and the most requests in flight at once is kept.
+struct InFlight<'a, T> {
+    inner: &'a T,
+    now: AtomicUsize,
+    most: AtomicUsize,
+}
+
+impl<T: SpeechToText + Sync> SpeechToText for InFlight<'_, T> {
+    fn info(&self) -> SttInfo {
+        self.inner.info()
+    }
+
+    async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
+        let now = self.now.fetch_add(1, Ordering::Relaxed) + 1;
+        self.most.fetch_max(now, Ordering::Relaxed);
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let output = self.inner.transcribe(request).await;
+        self.now.fetch_sub(1, Ordering::Relaxed);
+        output
+    }
+}
+
+/// Pieces go out four at a time (the policy's `concurrency`), and the
+/// script is the same as when they go one by one.
+#[tokio::test]
+async fn up_to_four_requests_are_in_flight_at_once() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gathered = gather(dir.path(), &meeting).await;
+    let mut scripts = Vec::new();
+    for concurrency in [4, 1] {
+        // A fresh answer sheet: it hands out each sentence once.
+        let truth_stt = TruthStt::new(&meeting.truth);
+        let stt = InFlight {
+            inner: &truth_stt,
+            now: AtomicUsize::new(0),
+            most: AtomicUsize::new(0),
+        };
+        let settings = MinutesSettings {
+            stt: SttPolicy {
+                concurrency,
+                ..settings().stt
+            },
+            ..settings()
+        };
+        let output = build_minutes(
+            &gathered,
+            &mut EnergyDetector,
+            &stt,
+            &mut SttLedger::in_memory(),
+            &settings,
+        )
+        .await
+        .expect("written");
+        assert_eq!(stt.most.load(Ordering::Relaxed), concurrency);
+        assert!(check(&output.transcript, &meeting.truth, Tolerance::default()).pass);
+        scripts.push(output.transcript.segments);
+    }
+    assert_eq!(scripts[0], scripts[1]);
+    assert_eq!(SttPolicy::default().concurrency, 4);
+}
+
+const MINUTES_BUCKET: &str = "minutes";
+
+/// The minutes bucket on a fake Cloud Storage, with holds timed by `clock`.
+async fn gcs_home(clock: fn() -> u64) -> (GcsMinutes, FakeGcs, Arc<Gcs>) {
+    let fake = FakeGcs::start(3_600).await;
+    fake.accept_token("t");
+    let tokens = Tokens::new(TokenSource::Static(AccessToken::new("t"))).expect("tokens");
+    let gcs = Arc::new(Gcs::with_base_url(tokens, fake.url()).expect("client"));
+    (
+        GcsMinutes::new(gcs.clone(), MINUTES_BUCKET).with_clock(clock),
+        fake,
+        gcs,
+    )
+}
+
+/// One hour after the fake meeting started (its runner options' now).
+fn an_hour_in() -> u64 {
+    BASE_UNIX_MS + 3_600_000
+}
+
+fn generations(fake: &FakeGcs) -> BTreeMap<String, u64> {
+    fake.objects(MINUTES_BUCKET)
+        .into_iter()
+        .map(|(name, stored)| (name, stored.generation))
+        .collect()
+}
+
+/// A meeting through the minutes bucket: the script under `transcripts/`,
+/// one piece object per piece, `runs/1` and `bundles/1.jsonl` at the end,
+/// the lease gone, no pubkey in any name. Run again (replacing the script):
+/// nothing is sent, everything comes from the bundle, and no object of the
+/// first run is written again.
+#[tokio::test]
+async fn a_meeting_goes_through_the_minutes_bucket() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plan = plan_fake(dir.path(), &meeting).await;
+    let store = LocalStore::new(dir.path().join("recordings"));
+    let (home, fake, _) = gcs_home(an_hour_in).await;
+    let truth_stt = TruthStt::new(&meeting.truth);
+    let stt = Counting::new(&truth_stt);
+    let options = run_options(&meeting.truth);
+    let done = run_meeting(
+        &home,
+        &store,
+        &plan,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &options,
+    )
+    .await
+    .expect("written");
+    let Done::Written { output, script } = done else {
+        panic!("{done:?}");
+    };
+    let pieces = output.transcript.segments.len();
+    assert_eq!(stt.sent(), pieces);
+    let ledger = GcsMinutes::ledger_prefix(&plan);
+    assert_eq!(
+        script,
+        format!("gs://{MINUTES_BUCKET}/{}", GcsMinutes::script_key(&plan))
+    );
+    let names: Vec<String> = fake.objects(MINUTES_BUCKET).into_keys().collect();
+    let count = |part: &str| {
+        names
+            .iter()
+            .filter(|name| name.starts_with(&format!("{ledger}{part}")))
+            .count()
+    };
+    assert_eq!(count("pieces/"), pieces);
+    assert_eq!(count("runs/"), 1);
+    assert_eq!(count("bundles/"), 1);
+    assert_eq!(count("lease"), 0, "the hold is let go");
+    assert!(names.contains(&GcsMinutes::script_key(&plan)));
+    for speaker in &meeting.truth.speakers {
+        assert!(
+            names.iter().all(|name| !name.contains(&speaker.pubkey)),
+            "a pubkey in an object name"
+        );
+    }
+
+    let first_run = generations(&fake);
+    let reads_before = fake.media_reads();
+    let stt = Counting::new(&truth_stt);
+    let again = run_meeting(
+        &home,
+        &store,
+        &plan,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &RunOptions {
+            overwrite: true,
+            ..options.clone()
+        },
+    )
+    .await
+    .expect("written again");
+    let Done::Written { output, .. } = again else {
+        panic!("{again:?}");
+    };
+    assert_eq!(stt.sent(), 0);
+    assert_eq!(output.report.stt_reused, pieces as u64);
+    assert_eq!(output.report.run, 2);
+    // The ledger came from the bundle (one read), not piece by piece; the
+    // other read is the script, checked for its sessions.
+    assert_eq!(fake.media_reads() - reads_before, 2);
+    let second_run = generations(&fake);
+    for (name, generation) in &first_run {
+        if name.starts_with(&ledger) {
+            assert_eq!(second_run.get(name), Some(generation), "{name} rewritten");
+        }
+    }
+
+    // Without replacing, the meeting is done.
+    let stt = Counting::new(&truth_stt);
+    let skipped = run_meeting(
+        &home,
+        &store,
+        &plan,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &options,
+    )
+    .await
+    .expect("skipped");
+    assert!(
+        matches!(skipped, Done::Skipped(Skip::AlreadyProcessed)),
+        "{skipped:?}"
+    );
+    assert_eq!(stt.sent(), 0);
+}
+
+fn lease(expires_at_unix_ms: u64) -> Vec<u8> {
+    serde_json::json!({
+        "format": LEASE_FORMAT,
+        "holder": Uuid::from_u128(99),
+        "expires_at": "-",
+        "expires_at_unix_ms": expires_at_unix_ms,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// A meeting another worker holds is left alone until its lease expires;
+/// then it is taken over, processed, and let go.
+#[tokio::test]
+async fn a_held_meeting_waits_for_its_lease_to_expire() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plan = plan_fake(dir.path(), &meeting).await;
+    let store = LocalStore::new(dir.path().join("recordings"));
+    let (home, fake, _) = gcs_home(an_hour_in).await;
+    let name = format!("{}lease", GcsMinutes::ledger_prefix(&plan));
+    let truth_stt = TruthStt::new(&meeting.truth);
+
+    let held = fake.insert(MINUTES_BUCKET, &name, lease(an_hour_in() + 1));
+    let stt = Counting::new(&truth_stt);
+    let done = run_meeting(
+        &home,
+        &store,
+        &plan,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &run_options(&meeting.truth),
+    )
+    .await
+    .expect("locked");
+    assert!(matches!(done, Done::Locked), "{done:?}");
+    assert_eq!(stt.sent(), 0);
+    assert_eq!(
+        fake.objects(MINUTES_BUCKET)[&name].generation,
+        held,
+        "someone else's lease left alone"
+    );
+
+    fake.insert(MINUTES_BUCKET, &name, lease(an_hour_in() - 1));
+    let done = run_meeting(
+        &home,
+        &store,
+        &plan,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &run_options(&meeting.truth),
+    )
+    .await
+    .expect("written");
+    assert!(matches!(done, Done::Written { .. }), "{done:?}");
+    assert!(!fake.objects(MINUTES_BUCKET).contains_key(&name));
+}
+
+/// With the ledger in the bucket: an auth stop keeps what was paid for and
+/// counts no run; a piece object that cannot be read is counted and that
+/// piece sent again; nothing in `ledger/` is overwritten, not even the
+/// unreadable object.
+#[tokio::test]
+async fn the_bucket_ledger_keeps_paid_pieces_and_counts_unreadable_ones() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plan = plan_fake(dir.path(), &meeting).await;
+    let store = LocalStore::new(dir.path().join("recordings"));
+    let (home, fake, gcs) = gcs_home(an_hour_in).await;
+    let prefix = GcsMinutes::ledger_prefix(&plan);
+    let refusing = TruthStt::new(&meeting.truth).with_fault(Fault {
+        last_piece: 3,
+        ..fault(SttErrorKind::Auth, 3, 1)
+    });
+    let stt = Counting::new(&refusing);
+    let result = run_meeting(
+        &home,
+        &store,
+        &plan,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &run_options(&meeting.truth),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(MeetingError::Minutes(MinutesError::SttStopped(
+                SttErrorKind::Auth
+            )))
+        ),
+        "{result:?}"
+    );
+    let paid: Vec<String> = fake
+        .objects(MINUTES_BUCKET)
+        .into_keys()
+        .filter(|name| name.starts_with(&format!("{prefix}pieces/")))
+        .collect();
+    assert_eq!(paid.len(), 2);
+    assert!(fake
+        .objects(MINUTES_BUCKET)
+        .keys()
+        .all(|name| !name.contains("/runs/") && !name.ends_with("lease")));
+
+    // One of the two paid pieces gets torn.
+    let torn = fake.insert(MINUTES_BUCKET, &paid[0], b"{\"kind\":\"do".to_vec());
+    let truth_stt = TruthStt::new(&meeting.truth);
+    let stt = Counting::new(&truth_stt);
+    let done = run_meeting(
+        &home,
+        &store,
+        &plan,
+        &mut EnergyDetector,
+        &stt,
+        &settings(),
+        &run_options(&meeting.truth),
+    )
+    .await
+    .expect("written");
+    let Done::Written { output, .. } = done else {
+        panic!("{done:?}");
+    };
+    let pieces = output.transcript.segments.len();
+    assert_eq!(output.report.run, 1, "the stopped run does not count");
+    assert_eq!(output.report.ledger_unreadable_lines, 1);
+    assert_eq!(output.report.stt_reused, 1);
+    assert_eq!(stt.sent(), pieces - 1);
+    assert_eq!(
+        fake.objects(MINUTES_BUCKET)[&paid[0]].generation,
+        torn,
+        "never overwritten"
+    );
+
+    // A piece written twice keeps its first answer.
+    let mut ledger = GcsLedger::open(gcs, MINUTES_BUCKET.into(), prefix.clone())
+        .await
+        .expect("open");
+    let name = format!("{prefix}pieces/{}", "f".repeat(64));
+    fake.insert(
+        MINUTES_BUCKET,
+        &name,
+        format!(
+            "{{\"kind\":\"done\",\"key\":\"{}\",\"text\":\"first\",\"billed_seconds\":1}}",
+            "f".repeat(64)
+        )
+        .into_bytes(),
+    );
+    let before = fake.objects(MINUTES_BUCKET)[&name].clone();
+    ledger
+        .record(
+            &"f".repeat(64),
+            Outcome::Done {
+                text: "second".into(),
+                billed_seconds: 1,
+            },
+        )
+        .await
+        .expect("record");
+    assert_eq!(fake.objects(MINUTES_BUCKET)[&name], before);
 }

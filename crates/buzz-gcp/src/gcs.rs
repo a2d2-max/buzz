@@ -26,7 +26,9 @@ pub enum GcsErrorKind {
     Permission,
     /// No such object or bucket (HTTP 404).
     NotFound,
-    /// A write only-if-absent found the object already there (HTTP 412).
+    /// A precondition failed (HTTP 412): a write only-if-absent found the
+    /// object already there, or a generation-matched delete found it
+    /// written again.
     AlreadyExists,
     /// A rate or quota limit (HTTP 429, or 403 with a rate or quota reason).
     Quota,
@@ -325,6 +327,22 @@ impl Gcs {
     /// Delete the one object called exactly `name`.
     pub async fn delete(&self, bucket: &str, name: &str) -> Result<(), GcsError> {
         let url = self.url(&["storage", "v1", "b", bucket, "o", name]);
+        success(self.send(|http| http.delete(url.clone())).await?).await?;
+        Ok(())
+    }
+
+    /// Delete the one object called exactly `name`, only while it is still
+    /// at `generation`; otherwise fail with [`GcsErrorKind::AlreadyExists`]
+    /// (HTTP 412: it was written again since).
+    pub async fn delete_if_generation(
+        &self,
+        bucket: &str,
+        name: &str,
+        generation: u64,
+    ) -> Result<(), GcsError> {
+        let mut url = self.url(&["storage", "v1", "b", bucket, "o", name]);
+        url.query_pairs_mut()
+            .append_pair("ifGenerationMatch", &generation.to_string());
         success(self.send(|http| http.delete(url.clone())).await?).await?;
         Ok(())
     }

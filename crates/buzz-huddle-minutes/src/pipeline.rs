@@ -9,8 +9,10 @@ use buzz_huddle_recording::format_utc_millis;
 
 use crate::audio::{resample, write_wav_mono_i16, Mixer};
 use crate::collect::Meeting;
-use crate::ledger::{piece_key, Outcome, SttLedger};
-use crate::stt::{SpeechToText, SttErrorKind, SttRequest, FAILED_TEXT};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+
+use crate::ledger::{piece_key, Ledger, Outcome};
+use crate::stt::{SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, FAILED_TEXT};
 use crate::tracks::{demux, DecodeStats, DemuxStats, REGION_GAP_MS, SAMPLE_RATE};
 use crate::transcript::{AudioRef, Participant, Segment, Transcript, TRANSCRIPT_FORMAT};
 use crate::vad::{
@@ -40,6 +42,8 @@ pub struct SttPolicy {
     /// the next run sends only those pieces again (finished ones come from
     /// the ledger); this run writes it with the failures marked.
     pub max_runs: u32,
+    /// Requests in flight at once.
+    pub concurrency: usize,
 }
 
 impl Default for SttPolicy {
@@ -49,6 +53,7 @@ impl Default for SttPolicy {
             retry_delay_ms: 500,
             rate_limit_delay_ms: 5_000,
             max_runs: 3,
+            concurrency: 4,
         }
     }
 }
@@ -175,16 +180,17 @@ pub struct MinutesOutput {
 /// Run steps 2–6 on a gathered meeting. `ledger` holds the meeting's
 /// earlier transcription outcomes (see [`crate::ledger`]); every outcome of
 /// this run is added to it as it happens, also when the run stops early.
-pub async fn build_minutes<D, T>(
+pub async fn build_minutes<D, T, L>(
     meeting: &Meeting,
     detector: &mut D,
     stt: &T,
-    ledger: &mut SttLedger,
+    ledger: &mut L,
     settings: &MinutesSettings,
 ) -> Result<MinutesOutput, MinutesError>
 where
     D: SpeechDetector,
     T: SpeechToText,
+    L: Ledger,
 {
     if meeting.sessions.is_empty() {
         return Err(MinutesError::Empty);
@@ -267,12 +273,19 @@ where
             )?;
             report.segments = pieces.len();
             // One piece = one request. The script gets the speech times; the
-            // transcriber gets the padded audio.
-            for piece in pieces {
+            // transcriber gets the padded audio. A piece already in the
+            // ledger is never sent (or paid for) again; the rest go out up to
+            // `concurrency` at a time, and each outcome goes into the ledger
+            // as soon as it comes back.
+            let mut texts: Vec<Option<String>> = vec![None; pieces.len()];
+            let mut times = Vec::with_capacity(pieces.len());
+            let mut jobs = Vec::new();
+            for (index, piece) in pieces.iter().enumerate() {
                 // Script times end with the meeting; a frame stamped past
                 // the end cannot stretch it.
                 let end_ms = (track_start_ms + samples_to_ms(piece.speech.end)).min(duration_ms);
                 let start_ms = (track_start_ms + samples_to_ms(piece.speech.start)).min(end_ms);
+                times.push((start_ms, end_ms));
                 let request = SttRequest {
                     speaker: &person.pubkey,
                     start_ms: track_start_ms + samples_to_ms(piece.audio.start),
@@ -288,87 +301,85 @@ where
                     request.end_ms,
                     &frame_digests[first..last],
                 );
-                // Finished on an earlier run: never sent (or paid for) again.
-                let known = ledger.outcome(&key).cloned();
-                let text = match known {
+                match ledger.outcome(&key) {
                     Some(Outcome::Done {
                         text,
                         billed_seconds,
                     }) => {
                         stt_reused += 1;
                         stt_info.billed_seconds += billed_seconds;
-                        text
+                        texts[index] = Some(text.clone());
                     }
                     Some(Outcome::Rejected { .. }) => {
                         stt_reused += 1;
                         report.stt_failures += 1;
                         *failures_by_kind.entry(SttErrorKind::Rejected).or_default() += 1;
-                        FAILED_TEXT.to_string()
+                        texts[index] = Some(FAILED_TEXT.to_string());
                     }
-                    None => {
-                        let mut retries_left = settings.stt.retries;
-                        let mut transient_wait = settings.stt.retry_delay_ms;
-                        let mut rate_limit_wait = settings.stt.rate_limit_delay_ms;
-                        loop {
-                            stt_requests += 1;
-                            match stt.transcribe(request).await {
-                                Ok(output) => {
-                                    stt_info.billed_seconds += output.billed_seconds;
-                                    ledger.record(
-                                        &key,
-                                        Outcome::Done {
-                                            text: output.text.clone(),
-                                            billed_seconds: output.billed_seconds,
-                                        },
-                                    )?;
-                                    break output.text;
-                                }
-                                Err(error) => match error.kind {
-                                    SttErrorKind::Auth | SttErrorKind::Quota => {
-                                        return Err(MinutesError::SttStopped(error.kind));
-                                    }
-                                    SttErrorKind::Rejected => {
-                                        ledger
-                                            .record(&key, Outcome::Rejected { code: error.code })?;
-                                        report.stt_failures += 1;
-                                        *failures_by_kind
-                                            .entry(SttErrorKind::Rejected)
-                                            .or_default() += 1;
-                                        break FAILED_TEXT.to_string();
-                                    }
-                                    kind if retries_left > 0 => {
-                                        retries_left -= 1;
-                                        stt_retries += 1;
-                                        let wait = if kind == SttErrorKind::RateLimited {
-                                            &mut rate_limit_wait
-                                        } else {
-                                            &mut transient_wait
-                                        };
-                                        if *wait > 0 {
-                                            tokio::time::sleep(std::time::Duration::from_millis(
-                                                *wait,
-                                            ))
-                                            .await;
-                                        }
-                                        *wait = wait.saturating_mul(2);
-                                    }
-                                    kind => {
-                                        // Not recorded: the next run sends it again.
-                                        transient_failed += 1;
-                                        report.stt_failures += 1;
-                                        *failures_by_kind.entry(kind).or_default() += 1;
-                                        break FAILED_TEXT.to_string();
-                                    }
-                                },
-                            }
-                        }
-                    }
+                    None => jobs.push((index, key, request)),
+                }
+            }
+            let mut jobs = jobs.into_iter();
+            let mut in_flight = FuturesUnordered::new();
+            loop {
+                while in_flight.len() < settings.stt.concurrency.max(1) {
+                    let Some((index, key, request)) = jobs.next() else {
+                        break;
+                    };
+                    let policy = &settings.stt;
+                    in_flight
+                        .push(async move { (index, key, send_piece(stt, request, policy).await) });
+                }
+                let Some((index, key, sent)) = in_flight.next().await else {
+                    break;
                 };
+                stt_requests += sent.requests;
+                stt_retries += sent.retries;
+                let text = match sent.result {
+                    Ok(output) => {
+                        stt_info.billed_seconds += output.billed_seconds;
+                        ledger
+                            .record(
+                                &key,
+                                Outcome::Done {
+                                    text: output.text.clone(),
+                                    billed_seconds: output.billed_seconds,
+                                },
+                            )
+                            .await?;
+                        output.text
+                    }
+                    Err(error) => match error.kind {
+                        SttErrorKind::Auth | SttErrorKind::Quota => {
+                            // Nothing more goes out; requests not answered
+                            // yet are dropped.
+                            return Err(MinutesError::SttStopped(error.kind));
+                        }
+                        SttErrorKind::Rejected => {
+                            ledger
+                                .record(&key, Outcome::Rejected { code: error.code })
+                                .await?;
+                            report.stt_failures += 1;
+                            *failures_by_kind.entry(SttErrorKind::Rejected).or_default() += 1;
+                            FAILED_TEXT.to_string()
+                        }
+                        kind => {
+                            // Not recorded: the next run sends it again.
+                            transient_failed += 1;
+                            report.stt_failures += 1;
+                            *failures_by_kind.entry(kind).or_default() += 1;
+                            FAILED_TEXT.to_string()
+                        }
+                    },
+                };
+                texts[index] = Some(text);
+            }
+            for ((start_ms, end_ms), text) in times.into_iter().zip(texts) {
                 segments.push(Segment {
                     start_ms,
                     end_ms,
                     speaker: person.pubkey.clone(),
-                    text,
+                    text: text.unwrap_or_else(|| FAILED_TEXT.to_string()),
                 });
             }
         }
@@ -380,7 +391,7 @@ where
     }
     segments.sort_by(|a, b| (a.start_ms, &a.speaker).cmp(&(b.start_ms, &b.speaker)));
 
-    ledger.finish_run(run)?;
+    ledger.finish_run(run).await?;
     // Refused pieces never hold a meeting back. Transient ones do, until
     // the meeting's last run.
     if transient_failed > 0 && run < settings.stt.max_runs {
@@ -435,6 +446,51 @@ where
             stt_failures_by_kind: failures_by_kind.into_iter().collect(),
         },
     })
+}
+
+/// One piece's requests: the first attempt, then retries after transient
+/// failures and rate limits, waiting longer each time.
+struct Sent {
+    result: Result<SttOutput, SttError>,
+    requests: u64,
+    retries: u64,
+}
+
+async fn send_piece<T: SpeechToText>(stt: &T, request: SttRequest<'_>, policy: &SttPolicy) -> Sent {
+    let mut retries_left = policy.retries;
+    let mut transient_wait = policy.retry_delay_ms;
+    let mut rate_limit_wait = policy.rate_limit_delay_ms;
+    let (mut requests, mut retries) = (0, 0);
+    loop {
+        requests += 1;
+        match stt.transcribe(request).await {
+            Err(error)
+                if matches!(
+                    error.kind,
+                    SttErrorKind::Transient | SttErrorKind::RateLimited
+                ) && retries_left > 0 =>
+            {
+                retries_left -= 1;
+                retries += 1;
+                let wait = if error.kind == SttErrorKind::RateLimited {
+                    &mut rate_limit_wait
+                } else {
+                    &mut transient_wait
+                };
+                if *wait > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(*wait)).await;
+                }
+                *wait = wait.saturating_mul(2);
+            }
+            result => {
+                return Sent {
+                    result,
+                    requests,
+                    retries,
+                }
+            }
+        }
+    }
 }
 
 fn ms_to_samples(ms: u64) -> usize {

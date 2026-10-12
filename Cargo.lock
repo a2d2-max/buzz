@@ -1200,6 +1200,7 @@ name = "buzz-gcp"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "buzz-gcp",
  "bytes",
  "chrono",
  "reqwest 0.13.4",
@@ -1216,10 +1217,14 @@ name = "buzz-huddle-minutes"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "buzz-gcp",
  "buzz-huddle-recording",
  "chrono",
  "clap",
  "fs2",
+ "futures-util",
  "hex",
  "opus",
  "reqwest 0.13.4",

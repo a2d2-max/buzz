@@ -1,260 +1,24 @@
-//! The client against a fake Cloud Storage and metadata server on
-//! 127.0.0.1 (no network). The fake routes on the encoded path, so an
-//! object name whose `/` is not sent as `%2F` is not found.
+//! The client against the fake Cloud Storage and metadata server of
+//! `buzz_gcp::fake` (127.0.0.1, no network).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-
-use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use buzz_gcp::fake::FakeGcs;
 use buzz_gcp::gcs::{Gcs, GcsErrorKind, ObjectInfo, Write};
 use buzz_gcp::token::{AccessToken, TokenError, TokenSource, Tokens};
 use serde_json::json;
 
 const BUCKET: &str = "bucket";
-const PAGE: usize = 2;
-
-/// One stored object: bytes, generation, content type.
-type Stored = (Vec<u8>, u64, String);
-
-#[derive(Default)]
-struct Fake {
-    objects: Mutex<BTreeMap<String, Stored>>,
-    generations: AtomicU64,
-    /// Metadata tokens handed out so far.
-    issued: AtomicUsize,
-    /// `expires_in` of the next metadata token, s.
-    expires_in: AtomicU64,
-    /// The only token storage accepts.
-    valid: Mutex<String>,
-    /// Answer this many storage calls with 401.
-    refuse: AtomicUsize,
-    /// Answers to give storage calls before anything else.
-    fail: Mutex<VecDeque<(u16, serde_json::Value)>>,
-    storage_calls: AtomicUsize,
-    list_calls: AtomicUsize,
-}
-
-impl Fake {
-    /// The 401 / injected answer for a storage call, if any.
-    fn gate(&self, headers: &HeaderMap) -> Option<Response> {
-        self.storage_calls.fetch_add(1, Ordering::Relaxed);
-        if let Some((status, body)) = self.fail.lock().expect("lock").pop_front() {
-            let status = StatusCode::from_u16(status).expect("status");
-            return Some((status, Json(body)).into_response());
-        }
-        let expected = format!("Bearer {}", self.valid.lock().expect("lock"));
-        let given = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
-        let refused = self
-            .refuse
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok();
-        if refused || given != Some(expected.as_str()) {
-            return Some(
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": {"code": 401, "message": "Invalid Credentials"}})),
-                )
-                    .into_response(),
-            );
-        }
-        None
-    }
-}
-
-fn resource(name: &str, stored: &Stored) -> serde_json::Value {
-    json!({
-        "bucket": BUCKET,
-        "name": name,
-        "size": stored.0.len().to_string(),
-        "generation": stored.1.to_string(),
-        "contentType": stored.2,
-        "updated": "2026-10-12T05:00:00.123Z",
-    })
-}
-
-fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": {"code": 404, "message": "No such object"}})),
-    )
-        .into_response()
-}
-
-async fn metadata_token(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
-    if headers.get("metadata-flavor").map(|v| v.as_bytes()) != Some(b"Google") {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let n = fake.issued.fetch_add(1, Ordering::Relaxed) + 1;
-    let token = format!("tok-{n}");
-    fake.valid.lock().expect("lock").clone_from(&token);
-    Json(json!({
-        "access_token": token,
-        "expires_in": fake.expires_in.load(Ordering::Relaxed),
-        "token_type": "Bearer",
-    }))
-    .into_response()
-}
-
-async fn list(
-    State(fake): State<Arc<Fake>>,
-    Path(bucket): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(answer) = fake.gate(&headers) {
-        return answer;
-    }
-    assert_eq!(bucket, BUCKET);
-    fake.list_calls.fetch_add(1, Ordering::Relaxed);
-    let prefix = query.get("prefix").cloned().unwrap_or_default();
-    let start: usize = query
-        .get("pageToken")
-        .map_or(0, |t| t.parse().expect("page"));
-    let objects = fake.objects.lock().expect("lock");
-    let matching: Vec<_> = objects
-        .iter()
-        .filter(|(name, _)| name.starts_with(&prefix))
-        .collect();
-    let items: Vec<_> = matching
-        .iter()
-        .skip(start)
-        .take(PAGE)
-        .map(|(name, stored)| resource(name, stored))
-        .collect();
-    let mut body = json!({ "kind": "storage#objects" });
-    if !items.is_empty() {
-        body["items"] = json!(items);
-    }
-    if start + PAGE < matching.len() {
-        body["nextPageToken"] = json!((start + PAGE).to_string());
-    }
-    Json(body).into_response()
-}
-
-async fn read(
-    State(fake): State<Arc<Fake>>,
-    Path((bucket, name)): Path<(String, String)>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(answer) = fake.gate(&headers) {
-        return answer;
-    }
-    assert_eq!(bucket, BUCKET);
-    let objects = fake.objects.lock().expect("lock");
-    let Some(stored) = objects.get(&name) else {
-        return not_found();
-    };
-    if query.get("alt").map(String::as_str) != Some("media") {
-        return Json(resource(&name, stored)).into_response();
-    }
-    let Some(range) = headers.get("range") else {
-        return stored.0.clone().into_response();
-    };
-    let last: usize = range
-        .to_str()
-        .expect("range")
-        .strip_prefix("bytes=0-")
-        .expect("range from 0")
-        .parse()
-        .expect("range end");
-    if stored.0.is_empty() {
-        return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
-    }
-    let end = (last + 1).min(stored.0.len());
-    (StatusCode::PARTIAL_CONTENT, stored.0[..end].to_vec()).into_response()
-}
-
-async fn delete(
-    State(fake): State<Arc<Fake>>,
-    Path((bucket, name)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(answer) = fake.gate(&headers) {
-        return answer;
-    }
-    assert_eq!(bucket, BUCKET);
-    match fake.objects.lock().expect("lock").remove(&name) {
-        Some(_) => StatusCode::NO_CONTENT.into_response(),
-        None => not_found(),
-    }
-}
-
-async fn upload(
-    State(fake): State<Arc<Fake>>,
-    Path(bucket): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if let Some(answer) = fake.gate(&headers) {
-        return answer;
-    }
-    assert_eq!(bucket, BUCKET);
-    assert_eq!(query.get("uploadType").map(String::as_str), Some("media"));
-    let name = query.get("name").expect("name").clone();
-    let mut objects = fake.objects.lock().expect("lock");
-    if query.get("ifGenerationMatch").map(String::as_str) == Some("0")
-        && objects.contains_key(&name)
-    {
-        return (
-            StatusCode::PRECONDITION_FAILED,
-            Json(json!({"error": {"code": 412, "message": "At least one of the pre-conditions you specified did not hold."}})),
-        )
-            .into_response();
-    }
-    let generation = fake.generations.fetch_add(1, Ordering::Relaxed) + 1;
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let stored = (body.to_vec(), generation, content_type);
-    let answer = resource(&name, &stored);
-    objects.insert(name, stored);
-    Json(answer).into_response()
-}
-
-/// Start the fake; returns its base URL.
-async fn start(fake: Arc<Fake>) -> String {
-    let app = Router::new()
-        .route(
-            "/computeMetadata/v1/instance/service-accounts/default/token",
-            get(metadata_token),
-        )
-        .route("/storage/v1/b/{bucket}/o", get(list))
-        .route("/storage/v1/b/{bucket}/o/{name}", get(read).delete(delete))
-        .route(
-            "/upload/storage/v1/b/{bucket}/o",
-            axum::routing::post(upload),
-        )
-        .with_state(fake);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let address = listener.local_addr().expect("address");
-    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-    format!("http://{address}")
-}
 
 /// A fake with tokens from its metadata server lasting `expires_in` s.
-async fn client(expires_in: u64) -> (Gcs, Arc<Fake>) {
-    let fake = Arc::new(Fake::default());
-    fake.expires_in.store(expires_in, Ordering::Relaxed);
-    let url = start(fake.clone()).await;
+async fn client(expires_in: u64) -> (Gcs, FakeGcs) {
+    let fake = FakeGcs::start(expires_in).await;
     let tokens = Tokens::new(TokenSource::MetadataServer {
-        base_url: url.clone(),
+        base_url: fake.url().to_string(),
     })
     .expect("tokens");
-    (Gcs::with_base_url(tokens, &url).expect("client"), fake)
+    (
+        Gcs::with_base_url(tokens, fake.url()).expect("client"),
+        fake,
+    )
 }
 
 fn kind<T: std::fmt::Debug>(
@@ -282,7 +46,7 @@ async fn objects_round_trip() {
     assert_eq!(first.size, 11);
     assert_eq!(first.updated_unix_ms, 1_791_781_200_123);
     assert_eq!(
-        fake.objects.lock().expect("lock")[name].2,
+        fake.objects(BUCKET)[name].content_type,
         "text/plain",
         "content type sent"
     );
@@ -295,17 +59,13 @@ async fn objects_round_trip() {
         gcs.get_start(BUCKET, name, 100).await.expect("start"),
         "hello world"
     );
-    let calls = fake.storage_calls.load(Ordering::Relaxed);
+    let calls = fake.storage_calls();
     assert!(gcs
         .get_start(BUCKET, name, 0)
         .await
         .expect("start")
         .is_empty());
-    assert_eq!(
-        fake.storage_calls.load(Ordering::Relaxed),
-        calls,
-        "no call for 0 bytes"
-    );
+    assert_eq!(fake.storage_calls(), calls, "no call for 0 bytes");
 
     // Writing only-if-absent over an existing object: 412, left alone.
     assert_eq!(
@@ -365,13 +125,9 @@ async fn objects_round_trip() {
         .expect("start")
         .is_empty());
 
-    let before = fake.list_calls.load(Ordering::Relaxed);
+    let before = fake.list_calls();
     let listed = gcs.list(BUCKET, "test/").await.expect("list");
-    assert_eq!(
-        fake.list_calls.load(Ordering::Relaxed) - before,
-        3,
-        "3 pages"
-    );
+    assert_eq!(fake.list_calls() - before, 3, "3 pages");
     let names: Vec<_> = listed.iter().map(|o| o.name.as_str()).collect();
     assert_eq!(names, ["test/0", "test/1", "test/2", "test/3", name]);
     let a: &ObjectInfo = &listed[4];
@@ -414,7 +170,7 @@ async fn failures_are_sorted_into_kinds() {
         (reason(412, "conditionNotMet"), GcsErrorKind::AlreadyExists),
     ];
     for ((status, body), expected) in cases {
-        fake.fail.lock().expect("lock").push_back((status, body));
+        fake.fail_next(status, body);
         assert_eq!(
             kind(gcs.get(BUCKET, "x").await),
             (expected, Some(status)),
@@ -423,7 +179,7 @@ async fn failures_are_sorted_into_kinds() {
     }
 
     // Refused twice (the retry with a new token too): an auth failure.
-    fake.refuse.store(2, Ordering::Relaxed);
+    fake.refuse_next(2);
     assert_eq!(
         kind(gcs.get(BUCKET, "x").await),
         (GcsErrorKind::Auth, Some(401))
@@ -462,32 +218,32 @@ async fn tokens_are_kept_until_five_minutes_before_expiry() {
     for _ in 0..3 {
         gcs.list(BUCKET, "").await.expect("list");
     }
-    assert_eq!(fake.issued.load(Ordering::Relaxed), 1);
+    assert_eq!(fake.tokens_issued(), 1);
 
     // A token with less than five minutes left is replaced before use.
     let (gcs, fake) = client(299).await;
     for _ in 0..3 {
         gcs.list(BUCKET, "").await.expect("list");
     }
-    assert_eq!(fake.issued.load(Ordering::Relaxed), 3);
+    assert_eq!(fake.tokens_issued(), 3);
 }
 
 #[tokio::test]
 async fn a_refused_token_is_replaced_once() {
     let (gcs, fake) = client(3_600).await;
     gcs.list(BUCKET, "").await.expect("first token");
-    fake.refuse.store(1, Ordering::Relaxed);
-    let before = fake.storage_calls.load(Ordering::Relaxed);
+    fake.refuse_next(1);
+    let before = fake.storage_calls();
     gcs.list(BUCKET, "").await.expect("second token");
-    assert_eq!(fake.storage_calls.load(Ordering::Relaxed) - before, 2);
-    assert_eq!(fake.issued.load(Ordering::Relaxed), 2);
+    assert_eq!(fake.storage_calls() - before, 2);
+    assert_eq!(fake.tokens_issued(), 2);
 }
 
 #[tokio::test]
 async fn tokens_never_show_in_errors_or_debug_output() {
     const SECRET: &str = "ya29.very-secret-token";
-    let fake = Arc::new(Fake::default());
-    let url = start(fake.clone()).await;
+    let fake = FakeGcs::start(3_600).await;
+    let url = fake.url().to_string();
     let tokens = Tokens::new(TokenSource::Static(AccessToken::new(SECRET))).expect("tokens");
     assert_eq!(tokens.token().await.expect("token").secret(), SECRET);
     assert_eq!(
@@ -496,7 +252,7 @@ async fn tokens_never_show_in_errors_or_debug_output() {
     );
     let gcs = Gcs::with_base_url(tokens, &url).expect("client");
     // The fake accepts another token: every call is refused.
-    fake.valid.lock().expect("lock").push_str("something-else");
+    fake.accept_token("something-else");
     let error = gcs.get(BUCKET, "x").await.expect_err("refused");
     assert_eq!(error.kind, GcsErrorKind::Auth);
     for text in [format!("{error}"), format!("{error:?}"), format!("{gcs:?}")] {
@@ -542,4 +298,43 @@ async fn gcloud_tokens_are_read_and_kept_for_a_while() {
         Err(TokenError::Gcloud(message)) => assert!(message.contains("no active account")),
         other => panic!("{other:?}"),
     }
+}
+
+/// A generation-matched delete removes the object only while nobody wrote
+/// it again.
+#[tokio::test]
+async fn a_generation_matched_delete_leaves_a_newer_object() {
+    let (gcs, fake) = client(3_600).await;
+    let old = gcs
+        .put(
+            BUCKET,
+            "lease",
+            b"a".to_vec(),
+            "application/json",
+            Write::IfAbsent,
+        )
+        .await
+        .expect("put");
+    let new = gcs
+        .put(
+            BUCKET,
+            "lease",
+            b"b".to_vec(),
+            "application/json",
+            Write::Overwrite,
+        )
+        .await
+        .expect("put");
+    assert_eq!(
+        kind(
+            gcs.delete_if_generation(BUCKET, "lease", old.generation)
+                .await
+        ),
+        (GcsErrorKind::AlreadyExists, Some(412))
+    );
+    assert_eq!(gcs.get(BUCKET, "lease").await.expect("still there"), "b");
+    gcs.delete_if_generation(BUCKET, "lease", new.generation)
+        .await
+        .expect("delete");
+    assert!(fake.objects(BUCKET).is_empty());
 }

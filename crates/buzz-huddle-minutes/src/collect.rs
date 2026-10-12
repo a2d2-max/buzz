@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use buzz_huddle_recording::{decode_chunk, ChunkHeader, Manifest, FORMAT};
+use buzz_huddle_recording::{decode_chunk, ChunkHeader, Manifest, CHUNK_HEADER_LEN, FORMAT};
 use uuid::Uuid;
 
 use crate::store::{RecordingStore, StoreError};
@@ -105,7 +105,7 @@ impl Meeting {
     /// roster-only keepalive chunk), so `quiet_ms` (10 min) with no new object
     /// means the room is empty or its pod died, not that everyone is muted.
     pub fn is_quiet(&self, now_unix_ms: u64, quiet_ms: u64) -> bool {
-        now_unix_ms.saturating_sub(self.last_modified_unix_ms()) >= quiet_ms
+        is_quiet(self.last_modified_unix_ms(), now_unix_ms, quiet_ms)
     }
 
     /// Why this meeting should be left alone this run, if it should.
@@ -120,19 +120,14 @@ impl Meeting {
         now_unix_ms: u64,
         quiet_ms: u64,
     ) -> Option<Skip> {
-        if self
-            .sessions
-            .iter()
-            .any(|session| processed.contains(&session.session_id))
-        {
-            Some(Skip::AlreadyProcessed)
-        } else if now_unix_ms.saturating_sub(self.started_at_unix_ms()) > MAX_MEETING_AGE_MS {
-            Some(Skip::TooOld)
-        } else if !self.is_quiet(now_unix_ms, quiet_ms) {
-            Some(Skip::MaybeLive)
-        } else {
-            None
-        }
+        skip_reason(
+            self.sessions.iter().map(|session| session.session_id),
+            self.started_at_unix_ms(),
+            self.last_modified_unix_ms(),
+            processed,
+            now_unix_ms,
+            quiet_ms,
+        )
     }
 
     /// Everything known to be missing, over all sessions.
@@ -194,29 +189,181 @@ pub struct Collected {
     pub unplaced_sessions: Vec<Uuid>,
 }
 
-#[derive(Default)]
+/// The quiet-time rule shared by [`Meeting`] and [`MeetingPlan`].
+fn is_quiet(last_modified_unix_ms: u64, now_unix_ms: u64, quiet_ms: u64) -> bool {
+    now_unix_ms.saturating_sub(last_modified_unix_ms) >= quiet_ms
+}
+
+/// The skip rules shared by [`Meeting`] and [`MeetingPlan`].
+fn skip_reason(
+    mut session_ids: impl Iterator<Item = Uuid>,
+    started_at_unix_ms: u64,
+    last_modified_unix_ms: u64,
+    processed: &HashSet<Uuid>,
+    now_unix_ms: u64,
+    quiet_ms: u64,
+) -> Option<Skip> {
+    if session_ids.any(|session| processed.contains(&session)) {
+        Some(Skip::AlreadyProcessed)
+    } else if now_unix_ms.saturating_sub(started_at_unix_ms) > MAX_MEETING_AGE_MS {
+        Some(Skip::TooOld)
+    } else if !is_quiet(last_modified_unix_ms, now_unix_ms, quiet_ms) {
+        Some(Skip::MaybeLive)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct SessionObjects {
     chunk_keys: BTreeMap<u32, String>,
     manifest_key: Option<String>,
     last_modified_unix_ms: u64,
 }
 
-/// Load every session stored under `{prefix}/{community_id}/{channel_id}/`
-/// and group them into meetings: a session that starts more than `gap_ms`
+/// One session as seen from the listing, its manifest or the start of its
+/// chunks — no chunk bodies.
+#[derive(Debug, Clone)]
+pub struct SessionHead {
+    /// Session id (the folder name).
+    pub session_id: Uuid,
+    /// Wall-clock session start, UTC ms.
+    pub started_at_unix_ms: u64,
+    /// Session end, UTC ms: the manifest's, or for a chunk-only session
+    /// the latest record time found in the first bytes of its last
+    /// readable chunk — up to one chunk short of the real end, which is
+    /// fine for splitting meetings by a 10-minute gap.
+    pub ended_at_unix_ms: u64,
+    /// Newest write time among this session's objects, UTC ms.
+    pub last_modified_unix_ms: u64,
+    manifest: Option<Manifest>,
+    unreadable_manifest: bool,
+    objects: SessionObjects,
+}
+
+/// A meeting found by [`plan_meetings`]: which sessions, nothing loaded
+/// yet. [`load`](Self::load) fetches its chunks.
+#[derive(Debug, Clone)]
+pub struct MeetingPlan {
+    /// Community id from the storage path.
+    pub community_id: Uuid,
+    /// Huddle channel id.
+    pub channel_id: Uuid,
+    /// Sessions, earliest first.
+    pub sessions: Vec<SessionHead>,
+    /// Sessions of this meeting with nothing readable, placed here by
+    /// their write time.
+    pub unreadable_sessions: Vec<Uuid>,
+    /// Sessions of the same channel with nothing readable that no meeting's
+    /// time covers (the same list on every meeting of the channel).
+    pub unplaced_in_channel: Vec<Uuid>,
+}
+
+impl MeetingPlan {
+    /// Meeting start (first session start), UTC ms.
+    pub fn started_at_unix_ms(&self) -> u64 {
+        self.sessions
+            .first()
+            .map_or(0, |session| session.started_at_unix_ms)
+    }
+
+    /// The first session's id; names the meeting's script and ledger.
+    pub fn first_session_id(&self) -> Uuid {
+        self.sessions
+            .first()
+            .map(|session| session.session_id)
+            .unwrap_or_default()
+    }
+
+    fn ended_at_unix_ms(&self) -> u64 {
+        self.sessions
+            .iter()
+            .map(|session| session.ended_at_unix_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Newest object write time in the meeting, UTC ms.
+    pub fn last_modified_unix_ms(&self) -> u64 {
+        self.sessions
+            .iter()
+            .map(|session| session.last_modified_unix_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// See [`Meeting::skip_reason`]; needs nothing loaded.
+    pub fn skip_reason(
+        &self,
+        processed: &HashSet<Uuid>,
+        now_unix_ms: u64,
+        quiet_ms: u64,
+    ) -> Option<Skip> {
+        skip_reason(
+            self.sessions.iter().map(|session| session.session_id),
+            self.started_at_unix_ms(),
+            self.last_modified_unix_ms(),
+            processed,
+            now_unix_ms,
+            quiet_ms,
+        )
+    }
+
+    /// Fetch this meeting's chunks (and nothing of other meetings).
+    pub async fn load<S: RecordingStore>(&self, store: &S) -> Result<Meeting, CollectError> {
+        let mut meeting = Meeting {
+            community_id: self.community_id,
+            channel_id: self.channel_id,
+            parent_channel_id: None,
+            sessions: Vec::with_capacity(self.sessions.len()),
+            unreadable_sessions: self.unreadable_sessions.clone(),
+            unplaced_in_channel: self.unplaced_in_channel.clone(),
+        };
+        for head in &self.sessions {
+            match load_session(store, head).await? {
+                Some(session) => {
+                    if meeting.parent_channel_id.is_none() {
+                        meeting.parent_channel_id =
+                            session.manifest.as_ref().and_then(|m| m.parent_channel_id);
+                    }
+                    meeting.sessions.push(session);
+                }
+                // Readable a moment ago, not now (deleted in between).
+                None => meeting.unreadable_sessions.push(head.session_id),
+            }
+        }
+        Ok(meeting)
+    }
+}
+
+/// Every meeting under one huddle channel, nothing loaded yet.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    /// Meetings, earliest first.
+    pub meetings: Vec<MeetingPlan>,
+    /// Sessions with nothing readable that no meeting's time covers.
+    pub unplaced_sessions: Vec<Uuid>,
+}
+
+/// Bytes read from the start of a chunk-only session's last chunk to find
+/// when that chunk was opened (its first records).
+const LAST_CHUNK_HEAD_BYTES: u64 = 4_096;
+
+/// Find the sessions stored under `{prefix}/{community_id}/{channel_id}/`
+/// and group them into meetings, reading only the listing, manifests and
+/// the first bytes of chunks: a session that starts more than `gap_ms`
 /// after everything before it has ended begins a new meeting (the design's
 /// 10-minute rule; one channel can hold many meetings within the bucket's 15
 /// days). Folders that are not session UUIDs and files that are neither
 /// chunks nor a manifest are ignored (the mixed audio lives beside the
-/// sessions). Nothing broken is fatal: an unreadable chunk is skipped, an
-/// unreadable manifest leaves a chunk-only session, a session with nothing
-/// readable is placed by its write time — all counted in [`Losses`].
-pub async fn collect_meetings<S: RecordingStore>(
+/// sessions). A session with nothing readable is placed by its write time.
+pub async fn plan_meetings<S: RecordingStore>(
     store: &S,
     prefix: &str,
     community_id: Uuid,
     channel_id: Uuid,
     gap_ms: u64,
-) -> Result<Collected, CollectError> {
+) -> Result<Planned, CollectError> {
     let base = format!("{prefix}/{community_id}/{channel_id}/");
     let mut by_session: BTreeMap<Uuid, SessionObjects> = BTreeMap::new();
     for object in store.list(&base).await? {
@@ -241,38 +388,34 @@ pub async fn collect_meetings<S: RecordingStore>(
         return Err(CollectError::NoSessions(base));
     }
 
-    let mut sessions = Vec::with_capacity(by_session.len());
+    let mut heads = Vec::with_capacity(by_session.len());
     let mut unreadable: Vec<(Uuid, u64)> = Vec::new();
     for (session_id, objects) in by_session {
-        match load_session(store, session_id, &objects).await? {
-            Some(session) => sessions.push(session),
-            None => unreadable.push((session_id, objects.last_modified_unix_ms)),
+        let written = objects.last_modified_unix_ms;
+        match head_session(store, session_id, objects).await? {
+            Some(head) => heads.push(head),
+            None => unreadable.push((session_id, written)),
         }
     }
-    sessions.sort_by_key(|session| (session.started_at_unix_ms, session.session_id));
+    heads.sort_by_key(|head| (head.started_at_unix_ms, head.session_id));
 
-    let mut meetings: Vec<Meeting> = Vec::new();
+    let mut meetings: Vec<MeetingPlan> = Vec::new();
     let mut ended = 0u64;
-    for session in sessions {
-        let starts_new = meetings.is_empty() || session.started_at_unix_ms > ended + gap_ms;
+    for head in heads {
+        let starts_new = meetings.is_empty() || head.started_at_unix_ms > ended + gap_ms;
         if starts_new {
             ended = 0;
-            meetings.push(Meeting {
+            meetings.push(MeetingPlan {
                 community_id,
                 channel_id,
-                parent_channel_id: None,
                 sessions: Vec::new(),
                 unreadable_sessions: Vec::new(),
                 unplaced_in_channel: Vec::new(),
             });
         }
-        ended = ended.max(session.ended_at_unix_ms());
+        ended = ended.max(head.ended_at_unix_ms);
         if let Some(meeting) = meetings.last_mut() {
-            if meeting.parent_channel_id.is_none() {
-                meeting.parent_channel_id =
-                    session.manifest.as_ref().and_then(|m| m.parent_channel_id);
-            }
-            meeting.sessions.push(session);
+            meeting.sessions.push(head);
         }
     }
 
@@ -294,28 +437,108 @@ pub async fn collect_meetings<S: RecordingStore>(
     for meeting in &mut meetings {
         meeting.unplaced_in_channel.clone_from(&unplaced_sessions);
     }
-    Ok(Collected {
+    Ok(Planned {
         meetings,
         unplaced_sessions,
     })
 }
 
-async fn load_session<S: RecordingStore>(
+/// [`plan_meetings`], then load every meeting. Nothing broken is fatal: an
+/// unreadable chunk is skipped, an unreadable manifest leaves a chunk-only
+/// session, a session with nothing readable is placed by its write time —
+/// all counted in [`Losses`]. Loads the whole channel; the worker plans and
+/// loads one meeting at a time instead.
+pub async fn collect_meetings<S: RecordingStore>(
+    store: &S,
+    prefix: &str,
+    community_id: Uuid,
+    channel_id: Uuid,
+    gap_ms: u64,
+) -> Result<Collected, CollectError> {
+    let planned = plan_meetings(store, prefix, community_id, channel_id, gap_ms).await?;
+    let mut meetings = Vec::with_capacity(planned.meetings.len());
+    for plan in &planned.meetings {
+        meetings.push(plan.load(store).await?);
+    }
+    Ok(Collected {
+        meetings,
+        unplaced_sessions: planned.unplaced_sessions,
+    })
+}
+
+/// A session's head: start and end from its manifest, or from the first
+/// bytes of its chunks. `None` when nothing of it can be read.
+async fn head_session<S: RecordingStore>(
     store: &S,
     session_id: Uuid,
-    objects: &SessionObjects,
-) -> Result<Option<SessionRecording>, CollectError> {
-    let mut losses = Losses::default();
+    objects: SessionObjects,
+) -> Result<Option<SessionHead>, CollectError> {
     let manifest = match &objects.manifest_key {
-        Some(key) => {
-            let manifest = load_manifest(store, key, session_id).await?;
-            if manifest.is_none() {
-                losses.unreadable_manifests += 1;
-            }
-            manifest
-        }
+        Some(key) => load_manifest(store, key, session_id).await?,
         None => None,
     };
+    let unreadable_manifest = objects.manifest_key.is_some() && manifest.is_none();
+    let times = match &manifest {
+        Some(manifest) => {
+            parse_utc_ms(&manifest.started_at).map(|start| (start, start + manifest.duration_ms))
+        }
+        None => {
+            let mut start = None;
+            for (seq, key) in &objects.chunk_keys {
+                let bytes = store.get_start(key, CHUNK_HEADER_LEN as u64).await?;
+                if let Ok((header, _)) = decode_chunk(&bytes) {
+                    if header.session_id == session_id && header.chunk_seq == *seq {
+                        start = Some(header.session_start_unix_ms);
+                        break;
+                    }
+                }
+            }
+            match start {
+                Some(start) => {
+                    let mut last_t_ms = 0;
+                    for (seq, key) in objects.chunk_keys.iter().rev() {
+                        let bytes = store.get_start(key, LAST_CHUNK_HEAD_BYTES).await?;
+                        if let Ok((header, records)) = decode_chunk(&bytes) {
+                            if header.session_id == session_id && header.chunk_seq == *seq {
+                                last_t_ms = records
+                                    .map_while(Result::ok)
+                                    .map(|record| u64::from(record.t_ms()))
+                                    .max()
+                                    .unwrap_or(0);
+                                break;
+                            }
+                        }
+                    }
+                    Some((start, start + last_t_ms))
+                }
+                None => None,
+            }
+        }
+    };
+    Ok(
+        times.map(|(started_at_unix_ms, ended_at_unix_ms)| SessionHead {
+            session_id,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            last_modified_unix_ms: objects.last_modified_unix_ms,
+            manifest,
+            unreadable_manifest,
+            objects,
+        }),
+    )
+}
+
+async fn load_session<S: RecordingStore>(
+    store: &S,
+    head: &SessionHead,
+) -> Result<Option<SessionRecording>, CollectError> {
+    let session_id = head.session_id;
+    let objects = &head.objects;
+    let manifest = head.manifest.clone();
+    let mut losses = Losses::default();
+    if head.unreadable_manifest {
+        losses.unreadable_manifests += 1;
+    }
     match &manifest {
         // The recorder numbers a chunk when it opens it, so a gap in the
         // numbers is a failed upload — already in `lost_chunks`. What the
@@ -433,7 +656,7 @@ mod tests {
     use super::*;
 
     use crate::store::LocalStore;
-    use buzz_huddle_recording::{chunk_key, Record};
+    use buzz_huddle_recording::{chunk_key, manifest_key, Record};
 
     fn chunk(session: Uuid, seq: u32, start_unix_ms: u64, last_t_ms: u32) -> Vec<u8> {
         let mut bytes = ChunkHeader {
@@ -758,6 +981,120 @@ mod tests {
         assert_eq!(
             collected.meetings[0].unplaced_in_channel,
             [Uuid::from_u128(41)]
+        );
+    }
+
+    /// Test double wrapper: notes every read (key, and the length asked for
+    /// when only the start was read).
+    struct Reads<S> {
+        inner: S,
+        reads: std::sync::Mutex<Vec<(String, Option<u64>)>>,
+    }
+
+    impl<S> Reads<S> {
+        fn take(&self) -> Vec<(String, Option<u64>)> {
+            std::mem::take(&mut *self.reads.lock().expect("lock"))
+        }
+    }
+
+    impl<S: RecordingStore + Sync> RecordingStore for Reads<S> {
+        async fn list(&self, prefix: &str) -> Result<Vec<crate::store::ObjectInfo>, StoreError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+            self.reads
+                .lock()
+                .expect("lock")
+                .push((key.to_string(), None));
+            self.inner.get(key).await
+        }
+
+        async fn get_start(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
+            self.reads
+                .lock()
+                .expect("lock")
+                .push((key.to_string(), Some(len)));
+            self.inner.get_start(key, len).await
+        }
+
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+            self.inner.put(key, bytes).await
+        }
+    }
+
+    /// Planning reads manifests and the first bytes of chunks only; loading
+    /// a meeting reads that meeting's chunks and nothing else.
+    #[tokio::test]
+    async fn planning_reads_only_heads_and_loading_only_its_meeting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = LocalStore::new(dir.path());
+        let (community, channel) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let day = 86_400_000;
+        let monday = 1_791_781_200_000;
+        // Monday: two chunk-only sessions 2 minutes apart. Wednesday: one
+        // chunk-only session. Friday: one session with a manifest.
+        let sessions = [
+            (Uuid::from_u128(10), monday, vec![0u32, 2]),
+            (Uuid::from_u128(11), monday + 62_000, vec![0]),
+            (Uuid::from_u128(12), monday + 2 * day, vec![0, 1]),
+            (Uuid::from_u128(13), monday + 4 * day, vec![0]),
+        ];
+        for (session, start, seqs) in &sessions {
+            for &seq in seqs {
+                let key = chunk_key("h", community, channel, *session, seq);
+                local
+                    .put(&key, chunk(*session, seq, *start, 60_000))
+                    .await
+                    .expect("put");
+            }
+        }
+        let friday = Uuid::from_u128(13);
+        local
+            .put(
+                &manifest_key("h", community, channel, friday),
+                manifest(friday, monday + 4 * day, &[0], 0),
+            )
+            .await
+            .expect("put");
+        let store = Reads {
+            inner: local,
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let planned = plan_meetings(&store, "h", community, channel, 10 * 60_000)
+            .await
+            .expect("plan");
+        let ids: Vec<Vec<u128>> = planned
+            .meetings
+            .iter()
+            .map(|m| m.sessions.iter().map(|s| s.session_id.as_u128()).collect())
+            .collect();
+        assert_eq!(ids, [vec![10, 11], vec![12], vec![13]]);
+        // A chunk-only session ends at the last record found in the start
+        // of its last chunk.
+        assert_eq!(
+            planned.meetings[0].sessions[0].ended_at_unix_ms,
+            monday + 60_000
+        );
+        for (key, len) in store.take() {
+            match len {
+                Some(len) => assert!(len <= LAST_CHUNK_HEAD_BYTES, "{key}: {len}"),
+                None => assert!(key.ends_with("/manifest.json"), "whole {key} read"),
+            }
+        }
+
+        let meeting = planned.meetings[1].load(&store).await.expect("load");
+        assert_eq!(meeting.sessions[0].chunks.len(), 2);
+        let mut read: Vec<String> = store.take().into_iter().map(|(key, _)| key).collect();
+        read.sort();
+        let wednesday = Uuid::from_u128(12);
+        assert_eq!(
+            read,
+            [
+                chunk_key("h", community, channel, wednesday, 0),
+                chunk_key("h", community, channel, wednesday, 1),
+            ]
         );
     }
 

@@ -14,6 +14,7 @@
 //! The file holds transcribed text, so it is written 0600 like the script.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
 use std::path::Path;
 
@@ -54,7 +55,55 @@ enum Line {
     },
 }
 
-/// Transcription outcomes of one meeting, and how many runs it has had.
+/// Where a meeting's outcomes are kept: a local file ([`SttLedger`]) or
+/// Cloud Storage ([`crate::gcs_minutes::GcsLedger`]). Everything already
+/// recorded is read when the ledger is opened; [`record`](Ledger::record)
+/// and [`finish_run`](Ledger::finish_run) are durable when they return.
+pub trait Ledger {
+    /// Runs that went through the whole transcription step.
+    fn runs(&self) -> u32;
+    /// Entries that could not be read back (a torn write).
+    fn unreadable_lines(&self) -> u64;
+    /// What is known about the piece with `key`.
+    fn outcome(&self, key: &str) -> Option<&Outcome>;
+    /// Record a finished piece.
+    fn record(
+        &mut self,
+        key: &str,
+        outcome: Outcome,
+    ) -> impl Future<Output = std::io::Result<()>> + Send;
+    /// Note that run `number` went through the whole transcription step.
+    fn finish_run(&mut self, number: u32) -> impl Future<Output = std::io::Result<()>> + Send;
+}
+
+impl Ledger for SttLedger {
+    fn runs(&self) -> u32 {
+        SttLedger::runs(self)
+    }
+
+    fn unreadable_lines(&self) -> u64 {
+        SttLedger::unreadable_lines(self)
+    }
+
+    fn outcome(&self, key: &str) -> Option<&Outcome> {
+        SttLedger::outcome(self, key)
+    }
+
+    fn record(
+        &mut self,
+        key: &str,
+        outcome: Outcome,
+    ) -> impl Future<Output = std::io::Result<()>> + Send {
+        std::future::ready(SttLedger::record(self, key, outcome))
+    }
+
+    fn finish_run(&mut self, number: u32) -> impl Future<Output = std::io::Result<()>> + Send {
+        std::future::ready(SttLedger::finish_run(self, number))
+    }
+}
+
+/// Transcription outcomes of one meeting in a local file, and how many runs
+/// it has had.
 #[derive(Debug, Default)]
 pub struct SttLedger {
     outcomes: HashMap<String, Outcome>,
@@ -73,18 +122,18 @@ impl SttLedger {
     /// appended. Created 0600 when missing. A line that cannot be read (a
     /// crash in the middle of a write) is skipped and counted.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let mut ledger = Self::default();
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error),
         };
-        for line in text.lines() {
-            match serde_json::from_str::<Line>(line) {
-                Ok(line) => ledger.apply(line),
-                Err(_) => ledger.unreadable_lines += 1,
-            }
-        }
+        let parsed = parse_lines(&text);
+        let mut ledger = Self {
+            outcomes: parsed.outcomes,
+            runs: parsed.runs,
+            unreadable_lines: parsed.unreadable_lines,
+            file: None,
+        };
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -101,31 +150,9 @@ impl SttLedger {
         Ok(ledger)
     }
 
-    fn apply(&mut self, line: Line) {
-        match line {
-            Line::Run { number } => self.runs = self.runs.max(number),
-            Line::Done {
-                key,
-                text,
-                billed_seconds,
-            } => {
-                self.outcomes.insert(
-                    key,
-                    Outcome::Done {
-                        text,
-                        billed_seconds,
-                    },
-                );
-            }
-            Line::Rejected { key, code } => {
-                self.outcomes.insert(key, Outcome::Rejected { code });
-            }
-        }
-    }
-
-    fn append(&mut self, line: &Line) -> std::io::Result<()> {
+    fn append(&mut self, line: String) -> std::io::Result<()> {
         if let Some(file) = self.file.as_mut() {
-            let mut text = serde_json::to_string(line).map_err(std::io::Error::other)?;
+            let mut text = line;
             text.push('\n');
             // One write per line: a crash leaves at most one torn line.
             file.write_all(text.as_bytes())?;
@@ -147,7 +174,7 @@ impl SttLedger {
 
     /// Note that run `number` went through the whole transcription step.
     pub fn finish_run(&mut self, number: u32) -> std::io::Result<()> {
-        self.append(&Line::Run { number })?;
+        self.append(run_line(number))?;
         self.runs = self.runs.max(number);
         Ok(())
     }
@@ -159,24 +186,72 @@ impl SttLedger {
 
     /// Record a finished piece.
     pub fn record(&mut self, key: &str, outcome: Outcome) -> std::io::Result<()> {
-        let line = match &outcome {
-            Outcome::Done {
-                text,
-                billed_seconds,
-            } => Line::Done {
-                key: key.to_string(),
-                text: text.clone(),
-                billed_seconds: *billed_seconds,
-            },
-            Outcome::Rejected { code } => Line::Rejected {
-                key: key.to_string(),
-                code: code.clone(),
-            },
-        };
-        self.append(&line)?;
+        self.append(outcome_line(key, &outcome))?;
         self.outcomes.insert(key.to_string(), outcome);
         Ok(())
     }
+}
+
+/// Outcomes, finished runs and unreadable lines of ledger text.
+#[derive(Debug, Default)]
+pub(crate) struct Parsed {
+    pub(crate) outcomes: HashMap<String, Outcome>,
+    pub(crate) runs: u32,
+    pub(crate) unreadable_lines: u64,
+}
+
+/// Read ledger text (one JSON line per event). A line that cannot be read
+/// is skipped and counted.
+pub(crate) fn parse_lines(text: &str) -> Parsed {
+    let mut parsed = Parsed::default();
+    for line in text.lines() {
+        match serde_json::from_str::<Line>(line) {
+            Ok(Line::Run { number }) => parsed.runs = parsed.runs.max(number),
+            Ok(Line::Done {
+                key,
+                text,
+                billed_seconds,
+            }) => {
+                parsed.outcomes.insert(
+                    key,
+                    Outcome::Done {
+                        text,
+                        billed_seconds,
+                    },
+                );
+            }
+            Ok(Line::Rejected { key, code }) => {
+                parsed.outcomes.insert(key, Outcome::Rejected { code });
+            }
+            Err(_) => parsed.unreadable_lines += 1,
+        }
+    }
+    parsed
+}
+
+/// The ledger line of a finished piece (no newline).
+pub(crate) fn outcome_line(key: &str, outcome: &Outcome) -> String {
+    let line = match outcome {
+        Outcome::Done {
+            text,
+            billed_seconds,
+        } => Line::Done {
+            key: key.to_string(),
+            text: text.clone(),
+            billed_seconds: *billed_seconds,
+        },
+        Outcome::Rejected { code } => Line::Rejected {
+            key: key.to_string(),
+            code: code.clone(),
+        },
+    };
+    // Plain strings and numbers: serializing cannot fail.
+    serde_json::to_string(&line).unwrap_or_default()
+}
+
+/// The ledger line of a finished run (no newline).
+pub(crate) fn run_line(number: u32) -> String {
+    serde_json::to_string(&Line::Run { number }).unwrap_or_default()
 }
 
 /// Format of [`piece_key`]; part of every settings version.

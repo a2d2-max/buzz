@@ -69,7 +69,23 @@ impl TokenSource {
             program: PathBuf::from("gcloud"),
         }
     }
+
+    /// A fixed token from the environment variable [`STATIC_TOKEN_ENV`]
+    /// (tests), when it is set and not empty.
+    pub fn static_from_env() -> Option<Self> {
+        static_token(std::env::var(STATIC_TOKEN_ENV).ok())
+    }
 }
+
+fn static_token(value: Option<String>) -> Option<TokenSource> {
+    value
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .map(|token| TokenSource::Static(AccessToken(token)))
+}
+
+/// Environment variable holding a fixed token for tests.
+pub const STATIC_TOKEN_ENV: &str = "BUZZ_GCP_ACCESS_TOKEN";
 
 /// Why no token could be had. Never holds a token.
 #[derive(Debug, thiserror::Error)]
@@ -197,5 +213,19 @@ impl Tokens {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_static_token_comes_from_a_set_variable_only() {
+        assert!(static_token(None).is_none());
+        assert!(static_token(Some("  ".into())).is_none());
+        let source = static_token(Some(" ya29.test \n".into())).expect("source");
+        let tokens = Tokens::new(source).expect("tokens");
+        assert_eq!(tokens.token().await.expect("token").secret(), "ya29.test");
     }
 }
