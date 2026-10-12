@@ -1185,6 +1185,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-huddle-recording"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-media"
 version = "0.1.0"
 dependencies = [
@@ -1329,6 +1340,7 @@ dependencies = [
  "buzz-datastore-tracing",
  "buzz-db",
  "buzz-deletion",
+ "buzz-huddle-recording",
  "buzz-media",
  "buzz-pubsub",
  "buzz-relay-mesh",

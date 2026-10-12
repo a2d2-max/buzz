@@ -526,6 +526,28 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    // Huddle recorder (BUZZ_HUDDLE_RECORDING). Off by default: nothing is
+    // built and huddle audio is unchanged. When on, an unusable storage
+    // setting is fatal here, like the mesh: recording is either on or the
+    // operator is told why not. Installed before any room can exist.
+    if let Some(recorder) = buzz_relay::audio::recorder::HuddleRecorder::from_config(
+        &state.config.huddle_recording,
+        Arc::clone(&state.shutting_down),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to initialize huddle recording: {e}"))?
+    {
+        state
+            .audio_rooms
+            .install_recorder(recorder)
+            .map_err(|_| anyhow::anyhow!("huddle recorder installed twice"))?;
+        info!(
+            mode = ?state.config.huddle_recording.mode,
+            prefix = %state.config.huddle_recording.prefix,
+            chunk_secs = state.config.huddle_recording.chunk_secs,
+            "Huddle recording enabled"
+        );
+    }
+
     // Derived engine projections are driven from the durable DB outbox. With
     // no enabled binding the bounded worker remains inert; provider API keys
     // stay server-side and are resolved only when dispatching a claimed row.
@@ -1227,6 +1249,18 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     serve(router, health_router, Arc::clone(&state)).await?;
     state.community_revalidator_cancel.cancel();
 
+    // Huddle recordings: rooms that emptied during the drain already ended as
+    // `shutdown` (the recorder reads the same SIGTERM flag). Finish whatever
+    // is still open the same way and give uploads a bounded window.
+    if let Some(recorder) = state.audio_rooms.recorder() {
+        if !recorder.shutdown(HUDDLE_RECORDING_SHUTDOWN_TIMEOUT).await {
+            tracing::warn!(
+                timeout_secs = HUDDLE_RECORDING_SHUTDOWN_TIMEOUT.as_secs(),
+                "huddle recording uploads did not finish before shutdown"
+            );
+        }
+    }
+
     // Signal the audit worker to stop accepting, flush buffered entries, and
     // exit. Uses a CancellationToken so it works regardless of how many
     // Arc<AppState> clones are still alive in background tasks.
@@ -1370,6 +1404,11 @@ async fn run_periodic_until_cancelled<Tick, TickFuture>(
 /// all-at-once right after the grace, so the per-socket delay collapses to
 /// roughly the 5s grace plus the ack wait.
 const GRACEFUL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// After the drain, how long open huddle recordings get to upload their last
+/// chunks and manifests. Worst case SIGTERM → exit stays 5s + 30s + 10s + the
+/// 5s audit flush = 50s, inside the chart's 60s termination grace.
+const HUDDLE_RECORDING_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn serve(
     router: axum::Router,

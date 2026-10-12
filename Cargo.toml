@@ -29,6 +29,7 @@ members = [
     "crates/buzz-relay-mesh",
     "crates/buzz-dev-mcp",
     "crates/buzz-voice",
+    "crates/buzz-huddle-recording",
     "crates/buzz-backend-kubernetes",
     "crates/buzz-datastore-tracing",
     "examples/countdown-bot",
@@ -147,6 +148,7 @@ buzz-search = { path = "crates/buzz-search" }
 buzz-audit = { path = "crates/buzz-audit" }
 buzz-workflow = { path = "crates/buzz-workflow" }
 buzz-media = { path = "crates/buzz-media" }
+buzz-huddle-recording = { path = "crates/buzz-huddle-recording" }
 buzz-sdk = { path = "crates/buzz-sdk" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }

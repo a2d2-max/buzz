@@ -594,6 +594,11 @@ async fn handle_active_audio_connection(
         peer_index,
         "audio peer joined"
     );
+    // Owner/single-pod room: tell the huddle recorder (if on) which parent
+    // channel `ensure_membership` verified. Mirrors never record.
+    if remote_session.is_none() {
+        room.note_parent_channel(parent_id_for_event);
+    }
 
     // Owner path: install (or reuse) this room's single lease renewer now that
     // a peer is admitted, and capture its owner-loss signal. The connection
