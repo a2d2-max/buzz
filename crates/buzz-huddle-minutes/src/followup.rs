@@ -1,5 +1,12 @@
-//! After the script: the summary (Gemini) and the Notion page, done while
-//! the worker still holds the meeting.
+//! After the script: the context correction and the summary (Gemini), then
+//! the Notion page, done while the worker still holds the meeting.
+//!
+//! The correction ([`crate::correct`], `{first}.corrected.json`) never
+//! holds anything up: while it is not there (off for the run, waiting,
+//! failed or given up) the summary and the page use the original script,
+//! and once it is there they are made again from the corrected text. Its
+//! failures have the summary's shape (`{first}.correct-failed.json`, the
+//! same limits).
 //!
 //! What is done after the script counts only for the very script it was
 //! made from — the sha256 of the script's bytes — so a script written again
@@ -50,6 +57,7 @@ use buzz_gcp::token::Tokens;
 use serde::{Deserialize, Serialize};
 
 use crate::collect::MeetingPlan;
+use crate::correct::{self, Corrected, Glossary};
 use crate::models::sha256_hex;
 use crate::notion::{
     self, MeetingKind, MeetingPage, NotionClient, NotionErrorKind, NotionRecord, ProcessingStatus,
@@ -350,6 +358,18 @@ impl ForRun {
     }
 }
 
+/// How to ask Gemini for the correction.
+pub struct CorrectStep<'a> {
+    /// HTTP client.
+    pub http: &'a reqwest::Client,
+    /// Model, project, retries, time limit of each request.
+    pub settings: &'a GeminiSettings,
+    /// Google access tokens.
+    pub tokens: &'a Tokens,
+    /// The team's words.
+    pub glossary: &'a Glossary,
+}
+
 /// How to ask Gemini for the summary.
 pub struct SummaryStep<'a> {
     /// HTTP client.
@@ -382,6 +402,8 @@ fn system_now_ms() -> u64 {
 
 /// What to do after the script, for one run. A step left `None` is off.
 pub struct FollowUps<'a> {
+    /// The context correction ([`with_correct`](Self::with_correct)).
+    pub correct: Option<CorrectStep<'a>>,
     /// The summary.
     pub summary: Option<SummaryStep<'a>>,
     /// The Notion page.
@@ -390,6 +412,7 @@ pub struct FollowUps<'a> {
     pub names: &'a dyn DisplayNames,
     deadline: Option<Instant>,
     clock: &'a dyn Fn() -> u64,
+    correct_run: ForRun,
     summary_run: ForRun,
     notion_run: ForRun,
 }
@@ -402,14 +425,22 @@ impl<'a> FollowUps<'a> {
         names: &'a dyn DisplayNames,
     ) -> Self {
         Self {
+            correct: None,
             summary,
             notion,
             names,
             deadline: None,
             clock: &system_now_ms,
+            correct_run: ForRun::default(),
             summary_run: ForRun::default(),
             notion_run: ForRun::default(),
         }
+    }
+
+    /// Also correct the script before the summary.
+    pub fn with_correct(mut self, step: CorrectStep<'a>) -> Self {
+        self.correct = Some(step);
+        self
     }
 
     /// Nothing new starts with less than [`FOLLOW_UP_MIN_LEFT`] before
@@ -427,7 +458,7 @@ impl<'a> FollowUps<'a> {
 
     /// Some step is on.
     pub fn any(&self) -> bool {
-        self.summary.is_some() || self.notion.is_some()
+        self.correct.is_some() || self.summary.is_some() || self.notion.is_some()
     }
 
     fn now(&self) -> u64 {
@@ -479,8 +510,8 @@ pub enum Step {
     AlreadyDone,
     /// Done now.
     Done,
-    /// The summary was given up for this script on an earlier run
-    /// ([`StepFailures::summary_given_up`]); nothing sent.
+    /// The step (correction or summary) was given up for this script on an
+    /// earlier run ([`StepFailures::summary_given_up`]); nothing sent.
     GaveUp,
     /// Not tried this run; a later run does it.
     Later(Later),
@@ -489,9 +520,24 @@ pub enum Step {
     Failed(String),
 }
 
-/// The two steps after the script.
+/// What the correction made this run, numbers only (for the log).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrectReport {
+    /// Sure edits put into the text.
+    pub sure: usize,
+    /// Unsure edits left as suggestions.
+    pub unsure: usize,
+    /// Edits that failed a check.
+    pub dropped: u64,
+    /// Tokens and cost.
+    pub usage: Usage,
+}
+
+/// The steps after the script.
 #[derive(Debug)]
 pub struct FollowedUp {
+    /// The context correction.
+    pub correct: Step,
     /// The summary.
     pub summary: Step,
     /// The Notion page.
@@ -503,11 +549,13 @@ pub struct FollowedUp {
     /// Tokens and cost of the summary made this run (none when none was
     /// made now; a paid failure's are not known).
     pub summary_usage: Option<Usage>,
+    /// What the correction made this run (none when none was made now).
+    pub correct_made: Option<CorrectReport>,
 }
 
 impl FollowedUp {
-    fn steps(&self) -> [&Step; 2] {
-        [&self.summary, &self.notion]
+    fn steps(&self) -> [&Step; 3] {
+        [&self.correct, &self.summary, &self.notion]
     }
 
     /// A later run has something to do.
@@ -614,6 +662,35 @@ impl<H: MinutesHome> Held<'_, H> {
     }
 }
 
+/// Which text the summary and the page use.
+enum ForText {
+    /// The correction is off: the original, and stamps are not compared.
+    Off,
+    /// This script's correction and the sha256 of its stored bytes.
+    Made(Box<Corrected>, String),
+    /// No correction (yet, or given up): the original.
+    Original,
+}
+
+impl ForText {
+    /// What the summary and the page record as the text they used, to
+    /// compare with; `None` when the correction is off.
+    fn stamp(&self) -> Option<&str> {
+        match self {
+            Self::Off => None,
+            Self::Made(_, sha) => Some(sha),
+            Self::Original => Some(""),
+        }
+    }
+
+    fn corrected(&self) -> Option<&Corrected> {
+        match self {
+            Self::Made(corrected, _) => Some(corrected),
+            Self::Off | Self::Original => None,
+        }
+    }
+}
+
 /// Where the summary stands, for the page.
 enum ForPage {
     /// The summary is off: the page goes without one, whatever it had.
@@ -647,17 +724,45 @@ pub async fn follow_up_held<H: MinutesHome>(
         given: transcript,
         read: None,
     };
-    let (summary, for_page) = match summary_step(&mut held, steps).await {
+    let later = |on: bool| {
+        if on {
+            Step::Later(Later::Home)
+        } else {
+            Step::Off
+        }
+    };
+    let (correct, for_text) = match correct_step(&mut held, steps).await {
         Ok(done) => done,
         Err(error) => {
             return FollowedUp {
-                summary: Step::Failed(format!("minutes home: {error}")),
-                notion: match steps.notion {
-                    Some(_) => Step::Later(Later::Home),
-                    None => Step::Off,
-                },
+                correct: Step::Failed(format!("minutes home: {error}")),
+                summary: later(steps.summary.is_some()),
+                notion: later(steps.notion.is_some()),
                 home_error: Some(error),
                 summary_usage: None,
+                correct_made: None,
+            }
+        }
+    };
+    let correct_made = match (&correct, &for_text) {
+        (Step::Done, ForText::Made(made, _)) => Some(CorrectReport {
+            sure: made.sure_edits(),
+            unsure: made.unsure_edits(),
+            dropped: made.dropped,
+            usage: made.usage.clone(),
+        }),
+        _ => None,
+    };
+    let (summary, for_page) = match summary_step(&mut held, steps, &for_text).await {
+        Ok(done) => done,
+        Err(error) => {
+            return FollowedUp {
+                correct,
+                summary: Step::Failed(format!("minutes home: {error}")),
+                notion: later(steps.notion.is_some()),
+                home_error: Some(error),
+                summary_usage: None,
+                correct_made,
             }
         }
     };
@@ -665,48 +770,175 @@ pub async fn follow_up_held<H: MinutesHome>(
         (Step::Done, ForPage::Made(made, _)) => Some(made.usage.clone()),
         _ => None,
     };
-    match notion_step(&mut held, steps, for_page).await {
+    match notion_step(&mut held, steps, for_page, &for_text).await {
         Ok(notion) => FollowedUp {
+            correct,
             summary,
             notion,
             home_error: None,
             summary_usage,
+            correct_made,
         },
         Err(error) => FollowedUp {
+            correct,
             summary,
             notion: Step::Failed(format!("minutes home: {error}")),
             home_error: Some(error),
             summary_usage,
+            correct_made,
         },
     }
+}
+
+/// Count a failed Gemini step (the correction or the summary) for its
+/// meeting and write its record: the log text, and whether the step is now
+/// given up for this script.
+async fn gemini_failure<H: MinutesHome>(
+    held: &Held<'_, H>,
+    run: &mut ForRun,
+    now: u64,
+    mut failures: StepFailures,
+    beside: Beside,
+    error: &SummaryError,
+) -> Result<(String, bool), MeetingError> {
+    let (cost, signal) = summary_class(error);
+    let cost = run.count_as(cost, signal);
+    failures.count(cost, error.kind.as_str(), &error.code, now);
+    if cost != Cost::Uncounted {
+        held.write_failures(beside, &failures).await?;
+    }
+    let given_up = failures.summary_given_up();
+    let text = format!(
+        "{} {}{}",
+        error.kind,
+        error.code,
+        failures.tally(cost, given_up, now)
+    );
+    Ok((text, given_up))
+}
+
+async fn correct_step<H: MinutesHome>(
+    held: &mut Held<'_, H>,
+    steps: &mut FollowUps<'_>,
+) -> Result<(Step, ForText), MeetingError> {
+    if steps.correct.is_none() {
+        return Ok((Step::Off, ForText::Off));
+    }
+    if let Some(bytes) = held
+        .home
+        .read_beside(held.meeting, Beside::Corrected)
+        .await?
+    {
+        let Ok(stored) = serde_json::from_slice::<Corrected>(&bytes) else {
+            // Asking again would pay again: someone has to look.
+            let failed = Step::Failed("stored correction unreadable".into());
+            return Ok((failed, ForText::Original));
+        };
+        if stored.script_sha256 == held.script_sha256 {
+            let sha = sha256_hex(&bytes);
+            return Ok((Step::AlreadyDone, ForText::Made(Box::new(stored), sha)));
+        }
+        // Another script's correction: this script still needs its own.
+    }
+    let Ok(failures) = held.failures(Beside::CorrectFailed).await? else {
+        // Its paid tries are not known: not paid for again.
+        let failed = Step::Failed("stored correction failures unreadable".into());
+        return Ok((failed, ForText::Original));
+    };
+    if failures.summary_given_up() {
+        return Ok((Step::GaveUp, ForText::Original));
+    }
+    if failures.waiting(steps.now()) {
+        return Ok((Step::Later(Later::Backoff), ForText::Original));
+    }
+    if steps.correct_run.off {
+        return Ok((Step::Later(Later::OffForRun), ForText::Original));
+    }
+    if steps.short_of_time() {
+        return Ok((Step::Later(Later::TimeLimit), ForText::Original));
+    }
+    let Some(step) = &steps.correct else {
+        return Ok((Step::Off, ForText::Off));
+    };
+    // No request or wait past the run's deadline.
+    let mut settings = step.settings.clone();
+    settings.deadline = steps.deadline;
+    let transcript = held.script().await?;
+    let asked = correct::correct(
+        step.http,
+        &settings,
+        step.tokens,
+        transcript,
+        steps.names,
+        step.glossary,
+    )
+    .await;
+    let error = match asked {
+        Ok(mut made) => {
+            steps.correct_run.heard(Signal::Answered);
+            steps.correct_run.succeeded = true;
+            made.script_sha256 = held.script_sha256.to_string();
+            let json = serde_json::to_vec_pretty(&made).map_err(io)?;
+            let sha = sha256_hex(&json);
+            held.write(Beside::Corrected, json).await?;
+            return Ok((Step::Done, ForText::Made(Box::new(made), sha)));
+        }
+        Err(error) => error,
+    };
+    // Nothing sent: the deadline came first.
+    if error.kind == SummaryErrorKind::OutOfTime && !error.may_have_cost() {
+        return Ok((Step::Later(Later::TimeLimit), ForText::Original));
+    }
+    let now = steps.now();
+    let (text, _) = gemini_failure(
+        held,
+        &mut steps.correct_run,
+        now,
+        failures,
+        Beside::CorrectFailed,
+        &error,
+    )
+    .await?;
+    Ok((Step::Failed(text), ForText::Original))
 }
 
 async fn summary_step<H: MinutesHome>(
     held: &mut Held<'_, H>,
     steps: &mut FollowUps<'_>,
+    for_text: &ForText,
 ) -> Result<(Step, ForPage), MeetingError> {
     if steps.summary.is_none() {
         return Ok((Step::Off, ForPage::Off));
     }
+    // This script's summary of the text before its correction: the page
+    // keeps it if the new one is given up.
+    let mut earlier = None;
     if let Some(bytes) = held.home.read_beside(held.meeting, Beside::Summary).await? {
         let Ok(stored) = serde_json::from_slice::<Summary>(&bytes) else {
             // Asking again would pay again: someone has to look.
             let failed = Step::Failed("stored summary unreadable".into());
             return Ok((failed, ForPage::Missing));
         };
+        let same_text = for_text
+            .stamp()
+            .is_none_or(|stamp| stamp == stored.corrected_sha256);
         if stored.script_sha256 == held.script_sha256 {
             let sha = sha256_hex(&bytes);
-            return Ok((Step::AlreadyDone, ForPage::Made(Box::new(stored), sha)));
+            if same_text {
+                return Ok((Step::AlreadyDone, ForPage::Made(Box::new(stored), sha)));
+            }
+            earlier = Some((Box::new(stored), sha));
         }
-        // Another script's summary: this script still needs its own.
+        // Another script's summary, or this script's before its correction
+        // came: this text still needs its own.
     }
-    let Ok(mut failures) = held.failures(Beside::SummaryFailed).await? else {
+    let Ok(failures) = held.failures(Beside::SummaryFailed).await? else {
         // Its paid tries are not known: not paid for again.
         let failed = Step::Failed("stored summary failures unreadable".into());
         return Ok((failed, ForPage::Missing));
     };
     if failures.summary_given_up() {
-        return Ok((Step::GaveUp, ForPage::GivenUp));
+        return Ok((Step::GaveUp, given_up_page(earlier)));
     }
     if failures.waiting(steps.now()) {
         return Ok((Step::Later(Later::Backoff), ForPage::Missing));
@@ -723,14 +955,32 @@ async fn summary_step<H: MinutesHome>(
     // No request or wait past the run's deadline.
     let mut settings = step.settings.clone();
     settings.deadline = steps.deadline;
-    let transcript = held.script().await?;
-    let asked =
-        summary::summarize(step.http, &settings, step.tokens, transcript, steps.names).await;
+    let script = held.script().await?;
+    let fixed;
+    let transcript = match for_text.corrected() {
+        Some(corrected) => {
+            fixed = correct::corrected_transcript(script, corrected);
+            &fixed
+        }
+        None => script,
+    };
+    // The model reads the corrected text; its evidence is checked against
+    // the original.
+    let asked = summary::summarize_from(
+        step.http,
+        &settings,
+        step.tokens,
+        script,
+        transcript,
+        steps.names,
+    )
+    .await;
     let error = match asked {
         Ok(mut made) => {
             steps.summary_run.heard(Signal::Answered);
             steps.summary_run.succeeded = true;
             made.script_sha256 = held.script_sha256.to_string();
+            made.corrected_sha256 = for_text.stamp().unwrap_or_default().to_string();
             let json = serde_json::to_vec_pretty(&made).map_err(io)?;
             let sha = sha256_hex(&json);
             held.write(Beside::Summary, json).await?;
@@ -742,35 +992,40 @@ async fn summary_step<H: MinutesHome>(
     if error.kind == SummaryErrorKind::OutOfTime && !error.may_have_cost() {
         return Ok((Step::Later(Later::TimeLimit), ForPage::Missing));
     }
-    let (cost, signal) = summary_class(&error);
-    let cost = steps.summary_run.count_as(cost, signal);
     let now = steps.now();
-    failures.count(cost, error.kind.as_str(), &error.code, now);
-    if cost != Cost::Uncounted {
-        held.write_failures(Beside::SummaryFailed, &failures)
-            .await?;
-    }
-    let given_up = failures.summary_given_up();
-    let failed = Step::Failed(format!(
-        "{} {}{}",
-        error.kind,
-        error.code,
-        failures.tally(cost, given_up, now)
-    ));
+    let (text, given_up) = gemini_failure(
+        held,
+        &mut steps.summary_run,
+        now,
+        failures,
+        Beside::SummaryFailed,
+        &error,
+    )
+    .await?;
     Ok((
-        failed,
+        Step::Failed(text),
         if given_up {
-            ForPage::GivenUp
+            given_up_page(earlier)
         } else {
             ForPage::Missing
         },
     ))
 }
 
+/// The page's summary once this text's summary is given up: the script's
+/// earlier summary (of the text before its correction) when there is one.
+fn given_up_page(earlier: Option<(Box<Summary>, String)>) -> ForPage {
+    match earlier {
+        Some((summary, sha)) => ForPage::Made(summary, sha),
+        None => ForPage::GivenUp,
+    }
+}
+
 async fn notion_step<H: MinutesHome>(
     held: &mut Held<'_, H>,
     steps: &mut FollowUps<'_>,
     for_page: ForPage,
+    for_text: &ForText,
 ) -> Result<Step, MeetingError> {
     if steps.notion.is_none() {
         return Ok(Step::Off);
@@ -793,6 +1048,9 @@ async fn notion_step<H: MinutesHome>(
                 && summary_stamp
                     .as_ref()
                     .is_none_or(|stamp| *stamp == record.summary_sha256)
+                && for_text
+                    .stamp()
+                    .is_none_or(|stamp| stamp == record.corrected_sha256)
         });
     if done {
         return Ok(Step::AlreadyDone);
@@ -818,11 +1076,13 @@ async fn notion_step<H: MinutesHome>(
     let stamp = RecordStamp {
         script_sha256: held.script_sha256.to_string(),
         summary_sha256: summary_stamp.unwrap_or_default(),
+        corrected_sha256: for_text.stamp().unwrap_or_default().to_string(),
     };
     let (home, hold, meeting) = (held.home, held.hold, held.meeting);
     let transcript = held.script().await?;
     let page = MeetingPage {
         transcript,
+        corrected: for_text.corrected(),
         summary: summary.as_deref(),
         summary_note: given_up.then_some(SUMMARY_GIVEN_UP),
         names: steps.names,
@@ -2848,5 +3108,382 @@ mod tests {
         assert!(failed_with(&a.summary, "rate-limited"), "{a:?}");
         assert!(failed_with(&a.summary, "(paid try 1 of 3)"), "{a:?}");
         assert_eq!(world.failures().paid_tries, 1);
+    }
+
+    // ---- The context correction.
+
+    const SPOKEN: &str = "회의록은 오션에 올려 주세요.";
+
+    fn spoken_script() -> Transcript {
+        transcript_with(&[(1_000, A, SPOKEN), (5_000, A, "금요일까지 보낼게요.")])
+    }
+
+    fn is_correction(request: &crate::test_http::Recorded) -> bool {
+        String::from_utf8_lossy(&request.body).contains("받아쓰기 교정 담당")
+    }
+
+    /// The correction's answer for [`spoken_script`]: one sure fix.
+    fn fix_answer() -> String {
+        json!({ "lines": [{ "id": "L000", "edits": [
+            { "from": "오션에", "to": "노션에", "level": "확정", "why": "ㄴ과 ㅇ" }
+        ] }] })
+        .to_string()
+    }
+
+    /// A fake Gemini for both steps: the correction fails (HTTP 500, free)
+    /// while `fail` is set and is cut off (paid) while `cut` is set; the
+    /// summary is cut off (paid) while `cut_summary` is set.
+    async fn two_step_gemini(
+        fail: Arc<AtomicBool>,
+        cut: Arc<AtomicBool>,
+        cut_summary: Arc<AtomicBool>,
+    ) -> FakeServer {
+        FakeServer::start(move |request| {
+            if !is_correction(request) {
+                let finish = if cut_summary.load(Ordering::SeqCst) {
+                    "MAX_TOKENS"
+                } else {
+                    "STOP"
+                };
+                return gemini_reply(&answer(json!([])), finish);
+            }
+            if fail.load(Ordering::SeqCst) {
+                Reply::json(500, &json!({ "error": { "status": "INTERNAL" } }))
+            } else if cut.load(Ordering::SeqCst) {
+                gemini_reply(&fix_answer(), "MAX_TOKENS")
+            } else {
+                gemini_reply(&fix_answer(), "STOP")
+            }
+        })
+        .await
+    }
+
+    struct Correcting {
+        world: World,
+        server: FakeServer,
+        settings: GeminiSettings,
+        glossary: Glossary,
+        fail: Arc<AtomicBool>,
+        cut: Arc<AtomicBool>,
+        cut_summary: Arc<AtomicBool>,
+    }
+
+    async fn correcting() -> Correcting {
+        let world = world().await;
+        let fail = Arc::new(AtomicBool::new(false));
+        let cut = Arc::new(AtomicBool::new(false));
+        let cut_summary = Arc::new(AtomicBool::new(false));
+        let server = two_step_gemini(fail.clone(), cut.clone(), cut_summary.clone()).await;
+        Correcting {
+            world,
+            settings: gemini_settings(&server),
+            server,
+            glossary: Glossary::team(),
+            fail,
+            cut,
+            cut_summary,
+        }
+    }
+
+    impl Correcting {
+        /// All three steps, or only the summary and the page.
+        async fn follow(&self, correct: bool, script: &Transcript) -> FollowedUp {
+            self.follow_steps(correct, true, script).await
+        }
+
+        /// The correction when `correct`, the summary when `summary`, and the
+        /// page.
+        async fn follow_steps(
+            &self,
+            correct: bool,
+            summary: bool,
+            script: &Transcript,
+        ) -> FollowedUp {
+            let mut steps = self.world.run(summary.then_some(&self.settings), true);
+            if correct {
+                steps = steps.with_correct(CorrectStep {
+                    http: &self.world.http,
+                    settings: &self.settings,
+                    tokens: &self.world.tokens,
+                    glossary: &self.glossary,
+                });
+            }
+            self.world.follow_with(script, &mut steps).await
+        }
+
+        /// The summary requests, in order.
+        fn summary_prompts(&self) -> Vec<String> {
+            self.server
+                .requests()
+                .iter()
+                .filter(|request| !is_correction(request))
+                .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+                .collect()
+        }
+
+        fn corrections_sent(&self) -> usize {
+            self.server
+                .requests()
+                .iter()
+                .filter(|request| is_correction(request))
+                .count()
+        }
+
+        fn corrected_path(&self) -> std::path::PathBuf {
+            self.world.home.beside_path(FIRST, Beside::Corrected)
+        }
+
+        fn stored(&self) -> Summary {
+            serde_json::from_slice(&self.world.summary_bytes()).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_correction_holds_nothing_up_and_is_used_once_it_comes() {
+        let c = correcting().await;
+        let script = spoken_script();
+        c.fail.store(true, Ordering::SeqCst);
+        let first = c.follow(true, &script).await;
+        assert!(failed_with(&first.correct, "transient"), "{first:?}");
+        assert!(failed_with(&first.correct, "(free failure 1"), "{first:?}");
+        assert_eq!(pair(&first), (Step::Done, Step::Done));
+        assert_eq!(first.correct_made, None);
+        // Made from the original, and stamped so.
+        assert!(c.summary_prompts()[0].contains("오션에"));
+        assert_eq!(c.stored().corrected_sha256, "");
+        assert_eq!(c.world.record().unwrap().corrected_sha256, "");
+        assert!(!c.corrected_path().exists());
+
+        // Waiting after the failure: nothing else is done again.
+        let waiting = c.follow(true, &script).await;
+        assert_eq!(waiting.correct, Step::Later(Later::Backoff));
+        assert_eq!(pair(&waiting), (Step::AlreadyDone, Step::AlreadyDone));
+
+        c.fail.store(false, Ordering::SeqCst);
+        c.world.advance(FIRST_BACKOFF);
+        let second = c.follow(true, &script).await;
+        assert_eq!(second.correct, Step::Done);
+        assert_eq!(pair(&second), (Step::Done, Step::Done));
+        let made = second.correct_made.clone().unwrap();
+        assert_eq!((made.sure, made.unsure, made.dropped), (1, 0, 0));
+        assert_eq!(made.usage.calls, 1);
+        let sha = sha256_hex(&std::fs::read(c.corrected_path()).unwrap());
+        assert_eq!(c.stored().corrected_sha256, sha);
+        assert_eq!(c.world.record().unwrap().corrected_sha256, sha);
+        // The summary now reads the corrected text only.
+        let prompts = c.summary_prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("노션에") && !prompts[1].contains("오션에"));
+        // The page shows the fix with the original word in place.
+        let (_, blocks) = c.world.page();
+        assert!(
+            blocks.contains("회의록은 노션에(원래: 오션에) 올려 주세요."),
+            "{blocks}"
+        );
+        // The script itself is never touched.
+        assert_eq!(script.segments[0].text, SPOKEN);
+
+        let sent = c.server.requests().len();
+        let third = c.follow(true, &script).await;
+        assert_eq!(third.correct, Step::AlreadyDone);
+        assert_eq!(pair(&third), (Step::AlreadyDone, Step::AlreadyDone));
+        assert_eq!(c.server.requests().len(), sent);
+    }
+
+    #[tokio::test]
+    async fn a_given_up_correction_never_makes_the_summary_again() {
+        let c = correcting().await;
+        let script = spoken_script();
+        c.cut.store(true, Ordering::SeqCst);
+        for paid in 1..=PAID_SUMMARY_TRIES {
+            let run = c.follow(true, &script).await;
+            let tally = format!("(paid try {paid} of {PAID_SUMMARY_TRIES}");
+            assert!(failed_with(&run.correct, &tally), "{run:?}");
+            let summary = if paid == 1 {
+                Step::Done
+            } else {
+                Step::AlreadyDone
+            };
+            assert_eq!(pair(&run).0, summary);
+        }
+        let sent = c.server.requests().len();
+        let after = c.follow(true, &script).await;
+        assert_eq!(after.correct, Step::GaveUp);
+        assert_eq!(pair(&after), (Step::AlreadyDone, Step::AlreadyDone));
+        assert_eq!(c.server.requests().len(), sent);
+        assert_eq!(c.summary_prompts().len(), 1);
+        let failures: StepFailures = serde_json::from_slice(
+            &std::fs::read(c.world.home.beside_path(FIRST, Beside::CorrectFailed)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failures.paid_tries, PAID_SUMMARY_TRIES);
+    }
+
+    #[tokio::test]
+    async fn turning_the_correction_on_later_makes_the_summary_and_page_again() {
+        let c = correcting().await;
+        let script = spoken_script();
+        let off = c.follow(false, &script).await;
+        assert_eq!(off.correct, Step::Off);
+        assert_eq!(pair(&off), (Step::Done, Step::Done));
+        assert_eq!(c.corrections_sent(), 0);
+
+        let on = c.follow(true, &script).await;
+        assert_eq!(on.correct, Step::Done);
+        assert_eq!(pair(&on), (Step::Done, Step::Done));
+        assert_eq!(c.summary_prompts().len(), 2);
+
+        // Off again: what was made stays; nothing is compared or sent.
+        let sent = c.server.requests().len();
+        let off = c.follow(false, &script).await;
+        assert_eq!(off.correct, Step::Off);
+        assert_eq!(pair(&off), (Step::AlreadyDone, Step::AlreadyDone));
+        assert_eq!(c.server.requests().len(), sent);
+    }
+
+    #[tokio::test]
+    async fn a_correction_counts_only_for_its_own_script() {
+        let c = correcting().await;
+        assert_eq!(c.follow(true, &spoken_script()).await.correct, Step::Done);
+        let other = other_script();
+        let again = c.follow(true, &other).await;
+        assert_eq!(again.correct, Step::Done);
+        assert_eq!(c.corrections_sent(), 2);
+        let stored: Corrected =
+            serde_json::from_slice(&std::fs::read(c.corrected_path()).unwrap()).unwrap();
+        assert_eq!(stored.script_sha256, sha_of(&other));
+        // The fix's words are not in the other script: dropped.
+        assert_eq!((stored.sure_edits(), stored.dropped), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_stored_correction_is_not_paid_for_again() {
+        let c = correcting().await;
+        std::fs::write(c.corrected_path(), b"{ not json").unwrap();
+        let run = c.follow(true, &spoken_script()).await;
+        assert!(
+            failed_with(&run.correct, "stored correction unreadable"),
+            "{run:?}"
+        );
+        assert_eq!(pair(&run), (Step::Done, Step::Done));
+        assert_eq!(c.corrections_sent(), 0);
+        assert_eq!(c.stored().corrected_sha256, "");
+    }
+
+    #[tokio::test]
+    async fn the_page_follows_the_correction_even_without_the_summary() {
+        let c = correcting().await;
+        let script = spoken_script();
+        c.fail.store(true, Ordering::SeqCst);
+        let first = c.follow_steps(true, false, &script).await;
+        assert!(failed_with(&first.correct, "transient"), "{first:?}");
+        assert_eq!(pair(&first), (Step::Off, Step::Done));
+        assert!(!c.world.page().1.contains("원래:"));
+
+        c.fail.store(false, Ordering::SeqCst);
+        c.world.advance(FIRST_BACKOFF);
+        let second = c.follow_steps(true, false, &script).await;
+        assert_eq!(second.correct, Step::Done);
+        // Only the correction changed: the page is written again for it.
+        assert_eq!(pair(&second), (Step::Off, Step::Done));
+        assert!(c.world.page().1.contains("노션에(원래: 오션에)"));
+        let third = c.follow_steps(true, false, &script).await;
+        assert_eq!(pair(&third), (Step::Off, Step::AlreadyDone));
+    }
+
+    #[tokio::test]
+    async fn a_summary_given_up_after_the_correction_keeps_the_earlier_one() {
+        let c = correcting().await;
+        let script = spoken_script();
+        c.fail.store(true, Ordering::SeqCst);
+        assert_eq!(
+            pair(&c.follow(true, &script).await),
+            (Step::Done, Step::Done)
+        );
+        let earlier = c.world.summary_bytes();
+
+        // The correction comes, and every new summary is cut off (paid).
+        c.fail.store(false, Ordering::SeqCst);
+        c.cut_summary.store(true, Ordering::SeqCst);
+        c.world.advance(FIRST_BACKOFF);
+        for paid in 1..PAID_SUMMARY_TRIES {
+            let run = c.follow(true, &script).await;
+            assert!(
+                failed_with(&run.summary, &format!("(paid try {paid} of")),
+                "{run:?}"
+            );
+            // The page waits for the new summary.
+            assert_eq!(run.notion, Step::Later(Later::Summary));
+        }
+        let last = c.follow(true, &script).await;
+        assert!(failed_with(&last.summary, "given up"), "{last:?}");
+        // The page keeps the summary it had, with the corrected script.
+        assert_eq!(last.notion, Step::Done);
+        assert_eq!(c.world.summary_bytes(), earlier);
+        let record = c.world.record().unwrap();
+        assert_eq!(record.summary_sha256, sha256_hex(&earlier));
+        let (_, blocks) = c.world.page();
+        assert!(!blocks.contains(SUMMARY_GIVEN_UP), "{blocks}");
+        assert!(blocks.contains("노션에(원래: 오션에)"), "{blocks}");
+
+        let sent = c.server.requests().len();
+        let after = c.follow(true, &script).await;
+        assert_eq!(pair(&after), (Step::GaveUp, Step::AlreadyDone));
+        assert_eq!(c.server.requests().len(), sent);
+    }
+
+    #[tokio::test]
+    async fn the_summary_checks_its_evidence_against_the_original_script() {
+        // The original says he heard it; a correction turns it into a promise.
+        let script = transcript_with(&[(1_000, A, "견적서는 제가 금요일까지 보낸대요.")]);
+        let fix = json!({ "lines": [{ "id": "L000", "edits": [
+            { "from": "보낸대요", "to": "보낼게요", "level": "확정", "why": "소리" }
+        ] }] })
+        .to_string();
+        let promise = json!([{
+            "text": "견적서 보내기",
+            "assignee_id": "P1",
+            "assignee_quote": "제가 금요일까지 보낼게요",
+            "due": "2026-10-16",
+            "due_quote": "금요일까지",
+            "status": "확정",
+            "evidence_start_ms": 1_000
+        }]);
+        let server = FakeServer::start(move |request| {
+            if is_correction(request) {
+                gemini_reply(&fix, "STOP")
+            } else {
+                gemini_reply(&answer(promise.clone()), "STOP")
+            }
+        })
+        .await;
+        let world = world().await;
+        let settings = gemini_settings(&server);
+        let glossary = Glossary::team();
+        let mut steps = world.run(Some(&settings), false).with_correct(CorrectStep {
+            http: &world.http,
+            settings: &settings,
+            tokens: &world.tokens,
+            glossary: &glossary,
+        });
+        let followed = world.follow_with(&script, &mut steps).await;
+        assert_eq!(
+            (followed.correct.clone(), pair(&followed).0),
+            (Step::Done, Step::Done)
+        );
+        // The model read the corrected text…
+        let prompt = server
+            .requests()
+            .iter()
+            .filter(|request| !is_correction(request))
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .next()
+            .unwrap();
+        assert!(prompt.contains("보낼게요"));
+        // …but only the original's words are evidence: no promise there.
+        let stored: Summary = serde_json::from_slice(&world.summary_bytes()).unwrap();
+        let item = &stored.action_items[0];
+        assert_eq!(item.assignee_pubkey, None);
+        assert_eq!(item.status, summary::ItemStatus::Unsure);
     }
 }

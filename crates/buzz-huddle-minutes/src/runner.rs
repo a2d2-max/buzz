@@ -128,6 +128,10 @@ pub enum Beside {
     SummaryFailed,
     /// The Notion page's failures for the current script.
     NotionFailed,
+    /// The context correction (`huddle-corrected/1`).
+    Corrected,
+    /// The correction's failures for the current script.
+    CorrectFailed,
 }
 
 impl Beside {
@@ -137,6 +141,8 @@ impl Beside {
             Self::Summary => ".summary.json",
             Self::SummaryFailed => ".summary-failed.json",
             Self::NotionFailed => ".notion-failed.json",
+            Self::Corrected => ".corrected.json",
+            Self::CorrectFailed => ".correct-failed.json",
         }
     }
 }

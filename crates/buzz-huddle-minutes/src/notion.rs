@@ -35,6 +35,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::collect::MeetingPlan;
+use crate::correct::{self, Corrected, Piece};
 use crate::runner::{MeetingError, MinutesHome};
 use crate::summary::{huddle_id, kst, line_name, DisplayNames, ItemStatus, RetryPolicy, Summary};
 use crate::transcript::Transcript;
@@ -691,8 +692,12 @@ fn same_meeting(page: &Value, channel: Uuid, sessions: &[Uuid]) -> bool {
 
 /// 노션에 올릴 회의 하나.
 pub struct MeetingPage<'a> {
-    /// 스크립트.
+    /// 스크립트(원본).
     pub transcript: &'a Transcript,
+    /// 이 스크립트의 후보정. 있으면 전체 스크립트에 고친 글을 줄 안 표시와 함께
+    /// 보인다: 고친 낱말은 "노션에(원래: 오션에)", 애매 제안은 "오션에(혹시 노션에?)".
+    /// 원본은 스크립트 파일에 그대로 있다.
+    pub corrected: Option<&'a Corrected>,
     /// 요약. 없으면 본문에 스크립트만 넣는다.
     pub summary: Option<&'a Summary>,
     /// 요약이 없을 때 "요약" 제목 아래 넣을 한 문단(예: 요약을 못 만든 까닭).
@@ -803,6 +808,25 @@ fn blocks(kind: &str, runs: Vec<Value>, checked: bool) -> Vec<Value> {
 
 fn paragraph(text: &str) -> Vec<Value> {
     blocks("paragraph", text_runs(text, None), false)
+}
+
+/// 스크립트 한 줄의 글: 후보정이 있으면 고친 글에 줄 안 표시를 붙인 것.
+fn line_text(
+    segment: &crate::transcript::Segment,
+    line: Option<&correct::CorrectedLine>,
+) -> String {
+    let Some(line) = line else {
+        return segment.text.trim().to_string();
+    };
+    let mut text = String::new();
+    for piece in correct::pieces(&segment.text, line) {
+        match piece {
+            Piece::Same(same) => text.push_str(same),
+            Piece::Fixed { from, to } => text.push_str(&format!("{to}(원래: {from})")),
+            Piece::Maybe { from, to } => text.push_str(&format!("{from}(혹시 {to}?)")),
+        }
+    }
+    text.trim().to_string()
 }
 
 fn heading(text: &str) -> Value {
@@ -1054,18 +1078,19 @@ pub fn body_blocks(
     }
 
     out.push(heading("전체 스크립트"));
-    let mut segments: Vec<_> = transcript.segments.iter().collect();
-    segments.sort_by_key(|segment| segment.start_ms);
+    let mut segments: Vec<_> = transcript.segments.iter().enumerate().collect();
+    segments.sort_by_key(|(_, segment)| segment.start_ms);
     if segments.is_empty() {
         out.extend(paragraph("없음"));
     }
-    for segment in segments {
+    for (index, segment) in segments {
         let mut runs = time_link(segment.start_ms);
         let name = line_name(segment, page.names);
-        runs.extend(text_runs(
-            &format!(" {name}: {}", segment.text.trim()),
-            None,
-        ));
+        let line = page
+            .corrected
+            .and_then(|corrected| corrected.lines.get(&index));
+        let text = line_text(segment, line);
+        runs.extend(text_runs(&format!(" {name}: {text}"), None));
         out.extend(blocks("paragraph", runs, false));
     }
     out
@@ -1421,6 +1446,9 @@ pub struct NotionRecord {
     /// 페이지에 쓴 요약: 요약 파일의 sha256, 요약을 포기했으면 `failed`, 없으면 비움.
     #[serde(default)]
     pub summary_sha256: String,
+    /// 페이지에 쓴 후보정: 후보정 파일의 sha256, 원본 글로 썼으면 비움.
+    #[serde(default)]
+    pub corrected_sha256: String,
 }
 
 /// 노션 기록에 같이 적는, 페이지에 무엇을 썼는지.
@@ -1430,6 +1458,8 @@ pub struct RecordStamp {
     pub script_sha256: String,
     /// 요약 파일의 sha256, `failed`, 또는 비움.
     pub summary_sha256: String,
+    /// 후보정 파일의 sha256, 또는 비움(원본 글).
+    pub corrected_sha256: String,
 }
 
 impl NotionRecord {
@@ -1442,6 +1472,7 @@ impl NotionRecord {
             done: false,
             script_sha256: String::new(),
             summary_sha256: String::new(),
+            corrected_sha256: String::new(),
         }
     }
 }
@@ -1491,6 +1522,7 @@ pub async fn publish_held<H: MinutesHome>(
             done: result.is_ok(),
             script_sha256: stamp.script_sha256.clone(),
             summary_sha256: stamp.summary_sha256.clone(),
+            corrected_sha256: stamp.corrected_sha256.clone(),
             ..NotionRecord::new(page.transcript, &page_id)
         };
         let json = serde_json::to_vec_pretty(&record)
@@ -1978,12 +2010,14 @@ pub(crate) mod tests {
             usage: Usage::default(),
             corrections: Corrections::default(),
             script_sha256: String::new(),
+            corrected_sha256: String::new(),
         }
     }
 
     fn page<'a>(transcript: &'a Transcript, summary: &'a Summary) -> MeetingPage<'a> {
         MeetingPage {
             transcript,
+            corrected: None,
             summary: Some(summary),
             summary_note: None,
             names: &PubkeyPrefixNames,
@@ -2914,5 +2948,61 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(error.kind, NotionErrorKind::BadRequest);
         assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn corrected_lines_show_the_fix_and_the_original_word_in_place() {
+        let transcript = transcript_with(&[
+            (0, A, "허드 회의록은 오션에 올려 주세요"),
+            (5_000, B, "네 지금 올릴게요"),
+            (9_000, A, "그대로인 줄"),
+        ]);
+        let edit = |from: &str, to: &str, level: &str| json!({ "from": from, "to": to, "level": level, "why": "" });
+        let answer = json!({ "lines": [
+            { "id": "L000", "edits": [edit("오션에", "노션에", "확정"), edit("허드", "허들", "애매")] },
+            { "id": "L001", "edits": [edit("올릴게요", "올릴께요", "애매")] }
+        ] });
+        let corrected = correct::check_answer(&answer.to_string(), &transcript).unwrap();
+        let summary = summary_of(&transcript);
+        let mut page = page(&transcript, &summary);
+        page.corrected = Some(&corrected);
+        let body = body_blocks(
+            &page,
+            &HashMap::new(),
+            DEFAULT_PLAYBACK_LINK,
+            &HashSet::new(),
+        );
+        validate_blocks(&body).unwrap();
+        let at = body
+            .iter()
+            .position(|block| block["type"] == "heading_2" && block_text(block) == "전체 스크립트")
+            .unwrap();
+        let script = &body[at + 1..];
+        // One paragraph per line, as without the correction.
+        assert_eq!(script.len(), 3);
+        assert!(script.iter().all(|block| block["type"] == "paragraph"));
+        assert_eq!(
+            block_text(&script[0]),
+            "[00:00] aaaaaaaa: 허드(혹시 허들?) 회의록은 노션에(원래: 오션에) 올려 주세요"
+        );
+        assert_eq!(
+            block_text(&script[1]),
+            "[00:05] bbbbbbbb: 네 지금 올릴게요(혹시 올릴께요?)"
+        );
+        assert_eq!(block_text(&script[2]), "[00:09] aaaaaaaa: 그대로인 줄");
+
+        // Without the correction the page is as before.
+        page.corrected = None;
+        let plain = body_blocks(
+            &page,
+            &HashMap::new(),
+            DEFAULT_PLAYBACK_LINK,
+            &HashSet::new(),
+        );
+        assert_eq!(plain.len(), body.len());
+        assert_eq!(
+            block_text(&plain[at + 1]),
+            "[00:00] aaaaaaaa: 허드 회의록은 오션에 올려 주세요"
+        );
     }
 }

@@ -18,9 +18,10 @@ use buzz_huddle_minutes::audio::read_wav_mono_i16;
 use buzz_huddle_minutes::check::{cer, check, check_mix, Tolerance};
 use buzz_huddle_minutes::chirp::ChirpStt;
 use buzz_huddle_minutes::collect::{find_channels, plan_meetings, CollectError};
+use buzz_huddle_minutes::correct;
 use buzz_huddle_minutes::followup::{
-    FollowUps, FollowedUp, NotionStep, Step as FollowStep, SummaryStep, WORKER_GEMINI_TIMEOUT,
-    WORKER_MAX_RETRY_AFTER_MS,
+    CorrectReport, CorrectStep, FollowUps, FollowedUp, NotionStep, Step as FollowStep, SummaryStep,
+    WORKER_GEMINI_TIMEOUT, WORKER_MAX_RETRY_AFTER_MS,
 };
 use buzz_huddle_minutes::gcs_minutes::GcsMinutes;
 use buzz_huddle_minutes::ledger::LEDGER_KEY_FORMAT;
@@ -166,6 +167,12 @@ enum Command {
         /// After the summary, write the Notion page (token: NOTION_TOKEN).
         #[arg(long, env = "BUZZ_MINUTES_NOTION", value_enum, default_value_t = Switch::Off)]
         notion: Switch,
+        /// Before the summary, fix misheard words with Gemini from the whole
+        /// script and the team's words (costs money). The script stays as it
+        /// is; the correction goes beside it, and the summary and the page
+        /// use it.
+        #[arg(long, env = "BUZZ_MINUTES_CORRECT", value_enum, default_value_t = Switch::Off)]
+        correct: Switch,
         /// Make every N-th piece fail transcription (fake transcriber).
         #[arg(long)]
         stt_fail_every: Option<usize>,
@@ -506,6 +513,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             summary: summary_switch,
             summary_model,
             notion: notion_switch,
+            correct: correct_switch,
             stt_fail_every,
             stt_fail_kind,
             stt_fail_attempts,
@@ -577,6 +585,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         minutes_bucket.as_deref(),
                         summary_switch,
                         notion_switch,
+                        correct_switch,
                     )?;
                     AnyStt::Placeholder
                 }
@@ -630,6 +639,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let mut gemini_settings = summary::GeminiSettings::new(&summary_model);
             gemini_settings.request_timeout = WORKER_GEMINI_TIMEOUT;
             gemini_settings.retry.max_retry_after_ms = WORKER_MAX_RETRY_AFTER_MS;
+            let correct_tokens = match correct_switch {
+                Switch::On => Some(Tokens::new(token_source()?)?),
+                Switch::Off => None,
+            };
+            let mut correct_settings = summary::GeminiSettings::new(correct::DEFAULT_MODEL);
+            correct_settings.request_timeout = WORKER_GEMINI_TIMEOUT;
+            correct_settings.retry.max_retry_after_ms = WORKER_MAX_RETRY_AFTER_MS;
+            let glossary = correct::Glossary::team();
             let notion_token = match notion_switch {
                 Switch::On => Some(token_from_env("NOTION_TOKEN")?),
                 Switch::Off => None,
@@ -655,6 +672,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 &names,
             )
             .with_deadline(deadline);
+            if let Some(tokens) = &correct_tokens {
+                follow = follow.with_correct(CorrectStep {
+                    http: &gemini_http,
+                    settings: &correct_settings,
+                    tokens,
+                    glossary: &glossary,
+                });
+            }
             let follow = follow.any().then_some(&mut follow);
             let code = match (out, minutes_bucket, &gcs) {
                 (Some(out), _, _) => {
@@ -826,6 +851,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let names = summary::PubkeyPrefixNames;
             let page = notion::MeetingPage {
                 transcript: &transcript,
+                corrected: None,
                 summary: Some(&summary),
                 summary_note: None,
                 names: &names,
@@ -1117,6 +1143,9 @@ async fn process_channels<H: MinutesHome>(
             );
             if let Some(followed) = followed {
                 eprintln!("  {}", follow_line(&followed));
+                if let Some(made) = &followed.correct_made {
+                    eprintln!("  {}", correct_line(made));
+                }
                 if let Some(usage) = &followed.summary_usage {
                     eprintln!("  {}", usage_line(usage));
                 }
@@ -1144,7 +1173,7 @@ async fn process_channels<H: MinutesHome>(
         eprintln!("{failed} meeting(s) not written");
     }
     if follow_failed > 0 {
-        eprintln!("{follow_failed} meeting(s) with a summary or Notion page failed (tried again next run)");
+        eprintln!("{follow_failed} meeting(s) with a correction, summary or Notion page failed (tried again next run)");
     }
     if failed > 0 || unreadable_channels > 0 || follow_failed > 0 {
         return ExitCode::FAILURE;
@@ -1173,20 +1202,41 @@ fn count_follow_up(followed: &FollowedUp, failed: &mut usize, follow_failed: &mu
 /// One log line for the steps after the script (kinds and codes only: no
 /// meeting text, no Notion message).
 fn follow_line(followed: &FollowedUp) -> String {
-    let step = |step: &FollowStep| match step {
+    let step = |step: &FollowStep, given_up: &str| match step {
         FollowStep::Off => "off".to_string(),
         FollowStep::AlreadyDone => "already done".to_string(),
         FollowStep::Done => "done".to_string(),
-        FollowStep::GaveUp => {
-            "given up earlier for this script (the page says 요약 실패)".to_string()
-        }
+        FollowStep::GaveUp => format!("given up earlier for this script ({given_up})"),
         FollowStep::Later(why) => format!("next run ({})", why.as_str()),
         FollowStep::Failed(error) => format!("failed: {error}"),
     };
     format!(
-        "summary {} | notion {}",
-        step(&followed.summary),
-        step(&followed.notion)
+        "correct {} | summary {} | notion {}",
+        step(&followed.correct, "the summary and page use the original"),
+        step(
+            &followed.summary,
+            "the page says 요약 실패, or keeps the summary made before the correction",
+        ),
+        step(&followed.notion, "")
+    )
+}
+
+/// What the correction made, numbers only.
+fn correct_line(made: &CorrectReport) -> String {
+    let usage = &made.usage;
+    format!(
+        "correct: fixed {} suggested {} dropped {} | input {} output {} thinking {} tokens in {} call(s), {:.1} s | cost {}",
+        made.sure,
+        made.unsure,
+        made.dropped,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.thinking_tokens,
+        usage.calls,
+        usage.elapsed_ms as f64 / 1_000.0,
+        usage
+            .cost_usd
+            .map_or("unknown price".to_string(), |usd| format!("${usd:.6}"))
     )
 }
 
@@ -1264,15 +1314,19 @@ fn placeholder_allowed(
     minutes_bucket: Option<&str>,
     summary: Switch,
     notion: Switch,
+    correct: Switch,
 ) -> anyhow::Result<()> {
     if all || minutes_bucket.is_some() {
         anyhow::bail!(
             "--stt-placeholder is for development only: not with --all or --minutes-bucket"
         );
     }
-    if matches!(summary, Switch::On) || matches!(notion, Switch::On) {
+    if [summary, notion, correct]
+        .iter()
+        .any(|switch| matches!(switch, Switch::On))
+    {
         anyhow::bail!(
-            "--stt-placeholder is for development only: not with --summary or --notion on"
+            "--stt-placeholder is for development only: not with --summary, --notion or --correct on"
         );
     }
     Ok(())
@@ -1353,7 +1407,7 @@ mod tests {
         let mut dev = vec!["--out", "o", "--stt-placeholder"];
         dev.extend_from_slice(&channel);
         assert!(parse(&dev).is_ok());
-        assert!(placeholder_allowed(false, None, Switch::Off, Switch::Off).is_ok());
+        assert!(placeholder_allowed(false, None, Switch::Off, Switch::Off, Switch::Off).is_ok());
 
         assert!(parse(&["--all", "--out", "o", "--stt-placeholder"]).is_err());
         let mut bucket = vec!["--minutes-bucket", "m", "--stt-placeholder"];
@@ -1364,11 +1418,14 @@ mod tests {
         assert!(parse(&with_chirp).is_err());
         // Even when the command line lets it through (say from the
         // environment), the run refuses it.
-        assert!(placeholder_allowed(true, None, Switch::Off, Switch::Off).is_err());
-        assert!(placeholder_allowed(false, Some("m"), Switch::Off, Switch::Off).is_err());
+        assert!(placeholder_allowed(true, None, Switch::Off, Switch::Off, Switch::Off).is_err());
+        assert!(
+            placeholder_allowed(false, Some("m"), Switch::Off, Switch::Off, Switch::Off).is_err()
+        );
         // Nor the summary or the Notion page: a page found by its huddle id
         // would be overwritten with placeholder text.
-        assert!(placeholder_allowed(false, None, Switch::On, Switch::Off).is_err());
-        assert!(placeholder_allowed(false, None, Switch::Off, Switch::On).is_err());
+        assert!(placeholder_allowed(false, None, Switch::On, Switch::Off, Switch::Off).is_err());
+        assert!(placeholder_allowed(false, None, Switch::Off, Switch::On, Switch::Off).is_err());
+        assert!(placeholder_allowed(false, None, Switch::Off, Switch::Off, Switch::On).is_err());
     }
 }

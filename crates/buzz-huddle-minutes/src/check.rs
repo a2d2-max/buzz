@@ -381,14 +381,6 @@ pub struct CerReport {
 /// and punctuation are dropped and Latin letters lower-cased on both sides;
 /// "받아쓰기 실패" lines count as empty.
 pub fn cer(transcript: &Transcript, truth: &Truth) -> CerReport {
-    let normal = |text: &str| -> Vec<char> {
-        text.chars()
-            .filter(|c| {
-                !c.is_whitespace() && !c.is_ascii_punctuation() && !"…·「」『』“”‘’".contains(*c)
-            })
-            .flat_map(char::to_lowercase)
-            .collect()
-    };
     let mut speakers: Vec<&str> = truth
         .utterances
         .iter()
@@ -410,14 +402,14 @@ pub fn cer(transcript: &Transcript, truth: &Truth) -> CerReport {
             .filter(|u| u.speaker == speaker)
             .collect();
         said.sort_by_key(|u| u.start_ms);
-        let expected: Vec<char> = said.iter().flat_map(|u| normal(&u.text)).collect();
+        let expected: Vec<char> = said.iter().flat_map(|u| normal_chars(&u.text)).collect();
         let mut lines: Vec<_> = transcript
             .segments
             .iter()
             .filter(|s| s.speaker.as_deref() == Some(speaker) && s.text != FAILED_TEXT)
             .collect();
         lines.sort_by_key(|s| s.start_ms);
-        let heard: Vec<char> = lines.iter().flat_map(|s| normal(&s.text)).collect();
+        let heard: Vec<char> = lines.iter().flat_map(|s| normal_chars(&s.text)).collect();
         edits += edit_distance(&expected, &heard);
         truth_chars += expected.len();
     }
@@ -432,8 +424,19 @@ pub fn cer(transcript: &Transcript, truth: &Truth) -> CerReport {
     }
 }
 
+/// The characters a CER counts: spaces and punctuation dropped, Latin
+/// letters lower-cased.
+pub(crate) fn normal_chars(text: &str) -> Vec<char> {
+    text.chars()
+        .filter(|c| {
+            !c.is_whitespace() && !c.is_ascii_punctuation() && !"…·「」『』“”‘’".contains(*c)
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Levenshtein distance over characters.
-fn edit_distance(a: &[char], b: &[char]) -> usize {
+pub(crate) fn edit_distance(a: &[char], b: &[char]) -> usize {
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, x) in a.iter().enumerate() {
         let mut diagonal = row[0];

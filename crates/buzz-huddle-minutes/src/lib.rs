@@ -14,6 +14,7 @@
 //! 6. [`audio`] mixes everyone into the playback file.
 //!
 //! 7. [`summary`] 는 스크립트를 Gemini 로 요약하고 지어낸 담당자·기한을 걸러 낸다.
+//!    그 앞에 [`correct`] 가 문맥으로 잘못 들은 낱말을 고친다(원본은 그대로).
 //! 8. [`notion`] 은 회의록 페이지를 노션 DB 에 쓴다.
 //!
 //! [`sim`] builds fake recordings with an answer sheet and [`check`]
@@ -28,6 +29,7 @@ pub mod bleed;
 pub mod check;
 pub mod chirp;
 pub mod collect;
+pub mod correct;
 pub mod diarize;
 pub mod followup;
 pub mod gcs_minutes;

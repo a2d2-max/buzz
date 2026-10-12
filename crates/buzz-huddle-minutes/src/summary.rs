@@ -130,6 +130,10 @@ pub struct Summary {
     /// 요약한 스크립트 바이트의 sha256(작업기가 채운다). 비어 있으면 모른다.
     #[serde(default)]
     pub script_sha256: String,
+    /// 요약에 쓴 후보정 파일(`corrected.json`)의 sha256(작업기가 채운다). 비어 있으면
+    /// 원본 글로 만들었다(후보정이 꺼졌거나, 아직 없거나, 포기됐다).
+    #[serde(default)]
+    pub corrected_sha256: String,
 }
 
 /// 결정사항 하나.
@@ -277,6 +281,15 @@ pub fn known_price(model: &str) -> Option<Price> {
         }),
         _ => None,
     }
+}
+
+/// `usage` 의 달러(생각 토큰은 출력 단가로). 단가를 모르면 `None`.
+pub(crate) fn cost_usd(price: Option<Price>, usage: &Usage) -> Option<f64> {
+    price.map(|price| {
+        (usage.input_tokens as f64 * price.input_usd_per_mtok
+            + (usage.output_tokens + usage.thinking_tokens) as f64 * price.output_usd_per_mtok)
+            / 1_000_000.0
+    })
 }
 
 /// 일시 오류·429 를 다시 하는 법. `pipeline::SttPolicy` 와 같은 모양.
@@ -444,7 +457,7 @@ pub struct SummaryError {
 }
 
 impl SummaryError {
-    fn new(kind: SummaryErrorKind, code: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: SummaryErrorKind, code: impl Into<String>) -> Self {
         Self {
             kind,
             code: code.into(),
@@ -671,7 +684,7 @@ fn weekday_ko(day: Weekday) -> &'static str {
 }
 
 /// 글 안 줄바꿈을 지워 한 줄로.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split(['\n', '\r'])
         .map(str::trim)
         .filter(|part| !part.is_empty())
@@ -1498,6 +1511,7 @@ pub fn check_answer(
         usage: Usage::default(),
         corrections: checker.corrections,
         script_sha256: String::new(),
+        corrected_sha256: String::new(),
     })
 }
 
@@ -1570,7 +1584,7 @@ fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// ([`SummaryError::maybe_paid`]). `settings.deadline` 이 있으면 요청 하나
 /// (`request_timeout`)나 기다림이 마감을 넘기지 않게 한다: 요청을 못 보내면
 /// [`SummaryErrorKind::OutOfTime`], 못 기다리면 그 실패를 바로 돌려준다.
-async fn generate(
+pub(crate) async fn generate(
     client: &reqwest::Client,
     settings: &GeminiSettings,
     tokens: &Tokens,
@@ -1747,6 +1761,20 @@ pub async fn summarize(
     transcript: &Transcript,
     names: &dyn DisplayNames,
 ) -> Result<Summary, SummaryError> {
+    summarize_from(client, settings, tokens, transcript, transcript, names).await
+}
+
+/// [`summarize`] 인데 모델에게는 `shown`(후보정한 글)을 보이고, 근거(시각·담당자·기한
+/// 인용)와 확정 판정은 `original`(원본 스크립트)로 검사한다. 고친 글이 원본에 없는 약속을
+/// 만들어도 담당자·확정이 되지 않는다. 둘은 같은 회의의 같은 줄들이어야 한다.
+pub async fn summarize_from(
+    client: &reqwest::Client,
+    settings: &GeminiSettings,
+    tokens: &Tokens,
+    original: &Transcript,
+    shown: &Transcript,
+    names: &dyn DisplayNames,
+) -> Result<Summary, SummaryError> {
     let started = Instant::now();
     let mut usage = Usage::default();
     // A failure after a paid answer still counts that answer.
@@ -1755,7 +1783,7 @@ pub async fn summarize(
         ..error
     };
     for compact in [false, true] {
-        let body = build_request(transcript, names, settings, compact);
+        let body = build_request(shown, names, settings, compact);
         let (answer, used) = generate(client, settings, tokens, &body)
             .await
             .map_err(|error| paid(error, &usage))?;
@@ -1765,12 +1793,8 @@ pub async fn summarize(
             continue;
         };
         let mut summary =
-            check_answer(&answer, transcript, names).map_err(|error| paid(error, &usage))?;
-        usage.cost_usd = settings.price.map(|price| {
-            (usage.input_tokens as f64 * price.input_usd_per_mtok
-                + (usage.output_tokens + usage.thinking_tokens) as f64 * price.output_usd_per_mtok)
-                / 1_000_000.0
-        });
+            check_answer(&answer, original, names).map_err(|error| paid(error, &usage))?;
+        usage.cost_usd = cost_usd(settings.price, &usage);
         summary.model = settings.model.clone();
         usage.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         summary.usage = usage;
