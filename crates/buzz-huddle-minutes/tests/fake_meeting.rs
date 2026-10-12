@@ -1436,12 +1436,13 @@ async fn lock_child() {
         &settings(),
         &run_options(&truth),
     )
-    .await
-    .expect("run");
+    .await;
+    // A failure is a result too: what was sent is reported either way.
     let outcome = match done {
-        Done::Written { .. } => "written".to_string(),
-        Done::Locked => "locked".to_string(),
-        Done::Skipped(skip) => format!("skipped-{skip:?}"),
+        Ok(Done::Written { .. }) => "written".to_string(),
+        Ok(Done::Locked) => "locked".to_string(),
+        Ok(Done::Skipped(skip)) => format!("skipped-{skip:?}"),
+        Err(_) => "failed".to_string(),
     };
     std::fs::write(
         dir.join(format!("child-{n}.txt")),
@@ -1451,8 +1452,8 @@ async fn lock_child() {
 }
 
 /// Two workers on the same meeting at the same time, as two processes: one
-/// transcribes it, the other finds it locked and sends nothing, so the
-/// requests add up to one run.
+/// transcribes it, the other sends nothing, so the requests add up to one
+/// run. (Without the lock both would wait out the 20 s, then both pay.)
 #[test]
 fn two_workers_at_once_pay_for_one_run() {
     let meeting = fake_meeting(7);
@@ -1500,9 +1501,19 @@ fn two_workers_at_once_pay_for_one_run() {
         serde_json::from_slice(&std::fs::read(&scripts[0]).expect("script")).expect("json");
     let pieces = transcript.segments.len();
     assert!(pieces > 0);
-    assert_eq!(
-        results,
-        vec![("locked".to_string(), 0), ("written".to_string(), pieces)]
+    // The money: the two workers together paid for one run.
+    let sent: usize = results.iter().map(|(_, sent)| sent).sum();
+    assert_eq!(sent, pieces, "{results:?}");
+    // One wrote the script. The other found the meeting held (the usual
+    // case: the holder waits for it) or, had it started more than the
+    // holder's wait late, already done — never transcribed it again.
+    let outcomes: Vec<&str> = results
+        .iter()
+        .map(|(outcome, _)| outcome.as_str())
+        .collect();
+    assert!(
+        outcomes == ["locked", "written"] || outcomes == ["skipped-AlreadyProcessed", "written"],
+        "{results:?}"
     );
 }
 

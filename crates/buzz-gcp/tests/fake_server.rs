@@ -1,12 +1,16 @@
 //! The client against the fake Cloud Storage and metadata server of
 //! `buzz_gcp::fake` (127.0.0.1, no network).
 
+use std::time::{Duration, Instant};
+
 use buzz_gcp::fake::FakeGcs;
 use buzz_gcp::gcs::{Gcs, GcsErrorKind, ObjectInfo, Write};
 use buzz_gcp::token::{AccessToken, TokenError, TokenSource, Tokens};
 use serde_json::json;
 
 const BUCKET: &str = "bucket";
+/// Largest object read in these tests.
+const MAX: u64 = 1 << 20;
 
 /// A fake with tokens from its metadata server lasting `expires_in` s.
 async fn client(expires_in: u64) -> (Gcs, FakeGcs) {
@@ -50,7 +54,10 @@ async fn objects_round_trip() {
         "text/plain",
         "content type sent"
     );
-    assert_eq!(gcs.get(BUCKET, name).await.expect("get"), "hello world");
+    assert_eq!(
+        gcs.get(BUCKET, name, MAX).await.expect("get"),
+        "hello world"
+    );
     assert_eq!(
         gcs.get_start(BUCKET, name, 5).await.expect("start"),
         "hello"
@@ -81,7 +88,10 @@ async fn objects_round_trip() {
         ),
         (GcsErrorKind::AlreadyExists, Some(412))
     );
-    assert_eq!(gcs.get(BUCKET, name).await.expect("get"), "hello world");
+    assert_eq!(
+        gcs.get(BUCKET, name, MAX).await.expect("get"),
+        "hello world"
+    );
     let second = gcs
         .put(
             BUCKET,
@@ -136,7 +146,7 @@ async fn objects_round_trip() {
     // Delete removes exactly that one name.
     gcs.delete(BUCKET, name).await.expect("delete");
     assert_eq!(
-        kind(gcs.get(BUCKET, name).await),
+        kind(gcs.get(BUCKET, name, MAX).await),
         (GcsErrorKind::NotFound, Some(404))
     );
     assert_eq!(
@@ -159,9 +169,14 @@ async fn failures_are_sorted_into_kinds() {
     };
     let cases = [
         (reason(403, "forbidden"), GcsErrorKind::Permission),
-        (reason(403, "rateLimitExceeded"), GcsErrorKind::Quota),
+        (reason(403, "rateLimitExceeded"), GcsErrorKind::RateLimited),
+        (
+            reason(403, "userRateLimitExceeded"),
+            GcsErrorKind::RateLimited,
+        ),
         (reason(403, "quotaExceeded"), GcsErrorKind::Quota),
-        (reason(429, "rateLimitExceeded"), GcsErrorKind::Quota),
+        (reason(403, "dailyLimitExceeded"), GcsErrorKind::Quota),
+        (reason(429, "rateLimitExceeded"), GcsErrorKind::RateLimited),
         (reason(503, "backendError"), GcsErrorKind::Transient),
         (reason(500, "internalError"), GcsErrorKind::Transient),
         (reason(408, "requestTimeout"), GcsErrorKind::Transient),
@@ -172,7 +187,7 @@ async fn failures_are_sorted_into_kinds() {
     for ((status, body), expected) in cases {
         fake.fail_next(status, body);
         assert_eq!(
-            kind(gcs.get(BUCKET, "x").await),
+            kind(gcs.get(BUCKET, "x", MAX).await),
             (expected, Some(status)),
             "HTTP {status}"
         );
@@ -181,7 +196,7 @@ async fn failures_are_sorted_into_kinds() {
     // Refused twice (the retry with a new token too): an auth failure.
     fake.refuse_next(2);
     assert_eq!(
-        kind(gcs.get(BUCKET, "x").await),
+        kind(gcs.get(BUCKET, "x", MAX).await),
         (GcsErrorKind::Auth, Some(401))
     );
 
@@ -196,18 +211,18 @@ async fn failures_are_sorted_into_kinds() {
     )
     .expect("client");
     assert_eq!(
-        kind(unreachable.get(BUCKET, "x").await),
+        kind(unreachable.get(BUCKET, "x", MAX).await),
         (GcsErrorKind::Transient, None)
     );
-    // No token to be had: an auth failure, nothing sent.
+    // A metadata server that does not answer: worth another try.
     let no_token = Gcs::with_base_url(
         Tokens::new(TokenSource::MetadataServer { base_url: closed }).expect("tokens"),
         "http://127.0.0.1:9",
     )
     .expect("client");
     assert_eq!(
-        kind(no_token.get(BUCKET, "x").await),
-        (GcsErrorKind::Auth, None)
+        kind(no_token.get(BUCKET, "x", MAX).await),
+        (GcsErrorKind::Transient, None)
     );
 }
 
@@ -253,7 +268,7 @@ async fn tokens_never_show_in_errors_or_debug_output() {
     let gcs = Gcs::with_base_url(tokens, &url).expect("client");
     // The fake accepts another token: every call is refused.
     fake.accept_token("something-else");
-    let error = gcs.get(BUCKET, "x").await.expect_err("refused");
+    let error = gcs.get(BUCKET, "x", MAX).await.expect_err("refused");
     assert_eq!(error.kind, GcsErrorKind::Auth);
     for text in [format!("{error}"), format!("{error:?}"), format!("{gcs:?}")] {
         assert!(!text.contains(SECRET), "{text}");
@@ -278,7 +293,11 @@ fn fake_gcloud(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
 async fn gcloud_tokens_are_read_and_kept_for_a_while() {
     let dir = tempfile::tempdir().expect("tempdir");
     let program = fake_gcloud(dir.path(), "echo '  ya29.from-gcloud  '");
-    let tokens = Tokens::new(TokenSource::Gcloud { program }).expect("tokens");
+    let tokens = Tokens::new(TokenSource::Gcloud {
+        program,
+        timeout: Duration::from_secs(10),
+    })
+    .expect("tokens");
     for _ in 0..2 {
         assert_eq!(
             tokens.token().await.expect("token").secret(),
@@ -293,9 +312,16 @@ async fn gcloud_tokens_are_read_and_kept_for_a_while() {
         dir.path(),
         "echo 'ERROR: (gcloud.auth.print-access-token) no active account' >&2\nexit 1",
     );
-    let tokens = Tokens::new(TokenSource::Gcloud { program }).expect("tokens");
+    let tokens = Tokens::new(TokenSource::Gcloud {
+        program,
+        timeout: Duration::from_secs(10),
+    })
+    .expect("tokens");
     match tokens.token().await {
-        Err(TokenError::Gcloud(message)) => assert!(message.contains("no active account")),
+        Err(TokenError::Gcloud {
+            message,
+            transient: false,
+        }) => assert!(message.contains("no active account")),
         other => panic!("{other:?}"),
     }
 }
@@ -332,9 +358,184 @@ async fn a_generation_matched_delete_leaves_a_newer_object() {
         ),
         (GcsErrorKind::AlreadyExists, Some(412))
     );
-    assert_eq!(gcs.get(BUCKET, "lease").await.expect("still there"), "b");
+    assert_eq!(
+        gcs.get(BUCKET, "lease", MAX).await.expect("still there"),
+        "b"
+    );
     gcs.delete_if_generation(BUCKET, "lease", new.generation)
         .await
         .expect("delete");
     assert!(fake.objects(BUCKET).is_empty());
+}
+
+/// A token source that does not answer is worth another try; one that says
+/// no is an authentication failure.
+#[tokio::test]
+async fn token_failures_are_transient_or_auth() {
+    let (gcs, fake) = client(3_600).await;
+    fake.fail_metadata_next(503);
+    assert_eq!(
+        kind(gcs.get(BUCKET, "x", MAX).await),
+        (GcsErrorKind::Transient, None)
+    );
+    fake.fail_metadata_next(403);
+    assert_eq!(
+        kind(gcs.get(BUCKET, "x", MAX).await),
+        (GcsErrorKind::Auth, None)
+    );
+    gcs.list(BUCKET, "").await.expect("a token at last");
+}
+
+/// A token due for refresh is fetched by one caller; the others keep the
+/// old one (still valid) instead of waiting.
+#[tokio::test]
+async fn one_caller_refreshes_while_the_others_keep_the_old_token() {
+    // 299 s: due for refresh at once, valid for almost five minutes.
+    let fake = FakeGcs::start(299).await;
+    let tokens = Tokens::new(TokenSource::MetadataServer {
+        base_url: fake.url().to_string(),
+    })
+    .expect("tokens");
+    assert_eq!(tokens.token().await.expect("first").secret(), "tok-1");
+    let (a, b, c, d, e) = tokio::join!(
+        tokens.token(),
+        tokens.token(),
+        tokens.token(),
+        tokens.token(),
+        tokens.token()
+    );
+    let mut got: Vec<String> = [a, b, c, d, e]
+        .into_iter()
+        .map(|token| token.expect("token").secret().to_string())
+        .collect();
+    got.sort();
+    assert_eq!(got, ["tok-1", "tok-1", "tok-1", "tok-1", "tok-2"]);
+    assert_eq!(fake.tokens_issued(), 2);
+}
+
+/// Forgetting a refused token does not throw away a newer one.
+#[tokio::test]
+async fn forget_drops_only_the_refused_token() {
+    let fake = FakeGcs::start(3_600).await;
+    let tokens = Tokens::new(TokenSource::MetadataServer {
+        base_url: fake.url().to_string(),
+    })
+    .expect("tokens");
+    let first = tokens.token().await.expect("first");
+    tokens.forget(&first).await;
+    let second = tokens.token().await.expect("second");
+    assert_eq!(second.secret(), "tok-2");
+    tokens.forget(&first).await;
+    assert_eq!(tokens.token().await.expect("kept"), second);
+    assert_eq!(fake.tokens_issued(), 2);
+}
+
+/// A gcloud that hangs is killed after its time limit; that is worth
+/// another try.
+#[tokio::test]
+async fn a_hanging_gcloud_is_killed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let program = fake_gcloud(dir.path(), "sleep 30");
+    let tokens = Tokens::new(TokenSource::Gcloud {
+        program,
+        timeout: Duration::from_millis(300),
+    })
+    .expect("tokens");
+    let started = Instant::now();
+    let error = tokens.token().await.expect_err("killed");
+    assert!(error.is_transient(), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// A server that takes a request and never answers hits the overall time
+/// limit.
+#[tokio::test]
+async fn a_request_that_hangs_times_out() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let gcs = Gcs::with_base_url(
+        Tokens::new(TokenSource::Static(AccessToken::new("t"))).expect("tokens"),
+        &url,
+    )
+    .expect("client")
+    .with_request_timeout(Duration::from_millis(300));
+    let started = Instant::now();
+    assert_eq!(
+        kind(gcs.get(BUCKET, "x", MAX).await),
+        (GcsErrorKind::Transient, None)
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// A read stops at its size limit.
+#[tokio::test]
+async fn reads_stop_at_their_size_limit() {
+    let (gcs, _fake) = client(3_600).await;
+    gcs.put(
+        BUCKET,
+        "eleven",
+        b"hello world".to_vec(),
+        "text/plain",
+        Write::IfAbsent,
+    )
+    .await
+    .expect("put");
+    assert_eq!(
+        kind(gcs.get(BUCKET, "eleven", 5).await),
+        (GcsErrorKind::Other, None)
+    );
+    assert_eq!(
+        gcs.get(BUCKET, "eleven", 11).await.expect("fits"),
+        "hello world"
+    );
+}
+
+/// Writing only-if-absent the very bytes already stored counts as done (an
+/// earlier send whose answer was lost); other bytes are refused.
+#[tokio::test]
+async fn the_same_bytes_written_again_only_if_absent_count_as_done() {
+    let (gcs, fake) = client(3_600).await;
+    let first = gcs
+        .put(
+            BUCKET,
+            "chunk",
+            b"abc".to_vec(),
+            "application/octet-stream",
+            Write::IfAbsent,
+        )
+        .await
+        .expect("put");
+    let again = gcs
+        .put(
+            BUCKET,
+            "chunk",
+            b"abc".to_vec(),
+            "application/octet-stream",
+            Write::IfAbsent,
+        )
+        .await
+        .expect("same bytes: done");
+    assert_eq!(again.generation, first.generation, "not written twice");
+    assert_eq!(fake.objects(BUCKET)["chunk"].generation, first.generation);
+    assert_eq!(
+        kind(
+            gcs.put(
+                BUCKET,
+                "chunk",
+                b"abd".to_vec(),
+                "application/octet-stream",
+                Write::IfAbsent
+            )
+            .await
+        ),
+        (GcsErrorKind::AlreadyExists, Some(412))
+    );
 }

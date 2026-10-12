@@ -215,6 +215,10 @@ impl RecordingStore for LocalStore {
     }
 }
 
+/// Largest object [`GcsStore`] reads whole (chunks and manifests are far
+/// smaller).
+pub const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// A Cloud Storage bucket. Keys are object names.
 #[derive(Debug, Clone)]
 pub struct GcsStore {
@@ -270,7 +274,7 @@ impl RecordingStore for GcsStore {
     async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let bytes = self
             .gcs
-            .get(&self.bucket, key)
+            .get(&self.bucket, key, MAX_OBJECT_BYTES)
             .await
             .map_err(gcs_error("read", key))?;
         Ok(bytes.to_vec())

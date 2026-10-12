@@ -260,8 +260,11 @@ pub const LEDGER_KEY_FORMAT: &str = "huddle-minutes-ledger-key/1";
 /// Key of one piece (hex sha256): the settings version, who, where it was
 /// cut (the audio sent, ms on the meeting clock), and the recorded Opus
 /// frames inside that stretch with their places. It is made from what was
-/// recorded, not from decoded audio, so another CPU, decoder or resampler
-/// gives the same key; other settings or other cuts give another one.
+/// recorded, not from decoded audio, so as long as the cut lands in the
+/// same place another CPU, decoder or resampler gives the same key. The cut
+/// itself comes from speech detection on decoded audio: if a change moves
+/// it, the key changes and that piece is sent again. Other settings give
+/// another key too.
 pub fn piece_key(
     version: &str,
     speaker: &str,

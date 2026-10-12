@@ -3,7 +3,10 @@
 //! and delete one by its exact name.
 //!
 //! Nothing is retried here except once after HTTP 401 with a new token;
-//! [`GcsErrorKind`] tells the caller whether trying again makes sense.
+//! [`GcsErrorKind`] tells the caller whether trying again makes sense. A
+//! write only-if-absent that finds the object already there with exactly
+//! the bytes it was sending counts as done (the answer to an earlier send
+//! was lost). Every request has an overall time limit.
 
 use std::time::Duration;
 
@@ -11,10 +14,14 @@ use bytes::Bytes;
 use reqwest::{header, StatusCode, Url};
 use serde::Deserialize;
 
-use crate::token::Tokens;
+use crate::token::{AccessToken, Tokens};
 
 /// The Cloud Storage endpoint.
 pub const GCS_URL: &str = "https://storage.googleapis.com";
+/// Longest a request may take, upload or download included.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Largest JSON answer (a list page, an object resource) read.
+const MAX_JSON: u64 = 16 * 1024 * 1024;
 
 /// What kind of failure, so the caller can decide: try again later, stop
 /// everything, or treat it as an answer.
@@ -30,7 +37,11 @@ pub enum GcsErrorKind {
     /// object already there, or a generation-matched delete found it
     /// written again.
     AlreadyExists,
-    /// A rate or quota limit (HTTP 429, or 403 with a rate or quota reason).
+    /// Too many requests for now (HTTP 429, or 403 `rateLimitExceeded` /
+    /// `userRateLimitExceeded`): wait, then try again.
+    RateLimited,
+    /// A quota is used up (HTTP 403 `quotaExceeded` /
+    /// `dailyLimitExceeded`): stop.
     Quota,
     /// Worth trying again later: HTTP 5xx or 408, a lost connection, a
     /// timeout.
@@ -144,13 +155,10 @@ struct ErrorItem {
     reason: Option<String>,
 }
 
-/// Reasons of an HTTP 403 that mean a limit, not a missing permission.
-const LIMIT_REASONS: [&str; 4] = [
-    "rateLimitExceeded",
-    "userRateLimitExceeded",
-    "quotaExceeded",
-    "dailyLimitExceeded",
-];
+/// Reasons of an HTTP 403 that mean "not so fast", not a missing permission.
+const RATE_REASONS: [&str; 2] = ["rateLimitExceeded", "userRateLimitExceeded"];
+/// Reasons of an HTTP 403 that mean a quota is used up.
+const QUOTA_REASONS: [&str; 2] = ["quotaExceeded", "dailyLimitExceeded"];
 
 /// A Cloud Storage client.
 #[derive(Debug)]
@@ -158,6 +166,7 @@ pub struct Gcs {
     http: reqwest::Client,
     tokens: Tokens,
     base: Url,
+    request_timeout: Duration,
 }
 
 impl Gcs {
@@ -178,7 +187,18 @@ impl Gcs {
             .read_timeout(Duration::from_secs(120))
             .build()
             .map_err(|error| other(format!("http client: {error}")))?;
-        Ok(Self { http, tokens, base })
+        Ok(Self {
+            http,
+            tokens,
+            base,
+            request_timeout: REQUEST_TIMEOUT,
+        })
+    }
+
+    /// The same with another overall time limit per request (tests).
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     /// `base` + the path `segments`, each percent-encoded on its own (an
@@ -196,28 +216,35 @@ impl Gcs {
         &self,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, GcsError> {
-        let response = self.attempt(&build).await?;
+        let (response, token) = self.attempt(&build).await?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
-        self.tokens.forget().await;
-        self.attempt(&build).await
+        self.tokens.forget(&token).await;
+        Ok(self.attempt(&build).await?.0)
     }
 
     async fn attempt(
         &self,
         build: &impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, GcsError> {
-        let token = self
-            .tokens
-            .token()
-            .await
-            .map_err(|error| GcsError::new(GcsErrorKind::Auth, None, error.to_string()))?;
-        build(&self.http)
+    ) -> Result<(reqwest::Response, AccessToken), GcsError> {
+        let token = self.tokens.token().await.map_err(|error| {
+            // A token source that did not answer is worth another try; one
+            // that said no is not.
+            let kind = if error.is_transient() {
+                GcsErrorKind::Transient
+            } else {
+                GcsErrorKind::Auth
+            };
+            GcsError::new(kind, None, error.to_string())
+        })?;
+        let response = build(&self.http)
             .bearer_auth(token.secret())
+            .timeout(self.request_timeout)
             .send()
             .await
-            .map_err(|error| GcsError::new(GcsErrorKind::Transient, None, error.to_string()))
+            .map_err(transport)?;
+        Ok((response, token))
     }
 
     /// Every object whose name starts with `prefix`, following page tokens
@@ -259,11 +286,37 @@ impl Gcs {
         }
     }
 
-    /// The whole object.
-    pub async fn get(&self, bucket: &str, name: &str) -> Result<Bytes, GcsError> {
+    /// The whole object; fails with [`GcsErrorKind::Other`] when it is
+    /// larger than `max_len` bytes.
+    pub async fn get(&self, bucket: &str, name: &str, max_len: u64) -> Result<Bytes, GcsError> {
         let url = self.media_url(bucket, name);
         let response = success(self.send(|http| http.get(url.clone())).await?).await?;
-        read_bytes(response).await
+        read_limited(response, max_len).await
+    }
+
+    /// The object as it was at `generation` (fails with
+    /// [`GcsErrorKind::NotFound`] once it was written again), at most
+    /// `max_len` bytes.
+    pub async fn get_generation(
+        &self,
+        bucket: &str,
+        name: &str,
+        generation: u64,
+        max_len: u64,
+    ) -> Result<Bytes, GcsError> {
+        let mut url = self.media_url(bucket, name);
+        url.query_pairs_mut()
+            .append_pair("generation", &generation.to_string());
+        let response = success(self.send(|http| http.get(url.clone())).await?).await?;
+        read_limited(response, max_len).await
+    }
+
+    /// What is stored under `name` (size, generation, last write).
+    pub async fn stat(&self, bucket: &str, name: &str) -> Result<ObjectInfo, GcsError> {
+        let url = self.url(&["storage", "v1", "b", bucket, "o", name]);
+        let response = success(self.send(|http| http.get(url.clone())).await?).await?;
+        let object: RawObject = read_json(response).await?;
+        object.parse()
     }
 
     /// The first `len` bytes of the object (fewer when it is shorter).
@@ -280,10 +333,8 @@ impl Gcs {
         if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
             return Ok(Bytes::new());
         }
-        let mut bytes = read_bytes(success(response).await?).await?;
-        // A server that ignores Range sends everything.
-        bytes.truncate(usize::try_from(len).unwrap_or(usize::MAX));
-        Ok(bytes)
+        // A server that ignores Range sends everything: stop at `len`.
+        read_prefix(success(response).await?, len).await
     }
 
     fn media_url(&self, bucket: &str, name: &str) -> Url {
@@ -294,7 +345,9 @@ impl Gcs {
 
     /// Write `body` as `name`. With [`Write::IfAbsent`] an existing object
     /// is left alone and the call fails with
-    /// [`GcsErrorKind::AlreadyExists`].
+    /// [`GcsErrorKind::AlreadyExists`] — unless it holds exactly `body`
+    /// (an earlier send got through but its answer was lost): then it
+    /// counts as written.
     pub async fn put(
         &self,
         bucket: &str,
@@ -320,8 +373,32 @@ impl Gcs {
                     .body(body.clone())
             })
             .await?;
-        let object: RawObject = read_json(success(response).await?).await?;
-        object.parse()
+        match success(response).await {
+            Ok(response) => {
+                let object: RawObject = read_json(response).await?;
+                object.parse()
+            }
+            Err(error) if error.kind == GcsErrorKind::AlreadyExists && write == Write::IfAbsent => {
+                match self.holding(bucket, name, &body).await {
+                    Some(object) => Ok(object),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The object under `name`, when it holds exactly `body`.
+    async fn holding(&self, bucket: &str, name: &str, body: &Bytes) -> Option<ObjectInfo> {
+        let object = self.stat(bucket, name).await.ok()?;
+        if object.size != body.len() as u64 {
+            return None;
+        }
+        let stored = self
+            .get_generation(bucket, name, object.generation, object.size)
+            .await
+            .ok()?;
+        (stored == *body).then_some(object)
     }
 
     /// Delete the one object called exactly `name`.
@@ -367,16 +444,15 @@ async fn success(response: reqwest::Response) -> Result<reqwest::Response, GcsEr
         ),
         Err(_) => (None, Vec::new()),
     };
-    let limit = reasons
-        .iter()
-        .any(|reason| LIMIT_REASONS.contains(&reason.as_str()));
+    let any = |list: &[&str]| reasons.iter().any(|reason| list.contains(&reason.as_str()));
     let kind = match status.as_u16() {
         401 => GcsErrorKind::Auth,
-        403 if limit => GcsErrorKind::Quota,
+        403 if any(&RATE_REASONS) => GcsErrorKind::RateLimited,
+        403 if any(&QUOTA_REASONS) => GcsErrorKind::Quota,
         403 => GcsErrorKind::Permission,
         404 => GcsErrorKind::NotFound,
         412 => GcsErrorKind::AlreadyExists,
-        429 => GcsErrorKind::Quota,
+        429 => GcsErrorKind::RateLimited,
         408 | 500..=599 => GcsErrorKind::Transient,
         _ => GcsErrorKind::Other,
     };
@@ -393,17 +469,50 @@ async fn success(response: reqwest::Response) -> Result<reqwest::Response, GcsEr
     ))
 }
 
-async fn read_bytes(response: reqwest::Response) -> Result<Bytes, GcsError> {
-    response
-        .bytes()
-        .await
-        .map_err(|error| GcsError::new(GcsErrorKind::Transient, None, error.to_string()))
+fn transport(error: reqwest::Error) -> GcsError {
+    GcsError::new(GcsErrorKind::Transient, None, error.to_string())
+}
+
+/// The body, or [`GcsErrorKind::Other`] as soon as it passes `max_len`.
+async fn read_limited(mut response: reqwest::Response, max_len: u64) -> Result<Bytes, GcsError> {
+    let too_large = || {
+        GcsError::new(
+            GcsErrorKind::Other,
+            None,
+            format!("object larger than {max_len} bytes"),
+        )
+    };
+    if response.content_length().is_some_and(|len| len > max_len) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+        if (body.len() + chunk.len()) as u64 > max_len {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+/// The first `len` bytes of the body; the rest is not read.
+async fn read_prefix(mut response: reqwest::Response, len: u64) -> Result<Bytes, GcsError> {
+    let len = usize::try_from(len).unwrap_or(usize::MAX);
+    let mut body = Vec::new();
+    while body.len() < len {
+        let Some(chunk) = response.chunk().await.map_err(transport)? else {
+            break;
+        };
+        let take = chunk.len().min(len - body.len());
+        body.extend_from_slice(&chunk[..take]);
+    }
+    Ok(Bytes::from(body))
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, GcsError> {
-    let bytes = read_bytes(response).await?;
+    let bytes = read_limited(response, MAX_JSON).await?;
     serde_json::from_slice(&bytes)
         .map_err(|error| GcsError::new(GcsErrorKind::Other, None, format!("bad answer: {error}")))
 }

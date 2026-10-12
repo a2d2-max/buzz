@@ -37,6 +37,10 @@ pub const LEASE_MS: u64 = 2 * 60 * 60 * 1_000;
 pub const LEASE_FORMAT: &str = "huddle-minutes-lease/1";
 
 const JSON: &str = "application/json";
+/// Largest lease read.
+const MAX_LEASE: u64 = 4 * 1024;
+/// Largest script, bundle or piece read.
+const MAX_READ: u64 = 64 * 1024 * 1024;
 
 /// The minutes bucket as a [`MinutesHome`].
 #[derive(Debug, Clone)]
@@ -144,21 +148,22 @@ impl MinutesHome for GcsMinutes {
         }
         // Held, or left by a worker that died: take it over only once it
         // has expired, and only that very generation of it.
-        let Some(existing) = self
-            .gcs
-            .list(&self.bucket, &name)
-            .await?
-            .into_iter()
-            .find(|object| object.name == name)
-        else {
+        let existing = match self.gcs.stat(&self.bucket, &name).await {
+            Ok(existing) => existing,
             // Let go of just now: the next run takes it.
-            return Ok(None);
+            Err(error) if error.kind == GcsErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
-        let expires = match self.gcs.get(&self.bucket, &name).await {
+        let expires = match self
+            .gcs
+            .get_generation(&self.bucket, &name, existing.generation, MAX_LEASE)
+            .await
+        {
             Ok(bytes) => serde_json::from_slice::<Lease>(&bytes)
                 .map(|lease| lease.expires_at_unix_ms)
                 // An unreadable lease cannot be honoured.
                 .unwrap_or(0),
+            // Written again just now: someone holds it.
             Err(error) if error.kind == GcsErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
@@ -212,7 +217,7 @@ impl MinutesHome for GcsMinutes {
         );
         let mut processed = Vec::new();
         for object in self.gcs.list(&self.bucket, &prefix).await? {
-            let bytes = self.gcs.get(&self.bucket, &object.name).await?;
+            let bytes = self.gcs.get(&self.bucket, &object.name, MAX_READ).await?;
             let transcript: Transcript = serde_json::from_slice(&bytes)
                 .map_err(|e| MeetingError::Scripts(format!("{}: {e}", object.name)))?;
             for session in transcript.session_ids {
@@ -301,7 +306,11 @@ impl GcsLedger {
             unreadable: 0,
         };
         if let Some((_, name)) = newest_bundle {
-            let bytes = ledger.gcs.get(&ledger.bucket, &name).await.map_err(io)?;
+            let bytes = ledger
+                .gcs
+                .get(&ledger.bucket, &name, MAX_READ)
+                .await
+                .map_err(io)?;
             let parsed = parse_lines(&String::from_utf8_lossy(&bytes));
             ledger.outcomes = parsed.outcomes;
             ledger.unreadable += parsed.unreadable_lines;
@@ -310,7 +319,11 @@ impl GcsLedger {
             if ledger.outcomes.contains_key(&key) {
                 continue;
             }
-            let bytes = ledger.gcs.get(&ledger.bucket, &name).await.map_err(io)?;
+            let bytes = ledger
+                .gcs
+                .get(&ledger.bucket, &name, MAX_READ)
+                .await
+                .map_err(io)?;
             let parsed = parse_lines(&String::from_utf8_lossy(&bytes));
             match parsed.outcomes.into_iter().find(|(k, _)| *k == key) {
                 Some((key, outcome)) if parsed.unreadable_lines == 0 => {

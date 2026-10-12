@@ -2,10 +2,10 @@
 //! `fake`). It routes on the encoded path, like the real one, so an object
 //! name whose `/` is not sent as `%2F` is not found.
 //!
-//! Supported: list (prefix, pages of [`PAGE`]), read (whole or a `Range`
-//! from byte 0), upload (`uploadType=media`, `ifGenerationMatch=0`), delete
-//! (optionally `ifGenerationMatch=<generation>`), the metadata token
-//! endpoint. Storage calls must carry the last token handed out (or the one
+//! Supported: list (prefix, pages of [`PAGE`]), read (object resource, or
+//! the bytes whole or a `Range` from byte 0, optionally at a `generation`),
+//! upload (`uploadType=media`, `ifGenerationMatch=0`), delete (optionally
+//! `ifGenerationMatch=<generation>`), the metadata token endpoint. Storage calls must carry the last token handed out (or the one
 //! set with [`FakeGcs::accept_token`]).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -46,6 +46,7 @@ struct Inner {
     valid: Mutex<String>,
     refuse: AtomicUsize,
     fail: Mutex<VecDeque<(u16, Value)>>,
+    metadata_fail: Mutex<VecDeque<u16>>,
     storage_calls: AtomicUsize,
     list_calls: AtomicUsize,
     media_reads: AtomicUsize,
@@ -108,6 +109,15 @@ impl FakeGcs {
             .lock()
             .expect("lock")
             .push_back((status, body));
+    }
+
+    /// Answer the next metadata token request with `status`.
+    pub fn fail_metadata_next(&self, status: u16) {
+        self.inner
+            .metadata_fail
+            .lock()
+            .expect("lock")
+            .push_back(status);
     }
 
     /// Metadata tokens handed out so far.
@@ -203,6 +213,11 @@ async fn metadata_token(State(fake): State<Arc<Inner>>, headers: HeaderMap) -> R
     if headers.get("metadata-flavor").map(|v| v.as_bytes()) != Some(b"Google") {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if let Some(status) = fake.metadata_fail.lock().expect("lock").pop_front() {
+        return StatusCode::from_u16(status)
+            .expect("status")
+            .into_response();
+    }
     let n = fake.issued.fetch_add(1, Ordering::Relaxed) + 1;
     let token = format!("tok-{n}");
     fake.valid.lock().expect("lock").clone_from(&token);
@@ -263,6 +278,12 @@ async fn read(
     let Some(stored) = objects.get(&(bucket.clone(), name.clone())) else {
         return error(404, "No such object");
     };
+    if query
+        .get("generation")
+        .is_some_and(|generation| generation.parse::<u64>().ok() != Some(stored.generation))
+    {
+        return error(404, "No such object generation");
+    }
     if query.get("alt").map(String::as_str) != Some("media") {
         return Json(resource(&bucket, &name, stored)).into_response();
     }

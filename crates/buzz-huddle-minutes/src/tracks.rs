@@ -382,13 +382,20 @@ impl SpeakerFrames<'_> {
 /// concealment up to [`MAX_CONCEALED_FRAMES`], as silence beyond — so loss
 /// does not pull later audio early.
 fn plan_stream<'a>(frames: &[&SpeakerFrame<'a>], stats: &mut DecodeStats) -> Vec<Planned<'a>> {
-    // (step, receive position for received frames, samples before it)
-    let mut steps: Vec<(Step<'a>, Option<u64>, u64)> = Vec::with_capacity(frames.len());
+    // (step, samples before it, its block)
+    let mut steps: Vec<(Step<'a>, u64, usize)> = Vec::with_capacity(frames.len());
     let mut produced = 0u64;
     let mut last_seq: Option<u16> = None;
     let mut frames_behind = 0u32;
     let mut last_len = CONCEAL_SAMPLES as u64;
-    let mut last_receive: Option<u64> = None;
+    // Spurts, each anchored at its least-delayed frame, built as frames
+    // come. A long spurt is re-anchored every ANCHOR_BLOCK_FRAMES so a
+    // sender clock that runs a little fast or slow against the relay's
+    // cannot pile up an offset (a single anchor would drift 0.36 s per hour
+    // at 100 ppm).
+    let resync = i128::from(RESYNC_MS * SAMPLES_PER_MS);
+    let mut anchors: Vec<i128> = Vec::new();
+    let mut in_block = 0usize;
     for frame in frames {
         let receive = frame.t_ms * SAMPLES_PER_MS;
         let Some((header, packet)) = split_frame(frame.protocol_version, frame.frame) else {
@@ -410,19 +417,26 @@ fn plan_stream<'a>(frames: &[&SpeakerFrame<'a>], stats: &mut DecodeStats) -> Vec
                 stats.seq_restarts += 1;
             }
             let missing = if restarted { 0 } else { step - 1 };
+            // A concealed frame rides with the block of the frame before it.
+            let block = anchors.len().saturating_sub(1);
             if missing <= MAX_CONCEALED_FRAMES {
                 for _ in 0..missing {
-                    steps.push((Step::Conceal, None, produced));
+                    steps.push((Step::Conceal, produced, block));
                     produced += CONCEAL_SAMPLES as u64;
                     stats.concealed += 1;
                 }
             } else {
                 // Silence for the lost frames — but never longer than the
-                // time that actually passed between the two frames, so a
-                // sender's `seq` leaping ahead cannot open a huge hole.
+                // time that actually passed, so a sender's `seq` leaping
+                // ahead cannot open a huge hole. Time is measured from where
+                // the audio so far ends on the block's anchor, not from when
+                // the frame before arrived: that one may have come late in
+                // a burst, and measuring from it would fill too little and
+                // pull this frame back over the audio before it.
                 let claimed = u64::from(missing) * last_len;
-                let passed = last_receive
-                    .map_or(claimed, |before| receive.saturating_sub(before + last_len));
+                let passed = anchors.last().map_or(claimed, |anchor| {
+                    u64::try_from(i128::from(receive) - anchor - i128::from(produced)).unwrap_or(0)
+                });
                 let filled = claimed.min(passed);
                 produced += filled;
                 // Count what was actually filled, so a bare `seq` leap does
@@ -448,47 +462,32 @@ fn plan_stream<'a>(frames: &[&SpeakerFrame<'a>], stats: &mut DecodeStats) -> Vec
             ),
             Err(_) => (Step::Conceal, CONCEAL_SAMPLES as u64),
         };
-        steps.push((step, Some(receive), produced));
-        produced += len;
-        last_len = len;
-        last_receive = Some(receive);
-    }
-
-    // Spurts, each anchored at its least-delayed frame. A long spurt is
-    // re-anchored every ANCHOR_BLOCK_FRAMES so a sender clock that runs a
-    // little fast or slow against the relay's cannot pile up an offset (a
-    // single anchor would drift 0.36 s per hour at 100 ppm).
-    let resync = i128::from(RESYNC_MS * SAMPLES_PER_MS);
-    let mut anchors: Vec<i128> = Vec::new();
-    let mut in_block = 0usize;
-    let mut block_of = Vec::with_capacity(steps.len());
-    for &(_, receive, before) in &steps {
-        if let Some(receive) = receive {
-            let implied = i128::from(receive) - i128::from(before);
-            match anchors.last_mut() {
-                Some(anchor) if implied <= *anchor + resync && in_block < ANCHOR_BLOCK_FRAMES => {
-                    *anchor = (*anchor).min(implied);
-                    in_block += 1;
-                }
-                Some(anchor) if implied <= *anchor + resync => {
-                    // Same spurt, next block.
-                    anchors.push(implied);
-                    in_block = 1;
-                }
-                _ => {
-                    anchors.push(implied);
-                    in_block = 1;
-                    stats.spurts += 1;
-                }
+        // For a received frame, `receive − samples before it` is when its
+        // spurt would have started had it arrived without delay.
+        let implied = i128::from(receive) - i128::from(produced);
+        match anchors.last_mut() {
+            Some(anchor) if implied <= *anchor + resync && in_block < ANCHOR_BLOCK_FRAMES => {
+                *anchor = (*anchor).min(implied);
+                in_block += 1;
+            }
+            Some(anchor) if implied <= *anchor + resync => {
+                // Same spurt, next block.
+                anchors.push(implied);
+                in_block = 1;
+            }
+            _ => {
+                anchors.push(implied);
+                in_block = 1;
+                stats.spurts += 1;
             }
         }
-        // A concealed frame rides with the block of the frame before it.
-        block_of.push(anchors.len().saturating_sub(1));
+        steps.push((step, produced, anchors.len() - 1));
+        produced += len;
+        last_len = len;
     }
     steps
         .into_iter()
-        .zip(block_of)
-        .filter_map(|((step, _, before), block)| {
+        .filter_map(|(step, before, block)| {
             let anchor = *anchors.get(block)?;
             let at = u64::try_from((anchor + i128::from(before)).max(0)).unwrap_or(0);
             Some(Planned { step, at })
@@ -706,6 +705,28 @@ mod tests {
         // every frame is where it arrived.
         let received: Vec<u64> = sent.iter().map(|&(_, t)| t).collect();
         assert_eq!(positions, received);
+    }
+
+    #[test]
+    fn a_late_frame_before_a_long_loss_does_not_pull_later_audio_back() {
+        // Sent every 20 ms, received 40 ms later. Frame 29 comes 60 ms late
+        // (a burst of one); 30..50 are lost; 50..60 arrive on time.
+        let sent: Vec<(u16, u64)> = (0..60u16)
+            .filter(|i| !(30..50).contains(i))
+            .map(|i| {
+                let on_time = 1_040 + 20 * u64::from(i);
+                (i, if i == 29 { on_time + 60 } else { on_time })
+            })
+            .collect();
+        let (positions, stats) = plan(&sent);
+        let expected: Vec<u64> = sent
+            .iter()
+            .map(|&(i, _)| 1_040 + 20 * u64::from(i))
+            .collect();
+        assert_eq!(positions, expected);
+        assert_eq!(stats.lost_silent, 20);
+        assert_eq!(stats.seq_leaps, 0, "nothing leapt; frame 29 was late");
+        assert_eq!(stats.spurts, 1);
     }
 
     #[test]

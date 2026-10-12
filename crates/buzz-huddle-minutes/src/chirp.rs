@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use base64::Engine as _;
-use buzz_gcp::token::Tokens;
+use buzz_gcp::token::{AccessToken, Tokens};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
@@ -78,12 +78,20 @@ impl ChirpStt {
         })
     }
 
-    async fn send(&self, body: &serde_json::Value) -> Result<reqwest::Response, SttError> {
-        let token = self
-            .tokens
-            .token()
-            .await
-            .map_err(|error| SttError::new(SttErrorKind::Auth, format!("token: {error}")))?;
+    async fn send(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<(reqwest::Response, AccessToken), SttError> {
+        let token = self.tokens.token().await.map_err(|error| {
+            // A token source that did not answer is worth another try; one
+            // that said no stops the run.
+            let kind = if error.is_transient() {
+                SttErrorKind::Transient
+            } else {
+                SttErrorKind::Auth
+            };
+            SttError::new(kind, format!("token: {error}"))
+        })?;
         let mut builder = self
             .http
             .post(&self.url)
@@ -92,7 +100,7 @@ impl ChirpStt {
         if let Some(project) = &self.quota_project {
             builder = builder.header("x-goog-user-project", project);
         }
-        builder.send().await.map_err(|error| {
+        let response = builder.send().await.map_err(|error| {
             let what = if error.is_timeout() {
                 "timeout"
             } else if error.is_connect() {
@@ -101,7 +109,8 @@ impl ChirpStt {
                 "send"
             };
             SttError::new(SttErrorKind::Transient, what)
-        })
+        })?;
+        Ok((response, token))
     }
 }
 
@@ -301,11 +310,11 @@ impl SpeechToText for ChirpStt {
 
     async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
         let body = request_body(request.pcm_16k);
-        let mut response = self.send(&body).await?;
+        let (mut response, token) = self.send(&body).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             // An expired or revoked token: once more with a new one.
-            self.tokens.forget().await;
-            response = self.send(&body).await?;
+            self.tokens.forget(&token).await;
+            response = self.send(&body).await?.0;
         }
         if !response.status().is_success() {
             return Err(read_error(response).await);

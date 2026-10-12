@@ -223,7 +223,11 @@ async fn a_refused_token_is_replaced_once_then_auth_stops() {
         .expect("script");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     }
-    let tokens = Tokens::new(TokenSource::Gcloud { program }).expect("tokens");
+    let tokens = Tokens::new(TokenSource::Gcloud {
+        program,
+        timeout: std::time::Duration::from_secs(10),
+    })
+    .expect("tokens");
     let stt = ChirpStt::with_base_url(tokens, "a2d2-lab", None, &url).expect("stt");
     let unauthenticated = || error(401, "UNAUTHENTICATED", None);
     fake.answers.lock().expect("lock").extend([
@@ -251,4 +255,26 @@ async fn a_refused_token_is_replaced_once_then_auth_stops() {
     let error = stt.transcribe(request(&pcm)).await.expect_err("refused");
     assert_eq!(error.kind, SttErrorKind::Auth);
     assert_eq!(fake.seen.lock().expect("lock").len(), 4);
+}
+
+/// A token source that does not answer is a transient failure (the piece is
+/// retried); one that says no stops the run.
+#[tokio::test]
+async fn token_failures_are_transient_or_auth() {
+    let metadata = buzz_gcp::fake::FakeGcs::start(3_600).await;
+    let fake = Arc::new(Fake::default());
+    let url = start(fake.clone()).await;
+    let tokens = Tokens::new(TokenSource::MetadataServer {
+        base_url: metadata.url().to_string(),
+    })
+    .expect("tokens");
+    let stt = ChirpStt::with_base_url(tokens, "a2d2-lab", None, &url).expect("stt");
+    let pcm = vec![0.0f32; 1_600];
+    metadata.fail_metadata_next(503);
+    let error = stt.transcribe(request(&pcm)).await.expect_err("no token");
+    assert_eq!(error.kind, SttErrorKind::Transient);
+    metadata.fail_metadata_next(403);
+    let error = stt.transcribe(request(&pcm)).await.expect_err("refused");
+    assert_eq!(error.kind, SttErrorKind::Auth);
+    assert!(fake.seen.lock().expect("lock").is_empty(), "nothing sent");
 }
