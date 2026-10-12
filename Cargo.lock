@@ -1513,6 +1513,7 @@ dependencies = [
  "futures-util",
  "hex",
  "nostr 0.44.7",
+ "opus",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "rust-s3",
