@@ -10,8 +10,8 @@ job=a2d2-huddle-minutes
 scheduler=a2d2-huddle-minutes-every-10m
 schedule='*/10 * * * *' # UTC 기준. 실행끼리 겹치는 것은 docs/huddle-minutes-worker.md "실행" 절
 schedule_time_zone=Etc/UTC
-# 스케줄러 상태. 기본은 paused: 화자 분리가 붙기 전에는 10분마다 돌면 회의실 허들이
-# 기기 주인 한 사람 이름으로 노션에 올라간다. 켤 때만 SCHEDULER_STATE=enabled.
+# 스케줄러 상태. 기본은 paused: 화자 분리·후보정이 붙은 회의록을 실제 허들로 확인하고
+# 사용자가 켜기로 정할 때까지 멈춰 둔다. 켤 때만 SCHEDULER_STATE=enabled.
 scheduler_state=${SCHEDULER_STATE:-paused}
 
 # 작업기가 도는 계정, 스케줄러가 작업을 부를 때 쓰는 계정(작업 하나만 부를 수 있음)
@@ -41,8 +41,9 @@ mixed_condition_title=huddle-minutes-mixed-audio-only
 mixed_condition_expr="resource.name.startsWith(\"projects/_/buckets/$recordings_bucket/objects/$recordings_prefix/\") && resource.name.endsWith(\".wav\")"
 mixed_condition="expression=$mixed_condition_expr,title=$mixed_condition_title"
 
-# Cloud Run 작업 크기
-job_cpu=2
+# Cloud Run 작업 크기. 화자 나누기가 CPU 를 다 쓴다(1시간 회의실 녹음 bench: 2 CPU 에서
+# 전체 28분, 그중 화자 나누기 20분 / 4 CPU·스레드 4 에서 화자 나누기 10.6분, 전체 약 18분).
+job_cpu=4
 job_memory=4Gi
 job_task_timeout=55m # 작업기 lease(2시간)보다 짧게
 job_max_retries=0
@@ -56,8 +57,10 @@ image_cache_dir=/opt/huddle-minutes/cache
 # 작업기 실행: 인자는 하위 명령 하나, 나머지는 환경 변수(BUZZ_MINUTES_*).
 # 받아쓰기 인증(BUZZ_MINUTES_GCP_AUTH=metadata)과 시간 상한(BUZZ_MINUTES_TIME_LIMIT_MINUTES=50)은
 # 작업기 기본값을 그대로 쓴다. PREFIX 는 기본값과 같지만 위 IAM 조건과 같은 변수에서
-# 오게 일부러 적는다. 화자 분리(BUZZ_MINUTES_SPEAKERS·BLEED·VOICES_LEARN)는 작업기
-# 기본값(꺼짐)을 그대로 쓴다. 켤 때는 화자 모델도 이미지에 넣어야 한다(Dockerfile 2단계).
+# 오게 일부러 적는다. 화자 분리는 켠다(모델 셋은 Dockerfile 이 이미지에 넣는다).
+# 화자 나누기·목소리 특징 스레드는 CPU 수와 같게 둔다(작업기 기본값 2 는 CPU 를 따라가지 않는다).
+# 새는 소리 지우기(BLEED)·목소리 프로필 배우기(VOICES_LEARN)·목소리 저장소
+# (VOICES_BUCKET·VOICES_DIR)는 작업기 기본값(꺼짐)을 그대로 쓴다.
 job_command=process
 job_env=(
   "BUZZ_MINUTES_ALL=true"
@@ -69,6 +72,11 @@ job_env=(
   "BUZZ_MINUTES_VAD_MODEL=$image_cache_dir/models/silero_vad.onnx"
   "BUZZ_MINUTES_SUMMARY=on" # 모델은 작업기 기본값(gemini-3.8-flash)
   "BUZZ_MINUTES_NOTION=on"  # 토큰은 NOTION_TOKEN 비밀
+  "BUZZ_MINUTES_SPEAKERS=on"
+  "BUZZ_MINUTES_SPEAKER_THREADS=$job_cpu"
+  "BUZZ_MINUTES_ROOM_PIECES=cut" # 화자 토막마다 받아쓰기(작업기 기본값과 같지만 일부러 적는다)
+  "BUZZ_MINUTES_VAD_LEVEL=on"    # 말소리 찾기에만 크기 맞춘 소리를 준다
+  "BUZZ_MINUTES_CORRECT=on"      # 요약 전에 Gemini 로 잘못 들은 말 후보정
 )
 notion_env=NOTION_TOKEN
 
