@@ -5,14 +5,12 @@
 # 다시 돌려도 된다(있는 것은 그대로 두거나 같은 값으로 고친다).
 # 되돌리기 짝: delete-huddle-minutes.sh (여기서 만든 것만 이름으로 지운다).
 #
-# 아직 정할 것(정하기 전에는 APPLY=1 이 멈춘다):
-#   JOB_ARGS           작업기 인자. 지금 작업기의 process 는 --community·--channel
-#                      하나씩만 받아서, 10분마다 "끝난 회의를 다 훑는" 명령이 없다.
-#                      예) JOB_ARGS="process --recordings-bucket a2d2-huddle-recordings
-#                          --minutes-bucket a2d2-huddle-minutes --chirp-project a2d2-lab
-#                          --gcp-auth metadata --cache /opt/huddle-minutes/cache …"
-#   NOTION_SECRET_ENV  Notion 토큰을 넣을 환경 변수 이름. 작업기에 아직 Notion 코드가
-#                      없어서 비워 두면 비밀을 붙이지 않는다(권한은 미리 준다).
+# 작업기는 `process` 하나만 인자로 받고 나머지는 BUZZ_MINUTES_* 환경 변수로 받는다
+# (docs/huddle-minutes-worker.md "실행 (Cloud Run 작업)"). 값은 common.sh 의
+# job_env. 노션 토큰은 Secret Manager 를 NOTION_TOKEN 으로 붙인다.
+# 스케줄러는 기본으로 멈춘 채 만든다(common.sh scheduler_state). 그동안은 손으로 한
+# 번씩 돌린다(--all 이라 끝난 회의를 모두 처리한다):
+#   gcloud run jobs execute a2d2-huddle-minutes --project a2d2-lab --region asia-northeast3 --wait
 set -Eeuo pipefail
 export LC_ALL=C
 
@@ -24,21 +22,16 @@ esac
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$(cd "$(dirname "$0")" && pwd)/common.sh"
 
-job_args=${JOB_ARGS:-}
-notion_env=${NOTION_SECRET_ENV:-}
-
 # ─── 0. 점검(아무것도 바꾸지 않는다) ─────────────────────────────────────────
-log "계정 $(gcloud config get-value account 2>/dev/null) / 프로젝트 $project / APPLY=${APPLY:-0}"
+log "계정 $(gcloud config get-value account 2>/dev/null) / 프로젝트 $project / APPLY=${APPLY:-0} / 스케줄러 $scheduler_state"
+case "$scheduler_state" in
+  paused | enabled) ;;
+  *) echo "SCHEDULER_STATE 는 paused 나 enabled: $scheduler_state" >&2; exit 2 ;;
+esac
 gcloud artifacts docker images describe "$image" --project "$project" --format='value(image_summary.digest)' >/dev/null
 gcloud storage buckets describe "gs://$recordings_bucket" --format='value(name)' >/dev/null
 gcloud storage buckets describe "gs://$minutes_bucket" --format='value(name)' >/dev/null
 gcloud secrets describe "$notion_secret" --project "$project" --format='value(name)' >/dev/null
-if [ -z "$job_args" ]; then
-  log "JOB_ARGS 가 비었다: 작업기에 모든 채널을 훑는 명령이 아직 없다"
-  if [ "${APPLY:-0}" = 1 ]; then exit 3; fi
-  job_args="--help" # 찍기만 할 때의 자리 표시
-fi
-read -r -a args <<<"$job_args"
 
 # ─── 1. 서비스 계정 ──────────────────────────────────────────────────────────
 for pair in "$sa_name:Huddle minutes worker (Cloud Run job)" "$invoker_name:Huddle minutes invoker (Cloud Scheduler)"; do
@@ -97,10 +90,6 @@ else
 fi
 
 # ─── 4. Cloud Run 작업 ───────────────────────────────────────────────────────
-secret_flags=()
-if [ -n "$notion_env" ]; then
-  secret_flags=(--set-secrets "$notion_env=$notion_secret:latest")
-fi
 run gcloud run jobs deploy "$job" --project "$project" --region "$region" \
   --image "$image" \
   --service-account "$sa" \
@@ -109,18 +98,29 @@ run gcloud run jobs deploy "$job" --project "$project" --region "$region" \
   --max-retries "$job_max_retries" \
   --tasks "$job_tasks" --parallelism "$job_parallelism" \
   --labels "$labels" \
-  ${secret_flags[@]+"${secret_flags[@]}"} \
-  --args "$(IFS=,; echo "${args[*]}")"
+  --set-env-vars "$(IFS=,; echo "${job_env[*]}")" \
+  --set-secrets "$notion_env=$notion_secret:latest" \
+  --args "$job_command"
 
 # 스케줄러 계정은 이 작업 하나만 부를 수 있다.
 run gcloud run jobs add-iam-policy-binding "$job" --project "$project" --region "$region" \
   --member "serviceAccount:$invoker" --role roles/run.invoker
 
-# ─── 5. Cloud Scheduler (10분마다, UTC) ─────────────────────────────────────
+# ─── 5. Cloud Scheduler (10분마다, UTC; 기본은 멈춘 채) ─────────────────────
 uri="https://run.googleapis.com/v2/projects/$project/locations/$region/jobs/$job:run"
 verb=create
 if gcloud scheduler jobs describe "$scheduler" --project "$project" --location "$region" >/dev/null 2>&1; then
   verb=update
+fi
+# 새로 만들면 바로 켜진 상태라, 다음 10분 경계 직전이면 그 경계를 넘긴 뒤 만든다.
+# 그래야 멈추기 전에 한 번 도는 일이 없다.
+if [ "$verb" = create ] && [ "$scheduler_state" = paused ]; then
+  now=$(date -u +%s)
+  wait_s=$(((now / 600 + 1) * 600 - now))
+  if [ "$wait_s" -lt 120 ]; then
+    log "다음 10분 경계까지 ${wait_s}s: 넘긴 뒤 만든다"
+    if [ "${APPLY:-0}" = 1 ]; then sleep $((wait_s + 5)); fi
+  fi
 fi
 run gcloud scheduler jobs "$verb" http "$scheduler" --project "$project" --location "$region" \
   --schedule "$schedule" --time-zone "$schedule_time_zone" \
@@ -128,5 +128,26 @@ run gcloud scheduler jobs "$verb" http "$scheduler" --project "$project" --locat
   --oauth-service-account-email "$invoker" \
   --oauth-token-scope https://www.googleapis.com/auth/cloud-platform \
   --attempt-deadline 60s
+
+state() { gcloud scheduler jobs describe "$scheduler" --project "$project" --location "$region" --format='value(state)'; }
+want=PAUSED
+action=pause
+if [ "$scheduler_state" = enabled ]; then
+  want=ENABLED
+  action=resume
+fi
+if [ "${APPLY:-0}" = 1 ]; then
+  if [ "$(state)" != "$want" ]; then
+    run gcloud scheduler jobs "$action" "$scheduler" --project "$project" --location "$region"
+  fi
+  got="$(state)"
+  log "스케줄러 상태 $got"
+  if [ "$got" != "$want" ]; then
+    echo "스케줄러가 $want 가 아니다: $got" >&2
+    exit 4
+  fi
+else
+  run gcloud scheduler jobs "$action" "$scheduler" --project "$project" --location "$region"
+fi
 
 log "끝 (APPLY=${APPLY:-0})"
