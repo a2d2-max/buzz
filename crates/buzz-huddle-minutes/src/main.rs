@@ -34,6 +34,7 @@ use buzz_huddle_minutes::stt::{
 };
 use buzz_huddle_minutes::transcript::{SttInfo, Transcript};
 use buzz_huddle_minutes::vad::{SegmentPlan, SileroSettings, SileroVad};
+use buzz_huddle_minutes::{notion, summary};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
@@ -167,6 +168,79 @@ enum Command {
         #[arg(long)]
         mix: Option<PathBuf>,
     },
+    /// 스크립트를 Gemini 로 요약해 `huddle-summary/1` JSON(0600)으로 쓴다.
+    /// 접근 토큰은 환경 변수 GOOGLE_ACCESS_TOKEN 으로 받는다.
+    Summarize {
+        /// transcript.json.
+        #[arg(long)]
+        transcript: PathBuf,
+        /// 요약을 쓸 곳.
+        #[arg(long)]
+        out: PathBuf,
+        /// 모델 이름.
+        #[arg(long, default_value = summary::DEFAULT_MODEL)]
+        model: String,
+        /// GCP 프로젝트.
+        #[arg(long, default_value = summary::DEFAULT_PROJECT)]
+        project: String,
+        /// Vertex AI 위치.
+        #[arg(long, default_value = summary::DEFAULT_LOCATION)]
+        location: String,
+        /// 입력 단가(100만 토큰당 달러). 출력 단가와 같이 주면 아는 단가 대신 쓴다.
+        #[arg(long, requires = "output_usd_per_mtok")]
+        input_usd_per_mtok: Option<f64>,
+        /// 출력 단가(100만 토큰당 달러, 생각 토큰 포함).
+        #[arg(long, requires = "input_usd_per_mtok")]
+        output_usd_per_mtok: Option<f64>,
+    },
+    /// 스크립트와 요약을 노션 "허들 회의록" DB 에 쓴다(허들 ID 로 찾아 고치거나 만든다).
+    /// 노션 토큰은 환경 변수 NOTION_TOKEN 으로 받는다.
+    PublishNotion {
+        /// transcript.json.
+        #[arg(long)]
+        transcript: PathBuf,
+        /// summarize 가 쓴 요약.
+        #[arg(long)]
+        summary: PathBuf,
+        /// 제목 앞에 붙일 말(예: "[시험] ").
+        #[arg(long, default_value = "")]
+        title_prefix: String,
+        /// 다 쓴 뒤 "처리 상태".
+        #[arg(long, value_enum, default_value_t = StatusArg::Done)]
+        status: StatusArg,
+        /// "종류". 안 주면 비워 둔다.
+        #[arg(long, value_enum)]
+        kind: Option<KindArg>,
+        /// "채널" 칸에 쓸 이름(기본: channel id).
+        #[arg(long)]
+        channel_name: Option<String>,
+        /// 스크립트 시각에 거는 재생 링크 모양({channel_id}, {start_ms}).
+        #[arg(long, default_value = notion::DEFAULT_PLAYBACK_LINK)]
+        playback_link: String,
+    },
+}
+
+/// `--status` 값.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum StatusArg {
+    InProgress,
+    Done,
+    Failed,
+}
+
+/// `--kind` 값.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum KindArg {
+    Channel,
+    Dm,
+}
+
+/// 환경 변수에서 토큰을 읽는다. 값은 어디에도 찍지 않는다.
+fn token_from_env(name: &str) -> anyhow::Result<String> {
+    match std::env::var(name) {
+        Ok(token) if !token.trim().is_empty() => Ok(token.trim().to_string()),
+        _ => anyhow::bail!("set {name} (the value is never printed)"),
+    }
 }
 
 /// `--gcp-auth` values.
@@ -473,6 +547,141 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             if !pass {
                 return Ok(ExitCode::FAILURE);
             }
+        }
+        Command::Summarize {
+            transcript,
+            out,
+            model,
+            project,
+            location,
+            input_usd_per_mtok,
+            output_usd_per_mtok,
+        } => {
+            let token = token_from_env("GOOGLE_ACCESS_TOKEN")?;
+            let transcript: Transcript = serde_json::from_slice(
+                &std::fs::read(&transcript)
+                    .with_context(|| format!("read {}", transcript.display()))?,
+            )?;
+            let mut settings = summary::GeminiSettings::new(&model);
+            settings.project = project;
+            settings.location = location;
+            if let (Some(input), Some(output)) = (input_usd_per_mtok, output_usd_per_mtok) {
+                settings.price = Some(summary::Price {
+                    input_usd_per_mtok: input,
+                    output_usd_per_mtok: output,
+                });
+            }
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()?;
+            let names = summary::PubkeyPrefixNames;
+            let result = summary::summarize(&http, &settings, &token, &transcript, &names).await?;
+            if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+                create_private_dir(parent)?;
+            }
+            write_private(&out, &serde_json::to_vec_pretty(&result)?)?;
+            let usage = &result.usage;
+            let firm = result
+                .action_items
+                .iter()
+                .filter(|item| item.status == summary::ItemStatus::Firm)
+                .count();
+            eprintln!(
+                "summary: model {} ({}) | input {} output {} thinking {} tokens | cost {}",
+                result.model,
+                usage.model_version.as_deref().unwrap_or("?"),
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.thinking_tokens,
+                usage
+                    .cost_usd
+                    .map_or("unknown price".to_string(), |usd| format!("${usd:.6}"))
+            );
+            let fixed = &result.corrections;
+            eprintln!(
+                "  decisions {} | action items {} (firm {firm}) | topics {}",
+                result.decisions.len(),
+                result.action_items.len(),
+                result.topics.len()
+            );
+            eprintln!(
+                "  corrections {}: evidence snapped {} dropped {} | assignee cleared {} | due cleared {} fixed {} time dropped {} | firm→unsure {}",
+                fixed.total(),
+                fixed.evidence_snapped,
+                fixed.evidence_dropped,
+                fixed.assignee_cleared,
+                fixed.due_cleared,
+                fixed.due_fixed,
+                fixed.due_time_dropped,
+                fixed.status_downgraded
+            );
+            eprintln!("  out: {}", out.display());
+        }
+        Command::PublishNotion {
+            transcript,
+            summary: summary_path,
+            title_prefix,
+            status,
+            kind,
+            channel_name,
+            playback_link,
+        } => {
+            let token = token_from_env("NOTION_TOKEN")?;
+            let transcript: Transcript = serde_json::from_slice(
+                &std::fs::read(&transcript)
+                    .with_context(|| format!("read {}", transcript.display()))?,
+            )?;
+            let summary: summary::Summary = serde_json::from_slice(
+                &std::fs::read(&summary_path)
+                    .with_context(|| format!("read {}", summary_path.display()))?,
+            )?;
+            let settings = notion::NotionSettings {
+                playback_link,
+                ..notion::NotionSettings::default()
+            };
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?;
+            let mut client = notion::NotionClient::new(&http, &settings, &token)?;
+            let names = summary::PubkeyPrefixNames;
+            let page = notion::MeetingPage {
+                transcript: &transcript,
+                summary: Some(&summary),
+                names: &names,
+                title_prefix: &title_prefix,
+                channel_label: channel_name.as_deref(),
+                kind: kind.map(|kind| match kind {
+                    KindArg::Channel => notion::MeetingKind::Channel,
+                    KindArg::Dm => notion::MeetingKind::Dm,
+                }),
+                status: match status {
+                    StatusArg::InProgress => notion::ProcessingStatus::InProgress,
+                    StatusArg::Done => notion::ProcessingStatus::Done,
+                    StatusArg::Failed => notion::ProcessingStatus::Failed,
+                },
+            };
+            // 실패해도 그때까지 만든 페이지·줄 id 를 찍는다.
+            let mut report = notion::PublishReport::default();
+            let result = notion::publish(&mut client, &page, &mut report).await;
+            eprintln!(
+                "notion: page {} ({}) | other pages with this huddle id {} | blocks {} in {} requests, body attempts {} | people rows added {} linked {} | requests {}",
+                if report.page_id.is_empty() { "-" } else { &report.page_id },
+                if report.created { "created" } else { "found" },
+                report.duplicates,
+                report.blocks,
+                report.append_requests,
+                report.body_attempts,
+                report.people_rows_added.len(),
+                report.people_linked,
+                client.requests
+            );
+            for row in &report.people_rows_added {
+                eprintln!("  people row added: {row}");
+            }
+            if !notion::linkable_in_body(&settings.playback_link) {
+                eprintln!("  script times are plain text: Notion only links http(s) in page text");
+            }
+            result?;
         }
     }
     Ok(ExitCode::SUCCESS)
