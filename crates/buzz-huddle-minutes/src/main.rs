@@ -37,7 +37,7 @@ use buzz_huddle_minutes::runner::{
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Truth, SENTENCES,
 };
-use buzz_huddle_minutes::speakers::{report_line, SpeakerArgs};
+use buzz_huddle_minutes::speakers::{report_line, OnOff, SpeakerArgs};
 use buzz_huddle_minutes::store::{
     GcsStore, LocalStore, ObjectInfo, PutNew, RecordingStore, StoreError,
 };
@@ -206,6 +206,10 @@ enum Command {
         /// The script keeps the unpadded speech times.
         #[arg(long, default_value_t = SegmentPlan::default().pad_ms)]
         pad_ms: u64,
+        /// Let speech detection hear a level-matched copy (quiet, far voices).
+        /// The transcriber still gets the track as recorded.
+        #[arg(long, env = "BUZZ_MINUTES_VAD_LEVEL", value_enum, default_value_t = OnOff::Off)]
+        vad_level: OnOff,
         /// Speakers inside a track, naming, voice profiles.
         #[command(flatten)]
         speaker_args: SpeakerArgs,
@@ -524,6 +528,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             now_ms,
             max_segment_ms,
             pad_ms,
+            vad_level,
             speaker_args,
         } => {
             // Before anything else: the exact model the ledger keys assume.
@@ -594,6 +599,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let plan = SegmentPlan {
                 max_segment_ms,
                 pad_ms,
+                vad_level: vad_level == OnOff::On,
             };
             let settings = MinutesSettings {
                 segment_plan: plan,
@@ -1301,6 +1307,7 @@ impl SpeechToText for AnyStt {
                     (request.end_ms - request.start_ms) as f64 / 1_000.0
                 ),
                 billed_seconds: 0,
+                words: None,
             }),
         }
     }

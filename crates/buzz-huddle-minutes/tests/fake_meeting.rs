@@ -583,8 +583,76 @@ impl SpeechToText for RecordsRequests {
         Ok(SttOutput {
             text: format!("#{}", seen.len() - 1),
             billed_seconds: 0,
+            words: None,
         })
     }
+}
+
+/// Speech detection on a level-matched copy (`vad_level`): a quiet voice
+/// (−30 dB) the detector misses on the track as recorded is found, and the
+/// transcriber still gets the audio as recorded (not the louder copy).
+#[tokio::test]
+async fn level_matched_detection_finds_quiet_voices_but_sends_them_as_recorded() {
+    let mut clips = synthetic_clips();
+    mark_speech(&mut clips, &mut EnergyDetector).expect("mark speech");
+    let quiet = 10f32.powf(-30.0 / 20.0);
+    for clip in &mut clips {
+        for sample in &mut clip.pcm_16k {
+            *sample *= quiet;
+        }
+    }
+    let meeting = build_fake_meeting(&clips, 7, "huddles", BASE_UNIX_MS).expect("meeting");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gathered = gather(dir.path(), &meeting).await;
+    let mut runs = Vec::new();
+    for vad_level in [false, true] {
+        let stt = RecordsRequests::default();
+        let mut settings = settings();
+        settings.segment_plan.vad_level = vad_level;
+        let output = build_minutes(
+            &gathered,
+            &mut EnergyDetector,
+            &stt,
+            &mut SttLedger::in_memory(),
+            &settings,
+        )
+        .await
+        .expect("build minutes");
+        let seen = stt.seen.lock().expect("lock").clone();
+        runs.push((output, seen));
+    }
+    let speech = |output: &MinutesOutput| -> u64 {
+        output
+            .transcript
+            .segments
+            .iter()
+            .map(|s| s.end_ms - s.start_ms)
+            .sum()
+    };
+    let truth: u64 = meeting
+        .truth
+        .utterances
+        .iter()
+        .map(|u| u.end_ms - u.start_ms)
+        .sum();
+    let (off, on) = (&runs[0], &runs[1]);
+    eprintln!(
+        "quiet voice: speech found off {} ms, on {} ms, of {truth} ms",
+        speech(&off.0),
+        speech(&on.0)
+    );
+    assert!(
+        speech(&off.0) * 10 < truth,
+        "off: the quiet voice is missed"
+    );
+    assert!(speech(&on.0) * 10 > truth * 7, "on: most of it is found");
+    // Sent as recorded: nothing louder than the quiet clips (peak 0.3 × −30 dB,
+    // plus Opus rounding).
+    let peak =
+        on.1.iter()
+            .flat_map(|(_, _, _, pcm)| pcm.iter())
+            .fold(0f32, |m, x| m.max(x.abs()));
+    assert!(peak > 0.0 && peak < 0.3 * quiet * 1.5, "peak {peak}");
 }
 
 /// Each person's clean speech on the meeting clock (16 kHz), from the
@@ -927,6 +995,7 @@ impl SpeechToText for SaysSomething {
         Ok(SttOutput {
             text: "말".into(),
             billed_seconds: 0,
+            words: None,
         })
     }
 }
@@ -2116,6 +2185,7 @@ async fn the_bucket_ledger_keeps_paid_pieces_and_counts_unreadable_ones() {
             Outcome::Done {
                 text: "second".into(),
                 billed_seconds: 1,
+                words: None,
             },
         )
         .await

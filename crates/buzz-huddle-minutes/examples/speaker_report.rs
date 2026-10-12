@@ -61,6 +61,7 @@ impl SpeechToText for Placeholder {
         Ok(SttOutput {
             text: String::new(),
             billed_seconds: 0,
+            words: None,
         })
     }
 }

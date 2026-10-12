@@ -5,10 +5,14 @@
 //! 2. [`MeetingSpeakers::split`] (트랙마다, 받아쓰기 전에):
 //!    - B: 말 덩어리만 이어 붙여 화자를 나눈다. 말이 [`SpeakerSettings::min_cluster_ms`] 보다
 //!      적은 화자 묶음은 버린다(헛기침·웃음이 "새 사람"이 되지 않게). 남은 화자가 둘 이상이면
-//!      "여럿이 쓰는 트랙"이고, 덩어리를 화자가 바뀌는 자리에서 자른다.
+//!      "여럿이 쓰는 트랙"이고, 덩어리를 화자가 바뀌는 자리에서 자른다([`RoomPieces::Cut`], 기본).
+//!      [`RoomPieces::Whole`] 이면 받아쓰기에는 자르지 않은 덩어리를 보내고(단어 시각을 묻는다), 자른
+//!      토막은 줄을 나눌 때만 쓴다.
 //!    - A: 다른 트랙에서 새어 든 소리인 덩어리는 받아쓰기에 보내지 않는다.
 //!    - C 재료: 한 사람 트랙이면 그 사람 목소리 특징, 여럿 트랙이면 화자 묶음마다 특징을 낸다.
-//! 3. [`MeetingSpeakers::finish`] (모든 트랙 뒤, 스크립트 줄이 다 나온 뒤):
+//! 3. [`MeetingSpeakers::lines`] (덩어리마다, 받아쓴 뒤): 스크립트 줄을 만든다(whole 의 여럿 트랙이면
+//!    단어를 시각으로 화자에 나눈다).
+//! 4. [`MeetingSpeakers::finish`] (모든 트랙 뒤, 스크립트 줄이 다 나온 뒤):
 //!    - 회의실 화자 묶음을 같은 회의의 깨끗한 트랙 특징·저장된 프로필과 코사인으로 맞춘다.
 //!    - 맞은 사람이 같은 회의에 자기 기기로도 있고, 묶음의 말이 그 사람 트랙 말과 같은 시각이면
 //!      같은 말이 두 번 잡힌 것(스피커 에코·같은 방 노트북)이라 회의실 쪽 줄을 뺀다.
@@ -129,6 +133,21 @@ pub struct SpeakerSettings {
     pub embed_max_ms: u64,
     /// 특징을 내기 전에 덩어리 소리 크기를 이 RMS(dBFS)로 맞춘다(`None` 이면 그대로).
     pub embed_level_dbfs: Option<f32>,
+    /// 여럿이 쓰는 트랙의 받아쓰기 조각(기본 [`RoomPieces::Cut`]).
+    pub room_pieces: RoomPieces,
+}
+
+/// 여럿이 쓰는 트랙을 받아쓰기에 어떻게 보내나. 한 사람 트랙은 어느 쪽이든 같다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum RoomPieces {
+    /// A: 화자가 바뀌는 자리에서 자른 토막마다 보낸다(단어 시각 없음). KconfSpeech 실제 회의 발췌에서 C 보다
+    /// CER 이 낮았다(6.47% 대 7.42%). 장부 열쇠에 토막 경계가 들어가서, 화자 설정을 바꾸면 경계가 바뀐 조각은
+    /// 다시 보낸다.
+    #[default]
+    Cut,
+    /// C: VAD 덩어리 그대로 보내고 단어 시각을 받아 단어를 화자에 나눈다. 장부 열쇠가 화자 설정과 상관없다.
+    /// 단어 시각을 켜면 받아쓰기가 조금 나빠진다. 겹쳐 말하기가 있는 가짜 회의실에서는 A 보다 나았다(표본 작음).
+    Whole,
 }
 
 impl Default for SpeakerSettings {
@@ -153,6 +172,7 @@ impl Default for SpeakerSettings {
             embed_min_piece_ms: 1_000,
             embed_max_ms: 60_000,
             embed_level_dbfs: None,
+            room_pieces: RoomPieces::Cut,
         }
     }
 }
@@ -331,10 +351,49 @@ struct Cluster {
     spans_ms: Vec<(u64, u64)>,
 }
 
+/// 화자 나누기가 자른 토막 하나(받아쓰기에는 안 보내고, 단어를 나눠 줄 때 쓴다).
+#[derive(Debug, Clone, Copy)]
+struct Sub {
+    start_ms: u64,
+    end_ms: u64,
+    local: Option<usize>,
+    share: f32,
+    /// 다른 트랙에서 새어 든 소리(이 토막에 든 단어는 버린다).
+    bleed: bool,
+}
+
+/// 받아쓰기에 보낸 덩어리 하나: 말 구간(회의 ms)과, 화자 토막 그대로 보낸 것이면 그 화자.
+#[derive(Debug, Clone, Copy)]
+struct Sent {
+    start_ms: u64,
+    end_ms: u64,
+    local: Option<usize>,
+    share: f32,
+}
+
+/// 받아쓴 단어 하나와 매긴 화자 토막: (시작, 끝, 글, 그 토막의 몫).
+type HeardWord<'w> = (u64, u64, &'w str, f32);
+
+/// 스크립트 줄 하나(회의 ms). [`MeetingSpeakers::lines`] 가 낸다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    /// 시작(회의 ms).
+    pub start_ms: u64,
+    /// 끝(회의 ms).
+    pub end_ms: u64,
+    /// 글.
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 struct TrackState {
     device: String,
     multi: bool,
+    /// 받아쓰기에 보낸 덩어리마다, [`MeetingSpeakers::split`] 이 돌려준 순서.
+    sent: Vec<Sent>,
+    /// 화자 나누기가 자른 토막들(여럿 트랙을 [`RoomPieces::Whole`] 로 보낼 때만).
+    subs: Vec<Sub>,
+    /// 스크립트 줄마다(넣은 순서) 어느 화자인지. [`MeetingSpeakers::lines`] 가 채운다.
     pieces: Vec<RecordedPiece>,
     own: Option<Vec<f32>>,
     clusters: Vec<Cluster>,
@@ -398,8 +457,13 @@ impl<'a> MeetingSpeakers<'a> {
         })
     }
 
-    /// 한 트랙의 받아쓰기 덩어리를 화자마다 자르고, 새어 든 소리를 뺀다. 돌려준 덩어리가
-    /// 받아쓰기에 가고, 스크립트 줄은 이 순서대로 `device` 로 [`Segment::own`] 해서 넣는다.
+    /// 한 트랙의 화자를 나누고 새어 든 소리를 찾는다. 돌려준 덩어리가 받아쓰기에 간다.
+    /// - 한 사람 트랙: 새어 든 소리를 뺀 VAD 덩어리(예전 그대로).
+    /// - 여럿 트랙, [`RoomPieces::Cut`](기본): 화자가 바뀌는 자리에서 자른 토막(새어 든 것은 뺀다).
+    /// - 여럿 트랙, [`RoomPieces::Whole`]: 자르지 않은 VAD 덩어리(새어 든 소리뿐인 덩어리만 뺀다). 받아쓴 뒤
+    ///   단어 시각으로 화자에 나눈다.
+    ///
+    /// 받아쓴 뒤 덩어리마다 이 순서대로 [`lines`](Self::lines) 를 불러 스크립트 줄을 만든다.
     pub fn split(
         &mut self,
         device: &str,
@@ -505,33 +569,61 @@ impl<'a> MeetingSpeakers<'a> {
             envelope
         });
         let mut kept: Vec<SpeakerPiece> = Vec::with_capacity(cut.len());
+        let mut subs: Vec<Sub> = Vec::with_capacity(cut.len());
         for piece in cut {
             let from = track_start_ms + samples_to_ms(piece.piece.speech.start);
             let to = track_start_ms + samples_to_ms(piece.piece.speech.end);
-            if let Some(envelope) = &own_envelope {
-                if find_bleed(envelope, from, to, &others, &settings.bleed).is_some() {
-                    report.bleed_pieces += 1;
-                    report.bleed_ms += to - from;
-                    report.bleed_spans_ms.push((from, to));
-                    continue;
-                }
+            let bleed = own_envelope.as_ref().is_some_and(|envelope| {
+                find_bleed(envelope, from, to, &others, &settings.bleed).is_some()
+            });
+            subs.push(Sub {
+                start_ms: from,
+                end_ms: to,
+                local: piece.speaker,
+                share: piece.share,
+                bleed,
+            });
+            if bleed {
+                report.bleed_pieces += 1;
+                report.bleed_ms += to - from;
+                report.bleed_spans_ms.push((from, to));
+                continue;
             }
             kept.push(piece);
         }
+        // What goes to transcription: the kept pieces (cut at changes of
+        // speaker on a shared track), or, for whole pieces on a shared track,
+        // the VAD pieces that still hold something not leaked in.
+        let whole = multi && settings.room_pieces == RoomPieces::Whole;
+        let send: Vec<(Piece, Option<usize>, f32)> = if whole {
+            pieces
+                .iter()
+                .filter(|p| {
+                    kept.iter().any(|k| {
+                        k.piece.speech.start < p.speech.end && p.speech.start < k.piece.speech.end
+                    })
+                })
+                .map(|p| (*p, None, 1.0))
+                .collect()
+        } else {
+            kept.iter().map(|p| (p.piece, p.speaker, p.share)).collect()
+        };
 
         // C material: one embedding for a one-speaker track, one per cluster otherwise.
         let mut state = TrackState {
             device: device.to_string(),
             multi,
-            pieces: kept
+            sent: send
                 .iter()
-                .map(|p| RecordedPiece {
-                    start_ms: track_start_ms + samples_to_ms(p.piece.speech.start),
-                    end_ms: track_start_ms + samples_to_ms(p.piece.speech.end),
-                    local: p.speaker,
-                    share: p.share,
+                .map(|(p, local, share)| Sent {
+                    start_ms: track_start_ms + samples_to_ms(p.speech.start),
+                    end_ms: track_start_ms + samples_to_ms(p.speech.end),
+                    local: *local,
+                    share: *share,
                 })
                 .collect(),
+            subs: if whole { subs } else { Vec::new() },
+            pieces: Vec::new(),
             own: None,
             clusters: Vec::new(),
             report,
@@ -584,7 +676,164 @@ impl<'a> MeetingSpeakers<'a> {
             state.report.own_embedded_ms = embedded_ms;
         }
         self.tracks.push(state);
-        Ok(kept.into_iter().map(|p| p.piece).collect())
+        Ok(send.into_iter().map(|(p, _, _)| p).collect())
+    }
+
+    /// `device` 트랙의 덩어리가 화자 여럿을 담을 수 있나([`RoomPieces::Whole`] 의 여럿 트랙). 그러면
+    /// 받아쓰기에 단어 시각을 묻는다.
+    pub fn needs_words(&self, device: &str) -> bool {
+        self.tracks
+            .iter()
+            .rev()
+            .find(|t| t.device == device)
+            .is_some_and(|t| !t.subs.is_empty())
+    }
+
+    /// 받아쓴 덩어리 하나를 스크립트 줄로 만든다. `index` 는 [`split`](Self::split) 이 돌려준 순서,
+    /// `audio_start_ms` 는 보낸 소리의 시작(회의 ms, `words` 시각의 0), `text` 는 받아쓴 글.
+    /// 덩어리마다 순서대로 한 번씩 불러야 하고, 돌려준 줄을 그 순서대로 스크립트에 넣는다.
+    ///
+    /// - 한 사람 트랙, 또는 여럿 트랙을 [`RoomPieces::Cut`] 으로 보냈을 때: 덩어리 하나 = 줄 하나(말 구간
+    ///   그대로, 예전과 같다). 줄의 화자는 그 토막의 화자.
+    /// - 여럿 트랙을 [`RoomPieces::Whole`] 로 보냈을 때: 단어마다 시각이 가장 많이 겹치는(없으면 가장 가까운) 화자 토막을 찾아, 같은 화자가
+    ///   이어지는 단어끼리 줄로 묶는다. 줄 시각은 그 단어들의 시각(말 구간 안으로 자름). 새어 든
+    ///   소리 토막의 단어는 버린다. 묶음이 하나뿐이고 버린 단어가 없으면 글은 받아쓴 글 그대로.
+    ///   단어가 없으면(시각을 안 물은 옛 결과, 빈 결과, 받아쓰기 실패) 덩어리에서 말이 가장 많은
+    ///   화자에게 말 구간 그대로 한 줄로 준다.
+    pub fn lines(
+        &mut self,
+        device: &str,
+        index: usize,
+        audio_start_ms: u64,
+        text: &str,
+        words: Option<&[crate::stt::Word]>,
+    ) -> Vec<Line> {
+        let Some(track) = self.tracks.iter_mut().rev().find(|t| t.device == device) else {
+            return Vec::new();
+        };
+        let Some(&sent) = track.sent.get(index) else {
+            return Vec::new();
+        };
+        let (from, to) = (sent.start_ms, sent.end_ms);
+        let whole = |track: &mut TrackState, local: Option<usize>, share: f32| {
+            track.pieces.push(RecordedPiece {
+                start_ms: from,
+                end_ms: to,
+                local,
+                share,
+            });
+            vec![Line {
+                start_ms: from,
+                end_ms: to,
+                text: text.to_string(),
+            }]
+        };
+        if track.subs.is_empty() {
+            return whole(track, sent.local, sent.share);
+        }
+        let overlap =
+            |sub: &Sub, a: u64, b: u64| b.min(sub.end_ms).saturating_sub(a.max(sub.start_ms));
+        let subs: Vec<Sub> = track
+            .subs
+            .iter()
+            .filter(|sub| overlap(sub, from, to) > 0)
+            .copied()
+            .collect();
+        let mut words: Vec<&crate::stt::Word> = words.unwrap_or_default().iter().collect();
+        words.sort_by_key(|w| w.start_ms);
+        if words.is_empty() || subs.is_empty() {
+            // The speaker with the most (not leaked) speech in the piece.
+            let mut per: Vec<(Option<usize>, u64, f32)> = Vec::new();
+            for sub in subs.iter().filter(|s| !s.bleed) {
+                let ms = overlap(sub, from, to);
+                match per.iter_mut().find(|(l, _, _)| *l == sub.local) {
+                    Some(entry) => {
+                        entry.1 += ms;
+                        entry.2 += sub.share * ms as f32;
+                    }
+                    None => per.push((sub.local, ms, sub.share * ms as f32)),
+                }
+            }
+            if per.is_empty() && !subs.is_empty() {
+                // All of it leaked in from another track.
+                return Vec::new();
+            }
+            // Its share: how much of the piece's speech it holds (weighted by
+            // how sure each speaker piece was).
+            let total: u64 = per.iter().map(|p| p.1).sum();
+            let (local, share) = per
+                .iter()
+                .max_by_key(|p| p.1)
+                .map_or((None, 1.0), |&(local, _, weighted)| {
+                    (local, weighted / total.max(1) as f32)
+                });
+            return whole(track, local, share);
+        }
+        // Each word to the speaker piece it overlaps most, else the nearest.
+        let mut groups: Vec<(Option<usize>, Vec<HeardWord<'_>>)> = Vec::new();
+        let mut dropped = false;
+        for word in words {
+            let a = audio_start_ms + word.start_ms;
+            let b = (audio_start_ms + word.end_ms).max(a);
+            let middle = (a + b) / 2;
+            let distance = |sub: &Sub| {
+                if middle < sub.start_ms {
+                    sub.start_ms - middle
+                } else {
+                    middle.saturating_sub(sub.end_ms)
+                }
+            };
+            let Some(best) = subs
+                .iter()
+                .max_by(|x, y| {
+                    overlap(x, a, b)
+                        .cmp(&overlap(y, a, b))
+                        .then(distance(y).cmp(&distance(x)))
+                })
+                .copied()
+            else {
+                continue;
+            };
+            if best.bleed {
+                dropped = true;
+                continue;
+            }
+            let item = (a, b, word.text.as_str(), best.share);
+            match groups.last_mut() {
+                Some((local, items)) if *local == best.local => items.push(item),
+                _ => groups.push((best.local, vec![item])),
+            }
+        }
+        let single = groups.len() == 1 && !dropped;
+        let mut out = Vec::with_capacity(groups.len());
+        for (local, items) in &groups {
+            let first = items.iter().map(|item| item.0).min().unwrap_or(from);
+            let last = items.iter().map(|item| item.1).max().unwrap_or(to);
+            // Never an empty line: at least 1 ms, inside the piece.
+            let start_ms = first.clamp(from, to.saturating_sub(1).max(from));
+            let end_ms = last.clamp(start_ms + 1, to.max(start_ms + 1));
+            track.pieces.push(RecordedPiece {
+                start_ms,
+                end_ms,
+                local: *local,
+                share: weighted_share(items),
+            });
+            out.push(Line {
+                start_ms,
+                end_ms,
+                // One speaker for every word: the text as the engine wrote it.
+                text: if single {
+                    text.to_string()
+                } else {
+                    items
+                        .iter()
+                        .map(|item| item.2)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+            });
+        }
+        out
     }
 
     /// 덩어리들의 특징 평균(긴 덩어리부터 [`SpeakerSettings::embed_max_ms`] 까지).
@@ -1101,6 +1350,21 @@ fn short_key(pubkey: &str) -> String {
     pubkey.chars().take(8).collect()
 }
 
+/// 단어 길이로 무게를 단 화자 몫.
+fn weighted_share(items: &[HeardWord<'_>]) -> f32 {
+    let (mut weight, mut sum) = (0.0f32, 0.0f32);
+    for &(a, b, _, share) in items {
+        let w = (b - a).max(1) as f32;
+        weight += w;
+        sum += share * w;
+    }
+    if weight > 0.0 {
+        sum / weight
+    } else {
+        1.0
+    }
+}
+
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -1136,6 +1400,9 @@ pub struct SpeakerArgs {
     /// 화자 나누기·목소리 특징 ONNX 스레드 수.
     #[arg(long, env = "BUZZ_MINUTES_SPEAKER_THREADS", default_value_t = 2)]
     pub speaker_threads: i32,
+    /// 여럿이 쓰는 트랙을 받아쓰기에 보내는 방식: cut(화자 토막마다, 기본) 또는 whole(VAD 덩어리 + 단어 시각).
+    #[arg(long, env = "BUZZ_MINUTES_ROOM_PIECES", value_enum, default_value_t = RoomPieces::Cut)]
+    pub room_pieces: RoomPieces,
     /// 자기 기기 혼자 트랙에서 목소리 프로필을 저절로 배우기. 기본 끔 — 회의실 기기에서 남의 목소리가
     /// 주인 프로필로 쌓이는 문제가 풀리기 전엔 켜지 않는다(문서 "알려진 한계").
     #[arg(long, env = "BUZZ_MINUTES_VOICES_LEARN", value_enum, default_value_t = OnOff::Off)]
@@ -1176,6 +1443,7 @@ impl SpeakerArgs {
                 learn: self.voices_learn == OnOff::On,
                 ..ProfileSettings::default()
             },
+            room_pieces: self.room_pieces,
             bleed: BleedSettings {
                 enabled: self.bleed == OnOff::On,
                 ..BleedSettings::default()
@@ -1260,6 +1528,8 @@ mod tests {
         let room = TrackState {
             device: "aa".repeat(32),
             multi: true,
+            sent: Vec::new(),
+            subs: Vec::new(),
             pieces,
             own: None,
             clusters: vec![Cluster {
@@ -1279,6 +1549,8 @@ mod tests {
         let own = TrackState {
             device: "bb".repeat(32),
             multi: false,
+            sent: Vec::new(),
+            subs: Vec::new(),
             pieces: vec![RecordedPiece {
                 local: None,
                 ..piece(5_000, 6_000, 1.0)
@@ -1304,6 +1576,208 @@ mod tests {
 
     fn line(device: &str, start_ms: u64, end_ms: u64) -> Segment {
         Segment::own(device.repeat(32), start_ms, end_ms, "말".into())
+    }
+
+    fn sub(start_ms: u64, end_ms: u64, local: usize, bleed: bool) -> Sub {
+        Sub {
+            start_ms,
+            end_ms,
+            local: Some(local),
+            share: 1.0,
+            bleed,
+        }
+    }
+
+    fn sent(start_ms: u64, end_ms: u64, local: Option<usize>) -> Sent {
+        Sent {
+            start_ms,
+            end_ms,
+            local,
+            share: 1.0,
+        }
+    }
+
+    /// Cut pieces (the default): one line per piece, its speaker the piece's,
+    /// no word times asked, words ignored.
+    #[test]
+    fn cut_pieces_give_one_line_each_with_their_speaker() {
+        let settings = SpeakerSettings::default();
+        let mut meeting = meeting(&settings, Vec::new());
+        let track = &mut meeting.tracks[0];
+        track.sent = vec![sent(0, 1_000, Some(0)), sent(1_000, 2_000, Some(1))];
+        assert!(!meeting.needs_words(&"aa".repeat(32)));
+        let words = [word(0, 300, "무시")];
+        let first = meeting.lines(&"aa".repeat(32), 0, 0, "앞.", Some(&words));
+        let second = meeting.lines(&"aa".repeat(32), 1, 1_000, "뒤.", None);
+        assert_eq!(
+            [first, second].concat(),
+            vec![
+                Line {
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    text: "앞.".into()
+                },
+                Line {
+                    start_ms: 1_000,
+                    end_ms: 2_000,
+                    text: "뒤.".into()
+                },
+            ]
+        );
+        let locals: Vec<_> = meeting.tracks[0].pieces.iter().map(|p| p.local).collect();
+        assert_eq!(locals, [Some(0), Some(1)]);
+    }
+
+    fn word(start_ms: u64, end_ms: u64, text: &str) -> crate::stt::Word {
+        crate::stt::Word {
+            start_ms,
+            end_ms,
+            text: text.into(),
+        }
+    }
+
+    /// A shared track with one piece, speech 0..2000 ms (audio from 0): the
+    /// first second speaker 0, the second speaker 1 (or leaked in).
+    fn shared(settings: &SpeakerSettings, second_leaked: bool) -> MeetingSpeakers<'_> {
+        let mut meeting = meeting(settings, Vec::new());
+        meeting.tracks.truncate(1);
+        let track = &mut meeting.tracks[0];
+        track.sent = vec![sent(0, 2_000, None)];
+        track.subs = vec![sub(0, 1_000, 0, false), sub(1_000, 2_000, 1, second_leaked)];
+        meeting
+    }
+
+    #[test]
+    fn words_are_shared_out_by_time() {
+        let settings = SpeakerSettings::default();
+        let words = [
+            word(100, 400, "가"),
+            word(500, 900, "나"),
+            word(1_100, 1_500, "다"),
+            // Mostly over the second speaker's time.
+            word(950, 1_900, "라."),
+        ];
+        let mut meeting = shared(&settings, false);
+        assert!(meeting.needs_words(&"aa".repeat(32)));
+        let lines = meeting.lines(&"aa".repeat(32), 0, 0, "가 나 다 라.", Some(&words));
+        assert_eq!(
+            lines,
+            vec![
+                Line {
+                    start_ms: 100,
+                    end_ms: 900,
+                    text: "가 나".into()
+                },
+                Line {
+                    start_ms: 950,
+                    end_ms: 1_900,
+                    text: "라. 다".into()
+                },
+            ],
+            "words in time order, each to its speaker"
+        );
+        let locals: Vec<_> = meeting.tracks[0].pieces.iter().map(|p| p.local).collect();
+        assert_eq!(locals, [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn words_in_leaked_sound_are_dropped() {
+        let settings = SpeakerSettings::default();
+        let words = [word(100, 400, "가,"), word(1_100, 1_500, "다")];
+        let mut meeting = shared(&settings, true);
+        let lines = meeting.lines(&"aa".repeat(32), 0, 0, "가, 다", Some(&words));
+        assert_eq!(
+            lines,
+            vec![Line {
+                start_ms: 100,
+                end_ms: 400,
+                text: "가,".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_line_is_never_empty() {
+        let settings = SpeakerSettings::default();
+        // A zero-length word, and one stamped at the very end of the piece.
+        let words = [
+            word(100, 400, "가"),
+            word(1_500, 1_500, "나"),
+            word(2_000, 2_000, "다"),
+        ];
+        let mut meeting = shared(&settings, false);
+        meeting.tracks[0].subs = vec![
+            sub(0, 1_000, 0, false),
+            sub(1_000, 1_800, 1, false),
+            sub(1_800, 2_000, 0, false),
+        ];
+        let lines = meeting.lines(&"aa".repeat(32), 0, 0, "가 나 다", Some(&words));
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            assert!(line.end_ms > line.start_ms, "{line:?}");
+            assert!(line.start_ms < 2_000 && line.end_ms <= 2_000, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn one_speaker_for_every_word_keeps_the_engine_text() {
+        let settings = SpeakerSettings::default();
+        let words = [word(100, 400, "가,"), word(500, 900, "나.")];
+        let mut meeting = shared(&settings, false);
+        let lines = meeting.lines(&"aa".repeat(32), 0, 0, "가, 나.", Some(&words));
+        assert_eq!(
+            lines,
+            vec![Line {
+                start_ms: 100,
+                end_ms: 900,
+                text: "가, 나.".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn without_words_the_piece_goes_to_its_main_speaker() {
+        let settings = SpeakerSettings::default();
+        let mut meeting = shared(&settings, false);
+        meeting.tracks[0].subs = vec![sub(0, 600, 0, false), sub(600, 2_000, 1, false)];
+        let lines = meeting.lines(&"aa".repeat(32), 0, 0, "옛 결과", None);
+        assert_eq!(
+            lines,
+            vec![Line {
+                start_ms: 0,
+                end_ms: 2_000,
+                text: "옛 결과".into()
+            }]
+        );
+        let piece = &meeting.tracks[0].pieces[0];
+        assert_eq!(piece.local, Some(1));
+        assert!((piece.share - 0.7).abs() < 1e-6, "{}", piece.share);
+        // All of it leaked in: no line.
+        let mut meeting = shared(&settings, false);
+        meeting.tracks[0].subs = vec![sub(0, 2_000, 0, true)];
+        assert!(meeting
+            .lines(&"aa".repeat(32), 0, 0, "에코", None)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_one_speaker_track_gives_one_line_per_piece_as_before() {
+        let settings = SpeakerSettings::default();
+        let mut meeting = meeting(&settings, Vec::new());
+        let track = &mut meeting.tracks[1];
+        track.pieces.clear();
+        track.sent = vec![sent(5_000, 6_000, None)];
+        let words = [word(0, 300, "무시")];
+        let lines = meeting.lines(&"bb".repeat(32), 0, 4_800, "그대로.", Some(&words));
+        assert_eq!(
+            lines,
+            vec![Line {
+                start_ms: 5_000,
+                end_ms: 6_000,
+                text: "그대로.".into()
+            }]
+        );
+        assert!(!meeting.needs_words(&"bb".repeat(32)));
     }
 
     #[tokio::test]

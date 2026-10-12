@@ -120,8 +120,12 @@ pub struct SpeakerScore {
     pub echoes: usize,
     /// 에코가 주인인 채로 남은 회의실 줄이 있는 에코 수.
     pub echoes_left_dominant: usize,
-    /// 어느 줄에도 글이 없는 정답 문장(에코 빼고).
+    /// 낱말이 하나라도 그 트랙 줄 어디에도 없는 정답 문장(에코 빼고). 받아쓰기 대역이 낱말을 그대로
+    /// 주니, 0 이 아니면 잘못 지운 말이 있다는 뜻이다.
     pub sentences_lost: usize,
+    /// 낱말은 다 있지만 한 줄에 다 들어 있지 않은 문장(C 방식: 겹쳐 말한 곳 등에서 문장이 화자 둘로
+    /// 나뉜 것).
+    pub sentences_split: usize,
     /// 뺀 덩어리 수(새는 소리 + 두 번 잡힘).
     pub removed_pieces: usize,
     /// 그 가운데 진짜 말이 절반 넘던 것.
@@ -150,6 +154,7 @@ impl SpeakerScore {
         self.echoes += other.echoes;
         self.echoes_left_dominant += other.echoes_left_dominant;
         self.sentences_lost += other.sentences_lost;
+        self.sentences_split += other.sentences_split;
         self.removed_pieces += other.removed_pieces;
         self.removed_real_pieces += other.removed_real_pieces;
         self.removed_real_ms += other.removed_real_ms;
@@ -391,14 +396,32 @@ pub fn score_room_meeting(
         }
     }
 
-    // Text: twice, or nowhere.
-    for u in &truth.utterances {
+    // Text: twice, split, or gone. Words are taken from the track's lines as
+    // sentences use them, so a word two sentences share is not counted twice.
+    let mut pool: HashMap<(&str, &str), usize> = HashMap::new();
+    for l in lines.iter() {
+        for word in l.text.split_whitespace() {
+            *pool.entry((l.device.as_str(), word)).or_default() += 1;
+        }
+    }
+    let mut by_time: Vec<_> = truth.utterances.iter().collect();
+    by_time.sort_by_key(|u| u.start_ms);
+    for u in by_time {
         let holders = lines.iter().filter(|l| l.text.contains(&u.text)).count();
         if holders >= 2 {
             score.duplicated_sentences += 1;
         }
-        if holders == 0 {
+        let mut whole = true;
+        for word in u.text.split_whitespace() {
+            match pool.get_mut(&(u.device.as_str(), word)) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => whole = false,
+            }
+        }
+        if !whole {
             score.sentences_lost += 1;
+        } else if holders == 0 {
+            score.sentences_split += 1;
         }
     }
 

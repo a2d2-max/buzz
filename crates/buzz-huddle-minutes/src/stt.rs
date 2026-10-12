@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 use crate::sim::Truth;
 use crate::transcript::SttInfo;
 
@@ -25,15 +27,35 @@ pub struct SttRequest<'a> {
     pub end_ms: u64,
     /// The audio, 16 kHz mono: one natural speech unit with padding.
     pub pcm_16k: &'a [f32],
+    /// Ask for the time of each word. Only a piece that may hold more than
+    /// one speaker needs them (its words are shared out by time); every
+    /// other request goes out exactly as without them.
+    pub word_times: bool,
+}
+
+/// One word and where it is in the audio sent: ms from the start of the
+/// request's audio (not the meeting clock), so it stays right whatever the
+/// meeting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Word {
+    /// Start, ms from the start of the audio sent.
+    pub start_ms: u64,
+    /// End, ms from the start of the audio sent.
+    pub end_ms: u64,
+    /// The word as written (punctuation included).
+    pub text: String,
 }
 
 /// What the engine returned for one piece.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SttOutput {
     /// Transcribed text (may be empty for silence).
     pub text: String,
     /// Seconds billed for this request.
     pub billed_seconds: u64,
+    /// The words with their times when [`SttRequest::word_times`] asked for
+    /// them (possibly empty), `None` when it did not.
+    pub words: Option<Vec<Word>>,
 }
 
 /// Kinds of transcription failure; each is handled differently.
@@ -130,6 +152,11 @@ pub struct Fault {
 /// requested speaker that overlaps the piece by at least 300 ms and has not
 /// been returned before. Pieces of one person arrive in time order, so a
 /// sentence the VAD split in two goes to its first piece — once.
+///
+/// Asked for word times, it hears words instead, like a real engine: each
+/// sentence's words are spread evenly over the sentence's time, and a piece
+/// gets every word of the speaker whose middle is inside the audio sent (in
+/// time order). Pieces' audio never overlaps, so each word is heard once.
 #[derive(Debug)]
 pub struct TruthStt {
     utterances: Vec<(String, u64, u64, String)>,
@@ -189,6 +216,40 @@ impl SpeechToText for TruthStt {
                 return Err(SttError::new(fault.kind, "injected"));
             }
         }
+        let billed_seconds = (request.end_ms - request.start_ms).div_ceil(1_000);
+        if request.word_times {
+            let mut words = Vec::new();
+            for (speaker, start, end, text) in &self.utterances {
+                if speaker != request.speaker {
+                    continue;
+                }
+                let parts: Vec<&str> = text.split_whitespace().collect();
+                let n = parts.len() as u64;
+                for (i, part) in (0u64..).zip(&parts) {
+                    let a = start + (end - start) * i / n;
+                    let b = start + (end - start) * (i + 1) / n;
+                    let middle = (a + b) / 2;
+                    if (request.start_ms..request.end_ms).contains(&middle) {
+                        words.push(Word {
+                            start_ms: a.max(request.start_ms) - request.start_ms,
+                            end_ms: b.min(request.end_ms) - request.start_ms,
+                            text: (*part).to_string(),
+                        });
+                    }
+                }
+            }
+            words.sort_by_key(|w| w.start_ms);
+            let text = words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Ok(SttOutput {
+                text,
+                billed_seconds,
+                words: Some(words),
+            });
+        }
         let mut given = self.given.lock().map_err(|_| lock_error())?;
         let mut texts = Vec::new();
         for (index, (speaker, start, end, text)) in self.utterances.iter().enumerate() {
@@ -206,7 +267,8 @@ impl SpeechToText for TruthStt {
         let text = texts.join(" ");
         Ok(SttOutput {
             text,
-            billed_seconds: (request.end_ms - request.start_ms).div_ceil(1_000),
+            billed_seconds,
+            words: None,
         })
     }
 }
