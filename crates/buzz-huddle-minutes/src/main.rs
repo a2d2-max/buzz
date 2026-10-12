@@ -7,19 +7,20 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Context;
-use std::collections::HashMap;
 
 use buzz_huddle_minutes::audio::read_wav_mono_i16;
 use buzz_huddle_minutes::check::{check, check_mix, Tolerance};
 use buzz_huddle_minutes::collect::collect_meetings;
 use buzz_huddle_minutes::models::{ensure_silero_vad, silero_vad_path};
-use buzz_huddle_minutes::pipeline::{build_minutes, mixed_audio_key, MinutesSettings};
+use buzz_huddle_minutes::pipeline::{build_minutes, mixed_audio_key, MinutesSettings, SttPolicy};
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Truth, SENTENCES,
 };
 use buzz_huddle_minutes::store::{LocalStore, RecordingStore};
-use buzz_huddle_minutes::stt::TruthStt;
+use buzz_huddle_minutes::stt::{Fault, SttErrorKind, TruthStt};
 use buzz_huddle_minutes::transcript::Transcript;
 use buzz_huddle_minutes::vad::{SegmentPlan, SileroSettings, SileroVad};
 use clap::{Parser, Subcommand};
@@ -79,9 +80,15 @@ enum Command {
         /// Answer sheet for the fake transcriber (the only engine so far).
         #[arg(long)]
         stt_truth: PathBuf,
-        /// Make every N-th transcription fail (to see the failure marker).
+        /// Make every N-th piece fail transcription (fake transcriber).
         #[arg(long)]
         stt_fail_every: Option<usize>,
+        /// Kind of the injected failure.
+        #[arg(long, value_enum, default_value_t = FailKind::Rejected)]
+        stt_fail_kind: FailKind,
+        /// How many attempts of a failing piece fail.
+        #[arg(long, default_value_t = u32::MAX)]
+        stt_fail_attempts: u32,
         /// Cache folder holding models/silero_vad.onnx.
         #[arg(long)]
         cache: Option<PathBuf>,
@@ -128,6 +135,69 @@ enum Command {
         #[arg(long)]
         mix: Option<PathBuf>,
     },
+}
+
+/// `--stt-fail-kind` values.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum FailKind {
+    Auth,
+    Quota,
+    Rejected,
+    Transient,
+}
+
+impl From<FailKind> for SttErrorKind {
+    fn from(kind: FailKind) -> Self {
+        match kind {
+            FailKind::Auth => Self::Auth,
+            FailKind::Quota => Self::Quota,
+            FailKind::Rejected => Self::Rejected,
+            FailKind::Transient => Self::Transient,
+        }
+    }
+}
+
+/// Every session id already in a script under `out`, with its file name.
+/// An unreadable script is an error: skipping it could process a meeting
+/// twice.
+fn processed_sessions(out: &Path) -> anyhow::Result<Vec<(Uuid, String)>> {
+    let mut processed = Vec::new();
+    for entry in std::fs::read_dir(out)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".transcript.json") {
+            continue;
+        }
+        let transcript: Transcript = serde_json::from_slice(&std::fs::read(entry.path())?)
+            .with_context(|| format!("read {}", entry.path().display()))?;
+        for session in transcript.session_ids {
+            processed.push((session, name.clone()));
+        }
+    }
+    Ok(processed)
+}
+
+/// Write a file readable by its owner only (0600), atomically.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let partial = path.with_extension("partial");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&partial)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&partial, path)
 }
 
 fn default_cache() -> PathBuf {
@@ -202,6 +272,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             out,
             stt_truth,
             stt_fail_every,
+            stt_fail_kind,
+            stt_fail_attempts,
             cache,
             quiet_minutes,
             meeting_gap_minutes,
@@ -212,7 +284,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let store = LocalStore::new(&recordings);
             let quiet_ms = quiet_minutes * 60_000;
             let gap_ms = meeting_gap_minutes * 60_000;
-            let meetings = collect_meetings(&store, &prefix, community, channel, gap_ms).await?;
+            let collected = collect_meetings(&store, &prefix, community, channel, gap_ms).await?;
             let now = now_unix_ms();
             let model = silero_vad_path(&cache.unwrap_or_else(default_cache));
             let mut detector = SileroVad::new(&model, SileroSettings::default())
@@ -222,30 +294,39 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     .with_context(|| format!("read {}", stt_truth.display()))?,
             )?;
             let mut stt = TruthStt::new(&truth);
-            if let Some(n) = stt_fail_every {
-                stt = stt.failing_every(n);
+            if let Some(every) = stt_fail_every {
+                stt = stt.with_fault(Fault {
+                    kind: stt_fail_kind.into(),
+                    every,
+                    failing_attempts: stt_fail_attempts,
+                });
             }
             std::fs::create_dir_all(&out)?;
-            eprintln!("meetings in this channel: {}", meetings.len());
-            for (m, meeting) in meetings.iter().enumerate() {
+            let processed = processed_sessions(&out)?;
+            eprintln!(
+                "meetings in this channel: {} | sessions with nothing readable outside any meeting: {}",
+                collected.meetings.len(),
+                collected.unplaced_sessions.len()
+            );
+            let mut failed_meetings = 0usize;
+            for (m, meeting) in collected.meetings.iter().enumerate() {
                 let first = meeting
                     .sessions
                     .first()
                     .map(|session| session.session_id)
                     .unwrap_or_default();
                 // One script per meeting, named after its first session.
-                let transcript_path = out.join(format!("{first}.transcript.json"));
-                if transcript_path.exists() && !overwrite {
-                    eprintln!(
-                        "meeting {m}: skipped, {} exists (pass --overwrite to replace it)",
-                        transcript_path.display()
-                    );
-                    continue;
-                }
-                if !meeting.is_quiet(now, quiet_ms) {
-                    eprintln!(
-                        "meeting {m}: skipped, something was written less than {quiet_minutes} min ago; it may not be over"
-                    );
+                let name = format!("{first}.transcript.json");
+                let transcript_path = out.join(&name);
+                // `--overwrite` may replace this meeting's own script, never
+                // another script that shares a session with it.
+                let already: HashSet<Uuid> = processed
+                    .iter()
+                    .filter(|(_, file)| !(overwrite && **file == name))
+                    .map(|(session, _)| *session)
+                    .collect();
+                if let Some(skip) = meeting.skip_reason(&already, now, quiet_ms) {
+                    eprintln!("meeting {m}: skipped ({})", skip.as_str());
                     continue;
                 }
                 let audio_key = mixed_audio_key(&prefix, meeting);
@@ -254,32 +335,54 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         max_segment_ms,
                         pad_ms,
                     },
+                    stt: SttPolicy::default(),
                     audio_key: audio_key.clone(),
                     now_unix_ms: now,
                 };
-                let output = build_minutes(meeting, &mut detector, &stt, &settings).await?;
+                let output = match build_minutes(meeting, &mut detector, &stt, &settings).await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        failed_meetings += 1;
+                        eprintln!("meeting {m}: not written: {error}");
+                        if error.stops_the_run() {
+                            eprintln!("stopping: later meetings would fail the same way");
+                            return Ok(ExitCode::FAILURE);
+                        }
+                        continue;
+                    }
+                };
                 store.put(&audio_key, output.mixed_audio).await?;
-                std::fs::write(
+                write_private(
                     &transcript_path,
-                    serde_json::to_vec_pretty(&output.transcript)?,
+                    &serde_json::to_vec_pretty(&output.transcript)?,
                 )?;
 
                 let report = &output.report;
-                let losses = meeting.losses();
+                let losses = &report.losses;
                 eprintln!(
-                    "meeting {m}: sessions {} | lost chunks {} dropped frames {} missing chunk numbers {} unreadable chunks {}",
+                    "meeting {m}: sessions {} | lost chunks {} missing chunks {} unreadable chunks {} unreadable manifests {} unreadable sessions {} dropped frames {} failed pieces {}",
                     meeting.sessions.len(),
                     losses.lost_chunks,
+                    losses.missing_chunks,
+                    losses.unreadable_chunks,
+                    losses.unreadable_manifests,
+                    losses.unreadable_sessions,
                     losses.dropped_frames,
-                    losses.missing_chunk_numbers,
-                    losses.unreadable_chunks
+                    losses.failed_segments
                 );
+                let by_kind: Vec<String> = report
+                    .stt_failures_by_kind
+                    .iter()
+                    .map(|(kind, count)| format!("{kind} {count}"))
+                    .collect();
                 eprintln!(
-                    "  frames {} unknown {} overlap-skipped {} broken-chunks {}",
+                    "  frames {} unknown {} overlap-skipped {} broken-chunks {} | stt retries {} gave up [{}]",
                     report.demux.frames,
                     report.demux.unknown_sender,
                     report.demux.overlap_skipped,
-                    report.demux.broken_chunks
+                    report.demux.broken_chunks,
+                    report.stt_retries,
+                    by_kind.join(", ")
                 );
                 for (i, speaker) in report.speakers.iter().enumerate() {
                     eprintln!(
@@ -299,6 +402,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
                 eprintln!("  transcript: {}", transcript_path.display());
                 eprintln!("  mixed audio: {}", recordings.join(&audio_key).display());
+            }
+            if failed_meetings > 0 {
+                eprintln!("{failed_meetings} meeting(s) not written");
+                return Ok(ExitCode::FAILURE);
             }
         }
         Command::Check {

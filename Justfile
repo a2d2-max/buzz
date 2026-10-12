@@ -377,6 +377,10 @@ test-unit:
         # already runs it.
         cargo test -p buzz-auth --doc
         cargo nextest run -p buzz-voice --lib
+        # Huddle minutes worker: fake-meeting end-to-end tests with synthetic
+        # audio and an energy detector — no network, no model download (the
+        # FLEURS + Silero test is #[ignore]d).
+        cargo nextest run -p buzz-huddle-minutes
         cargo nextest run -p buzz-cli
         # buzz-acp owns the relay-to-agent trust boundary. Run its tests here so
         # forged relay events cannot regain a path into agent routing unnoticed.

@@ -16,13 +16,15 @@
 //!   one group). Start error = first piece start − first sentence start;
 //!   end error = last piece end − last sentence end.
 //!
-//! The time limits follow how the times are used. `start_ms` is where
-//! playback jumps when a line is clicked: starting early is harmless,
-//! starting late cuts the first word. `end_ms` only marks the line while it
-//! plays: running on is harmless, ending early cuts the last word out of the
-//! transcribed audio. Script times are the speech without the padding sent
-//! to the transcriber; relay receive times trail the speech by the network
-//! delay, so both edges tend to run slightly late.
+//! - **Merged**: no piece may hold two sentences — the sentences in the
+//!   fake meeting are at least 0.7 s apart, so a piece spanning two means a
+//!   pause was not cut.
+//!
+//! The time limits are the measured range plus a small margin (see
+//! [`Tolerance::default`]). `start_ms` is where playback jumps when a line
+//! is clicked; `end_ms` marks the line while it plays. Script times are the
+//! speech without the padding sent to the transcriber; relay receive times
+//! trail the speech by the network delay, so both edges run slightly late.
 
 use std::collections::HashMap;
 
@@ -83,11 +85,16 @@ pub struct Tolerance {
 
 impl Default for Tolerance {
     fn default() -> Self {
+        // Measured on FLEURS seeds 1–8 (unpadded script times): starts
+        // −165…+160 ms (one +598 ms where Silero missed a first syllable),
+        // ends −13…+633 ms. Limits = that range plus about 70–90 ms, so a
+        // real shift of a few hundred ms fails instead of hiding inside a
+        // wide band.
         Self {
-            start_early_ms: 500,
+            start_early_ms: 250,
             start_late_ms: 200,
-            end_early_ms: 200,
-            end_late_ms: 1_000,
+            end_early_ms: 100,
+            end_late_ms: 700,
         }
     }
 }
@@ -125,7 +132,8 @@ pub struct CheckReport {
     pub groups: usize,
     /// Groups where one sentence spans several pieces.
     pub split_groups: usize,
-    /// Groups where one piece holds several sentences.
+    /// Groups holding several sentences: some piece reaches across the
+    /// pause between two of them.
     pub merged_groups: usize,
     /// Start errors, ms (piece − sentence; negative = piece starts early).
     pub start_error_ms: ErrorStats,
@@ -289,7 +297,7 @@ pub fn check(transcript: &Transcript, truth: &Truth, tolerance: Tolerance) -> Ch
         if group_sentences.len() == 1 && group_segments.len() > 1 {
             split_groups += 1;
         }
-        if group_segments.len() == 1 && group_sentences.len() > 1 {
+        if group_sentences.len() > 1 {
             merged_groups += 1;
         }
         let first_sentence = group_sentences.iter().map(|&i| sentences[i].start_ms).min();
@@ -328,6 +336,7 @@ pub fn check(transcript: &Transcript, truth: &Truth, tolerance: Tolerance) -> Ch
         && units_under_half == 0
         && missing.is_empty()
         && order_inversions == 0
+        && merged_groups == 0
         && failed_segments == 0
         && groups_out_of_tolerance == 0
         && groups > 0;
@@ -490,4 +499,91 @@ fn correlation(reference: &[f64], signal: &[f64], at: i64) -> Option<f64> {
     }
     let den = (da * db).sqrt();
     (den > 0.0).then(|| num / den)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::{TruthUtterance, TRUTH_FORMAT};
+    use crate::transcript::{AudioRef, Losses, Segment, SttInfo, TRANSCRIPT_FORMAT};
+    use uuid::Uuid;
+
+    fn sentence(id: &str, start_ms: u64, end_ms: u64) -> TruthUtterance {
+        TruthUtterance {
+            id: id.into(),
+            speaker: "aa".into(),
+            label: "A".into(),
+            start_ms,
+            end_ms,
+            text: format!("문장 {id}"),
+            speaker_wav_start_ms: 0,
+            speaker_wav_end_ms: 0,
+            speech_units_ms: vec![[start_ms, end_ms]],
+        }
+    }
+
+    fn script(segments: Vec<Segment>) -> Transcript {
+        Transcript {
+            format: TRANSCRIPT_FORMAT.into(),
+            community_id: Uuid::nil(),
+            channel_id: Uuid::nil(),
+            parent_channel_id: None,
+            session_ids: Vec::new(),
+            started_at: String::new(),
+            ended_at: String::new(),
+            duration_ms: 10_000,
+            participants: Vec::new(),
+            segments,
+            audio: AudioRef {
+                key: String::new(),
+                expires_at: String::new(),
+            },
+            stt: SttInfo {
+                engine: String::new(),
+                region: String::new(),
+                language: String::new(),
+                billed_seconds: 0,
+            },
+            losses: Losses::default(),
+        }
+    }
+
+    fn line(start_ms: u64, end_ms: u64, text: &str) -> Segment {
+        Segment {
+            start_ms,
+            end_ms,
+            speaker: "aa".into(),
+            text: text.into(),
+        }
+    }
+
+    /// One piece reaching across the pause between two sentences fails the
+    /// check even when every time edge and every text is fine.
+    #[test]
+    fn a_piece_across_two_sentences_fails() {
+        let truth = Truth {
+            format: TRUTH_FORMAT.into(),
+            community_id: Uuid::nil(),
+            channel_id: Uuid::nil(),
+            prefix: String::new(),
+            started_at: String::new(),
+            duration_ms: 10_000,
+            speakers: Vec::new(),
+            sessions: Vec::new(),
+            utterances: vec![sentence("1", 1_000, 3_000), sentence("2", 4_000, 6_000)],
+        };
+        let apart = script(vec![
+            line(1_050, 3_050, "문장 1"),
+            line(4_050, 6_050, "문장 2"),
+        ]);
+        let report = check(&apart, &truth, Tolerance::default());
+        assert!(report.pass, "{report:#?}");
+        assert_eq!(report.merged_groups, 0);
+
+        let joined = script(vec![line(1_050, 6_050, "문장 1 문장 2")]);
+        let report = check(&joined, &truth, Tolerance::default());
+        assert_eq!(report.merged_groups, 1);
+        assert_eq!(report.groups_out_of_tolerance, 0);
+        assert!(!report.pass);
+    }
 }

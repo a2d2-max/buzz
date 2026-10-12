@@ -2,9 +2,8 @@
 //! later; [`TruthStt`] is a test double that answers from a fake meeting's
 //! answer sheet.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::sim::Truth;
@@ -37,12 +36,57 @@ pub struct SttOutput {
     pub billed_seconds: u64,
 }
 
-/// Why a piece could not be transcribed. Carries no audio or text.
+/// Kinds of transcription failure; each is handled differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SttErrorKind {
+    /// Credentials or permission refused. Nothing will work: stop.
+    Auth,
+    /// Quota or rate limit used up. More requests make it worse: stop.
+    Quota,
+    /// The engine refused this audio. Retrying will not help: mark the
+    /// piece as failed.
+    Rejected,
+    /// Network trouble or a server hiccup: retry, then mark as failed.
+    Transient,
+}
+
+impl SttErrorKind {
+    /// Short name for logs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Quota => "quota",
+            Self::Rejected => "rejected",
+            Self::Transient => "transient",
+        }
+    }
+}
+
+impl std::fmt::Display for SttErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a piece could not be transcribed. Carries a kind and a short code
+/// (e.g. an HTTP status and error reason), never audio or text.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SttError {
-    /// The engine answered with an error.
-    #[error("transcription failed: {0}")]
-    Engine(String),
+#[error("transcription failed ({kind}): {code}")]
+pub struct SttError {
+    /// How to handle it.
+    pub kind: SttErrorKind,
+    /// Engine error code, e.g. `HTTP 429 RESOURCE_EXHAUSTED`.
+    pub code: String,
+}
+
+impl SttError {
+    /// Error of `kind` with `code`.
+    pub fn new(kind: SttErrorKind, code: impl Into<String>) -> Self {
+        Self {
+            kind,
+            code: code.into(),
+        }
+    }
 }
 
 /// A speech-to-text engine.
@@ -61,6 +105,19 @@ pub trait SpeechToText {
 /// A piece must overlap a sentence this much for [`TruthStt`] to hear it.
 const TRUTH_MIN_OVERLAP_MS: u64 = 300;
 
+/// Failures [`TruthStt`] injects: every `every`-th distinct piece (1-based,
+/// in request order) fails its first `failing_attempts` attempts with
+/// `kind`. Retries of the same piece count as further attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fault {
+    /// Kind of the injected error.
+    pub kind: SttErrorKind,
+    /// Which pieces fail.
+    pub every: usize,
+    /// How many attempts of such a piece fail (`u32::MAX` = always).
+    pub failing_attempts: u32,
+}
+
 /// Test double: returns the answer-sheet text of each sentence of the
 /// requested speaker that overlaps the piece by at least 300 ms and has not
 /// been returned before. Pieces of one person arrive in time order, so a
@@ -69,8 +126,9 @@ const TRUTH_MIN_OVERLAP_MS: u64 = 300;
 pub struct TruthStt {
     utterances: Vec<(String, u64, u64, String)>,
     given: Mutex<HashSet<usize>>,
-    fail_every: Option<usize>,
-    calls: AtomicUsize,
+    fault: Option<Fault>,
+    /// (speaker, start_ms) → (piece number, attempts so far).
+    attempts: Mutex<HashMap<(String, u64), (usize, u32)>>,
 }
 
 impl TruthStt {
@@ -85,14 +143,14 @@ impl TruthStt {
         Self {
             utterances,
             given: Mutex::new(HashSet::new()),
-            fail_every: None,
-            calls: AtomicUsize::new(0),
+            fault: None,
+            attempts: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Make every `n`-th call fail (1-based), to exercise the failure path.
-    pub fn failing_every(mut self, n: usize) -> Self {
-        self.fail_every = (n > 0).then_some(n);
+    /// Inject failures (see [`Fault`]).
+    pub fn with_fault(mut self, fault: Fault) -> Self {
+        self.fault = (fault.every > 0).then_some(fault);
         self
     }
 }
@@ -108,14 +166,19 @@ impl SpeechToText for TruthStt {
     }
 
     async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
-        let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.fail_every.is_some_and(|n| call.is_multiple_of(n)) {
-            return Err(SttError::Engine("simulated failure".into()));
+        let lock_error = || SttError::new(SttErrorKind::Transient, "answer sheet lock poisoned");
+        if let Some(fault) = self.fault {
+            let mut attempts = self.attempts.lock().map_err(|_| lock_error())?;
+            let next = attempts.len() + 1;
+            let entry = attempts
+                .entry((request.speaker.to_string(), request.start_ms))
+                .or_insert((next, 0));
+            entry.1 += 1;
+            if entry.0 % fault.every == 0 && entry.1 <= fault.failing_attempts {
+                return Err(SttError::new(fault.kind, "injected"));
+            }
         }
-        let mut given = self
-            .given
-            .lock()
-            .map_err(|_| SttError::Engine("answer sheet lock poisoned".into()))?;
+        let mut given = self.given.lock().map_err(|_| lock_error())?;
         let mut texts = Vec::new();
         for (index, (speaker, start, end, text)) in self.utterances.iter().enumerate() {
             let overlap = request

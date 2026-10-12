@@ -15,14 +15,16 @@ use buzz_huddle_minutes::check::{check, check_mix, Tolerance};
 use buzz_huddle_minutes::collect::collect_meetings;
 use buzz_huddle_minutes::media::{level_dbov, MediaHeader, FLAG_DTX};
 use buzz_huddle_minutes::models::silero_vad_path;
-use buzz_huddle_minutes::pipeline::{build_minutes, MinutesOutput, MinutesSettings};
+use buzz_huddle_minutes::pipeline::{
+    build_minutes, MinutesError, MinutesOutput, MinutesSettings, SttPolicy,
+};
 use buzz_huddle_minutes::sim::{
     build_fake_meeting, load_bench_clips, mark_speech, write_fake_meeting, Clip, FakeMeeting,
     SENTENCES,
 };
 use buzz_huddle_minutes::store::{LocalStore, RecordingStore};
 use buzz_huddle_minutes::stt::{
-    SpeechToText, SttError, SttOutput, SttRequest, TruthStt, FAILED_TEXT,
+    Fault, SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, TruthStt, FAILED_TEXT,
 };
 use buzz_huddle_minutes::transcript::SttInfo;
 use buzz_huddle_minutes::vad::{
@@ -91,12 +93,36 @@ fn synthetic_clips() -> Vec<Clip> {
         .collect()
 }
 
-async fn run_worker<D: SpeechDetector>(
+/// Settings for tests: default pieces and policy, no waiting between retries.
+fn settings() -> MinutesSettings {
+    MinutesSettings {
+        segment_plan: SegmentPlan::default(),
+        stt: SttPolicy {
+            retry_delay_ms: 0,
+            ..SttPolicy::default()
+        },
+        audio_key: "mixed.wav".into(),
+        now_unix_ms: 0,
+    }
+}
+
+async fn run_worker<D: SpeechDetector, T: SpeechToText>(
     dir: &Path,
     meeting: &FakeMeeting,
     detector: &mut D,
-    stt: &TruthStt,
+    stt: &T,
 ) -> MinutesOutput {
+    try_worker(dir, meeting, detector, stt)
+        .await
+        .expect("build minutes")
+}
+
+async fn try_worker<D: SpeechDetector, T: SpeechToText>(
+    dir: &Path,
+    meeting: &FakeMeeting,
+    detector: &mut D,
+    stt: &T,
+) -> Result<MinutesOutput, MinutesError> {
     write_fake_meeting(dir, meeting).expect("write fake meeting");
     let store = LocalStore::new(dir.join("recordings"));
     let truth = &meeting.truth;
@@ -108,7 +134,8 @@ async fn run_worker<D: SpeechDetector>(
         10 * 60_000,
     )
     .await
-    .expect("collect");
+    .expect("collect")
+    .meetings;
     assert_eq!(meetings.len(), 1, "both sessions belong to one meeting");
     let gathered = meetings.remove(0);
     assert_eq!(gathered.sessions.len(), 2);
@@ -120,14 +147,7 @@ async fn run_worker<D: SpeechDetector>(
         gathered.sessions[1].manifest.is_none(),
         "session 2 is chunks only"
     );
-    let settings = MinutesSettings {
-        segment_plan: SegmentPlan::default(),
-        audio_key: "mixed.wav".into(),
-        now_unix_ms: 0,
-    };
-    build_minutes(&gathered, detector, stt, &settings)
-        .await
-        .expect("build minutes")
+    build_minutes(&gathered, detector, stt, &settings()).await
 }
 
 fn speaker_wavs(meeting: &FakeMeeting) -> HashMap<String, Vec<f32>> {
@@ -197,17 +217,33 @@ async fn script_matches_the_answer_sheet() {
     // where the answer sheet says, all at the same small delay.
     let (rate, mix) = read_wav_mono_i16(&output.mixed_audio).expect("mixed audio is a WAV");
     assert_eq!(rate, 16_000);
-    let mix_ms = mix.len() as u64 * 1_000 / 16_000;
-    assert!(mix_ms + 50 >= output.transcript.duration_ms, "{mix_ms} ms");
+    // Both end with the meeting: the mix is exactly as long, no line ends after.
+    let duration_ms = output.transcript.duration_ms;
+    assert_eq!(mix.len() as u64, duration_ms * 16);
+    assert!(output
+        .transcript
+        .segments
+        .iter()
+        .all(|s| s.start_ms <= s.end_ms && s.end_ms <= duration_ms));
     let mix_report = check_mix(&mix, &meeting.truth, &speaker_wavs(&meeting));
     assert!(mix_report.pass, "{mix_report:#?}");
 }
 
+fn fault(kind: SttErrorKind, every: usize, failing_attempts: u32) -> Fault {
+    Fault {
+        kind,
+        every,
+        failing_attempts,
+    }
+}
+
+/// A few pieces the engine refuses stay in the script as "받아쓰기 실패",
+/// are counted in the losses, and nothing is dropped.
 #[tokio::test]
-async fn failed_transcriptions_stay_in_the_script() {
+async fn a_few_refused_pieces_stay_in_the_script_marked() {
     let meeting = fake_meeting(7);
     let dir = tempfile::tempdir().expect("tempdir");
-    let stt = TruthStt::new(&meeting.truth).failing_every(3);
+    let stt = TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Rejected, 12, u32::MAX));
     let output = run_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
 
     let pieces: usize = output.report.speakers.iter().map(|s| s.segments).sum();
@@ -223,8 +259,130 @@ async fn failed_transcriptions_stay_in_the_script() {
         pieces,
         "no piece is dropped"
     );
+    assert!(failures > 0);
+    assert_eq!(failures, pieces / 12);
     assert_eq!(marked, failures);
-    assert_eq!(failures, pieces / 3);
+    assert_eq!(output.transcript.losses.failed_segments, failures as u64);
+    assert_eq!(output.report.stt_retries, 0, "a refusal is not retried");
+    assert_eq!(
+        output.report.stt_failures_by_kind,
+        [(SttErrorKind::Rejected, failures as u64)]
+    );
+}
+
+/// More than one piece in ten failing: nothing is written.
+#[tokio::test]
+async fn too_many_failed_pieces_write_nothing() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stt = TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Rejected, 3, u32::MAX));
+    let result = try_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
+    assert!(
+        matches!(result, Err(MinutesError::TooManySttFailures { .. })),
+        "{result:?}"
+    );
+}
+
+/// Credentials or quota refused: the meeting stops at once and the whole
+/// run is told to stop.
+#[tokio::test]
+async fn auth_or_quota_failure_stops_at_once() {
+    for kind in [SttErrorKind::Auth, SttErrorKind::Quota] {
+        let meeting = fake_meeting(7);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stt = TruthStt::new(&meeting.truth).with_fault(fault(kind, 2, u32::MAX));
+        let result = try_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
+        match result {
+            Err(error @ MinutesError::SttStopped(stopped)) => {
+                assert_eq!(stopped, kind);
+                assert!(error.stops_the_run());
+            }
+            other => panic!("{kind}: {other:?}"),
+        }
+    }
+}
+
+/// Transient failures are retried; a piece that keeps failing is marked
+/// only after the last retry.
+#[tokio::test]
+async fn transient_failures_are_retried_before_giving_up() {
+    // Every 2nd piece fails twice, then works: retried, nothing lost.
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stt = TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Transient, 2, 2));
+    let output = run_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
+    let pieces: usize = output.report.speakers.iter().map(|s| s.segments).sum();
+    assert_eq!(output.transcript.losses.failed_segments, 0);
+    assert_eq!(output.report.stt_retries, (pieces / 2 * 2) as u64);
+    assert!(check(&output.transcript, &meeting.truth, Tolerance::default()).pass);
+
+    // Every 12th piece always fails: 3 retries each, then marked.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stt =
+        TruthStt::new(&meeting.truth).with_fault(fault(SttErrorKind::Transient, 12, u32::MAX));
+    let output = run_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
+    let pieces: usize = output.report.speakers.iter().map(|s| s.segments).sum();
+    let failed = (pieces / 12) as u64;
+    assert_eq!(output.transcript.losses.failed_segments, failed);
+    assert_eq!(output.report.stt_retries, failed * 3);
+}
+
+/// Test double: remembers each request and answers with its number, so
+/// every script line can be matched to the audio that was sent.
+#[derive(Default)]
+struct RecordsRequests {
+    seen: std::sync::Mutex<Vec<(u64, u64, usize)>>,
+}
+
+impl SpeechToText for RecordsRequests {
+    fn info(&self) -> SttInfo {
+        SaysSomething.info()
+    }
+
+    async fn transcribe(&self, request: SttRequest<'_>) -> Result<SttOutput, SttError> {
+        let mut seen = self.seen.lock().expect("lock");
+        seen.push((request.start_ms, request.end_ms, request.pcm_16k.len()));
+        Ok(SttOutput {
+            text: format!("#{}", seen.len() - 1),
+            billed_seconds: 0,
+        })
+    }
+}
+
+/// The padding goes on the audio sent, never into the script's times:
+/// each line starts and ends inside its request, by exactly the padding
+/// wherever there was room, and the audio sent is as long as its times say.
+#[tokio::test]
+async fn padding_reaches_the_transcriber_but_not_the_script() {
+    let meeting = fake_meeting(7);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stt = RecordsRequests::default();
+    let output = run_worker(dir.path(), &meeting, &mut EnergyDetector, &stt).await;
+    let seen = stt.seen.lock().expect("lock").clone();
+    let pad = SegmentPlan::default().pad_ms;
+    let mut full_pad = 0;
+    for segment in &output.transcript.segments {
+        let n: usize = segment.text[1..].parse().expect("request number");
+        let (start, end, samples) = seen[n];
+        assert!(
+            start <= segment.start_ms && segment.start_ms - start <= pad,
+            "{segment:?}"
+        );
+        assert!(
+            end >= segment.end_ms && end - segment.end_ms <= pad,
+            "{segment:?}"
+        );
+        let expected = usize::try_from((end - start) * 16).expect("samples");
+        assert!(samples.abs_diff(expected) < 16, "{samples} vs {expected}");
+        if segment.start_ms - start == pad && end - segment.end_ms == pad {
+            full_pad += 1;
+        }
+    }
+    let lines = output.transcript.segments.len();
+    assert!(
+        full_pad * 10 >= lines * 9,
+        "{full_pad} of {lines} lines have the full padding"
+    );
 }
 
 type Roster = BTreeMap<(u8, u8), [u8; 32]>;
@@ -432,7 +590,8 @@ async fn roster_only_keepalive_chunks_change_nothing_but_the_end() {
         10 * 60_000,
     )
     .await
-    .expect("collect");
+    .expect("collect")
+    .meetings;
     assert_eq!(meetings.len(), 1);
     assert_eq!(meetings[0].losses(), Default::default());
     // The fixture really added three roster-only chunks, and all were read.
@@ -777,7 +936,8 @@ async fn an_eleven_minute_mute_with_keepalives_stays_one_live_meeting() {
         let store = store_objects(dir.path(), &objects, now).await;
         let meetings = collect_meetings(&store, prefix, community, channel, 10 * MINUTE)
             .await
-            .expect("collect");
+            .expect("collect")
+            .meetings;
         assert_eq!(meetings.len(), 1);
         assert!(
             !meetings[0].is_quiet(now, 10 * MINUTE),
@@ -789,7 +949,8 @@ async fn an_eleven_minute_mute_with_keepalives_stays_one_live_meeting() {
     let store = store_objects(dir.path(), &without_keepalives, now).await;
     let meetings = collect_meetings(&store, prefix, community, channel, 10 * MINUTE)
         .await
-        .expect("collect");
+        .expect("collect")
+        .meetings;
     assert!(
         meetings[0].is_quiet(now, 10 * MINUTE),
         "without keepalives it looks over"
@@ -800,7 +961,8 @@ async fn an_eleven_minute_mute_with_keepalives_stays_one_live_meeting() {
     let store = store_objects(dir.path(), &objects, u64::MAX).await;
     let mut meetings = collect_meetings(&store, prefix, community, channel, 10 * MINUTE)
         .await
-        .expect("collect");
+        .expect("collect")
+        .meetings;
     assert_eq!(meetings.len(), 1, "one meeting across the mute");
     assert_eq!(meetings[0].sessions.len(), 2);
     assert_eq!(meetings[0].losses(), Default::default());
@@ -808,7 +970,8 @@ async fn an_eleven_minute_mute_with_keepalives_stays_one_live_meeting() {
     let plain = store_objects(plain_dir.path(), &without_keepalives, u64::MAX).await;
     let split = collect_meetings(&plain, prefix, community, channel, 10 * MINUTE)
         .await
-        .expect("collect");
+        .expect("collect")
+        .meetings;
     assert_eq!(
         split.len(),
         2,
@@ -818,12 +981,7 @@ async fn an_eleven_minute_mute_with_keepalives_stays_one_live_meeting() {
     // (c) No speech pieces inside the mute, nothing broken or unknown, and
     // both people's talk is there.
     let meeting = meetings.remove(0);
-    let settings = MinutesSettings {
-        segment_plan: SegmentPlan::default(),
-        audio_key: "mixed.wav".into(),
-        now_unix_ms: 0,
-    };
-    let output = build_minutes(&meeting, &mut EnergyDetector, &SaysSomething, &settings)
+    let output = build_minutes(&meeting, &mut EnergyDetector, &SaysSomething, &settings())
         .await
         .expect("build minutes");
     assert_eq!(output.report.demux.broken_chunks, 0);

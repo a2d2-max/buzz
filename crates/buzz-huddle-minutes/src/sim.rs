@@ -432,7 +432,7 @@ pub fn build_fake_meeting(clips: &[Clip], seed: u64, prefix: &str) -> anyhow::Re
     let total_48k = usize::try_from((s2_end + 1_000) * 48)?;
     let mut signals = vec![vec![0f32; total_48k]; LABELS.len()];
     for (speaker, start, clip) in &utterances {
-        let up = resample(&clip.pcm_16k, 16_000, 48_000);
+        let up = resample(&clip.pcm_16k, 16_000, 48_000)?;
         // `start` is where the speech begins; the clip's quiet lead-in goes
         // before it. Added, so a lead-in never cuts the previous tail.
         let offset = usize::try_from((start - clip.speech_ms().0) * 48)?;

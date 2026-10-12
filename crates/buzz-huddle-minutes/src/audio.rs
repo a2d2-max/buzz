@@ -98,16 +98,29 @@ fn to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * 32_767.0).round() as i16
 }
 
+/// sherpa-onnx could not build a resampler for these rates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("cannot resample {from_hz} Hz to {to_hz} Hz")]
+pub struct ResampleError {
+    /// Input rate.
+    pub from_hz: u32,
+    /// Output rate.
+    pub to_hz: u32,
+}
+
 /// Resample a whole signal (sherpa-onnx's windowed-sinc linear resampler).
-pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
+/// A resampler that cannot be built is an error, never silently empty audio.
+pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Result<Vec<f32>, ResampleError> {
+    let error = ResampleError { from_hz, to_hz };
+    if from_hz == 0 || to_hz == 0 {
+        return Err(error);
+    }
     if from_hz == to_hz || samples.is_empty() {
-        return samples.to_vec();
+        return Ok(samples.to_vec());
     }
-    let rate = |hz: u32| i32::try_from(hz).unwrap_or(i32::MAX);
-    match LinearResampler::create(rate(from_hz), rate(to_hz)) {
-        Some(resampler) => resampler.resample(samples, true),
-        None => Vec::new(),
-    }
+    let rate = |hz: u32| i32::try_from(hz).map_err(|_| error);
+    let resampler = LinearResampler::create(rate(from_hz)?, rate(to_hz)?).ok_or(error)?;
+    Ok(resampler.resample(samples, true))
 }
 
 /// Sums people's tracks on one timeline.
@@ -192,7 +205,14 @@ mod tests {
         let tone: Vec<f32> = (0..48_000)
             .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
             .collect();
-        let down = resample(&tone, 48_000, 16_000);
+        let down = resample(&tone, 48_000, 16_000).expect("resample");
         assert!((down.len() as i64 - 16_000).abs() <= 16, "{}", down.len());
+        assert_eq!(
+            resample(&tone, 0, 16_000),
+            Err(ResampleError {
+                from_hz: 0,
+                to_hz: 16_000
+            })
+        );
     }
 }

@@ -34,6 +34,47 @@ pub struct Transcript {
     pub audio: AudioRef,
     /// Which transcriber ran.
     pub stt: SttInfo,
+    /// What is known to be missing from this script. Read as all zero from
+    /// a script written before this field existed.
+    #[serde(default)]
+    pub losses: Losses,
+}
+
+/// What is known to be missing from a meeting's recording or script.
+/// Counts only, so a hole never goes unnoticed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Losses {
+    /// Chunks the recorder could not upload (`lost_chunks` in manifests).
+    pub lost_chunks: u64,
+    /// Chunks that should be in storage but are not: listed in a manifest
+    /// but absent, or (no manifest) numbers missing from 0 to the last one.
+    pub missing_chunks: u64,
+    /// Chunks present but unreadable (bad header, wrong session or number)
+    /// in sessions that were otherwise read.
+    pub unreadable_chunks: u64,
+    /// Manifests that could not be read; their sessions were used as
+    /// chunk-only sessions.
+    pub unreadable_manifests: u64,
+    /// Sessions with nothing readable at all (placed in this meeting by
+    /// their write time); their chunks are not counted again above.
+    pub unreadable_sessions: u64,
+    /// Frames the recorder dropped because its queue was full.
+    pub dropped_frames: u64,
+    /// Pieces left as "받아쓰기 실패".
+    pub failed_segments: u64,
+}
+
+impl Losses {
+    /// Add `other` into `self`.
+    pub fn add(&mut self, other: &Losses) {
+        self.lost_chunks += other.lost_chunks;
+        self.missing_chunks += other.missing_chunks;
+        self.unreadable_chunks += other.unreadable_chunks;
+        self.unreadable_manifests += other.unreadable_manifests;
+        self.unreadable_sessions += other.unreadable_sessions;
+        self.dropped_frames += other.dropped_frames;
+        self.failed_segments += other.failed_segments;
+    }
 }
 
 /// One person in the meeting.

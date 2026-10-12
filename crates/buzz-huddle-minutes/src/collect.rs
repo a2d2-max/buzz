@@ -5,12 +5,13 @@
 //! session folder holds `chunk-{seq:06}.bhr` objects and, once finished,
 //! `manifest.json`. A session whose pod died has chunks only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use buzz_huddle_recording::{decode_chunk, ChunkHeader, Manifest, FORMAT};
 use uuid::Uuid;
 
 use crate::store::{RecordingStore, StoreError};
+pub use crate::transcript::Losses;
 
 /// One chunk object, loaded.
 #[derive(Debug, Clone)]
@@ -50,29 +51,6 @@ impl SessionRecording {
     }
 }
 
-/// Recording that is known to be missing. Counts only, so a gap of audio
-/// never goes unnoticed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Losses {
-    /// `lost_chunks` from the manifests (uploads that failed).
-    pub lost_chunks: u64,
-    /// `dropped_frames` from the manifests (recorder queue full).
-    pub dropped_frames: u64,
-    /// Chunk numbers missing between the first and last chunk found.
-    pub missing_chunk_numbers: u64,
-    /// Chunks skipped because their header was unreadable or wrong.
-    pub unreadable_chunks: u64,
-}
-
-impl Losses {
-    fn add(&mut self, other: &Losses) {
-        self.lost_chunks += other.lost_chunks;
-        self.dropped_frames += other.dropped_frames;
-        self.missing_chunk_numbers += other.missing_chunk_numbers;
-        self.unreadable_chunks += other.unreadable_chunks;
-    }
-}
-
 /// One meeting: sessions of one huddle that follow each other closely, in
 /// `started_at` order.
 #[derive(Debug, Clone)]
@@ -85,6 +63,9 @@ pub struct Meeting {
     pub parent_channel_id: Option<Uuid>,
     /// Sessions, earliest first.
     pub sessions: Vec<SessionRecording>,
+    /// Sessions of this meeting with nothing readable, placed here by
+    /// their write time.
+    pub unreadable_sessions: Vec<Uuid>,
 }
 
 impl Meeting {
@@ -124,9 +105,39 @@ impl Meeting {
         now_unix_ms.saturating_sub(self.last_modified_unix_ms()) >= quiet_ms
     }
 
+    /// Why this meeting should be left alone this run, if it should.
+    /// `processed` holds every session id already in a written script: any
+    /// overlap means the meeting was processed. A meeting whose earliest
+    /// session is over [`MAX_MEETING_AGE_MS`] old is not touched — the
+    /// bucket's 15-day rule deletes the oldest sessions first, so it may be
+    /// half gone.
+    pub fn skip_reason(
+        &self,
+        processed: &HashSet<Uuid>,
+        now_unix_ms: u64,
+        quiet_ms: u64,
+    ) -> Option<Skip> {
+        if self
+            .sessions
+            .iter()
+            .any(|session| processed.contains(&session.session_id))
+        {
+            Some(Skip::AlreadyProcessed)
+        } else if now_unix_ms.saturating_sub(self.started_at_unix_ms()) > MAX_MEETING_AGE_MS {
+            Some(Skip::TooOld)
+        } else if !self.is_quiet(now_unix_ms, quiet_ms) {
+            Some(Skip::MaybeLive)
+        } else {
+            None
+        }
+    }
+
     /// Everything known to be missing, over all sessions.
     pub fn losses(&self) -> Losses {
-        let mut total = Losses::default();
+        let mut total = Losses {
+            unreadable_sessions: self.unreadable_sessions.len() as u64,
+            ..Losses::default()
+        };
         for session in &self.sessions {
             total.add(&session.losses);
         }
@@ -143,14 +154,41 @@ pub enum CollectError {
     /// No session folder under the huddle.
     #[error("no recording sessions under {0}")]
     NoSessions(String),
-    /// A manifest is not valid JSON or has another format.
-    #[error("session {session_id}: bad manifest: {reason}")]
-    BadManifest {
-        /// Session folder.
-        session_id: Uuid,
-        /// What was wrong.
-        reason: String,
-    },
+}
+
+/// Meetings whose earliest session is older than this are not touched
+/// (14 days; the bucket deletes after 15).
+pub const MAX_MEETING_AGE_MS: u64 = 14 * 24 * 60 * 60 * 1_000;
+
+/// Why a meeting is left alone this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skip {
+    /// One of its sessions is already in a written script.
+    AlreadyProcessed,
+    /// Its earliest session is over 14 days old.
+    TooOld,
+    /// Something was written less than the quiet time ago.
+    MaybeLive,
+}
+
+impl Skip {
+    /// Short name for logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyProcessed => "already processed",
+            Self::TooOld => "older than 14 days",
+            Self::MaybeLive => "may not be over",
+        }
+    }
+}
+
+/// Everything found under one huddle channel.
+#[derive(Debug, Clone)]
+pub struct Collected {
+    /// Meetings, earliest first.
+    pub meetings: Vec<Meeting>,
+    /// Sessions with nothing readable that no meeting's time covers.
+    pub unplaced_sessions: Vec<Uuid>,
 }
 
 #[derive(Default)]
@@ -166,14 +204,16 @@ struct SessionObjects {
 /// 10-minute rule; one channel can hold many meetings within the bucket's 15
 /// days). Folders that are not session UUIDs and files that are neither
 /// chunks nor a manifest are ignored (the mixed audio lives beside the
-/// sessions). An unreadable chunk is skipped and counted, not fatal.
+/// sessions). Nothing broken is fatal: an unreadable chunk is skipped, an
+/// unreadable manifest leaves a chunk-only session, a session with nothing
+/// readable is placed by its write time — all counted in [`Losses`].
 pub async fn collect_meetings<S: RecordingStore>(
     store: &S,
     prefix: &str,
     community_id: Uuid,
     channel_id: Uuid,
     gap_ms: u64,
-) -> Result<Vec<Meeting>, CollectError> {
+) -> Result<Collected, CollectError> {
     let base = format!("{prefix}/{community_id}/{channel_id}/");
     let mut by_session: BTreeMap<Uuid, SessionObjects> = BTreeMap::new();
     for object in store.list(&base).await? {
@@ -199,9 +239,11 @@ pub async fn collect_meetings<S: RecordingStore>(
     }
 
     let mut sessions = Vec::with_capacity(by_session.len());
+    let mut unreadable: Vec<(Uuid, u64)> = Vec::new();
     for (session_id, objects) in by_session {
-        if let Some(session) = load_session(store, session_id, &objects).await? {
-            sessions.push(session);
+        match load_session(store, session_id, &objects).await? {
+            Some(session) => sessions.push(session),
+            None => unreadable.push((session_id, objects.last_modified_unix_ms)),
         }
     }
     sessions.sort_by_key(|session| (session.started_at_unix_ms, session.session_id));
@@ -217,6 +259,7 @@ pub async fn collect_meetings<S: RecordingStore>(
                 channel_id,
                 parent_channel_id: None,
                 sessions: Vec::new(),
+                unreadable_sessions: Vec::new(),
             });
         }
         ended = ended.max(session.ended_at_unix_ms());
@@ -228,7 +271,26 @@ pub async fn collect_meetings<S: RecordingStore>(
             meeting.sessions.push(session);
         }
     }
-    Ok(meetings)
+
+    // A session with nothing readable has no start time; its objects' write
+    // time puts it in the meeting that was being recorded then.
+    let mut unplaced_sessions = Vec::new();
+    for (session_id, written) in unreadable {
+        let home = meetings.iter_mut().find(|meeting| {
+            let last = meeting
+                .ended_at_unix_ms()
+                .max(meeting.last_modified_unix_ms());
+            (meeting.started_at_unix_ms()..=last + gap_ms).contains(&written)
+        });
+        match home {
+            Some(meeting) => meeting.unreadable_sessions.push(session_id),
+            None => unplaced_sessions.push(session_id),
+        }
+    }
+    Ok(Collected {
+        meetings,
+        unplaced_sessions,
+    })
 }
 
 async fn load_session<S: RecordingStore>(
@@ -236,21 +298,37 @@ async fn load_session<S: RecordingStore>(
     session_id: Uuid,
     objects: &SessionObjects,
 ) -> Result<Option<SessionRecording>, CollectError> {
+    let mut losses = Losses::default();
     let manifest = match &objects.manifest_key {
-        Some(key) => Some(load_manifest(store, key, session_id).await?),
+        Some(key) => {
+            let manifest = load_manifest(store, key, session_id).await?;
+            if manifest.is_none() {
+                losses.unreadable_manifests += 1;
+            }
+            manifest
+        }
         None => None,
     };
-    let mut losses = Losses::default();
-    if let Some(manifest) = &manifest {
-        losses.lost_chunks = manifest.lost_chunks;
-        losses.dropped_frames = manifest.dropped_frames;
-    }
-    if let (Some(first), Some(last)) = (
-        objects.chunk_keys.keys().next(),
-        objects.chunk_keys.keys().next_back(),
-    ) {
-        let expected = u64::from(last - first) + 1;
-        losses.missing_chunk_numbers = expected - objects.chunk_keys.len() as u64;
+    match &manifest {
+        // The recorder numbers a chunk when it opens it, so a gap in the
+        // numbers is a failed upload — already in `lost_chunks`. What the
+        // manifest lists but storage lacks is missing on top of that.
+        Some(manifest) => {
+            losses.lost_chunks = manifest.lost_chunks;
+            losses.dropped_frames = manifest.dropped_frames;
+            losses.missing_chunks = manifest
+                .chunks
+                .iter()
+                .filter(|chunk| !objects.chunk_keys.contains_key(&chunk.seq))
+                .count() as u64;
+        }
+        // Without a manifest every number from 0 to the last one found
+        // should be there.
+        None => {
+            if let Some(last) = objects.chunk_keys.keys().next_back() {
+                losses.missing_chunks = u64::from(*last) + 1 - objects.chunk_keys.len() as u64;
+            }
+        }
     }
     let mut chunks = Vec::with_capacity(objects.chunk_keys.len());
     for (seq, key) in &objects.chunk_keys {
@@ -263,15 +341,10 @@ async fn load_session<S: RecordingStore>(
         }
     }
     let started_at_unix_ms = match (&manifest, chunks.first()) {
-        (Some(manifest), _) => {
-            parse_utc_ms(&manifest.started_at).ok_or_else(|| CollectError::BadManifest {
-                session_id,
-                reason: format!(
-                    "started_at {:?} is not a UTC timestamp",
-                    manifest.started_at
-                ),
-            })?
-        }
+        (Some(manifest), _) => match parse_utc_ms(&manifest.started_at) {
+            Some(ms) => ms,
+            None => return Ok(None),
+        },
         (None, Some(chunk)) => chunk.header.session_start_unix_ms,
         (None, None) => return Ok(None),
     };
@@ -302,27 +375,21 @@ async fn load_session<S: RecordingStore>(
     }))
 }
 
+/// A readable manifest of this session, or `None` when it is not valid
+/// JSON, has another format (e.g. a future `/2`) or names another session.
 async fn load_manifest<S: RecordingStore>(
     store: &S,
     key: &str,
     session_id: Uuid,
-) -> Result<Manifest, CollectError> {
+) -> Result<Option<Manifest>, CollectError> {
     let bytes = store.get(key).await?;
-    let manifest: Manifest =
-        serde_json::from_slice(&bytes).map_err(|error| CollectError::BadManifest {
-            session_id,
-            reason: error.to_string(),
-        })?;
-    if manifest.format != FORMAT || manifest.session_id != session_id {
-        return Err(CollectError::BadManifest {
-            session_id,
-            reason: format!(
-                "format {:?} session {} (expected {FORMAT} {session_id})",
-                manifest.format, manifest.session_id
-            ),
-        });
-    }
-    Ok(manifest)
+    let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes) else {
+        return Ok(None);
+    };
+    let usable = manifest.format == FORMAT
+        && manifest.session_id == session_id
+        && parse_utc_ms(&manifest.started_at).is_some();
+    Ok(usable.then_some(manifest))
 }
 
 fn chunk_seq(name: &str) -> Option<u32> {
@@ -399,17 +466,200 @@ mod tests {
 
         let meetings = collect_meetings(&store, "h", community, channel, 10 * 60_000)
             .await
-            .expect("collect");
+            .expect("collect")
+            .meetings;
         assert_eq!(meetings.len(), 2);
         let ids: Vec<Vec<u128>> = meetings
             .iter()
             .map(|m| m.sessions.iter().map(|s| s.session_id.as_u128()).collect())
             .collect();
         assert_eq!(ids, [vec![10, 11], vec![12]]);
-        assert_eq!(meetings[0].losses().missing_chunk_numbers, 1);
+        assert_eq!(meetings[0].losses().missing_chunks, 1);
         assert_eq!(meetings[0].ended_at_unix_ms(), monday + 62_000 + 60_000);
         assert_eq!(meetings[1].losses().unreadable_chunks, 1);
         assert_eq!(meetings[1].sessions[0].chunks.len(), 1);
+    }
+
+    fn manifest(session: Uuid, start_unix_ms: u64, seqs: &[u32], lost: u64) -> Vec<u8> {
+        let manifest = Manifest {
+            format: FORMAT.into(),
+            community_id: Uuid::from_u128(1),
+            channel_id: Uuid::from_u128(2),
+            parent_channel_id: None,
+            session_id: session,
+            started_at: buzz_huddle_recording::format_utc_millis(start_unix_ms),
+            ended_at: buzz_huddle_recording::format_utc_millis(start_unix_ms + 60_000),
+            duration_ms: 60_000,
+            protocol_version: 2,
+            end_reason: buzz_huddle_recording::EndReason::RoomEmpty,
+            chunks: seqs
+                .iter()
+                .map(|&seq| buzz_huddle_recording::ManifestChunk {
+                    seq,
+                    key: chunk_key("h", Uuid::from_u128(1), Uuid::from_u128(2), session, seq),
+                    bytes: 0,
+                    records: 2,
+                    first_t_ms: 0,
+                    last_t_ms: 60_000,
+                })
+                .collect(),
+            participants: Vec::new(),
+            dropped_frames: 3,
+            lost_chunks: lost,
+        };
+        serde_json::to_vec(&manifest).expect("manifest")
+    }
+
+    /// Every way a session can be incomplete is counted once, and none of
+    /// them stops the others from being read.
+    #[tokio::test]
+    async fn losses_are_counted_once_and_nothing_broken_is_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalStore::new(dir.path());
+        let (community, channel) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let start = 1_791_781_200_000;
+        let put = |session: u128, name: String, bytes: Vec<u8>| {
+            let key = format!(
+                "h/{community}/{channel}/{}/{name}",
+                Uuid::from_u128(session)
+            );
+            let store = store.clone();
+            async move { store.put(&key, bytes).await.expect("put") }
+        };
+        let chunk_name = |seq: u32| format!("chunk-{seq:06}.bhr");
+        // 20: manifest lists 0 and 2, chunk 1 failed to upload (lost 1):
+        //     the gap is the lost chunk, not counted again.
+        put(
+            20,
+            chunk_name(0),
+            chunk(Uuid::from_u128(20), 0, start, 60_000),
+        )
+        .await;
+        put(
+            20,
+            chunk_name(2),
+            chunk(Uuid::from_u128(20), 2, start, 60_000),
+        )
+        .await;
+        put(
+            20,
+            "manifest.json".into(),
+            manifest(Uuid::from_u128(20), start, &[0, 2], 1),
+        )
+        .await;
+        // 21: manifest lists 0 and 1, storage has only 0: one missing.
+        put(
+            21,
+            chunk_name(0),
+            chunk(Uuid::from_u128(21), 0, start + 1_000, 60_000),
+        )
+        .await;
+        put(
+            21,
+            "manifest.json".into(),
+            manifest(Uuid::from_u128(21), start + 1_000, &[0, 1], 0),
+        )
+        .await;
+        // 22: broken manifest, chunks 1 and 2 only: used chunk-only, chunk 0 missing.
+        put(
+            22,
+            chunk_name(1),
+            chunk(Uuid::from_u128(22), 1, start + 2_000, 60_000),
+        )
+        .await;
+        put(
+            22,
+            chunk_name(2),
+            chunk(Uuid::from_u128(22), 2, start + 2_000, 60_000),
+        )
+        .await;
+        put(22, "manifest.json".into(), b"{not json".to_vec()).await;
+        // 23: a manifest of a future format: also used chunk-only.
+        let mut future: serde_json::Value =
+            serde_json::from_slice(&manifest(Uuid::from_u128(23), start + 3_000, &[0], 0))
+                .expect("json");
+        future["format"] = "buzz-huddle-recording/2".into();
+        put(
+            23,
+            chunk_name(0),
+            chunk(Uuid::from_u128(23), 0, start + 3_000, 60_000),
+        )
+        .await;
+        put(
+            23,
+            "manifest.json".into(),
+            serde_json::to_vec(&future).expect("json"),
+        )
+        .await;
+        // 24: nothing readable at all.
+        put(24, chunk_name(0), b"BHR1 broken".to_vec()).await;
+
+        let collected = collect_meetings(&store, "h", community, channel, 10 * 60_000)
+            .await
+            .expect("collect");
+        assert_eq!(collected.meetings.len(), 1);
+        assert!(collected.unplaced_sessions.is_empty());
+        let meeting = &collected.meetings[0];
+        let ids: Vec<u128> = meeting
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_u128())
+            .collect();
+        assert_eq!(ids, [20, 21, 22, 23]);
+        assert_eq!(meeting.unreadable_sessions, [Uuid::from_u128(24)]);
+        assert_eq!(
+            meeting.losses(),
+            Losses {
+                lost_chunks: 1,
+                missing_chunks: 2,
+                // Session 24's chunk is counted once, as an unreadable session.
+                unreadable_chunks: 0,
+                unreadable_manifests: 2,
+                unreadable_sessions: 1,
+                dropped_frames: 6,
+                failed_segments: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn processed_old_and_live_meetings_are_left_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalStore::new(dir.path());
+        let (community, channel) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let start = 1_791_781_200_000;
+        for session in [30u128, 31] {
+            let key = chunk_key("h", community, channel, Uuid::from_u128(session), 0);
+            let started = start + (session as u64 - 30) * 1_000;
+            store
+                .put(&key, chunk(Uuid::from_u128(session), 0, started, 60_000))
+                .await
+                .expect("put");
+        }
+        let meeting = collect_meetings(&store, "h", community, channel, 10 * 60_000)
+            .await
+            .expect("collect")
+            .meetings
+            .remove(0);
+        let written = meeting.last_modified_unix_ms();
+        let quiet = 10 * 60_000;
+        let later = written + quiet;
+        let nothing = HashSet::new();
+        assert_eq!(meeting.skip_reason(&nothing, later, quiet), None);
+        let second = HashSet::from([Uuid::from_u128(31)]);
+        assert_eq!(
+            meeting.skip_reason(&second, later, quiet),
+            Some(Skip::AlreadyProcessed)
+        );
+        assert_eq!(
+            meeting.skip_reason(&nothing, written + 60_000, quiet),
+            Some(Skip::MaybeLive)
+        );
+        let too_late = start + MAX_MEETING_AGE_MS + 1;
+        assert_eq!(
+            meeting.skip_reason(&nothing, too_late.max(later), quiet),
+            Some(Skip::TooOld)
+        );
     }
 
     #[test]

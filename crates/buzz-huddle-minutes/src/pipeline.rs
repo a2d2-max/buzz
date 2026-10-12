@@ -9,7 +9,7 @@ use buzz_huddle_recording::format_utc_millis;
 
 use crate::audio::{resample, write_wav_mono_i16, Mixer};
 use crate::collect::Meeting;
-use crate::stt::{SpeechToText, SttRequest, FAILED_TEXT};
+use crate::stt::{SpeechToText, SttErrorKind, SttRequest, FAILED_TEXT};
 use crate::tracks::{demux, DecodeStats, DemuxStats, REGION_GAP_MS, SAMPLE_RATE};
 use crate::transcript::{AudioRef, Participant, Segment, Transcript, TRANSCRIPT_FORMAT};
 use crate::vad::{
@@ -23,11 +23,36 @@ pub const MIX_EXTENSION: &str = "wav";
 /// The recording bucket deletes objects 15 days after they are written.
 pub const RECORDING_RETENTION_DAYS: u64 = 15;
 
+/// How transcription failures are handled.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SttPolicy {
+    /// Extra attempts for a piece after a transient failure.
+    pub retries: u32,
+    /// Wait before the first retry, ms; doubles on each further retry.
+    pub retry_delay_ms: u64,
+    /// More failed pieces than this share of all pieces and the meeting is
+    /// not written (the next run tries again): a script missing more than
+    /// one line in ten is not usable as minutes.
+    pub max_failed_share: f64,
+}
+
+impl Default for SttPolicy {
+    fn default() -> Self {
+        Self {
+            retries: 3,
+            retry_delay_ms: 500,
+            max_failed_share: 0.10,
+        }
+    }
+}
+
 /// Knobs for one run.
 #[derive(Debug, Clone)]
 pub struct MinutesSettings {
     /// How speech spans become pieces.
     pub segment_plan: SegmentPlan,
+    /// How transcription failures are handled.
+    pub stt: SttPolicy,
     /// Object key the mixed audio will be stored under.
     pub audio_key: String,
     /// When the mixed audio is written, UTC ms (for `audio.expires_at`).
@@ -46,6 +71,31 @@ pub enum MinutesError {
     /// Speech detection failed.
     #[error(transparent)]
     Vad(#[from] VadError),
+    /// Audio could not be resampled.
+    #[error(transparent)]
+    Resample(#[from] crate::audio::ResampleError),
+    /// The transcriber refused credentials or ran out of quota; nothing
+    /// was written and nothing more should be sent.
+    #[error("transcription stopped: {0}")]
+    SttStopped(SttErrorKind),
+    /// Too many pieces failed; nothing was written so a later run retries.
+    #[error("{failed} of {pieces} pieces failed transcription (over the {share_percent}% limit)")]
+    TooManySttFailures {
+        /// Failed pieces.
+        failed: usize,
+        /// All pieces.
+        pieces: usize,
+        /// The limit, percent.
+        share_percent: f64,
+    },
+}
+
+impl MinutesError {
+    /// Whether the whole run should stop (later meetings would fail the
+    /// same way), not just this meeting.
+    pub fn stops_the_run(&self) -> bool {
+        matches!(self, Self::SttStopped(_))
+    }
 }
 
 /// What happened to one person.
@@ -74,6 +124,12 @@ pub struct RunReport {
     pub demux: DemuxStats,
     /// Per-person counters.
     pub speakers: Vec<SpeakerReport>,
+    /// What is known to be missing (also in the script).
+    pub losses: crate::transcript::Losses,
+    /// Retries after transient transcription failures.
+    pub stt_retries: u64,
+    /// Pieces given up on, by failure kind.
+    pub stt_failures_by_kind: Vec<(SttErrorKind, u64)>,
 }
 
 /// Script, mixed audio and counters.
@@ -112,6 +168,9 @@ where
     let mut speakers = Vec::with_capacity(routed.speakers.len());
     let mut stt_info = stt.info();
     stt_info.billed_seconds = 0;
+    let mut stt_retries = 0u64;
+    let mut failures_by_kind: std::collections::BTreeMap<SttErrorKind, u64> =
+        std::collections::BTreeMap::new();
 
     for person in &routed.speakers {
         let mut report = SpeakerReport {
@@ -129,7 +188,7 @@ where
             report.decode = track.stats.clone();
             let regions = track.sounding_regions(REGION_GAP_MS);
             let track_start_ms = track.start_ms;
-            let pcm = resample(&track.pcm, SAMPLE_RATE, VAD_SAMPLE_RATE);
+            let pcm = resample(&track.pcm, SAMPLE_RATE, VAD_SAMPLE_RATE)?;
             // The 48 kHz copy is not needed past this point.
             drop(track);
             mixer.add(track_start_ms, &pcm);
@@ -172,22 +231,43 @@ where
             // One piece = one request. The script gets the speech times; the
             // transcriber gets the padded audio.
             for piece in pieces {
-                let start_ms = track_start_ms + samples_to_ms(piece.speech.start);
-                let end_ms = track_start_ms + samples_to_ms(piece.speech.end);
+                // Script times end with the meeting; a frame stamped past
+                // the end cannot stretch it.
+                let end_ms = (track_start_ms + samples_to_ms(piece.speech.end)).min(duration_ms);
+                let start_ms = (track_start_ms + samples_to_ms(piece.speech.start)).min(end_ms);
                 let request = SttRequest {
                     speaker: &person.pubkey,
                     start_ms: track_start_ms + samples_to_ms(piece.audio.start),
                     end_ms: track_start_ms + samples_to_ms(piece.audio.end),
                     pcm_16k: &pcm[piece.audio.start..piece.audio.end],
                 };
-                let text = match stt.transcribe(request).await {
-                    Ok(output) => {
-                        stt_info.billed_seconds += output.billed_seconds;
-                        output.text
-                    }
-                    Err(_) => {
-                        report.stt_failures += 1;
-                        FAILED_TEXT.to_string()
+                let mut retries_left = settings.stt.retries;
+                let mut delay_ms = settings.stt.retry_delay_ms;
+                let text = loop {
+                    match stt.transcribe(request).await {
+                        Ok(output) => {
+                            stt_info.billed_seconds += output.billed_seconds;
+                            break output.text;
+                        }
+                        Err(error) => match error.kind {
+                            SttErrorKind::Auth | SttErrorKind::Quota => {
+                                return Err(MinutesError::SttStopped(error.kind));
+                            }
+                            SttErrorKind::Transient if retries_left > 0 => {
+                                retries_left -= 1;
+                                stt_retries += 1;
+                                if delay_ms > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                        .await;
+                                }
+                                delay_ms = delay_ms.saturating_mul(2);
+                            }
+                            kind => {
+                                report.stt_failures += 1;
+                                *failures_by_kind.entry(kind).or_default() += 1;
+                                break FAILED_TEXT.to_string();
+                            }
+                        },
                     }
                 };
                 segments.push(Segment {
@@ -206,6 +286,17 @@ where
     }
     segments.sort_by(|a, b| (a.start_ms, &a.speaker).cmp(&(b.start_ms, &b.speaker)));
 
+    let failed: usize = speakers.iter().map(|s| s.stt_failures).sum();
+    if failed as f64 > settings.stt.max_failed_share * segments.len() as f64 {
+        return Err(MinutesError::TooManySttFailures {
+            failed,
+            pieces: segments.len(),
+            share_percent: settings.stt.max_failed_share * 100.0,
+        });
+    }
+    let mut losses = meeting.losses();
+    losses.failed_segments = failed as u64;
+
     let expires_at = settings.now_unix_ms + RECORDING_RETENTION_DAYS * 24 * 60 * 60 * 1_000;
     let transcript = Transcript {
         format: TRANSCRIPT_FORMAT.into(),
@@ -223,13 +314,22 @@ where
             expires_at: format_utc_millis(expires_at),
         },
         stt: stt_info,
+        losses: losses.clone(),
     };
+    // The mix ends with the meeting too.
+    let mixed = mixer.samples();
+    let keep = usize::try_from(duration_ms * u64::from(MIX_SAMPLE_RATE) / 1_000)
+        .unwrap_or(usize::MAX)
+        .min(mixed.len());
     Ok(MinutesOutput {
         transcript,
-        mixed_audio: write_wav_mono_i16(mixer.sample_rate(), mixer.samples()),
+        mixed_audio: write_wav_mono_i16(mixer.sample_rate(), &mixed[..keep]),
         report: RunReport {
             demux: routed.stats,
             speakers,
+            losses,
+            stt_retries,
+            stt_failures_by_kind: failures_by_kind.into_iter().collect(),
         },
     })
 }

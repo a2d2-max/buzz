@@ -366,7 +366,9 @@ fn plan_stream<'a>(frames: &[&SpeakerFrame<'a>], stats: &mut DecodeStats) -> Vec
     let mut last_seq: Option<u16> = None;
     let mut frames_behind = 0u32;
     let mut last_len = CONCEAL_SAMPLES as u64;
+    let mut last_receive: Option<u64> = None;
     for frame in frames {
+        let receive = frame.t_ms * SAMPLES_PER_MS;
         let Some((header, packet)) = split_frame(frame.protocol_version, frame.frame) else {
             stats.undecodable += 1;
             continue;
@@ -393,7 +395,13 @@ fn plan_stream<'a>(frames: &[&SpeakerFrame<'a>], stats: &mut DecodeStats) -> Vec
                     stats.concealed += 1;
                 }
             } else {
-                produced += u64::from(missing) * last_len;
+                // Silence for the lost frames — but never longer than the
+                // time that actually passed between the two frames, so a
+                // sender's `seq` leaping ahead cannot open a huge hole.
+                let claimed = u64::from(missing) * last_len;
+                let passed = last_receive
+                    .map_or(claimed, |before| receive.saturating_sub(before + last_len));
+                produced += claimed.min(passed);
                 stats.lost_silent += u64::from(missing);
             }
         }
@@ -411,9 +419,10 @@ fn plan_stream<'a>(frames: &[&SpeakerFrame<'a>], stats: &mut DecodeStats) -> Vec
             ),
             Err(_) => (Step::Conceal, CONCEAL_SAMPLES as u64),
         };
-        steps.push((step, Some(frame.t_ms * SAMPLES_PER_MS), produced));
+        steps.push((step, Some(receive), produced));
         produced += len;
         last_len = len;
+        last_receive = Some(receive);
     }
 
     // Spurts, each anchored at its least-delayed frame. A long spurt is
@@ -642,6 +651,21 @@ mod tests {
         add_at(&mut pcm, 2, &[0.25, 0.25]);
         add_at(&mut pcm, 3, &[0.5, 0.5]);
         assert_eq!(pcm, [0.0, 0.0, 0.25, 0.75, 0.5]);
+    }
+
+    #[test]
+    fn a_seq_leap_cannot_open_a_hole_longer_than_the_time_that_passed() {
+        // 50 frames, then seq leaps ahead by 30 000 while the frames keep
+        // arriving every 20 ms.
+        let mut sent: Vec<(u16, u64)> =
+            (0..50u16).map(|i| (i, 1_000 + 20 * u64::from(i))).collect();
+        sent.extend((0..50u16).map(|i| (30_050 + i, 2_000 + 20 * u64::from(i))));
+        let (positions, stats) = plan(&sent);
+        assert_eq!(stats.lost_silent, 30_000);
+        // Without the cap the second half would sit 600 s away; with it,
+        // every frame is where it arrived.
+        let received: Vec<u64> = sent.iter().map(|&(_, t)| t).collect();
+        assert_eq!(positions, received);
     }
 
     #[test]

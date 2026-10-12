@@ -6,6 +6,8 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use tokio::io::AsyncWriteExt;
+
 /// One stored object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectInfo {
@@ -152,12 +154,32 @@ impl RecordingStore for LocalStore {
             key: key.to_string(),
             source,
         };
+        // Like the recorder's local mode: folders 0700, files 0600.
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(wrap)?;
+            let mut folders = tokio::fs::DirBuilder::new();
+            folders.recursive(true);
+            #[cfg(unix)]
+            folders.mode(0o700);
+            folders.create(parent).await.map_err(wrap)?;
         }
         // Write beside the target and rename so a reader never sees half a file.
         let partial = path.with_extension("partial");
-        tokio::fs::write(&partial, bytes).await.map_err(wrap)?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&partial).await.map_err(wrap)?;
+        file.write_all(&bytes).await.map_err(wrap)?;
+        file.flush().await.map_err(wrap)?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let private = std::fs::Permissions::from_mode(0o600);
+            tokio::fs::set_permissions(&partial, private)
+                .await
+                .map_err(wrap)?;
+        }
         tokio::fs::rename(&partial, &path).await.map_err(wrap)
     }
 }
@@ -217,6 +239,19 @@ mod tests {
             store.get("h/c10/s2/chunk-000000.bhr").await.expect("get"),
             [3]
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &str| {
+                std::fs::metadata(dir.path().join(p))
+                    .expect("stat")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode("h/c1/s1/manifest.json"), 0o600);
+            assert_eq!(mode("h/c1/s1"), 0o700);
+        }
 
         for bad in ["../x", "/etc/passwd", "a/../b", ""] {
             assert!(matches!(
