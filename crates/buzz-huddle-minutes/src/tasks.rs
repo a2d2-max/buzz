@@ -167,6 +167,10 @@ pub struct TaskSchema {
     pub status_kind: String,
     /// `작업상태` 선택지.
     pub status_options: Vec<String>,
+    /// `작업상태` 그룹마다 선택지 이름, 노션이 주는 차례대로(할 일 → 진행 중 → 완료). 상태가 앞으로
+    /// 가는지 볼 때 쓴다([`moves_forward`]). select 칸이면 비었다.
+    #[serde(default)]
+    pub status_groups: Vec<Vec<String>>,
     /// `종료일`(date) 이 있다.
     pub due: bool,
     /// `담당자`(people) 가 있다.
@@ -206,7 +210,6 @@ pub async fn read_schema(
     client: &mut NotionClient<'_>,
     database_id: &str,
 ) -> Result<TaskSchema, TaskDbError> {
-    use task_property as p;
     let database = client
         .get(&format!("/v1/databases/{}", database_id.trim()))
         .await
@@ -227,6 +230,12 @@ pub async fn read_schema(
         .get(&format!("/v1/data_sources/{source}"))
         .await
         .map_err(at("reading the task data source"))?;
+    schema_from(source, &data_source)
+}
+
+/// data source 응답에서 쓰는 칸을 읽는다.
+fn schema_from(source: &str, data_source: &Value) -> Result<TaskSchema, TaskDbError> {
+    use task_property as p;
     let properties = &data_source["properties"];
     let kind = |name: &str| properties[name]["type"].as_str().unwrap_or("").to_string();
     if kind(p::TITLE) != "title" {
@@ -236,15 +245,35 @@ pub async fn read_schema(
     if !matches!(status_kind.as_str(), "select" | "status") {
         return Err(schema_error("작업상태 is not a status or select"));
     }
-    let status_options = properties[p::STATUS][&status_kind]["options"]
+    let status = &properties[p::STATUS][&status_kind];
+    let options: Vec<&Value> = status["options"].as_array().into_iter().flatten().collect();
+    let name_of = |id: &str| {
+        options
+            .iter()
+            .find(|option| option["id"] == id)
+            .and_then(|option| option["name"].as_str())
+            .map(str::to_string)
+    };
+    let status_groups = status["groups"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|option| option["name"].as_str().map(str::to_string))
+        .map(|group| {
+            group["option_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str().and_then(name_of))
+                .collect()
+        })
         .collect();
     Ok(TaskSchema {
         data_source_id: source.to_string(),
-        status_options,
+        status_options: options
+            .iter()
+            .filter_map(|option| option["name"].as_str().map(str::to_string))
+            .collect(),
+        status_groups,
         due: kind(p::DUE) == "date",
         assignees: kind(p::ASSIGNEES) == "people",
         related_page: kind(p::RELATED_PAGE) == "url",
@@ -368,7 +397,7 @@ task 목록도 JSON 배열이다. id 는 K 번호다.
   - ms: 그 회의 항목의 ms 값을 그대로 쓴다.
   - 짝이 아니면 넣지 않는다. 한 회의 항목이 여러 task 와 짝일 수도 있다.
 - due_changes: 회의에서 어떤 task 의 기한이 분명히 새로 정해졌을 때만 넣는다. task 는 task id, due 는 그 말을 한 날(KST) 기준으로 풀어 쓴 YYYY-MM-DD, ms 는 그 기한을 말한 회의 항목의 ms 값. 기한을 지어내지 마라.
-- status_changes: 회의에서 어떤 task 의 진행 상태가 분명히 말해졌을 때만 넣는다(예: \"그거 배포 끝났어요\"). status 는 작업상태 선택지 중 하나를 글자 그대로, ms 는 근거가 된 회의 항목의 ms 값.
+- status_changes: 회의에서 어떤 task 의 진행 상태가 분명히 말해졌을 때만 넣는다(예: \"그거 다 끝났어요\"). status 는 작업상태 선택지 중 하나를 글자 그대로, ms 는 근거가 된 회의 항목의 ms 값.
 - new_tasks: 어느 task 와도 짝이 없고 새 task 로 만들 만한 할 일의 id(A 번호).
 - 해당하는 것이 없으면 빈 목록을 낸다. 확실하지 않으면 넣지 않는다.
 모든 글은 한국어로 쓴다.";
@@ -974,20 +1003,11 @@ pub fn hedged(text: &str) -> bool {
 }
 
 /// 그 상태로 실제로 바꾸려면 근거 말에 있어야 하는 말(글자·숫자만, 작은 글자로 견준다). 여기
-/// 없는 상태(미팅·시작 전·기획(A2D2)·디자인·개발·개발-토의필요)는 늘 제안으로만 남긴다.
+/// 없는 상태(미팅·시작 전·기획(A2D2)·디자인·개발·개발-토의필요)는 늘 제안으로만 남긴다. 머지·배포는
+/// 중간 단계 이야기라 완료 말이 아니다.
 pub fn status_words(status: &str) -> &'static [&'static str] {
     match status {
-        "완료" => &[
-            "끝났",
-            "끝냈",
-            "완료",
-            "마쳤",
-            "마무리했",
-            "배포했",
-            "머지",
-            "merge",
-            "닫았",
-        ],
+        "완료" => &["끝났", "끝냈", "완료", "마쳤", "마무리했", "닫았"],
         "Dev QA" => &["qa", "큐에이"],
         _ if status.starts_with("Production") => &["프로덕션", "production", "운영배포"],
         _ if status.starts_with("Staging") => &["스테이징", "staging"],
@@ -995,12 +1015,56 @@ pub fn status_words(status: &str) -> &'static [&'static str] {
     }
 }
 
-/// 근거 말에 그 상태를 말하는 말이 있나.
+/// 근거 말에 있으면 그 상태로는 제안만 하는 말(글자·숫자만, 작은 글자로 견준다). 우리 흐름은
+/// 개발 → Dev QA → Staging 배포예정 → Staging QA → Production 배포예정 → Production QA → 완료다.
+/// - 완료: 단계 말. 「개발 끝났어요」·「QA 끝났어요」·「스테이징에 배포했어요」·「PR 머지했어요」는 중간
+///   단계 이야기다.
+/// - Dev QA: 뒤 단계 말. 「스테이징 QA 들어갔어요」의 QA 는 Dev QA 가 아니다.
+pub fn status_stop_words(status: &str) -> &'static [&'static str] {
+    match status {
+        "완료" => &[
+            "개발",
+            "qa",
+            "큐에이",
+            "스테이징",
+            "staging",
+            "프로덕션",
+            "production",
+            "운영",
+            "배포",
+            "pr",
+            "머지",
+            "merge",
+        ],
+        "Dev QA" => &["스테이징", "staging", "프로덕션", "production", "운영"],
+        _ => &[],
+    }
+}
+
+/// 근거 말이 그 상태를 말하나: 그 상태의 말이 있고([`status_words`]) 막는 말이 없다
+/// ([`status_stop_words`]).
 fn says_status(status: &str, statement: &str) -> bool {
     let squashed = summary::squash(statement);
-    status_words(status)
-        .iter()
-        .any(|word| squashed.contains(word))
+    let has = |words: &[&str]| words.iter().any(|word| squashed.contains(word));
+    has(status_words(status)) && !has(status_stop_words(status))
+}
+
+/// 상태가 앞으로 가나. 차례는 노션이 주는 그룹 차례(할 일 → 진행 중 → 완료)에 선택지 차례를 더해
+/// 매긴다. 차례를 못 매기면(select 칸이라 그룹이 없음, 그룹에 없는 이름) 앞으로 간다고 보지 않는다.
+/// 완료 task 는 읽지 않으니(진행 중만 읽는다) 다시 열 일은 없다.
+pub fn moves_forward(schema: &TaskSchema, from: &str, to: &str) -> bool {
+    let rank = |name: &str| {
+        let group = schema
+            .status_groups
+            .iter()
+            .position(|group| group.iter().any(|option| option == name))?;
+        let option = schema
+            .status_options
+            .iter()
+            .position(|option| option == name)?;
+        Some((group, option))
+    };
+    matches!((rank(from), rank(to)), (Some(from), Some(to)) if to > from)
 }
 
 /// 같은 task 로 모인 짝들.
@@ -1152,8 +1216,8 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
         });
     }
 
-    // 3. 상태 바꿈: 선택지 안, 지금과 다름, 근거 말이 분명할 때만. 그 상태를 말하는 말이 근거
-    //    말에 없으면 제안으로만.
+    // 3. 상태 바꿈: 선택지 안, 지금과 다름, 근거 말이 분명할 때만. 앞으로 가고 근거 말이 그 상태를
+    //    말할 때만 실제로 바꾸고, 아니면 제안으로만.
     let mut status: BTreeMap<usize, Change> = BTreeMap::new();
     for change in answer.status_changes {
         let Some(task) = parse_task(&change.task, input.tasks.len()) else {
@@ -1195,7 +1259,8 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             from: current.clone(),
             to: wanted.to_string(),
             ms: lines.lines[j].start_ms,
-            suggest: !says_status(wanted, &lines.statement(j)),
+            suggest: !(moves_forward(input.schema, current, wanted)
+                && says_status(wanted, &lines.statement(j))),
         });
     }
 
@@ -2096,7 +2161,7 @@ pub(crate) mod tests {
         transcript_with(&[
             (1_000, A, "견적서 자동화 얘기부터 할게요."),
             (5_000, B, "견적서 자동화는 제가 금요일까지 끝낼게요."),
-            (9_000, A, "로그인 오류 수정은 어제 배포 끝났어요."),
+            (9_000, A, "로그인 오류 수정은 어제 다 끝났어요."),
             (11_000, B, "좋네요, 수고했어요."),
             (
                 13_000,
@@ -2171,15 +2236,9 @@ pub(crate) mod tests {
         .collect()
     }
 
+    /// [`schema_json`] 을 실행 때와 같은 함수로 읽은 칸.
     pub(crate) fn schema() -> TaskSchema {
-        TaskSchema {
-            data_source_id: TASK_DS.into(),
-            status_kind: "status".into(),
-            status_options: options(),
-            due: true,
-            assignees: true,
-            related_page: true,
-        }
+        schema_from(TASK_DS, &schema_json()).unwrap()
     }
 
     /// 진행 중 task: K1 견적서 자동화(개발, 10/20, user-9), K2 로그인 오류 수정(Dev QA),
@@ -2871,7 +2930,7 @@ pub(crate) mod tests {
     }
 
     /// 상태를 말하는 말이 근거 말에 없으면 바꾸지 않고 제안으로만: 「로그인 오류 수정 PR
-    /// 올렸어요.」 + 「네 볼게요.」 → 완료로 안 바꾼다. 「배포 끝났어요」면 바꾼다.
+    /// 올렸어요.」 + 「네 볼게요.」 → 완료로 안 바꾼다. 「다 끝났어요」면 바꾼다.
     #[test]
     fn a_status_without_its_words_is_only_suggested() {
         let answer = json!({
@@ -2892,18 +2951,19 @@ pub(crate) mod tests {
             change_line(Write::Status(0), &status),
             "상태 제안: Dev QA → 완료 (근거 [00:01])"
         );
-        // 다른 사람이 이어서 한 말의 상태 말은 이 근거 말이 아니다.
+        // 다른 사람이 이어서 한 말의 상태 말은 이 근거 말이 아니다(그 줄만 보면 완료로 바꿀 말이다).
         let other = [
-            (1_000, A, "로그인 오류 수정 PR 올렸어요."),
-            (5_000, B, "제가 머지했어요."),
+            (1_000, A, "로그인 오류 수정 건 정리해서 올렸어요."),
+            (5_000, B, "그거 제가 다 끝냈어요."),
         ];
-        let plan = check_meeting(&other, "로그인 오류 수정 PR", 1_000, &answer, &open());
+        assert!(says_status("완료", other[1].2));
+        let plan = check_meeting(&other, "로그인 오류 수정 정리", 1_000, &answer, &open());
         assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
         let done = [
-            (1_000, A, "로그인 오류 수정은 배포 끝났어요."),
+            (1_000, A, "로그인 오류 수정은 다 끝났어요."),
             (5_000, B, "네 볼게요."),
         ];
-        let plan = check_meeting(&done, "로그인 오류 수정 배포", 1_000, &answer, &open());
+        let plan = check_meeting(&done, "로그인 오류 수정 완료", 1_000, &answer, &open());
         assert!(!plan.tasks[0].status.as_ref().unwrap().suggest);
         assert_eq!(
             writes(&plan, TasksMode::Update),
@@ -3135,5 +3195,138 @@ pub(crate) mod tests {
         assert!(ledger.owed_records().is_empty());
         // 다른 task 는 막지 않는다.
         assert!(!ledger.blocked(Write::Append(1)));
+    }
+
+    /// 칸 읽기: 실제 꼴의 status 칸에서 선택지와 그룹(할 일 → 진행 중 → 완료)을 읽는다.
+    #[test]
+    fn the_status_groups_are_read_in_order() {
+        let schema = schema();
+        assert_eq!(schema.status_kind, "status");
+        assert_eq!(schema.status_options, options());
+        assert_eq!(schema.status_groups.len(), 3);
+        assert_eq!(schema.status_groups[0], ["미팅", "시작 전"]);
+        assert_eq!(schema.status_groups[2], ["완료"]);
+        assert!(schema.status_groups[1]
+            .iter()
+            .any(|option| option == "Dev QA"));
+    }
+
+    /// 상태는 앞으로만 간다(그룹 차례 할 일 → 진행 중 → 완료에 선택지 차례를 더해 매김). 뒤로 가거나
+    /// 차례를 못 매기면 제안만. 완료 task 는 읽지도 않아서 다시 열 일이 없다.
+    #[test]
+    fn a_status_only_moves_forward() {
+        let answer = |status: &str| {
+            json!({
+                "links": [link_d1("K2", 1_000)],
+                "due_changes": [],
+                "status_changes": [{ "task": "K2", "status": status, "ms": 1_000 }],
+                "new_tasks": []
+            })
+        };
+        let qa = [(1_000, A, "로그인 오류 수정은 QA 들어갔어요.")];
+        let with_status = |status: &str| {
+            let mut tasks = open();
+            tasks[1].status = status.into();
+            tasks
+        };
+        // 지금 Production 배포예정 + 「QA 들어갔어요」 + 모델이 Dev QA → 뒤로 가니 제안만.
+        let tasks = with_status("Production 배포예정");
+        let plan = check_meeting(&qa, "로그인 오류 수정 QA", 1_000, &answer("Dev QA"), &tasks);
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
+        // 같은 말로 앞으로 가면(개발 → Dev QA) 실제로 바꾼다.
+        let tasks = with_status("개발");
+        let plan = check_meeting(&qa, "로그인 오류 수정 QA", 1_000, &answer("Dev QA"), &tasks);
+        assert!(!plan.tasks[0].status.as_ref().unwrap().suggest);
+
+        let schema = schema();
+        assert!(moves_forward(&schema, "개발", "Dev QA"));
+        assert!(moves_forward(&schema, "Production QA", "완료"));
+        assert!(moves_forward(&schema, "시작 전", "기획(A2D2)"));
+        assert!(!moves_forward(&schema, "Production 배포예정", "Dev QA"));
+        assert!(!moves_forward(&schema, "Dev QA", "시작 전"));
+        assert!(!moves_forward(&schema, "완료", "개발"));
+        // 그룹이 선택지 차례보다 먼저다: 선택지 목록에서 완료가 맨 앞이어도 완료 그룹은 맨 뒤.
+        let mut shuffled = schema.clone();
+        shuffled.status_options.rotate_right(1);
+        assert_eq!(shuffled.status_options[0], "완료");
+        assert!(moves_forward(&shuffled, "Production QA", "완료"));
+        // 차례를 못 매기면 앞으로 간다고 보지 않는다: select 칸(그룹 없음), 그룹에 없는 이름.
+        let select = TaskSchema {
+            status_kind: "select".into(),
+            status_groups: Vec::new(),
+            ..schema.clone()
+        };
+        assert!(!moves_forward(&select, "개발", "Dev QA"));
+        assert!(!moves_forward(&schema, "개발", "없는 상태"));
+        assert!(!moves_forward(&schema, "", "Dev QA"));
+
+        // 완료 task 는 읽지 않는다(진행 중만): 다시 열 일이 없다.
+        let finished = OpenTask {
+            id: "task-done".into(),
+            title: "끝난 일".into(),
+            status: DONE_STATUS.into(),
+            ..OpenTask::default()
+        };
+        let page = json!({ "id": "task-done", "properties": task_properties(&finished) });
+        assert_eq!(open_task(&page, &schema), None);
+    }
+
+    /// 완료는 끝냈다는 말만으로 바꾸고, 단계 말(개발·QA·스테이징·배포·PR·머지 …)이 섞이면 제안만:
+    /// 머지·배포·「○○ 끝났어요」는 중간 단계 이야기다. Dev QA 는 뒤 단계 말(스테이징·프로덕션·운영)이
+    /// 있으면 제안만이다(「스테이징 QA」의 QA 는 Dev QA 가 아니다).
+    #[test]
+    fn stage_talk_does_not_finish_a_task() {
+        for words in [
+            "스테이징에 배포했어요",
+            "PR 머지했어요",
+            "개발 끝났어요",
+            "QA 끝났어요",
+            "운영 배포 끝냈어요",
+            "merge 했어요",
+        ] {
+            assert!(!says_status("완료", words), "{words}");
+        }
+        for words in ["다 끝났어요", "그 이슈 닫았어요", "마무리했어요"] {
+            assert!(says_status("완료", words), "{words}");
+        }
+        for words in [
+            "스테이징 QA 들어갔어요",
+            "프로덕션 QA 시작했어요",
+            "운영 QA 들어가요",
+        ] {
+            assert!(!says_status("Dev QA", words), "{words}");
+        }
+        assert!(says_status("Dev QA", "QA 들어갔어요"));
+
+        // 검사 전체로도: 지금 개발인 task 에 「스테이징 QA 들어갔어요」 + 모델이 Dev QA → 제안만.
+        let mut tasks = open();
+        tasks[1].status = "개발".into();
+        let answer = |status: &str| {
+            json!({
+                "links": [link_d1("K2", 1_000)],
+                "due_changes": [],
+                "status_changes": [{ "task": "K2", "status": status, "ms": 1_000 }],
+                "new_tasks": []
+            })
+        };
+        let staging = [(1_000, A, "로그인 오류 수정은 스테이징 QA 들어갔어요.")];
+        let plan = check_meeting(
+            &staging,
+            "로그인 오류 수정 QA",
+            1_000,
+            &answer("Dev QA"),
+            &tasks,
+        );
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
+        // 「스테이징에 배포했어요」에 모델이 완료를 내도 제안만.
+        let deployed = [(1_000, A, "로그인 오류 수정은 스테이징에 배포했어요.")];
+        let plan = check_meeting(
+            &deployed,
+            "로그인 오류 수정 배포",
+            1_000,
+            &answer("완료"),
+            &open(),
+        );
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
     }
 }
