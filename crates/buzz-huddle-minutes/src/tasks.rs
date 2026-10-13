@@ -2196,6 +2196,52 @@ pub(crate) mod tests {
             kinds(TasksMode::Update),
             ["due", "append", "status", "append", "create", "maybe"]
         );
+        // 두 겹이 따로 지킨다. 계획: 낮은 스위치의 계획에는 바꿈·새 task 가 아예 없다.
+        let plan = check_with(&good_answer(), TasksMode::Append);
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|task| task.due.is_none() && task.status.is_none()));
+        assert!(plan.creates.is_empty());
+        assert!(check_with(&good_answer(), TasksMode::Create)
+            .tasks
+            .iter()
+            .all(|task| task.due.is_none() && task.status.is_none()));
+        // 쓰기: update 로 세운 계획을 스위치를 낮춘 뒤에 이어 써도 낮은 스위치만큼만 쓴다.
+        let full = check_with(&good_answer(), TasksMode::Update);
+        assert_eq!(
+            writes(&full, TasksMode::Append),
+            [Write::Append(0), Write::Append(1), Write::Maybe]
+        );
+        assert_eq!(
+            writes(&full, TasksMode::Create),
+            [
+                Write::Append(0),
+                Write::Append(1),
+                Write::Create(0),
+                Write::Maybe
+            ]
+        );
+    }
+
+    /// 근거 말이 그 task 이야기가 아니면 바꾸지 않는다: 견적서 자동화의 기한·상태를 회의록 공유
+    /// 이야기("목요일까지 만들게요")로 바꾸려 하면 버린다(날짜가 말에 있고 부정어가 없어도).
+    #[test]
+    fn a_change_from_words_about_something_else_is_dropped() {
+        let mut answer = good_answer();
+        answer["due_changes"] = json!([{ "task": "K1", "due": "2026-10-15", "ms": 17_000 }]);
+        answer["status_changes"] = json!([{ "task": "K1", "status": "Dev QA", "ms": 17_000 }]);
+        let plan = check(&answer);
+        let k1 = plan.tasks.iter().find(|task| task.id == "task-1").unwrap();
+        assert_eq!((k1.due.clone(), k1.status.clone()), (None, None));
+        assert_eq!(plan.dropped.not_about, 2, "{:?}", plan.dropped);
+        // 같은 날짜를 그 task 이야기에서 읽으면 받는다(위 버림이 날짜 때문이 아님).
+        let mut answer = good_answer();
+        answer["due_changes"] = json!([{ "task": "K1", "due": "2026-10-16", "ms": 5_000 }]);
+        assert!(check(&answer)
+            .tasks
+            .iter()
+            .any(|task| task.id == "task-1" && task.due.is_some()));
     }
 
     /// 회의당 상한: 확실한 짝이 넘치면 바꿈이 있는 것·짝이 많은 것부터 남기고 나머지는 센다.

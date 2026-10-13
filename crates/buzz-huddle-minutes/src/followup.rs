@@ -4611,6 +4611,31 @@ mod tests {
         assert_eq!(link.tasks_asked(), 1);
     }
 
+    /// 계획은 쓰기 전에 장부에 남는다: 첫 쓰기부터 실패해도 다음 시도는 그 계획을 이어 쓰고
+    /// Gemini 를 다시 부르지 않는다(돈 한 번).
+    #[tokio::test]
+    async fn the_plan_is_kept_when_the_first_write_fails() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(failed_with(&first.tasks, "transient HTTP 503"), "{first:?}");
+        let ledger = link.ledger();
+        assert!(ledger.done.is_empty() && !ledger.finished, "{ledger:?}");
+        assert_eq!(ledger.plan.tasks.len(), 2);
+
+        link.world.state.lock().unwrap().failing_paths.clear();
+        link.world.advance(FIRST_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        assert_eq!(link.tasks_asked(), 1);
+        assert_eq!(
+            second.tasks_made.unwrap().usage,
+            None,
+            "nothing paid this run"
+        );
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+    }
+
     /// 통합이 task DB 에 연결 안 됨(403): 회의록은 그대로 성공이고, 회의 몫으로 세지 않으며,
     /// 그 실행의 남은 회의는 task DB 를 다시 묻지 않는다. 로그 글에 노션 메시지가 없다.
     #[tokio::test]
