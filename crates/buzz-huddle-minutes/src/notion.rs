@@ -1761,6 +1761,8 @@ pub(crate) mod tests {
         pub(crate) forbidden_paths: Vec<String>,
         /// 경로에 이 글이 든 쓰기(PATCH·POST)는 503 으로 답한다.
         pub(crate) failing_paths: Vec<String>,
+        /// 경로에 이 글이 든 쓰기(PATCH·POST)는 400 으로 거절한다.
+        pub(crate) refusing_paths: Vec<String>,
         next_id: usize,
     }
 
@@ -1811,6 +1813,49 @@ pub(crate) mod tests {
             })
     }
 
+    /// 스키마가 있는 data source(task DB)에 쓰는 칸 값을 실제 노션처럼 본다: 칸이 있어야 하고, 값의
+    /// 꼴(종류 열쇠)이 칸 종류와 같아야 하고, status·select 이름은 선택지에 있어야 한다(노션이 옵션을
+    /// 새로 만들지 않게). 문제가 있으면 그 까닭.
+    fn properties_problem(schema: &Value, properties: &Value) -> Option<String> {
+        for (name, value) in properties.as_object()? {
+            let column = &schema["properties"][name];
+            let Some(kind) = column["type"].as_str() else {
+                return Some(format!("{name} is not a property"));
+            };
+            if value.get(kind).is_none() {
+                return Some(format!("{name} is expected to be {kind}"));
+            }
+            if matches!(kind, "status" | "select") {
+                let wanted = &value[kind]["name"];
+                let known = column[kind]["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|option| option["name"] == *wanted);
+                if !known {
+                    return Some(format!("{name}: no such option"));
+                }
+            }
+        }
+        None
+    }
+
+    /// 스키마가 있는 data source 의 query filter 를 실제 노션처럼 본다: 칸의 조건 열쇠가 칸 종류와
+    /// 같아야 한다(status 칸에 select 조건을 쓰면 400).
+    fn filter_problem(schema: &Value, filter: &Value) -> Option<String> {
+        if let Some(all) = filter["and"].as_array().or(filter["or"].as_array()) {
+            return all.iter().find_map(|inner| filter_problem(schema, inner));
+        }
+        let name = filter["property"].as_str()?;
+        let Some(kind) = schema["properties"][name]["type"].as_str() else {
+            return Some(format!("{name} is not a property"));
+        };
+        filter
+            .get(kind)
+            .is_none()
+            .then(|| format!("{name} is a {kind} property"))
+    }
+
     /// 노션 query filter 를 흉내 낸다(이 모듈이 쓰는 모양만).
     fn matches(filter: &Value, page: &FakePage) -> bool {
         if let Some(all) = filter["and"].as_array() {
@@ -1838,8 +1883,14 @@ pub(crate) mod tests {
                 return *name == condition["equals"];
             }
         }
-        let text = property_text(&value);
-        let condition = filter.get("title").unwrap_or(&filter["rich_text"]);
+        let text = match value["url"].as_str() {
+            Some(url) => url.to_string(),
+            None => property_text(&value),
+        };
+        let condition = ["title", "rich_text", "url"]
+            .iter()
+            .find_map(|kind| filter.get(*kind))
+            .unwrap_or(&Value::Null);
         if let Some(wanted) = condition["equals"].as_str() {
             text == wanted
         } else if let Some(part) = condition["contains"].as_str() {
@@ -1926,6 +1977,12 @@ pub(crate) mod tests {
                     &json!({ "code": "service_unavailable", "message": "later" }),
                 );
             }
+            if request.method != "GET" && hits(&self.refusing_paths) {
+                return Reply::json(
+                    400,
+                    &json!({ "code": "validation_error", "message": "refused" }),
+                );
+            }
             let query = request.path.split_once('?').map_or("", |(_, q)| q);
             let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
             let not_found = || Reply::json(404, &json!({ "code": "object_not_found" }));
@@ -1936,6 +1993,16 @@ pub(crate) mod tests {
                         return Reply::json(
                             403,
                             &json!({ "code": "restricted_resource", "message": "회의 글 조각" }),
+                        );
+                    }
+                    if let Some(problem) = self
+                        .data_sources
+                        .get(*source)
+                        .and_then(|schema| filter_problem(schema, &body["filter"]))
+                    {
+                        return Reply::json(
+                            400,
+                            &json!({ "code": "validation_error", "message": problem }),
                         );
                     }
                     let mut found: Vec<&FakePage> = self
@@ -1987,6 +2054,16 @@ pub(crate) mod tests {
                     if self.people_forbidden && source == PEOPLE_DATA_SOURCE_ID {
                         return Reply::json(403, &json!({ "code": "restricted_resource" }));
                     }
+                    if let Some(problem) = self
+                        .data_sources
+                        .get(&source)
+                        .and_then(|schema| properties_problem(schema, &body["properties"]))
+                    {
+                        return Reply::json(
+                            400,
+                            &json!({ "code": "validation_error", "message": problem }),
+                        );
+                    }
                     let minutes = source == MINUTES_DATA_SOURCE_ID;
                     if minutes && std::mem::take(&mut self.race_create) {
                         self.new_page(&source, &body["properties"]);
@@ -2023,6 +2100,21 @@ pub(crate) mod tests {
                 ("PATCH", ["v1", "pages", id]) => {
                     if !self.page_patch_failures.is_empty() {
                         return self.page_patch_failures.remove(0);
+                    }
+                    let source = self
+                        .pages
+                        .iter()
+                        .find(|page| page.id == *id)
+                        .map(|page| page.data_source.clone())
+                        .unwrap_or_default();
+                    if let Some(problem) = self.data_sources.get(&source).and_then(|schema| {
+                        body.get("properties")
+                            .and_then(|properties| properties_problem(schema, properties))
+                    }) {
+                        return Reply::json(
+                            400,
+                            &json!({ "code": "validation_error", "message": problem }),
+                        );
                     }
                     let stamp = self.stamp();
                     let Some(page) = self.page_mut(id) else {

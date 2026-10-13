@@ -747,12 +747,15 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 });
             }
             // 팀 task DB 연결: 요약과 같은 Gemini, 회의록 페이지와 같은 노션 토큰.
-            let tasks_mode = tasks_switch(
+            let (tasks_mode, tasks_note) = tasks_switch(
                 tasks_mode,
                 summary_switch,
                 notion_switch,
                 task_db.as_deref(),
             );
+            if let Some(note) = tasks_note {
+                eprintln!("{note}");
+            }
             if let (true, Some(tokens), Some(token), Some(db)) = (
                 tasks_mode != TasksMode::Off,
                 &summary_tokens,
@@ -1325,16 +1328,23 @@ fn follow_line(followed: &FollowedUp) -> String {
         FollowStep::Failed(error) => format!("failed: {error}"),
         FollowStep::Skipped(why) => format!("skipped ({why})"),
     };
-    format!(
-        "correct {} | summary {} | notion {} | tasks {}",
+    let mut line = format!(
+        "correct {} | summary {} | notion {}",
         step(&followed.correct, "the summary and page use the original"),
         step(
             &followed.summary,
             "the page says 요약 실패, or keeps the summary made before the correction",
         ),
-        step(&followed.notion, ""),
-        step(&followed.tasks, "no task links for this meeting")
-    )
+        step(&followed.notion, "")
+    );
+    // task 연결이 꺼져 있으면 줄은 예전 그대로다.
+    if followed.tasks != FollowStep::Off {
+        line.push_str(&format!(
+            " | tasks {}",
+            step(&followed.tasks, "no task links for this meeting")
+        ));
+    }
+    line
 }
 
 /// task 연결 줄들(수만: task 제목·사람 이름·pubkey 없음). 이번에 해 봤을 때만.
@@ -1463,34 +1473,27 @@ impl SpeechToText for AnyStt {
     }
 }
 
-/// task 연결 스위치: 요약과 노션 페이지가 켜져 있고 task DB 가 있을 때만 켠다. 아니면 까닭을
-/// 한 줄 찍고 끈다(회의록은 그대로 간다).
+/// task 연결 스위치: 요약과 노션 페이지가 켜져 있고 task DB 가 있을 때만 켠다. 아니면 끄고
+/// 회의록은 그대로 간다. 실행 처음에 찍을 줄도 돌려준다(꺼 둔 채면 없음). task DB id 는 찍지 않는다.
 fn tasks_switch(
     mode: TasksMode,
     summary: Switch,
     notion: Switch,
     task_db: Option<&str>,
-) -> TasksMode {
+) -> (TasksMode, Option<String>) {
     if mode == TasksMode::Off {
-        return TasksMode::Off;
+        return (TasksMode::Off, None);
     }
-    let task_db = task_db.map(str::trim).filter(|db| !db.is_empty());
     let why = if !matches!((summary, notion), (Switch::On, Switch::On)) {
-        Some("needs --summary on and --notion on".to_string())
-    } else if task_db.is_none() {
-        Some("BUZZ_MINUTES_TASK_DB is not set".to_string())
+        Some("needs --summary on and --notion on")
+    } else if task_db.map(str::trim).is_none_or(str::is_empty) {
+        Some("BUZZ_MINUTES_TASK_DB is not set")
     } else {
         None
     };
-    match (why, task_db) {
-        (None, Some(db)) => {
-            eprintln!("tasks: {mode} into task db {db}");
-            mode
-        }
-        (why, _) => {
-            eprintln!("tasks: off ({})", why.unwrap_or_default());
-            TasksMode::Off
-        }
+    match why {
+        None => (mode, Some(format!("tasks: {mode}"))),
+        Some(why) => (TasksMode::Off, Some(format!("tasks: off ({why})"))),
     }
 }
 
@@ -1623,25 +1626,30 @@ mod tests {
     fn task_linking_needs_the_summary_the_page_and_a_db() {
         use Switch::{Off, On};
         let db = Some("3f162a7535ba80c984ece77366d3b5d5");
+        let mode = |mode, summary, notion, db| tasks_switch(mode, summary, notion, db).0;
+        assert_eq!(mode(TasksMode::Update, On, On, db), TasksMode::Update);
+        assert_eq!(mode(TasksMode::Append, On, On, db), TasksMode::Append);
+        assert_eq!(mode(TasksMode::Update, Off, On, db), TasksMode::Off);
+        assert_eq!(mode(TasksMode::Update, On, Off, db), TasksMode::Off);
+        assert_eq!(mode(TasksMode::Update, On, On, None), TasksMode::Off);
+        assert_eq!(mode(TasksMode::Update, On, On, Some("  ")), TasksMode::Off);
+        assert_eq!(mode(TasksMode::Off, On, On, db), TasksMode::Off);
+        // 실행 처음 줄: 켜졌는지·왜 꺼졌는지만, task DB id 는 안 찍는다. 꺼 둔 채면 줄도 없다.
         assert_eq!(
-            tasks_switch(TasksMode::Update, On, On, db),
-            TasksMode::Update
+            tasks_switch(TasksMode::Append, On, On, db).1.as_deref(),
+            Some("tasks: append")
         );
         assert_eq!(
-            tasks_switch(TasksMode::Append, On, On, db),
-            TasksMode::Append
+            tasks_switch(TasksMode::Update, On, On, None).1.as_deref(),
+            Some("tasks: off (BUZZ_MINUTES_TASK_DB is not set)")
         );
-        assert_eq!(tasks_switch(TasksMode::Update, Off, On, db), TasksMode::Off);
-        assert_eq!(tasks_switch(TasksMode::Update, On, Off, db), TasksMode::Off);
-        assert_eq!(
-            tasks_switch(TasksMode::Update, On, On, None),
-            TasksMode::Off
-        );
-        assert_eq!(
-            tasks_switch(TasksMode::Update, On, On, Some("  ")),
-            TasksMode::Off
-        );
-        assert_eq!(tasks_switch(TasksMode::Off, On, On, db), TasksMode::Off);
+        assert_eq!(tasks_switch(TasksMode::Off, On, On, db).1, None);
+        for note in [
+            tasks_switch(TasksMode::Update, On, On, db).1,
+            tasks_switch(TasksMode::Update, Off, On, db).1,
+        ] {
+            assert!(!note.unwrap().contains("3f162a75"), "no task db id in logs");
+        }
 
         let with = |mode: &'static str| {
             parse(&[
@@ -1704,6 +1712,17 @@ mod tests {
         );
         assert!(follow_line(&followed)
             .ends_with("| tasks skipped (the meeting ended over 24 hours ago)"));
+        // task 연결이 꺼져 있으면 줄은 예전 그대로다(「| tasks off」 를 붙이지 않는다).
+        let off = FollowedUp {
+            tasks: FollowStep::Off,
+            tasks_made: None,
+            ..followed
+        };
+        assert_eq!(
+            follow_line(&off),
+            "correct off | summary already done | notion already done"
+        );
+        assert!(tasks_lines(&off).is_empty());
     }
 
     /// 담당자 연결 DB 줄에는 수와 까닭의 종류만 찍힌다(줄 id·페이지 id 없음).

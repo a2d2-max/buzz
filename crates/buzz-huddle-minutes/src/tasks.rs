@@ -63,10 +63,10 @@ pub const MAYBE_HEADING: &str = "관련 있을 수 있는 task";
 pub const RECORD_HEADING: &str = "허들 회의 기록";
 /// 기록 제목에 붙여, 사람 손이 아니라 작업기가 붙였다는 것을 보인다.
 pub const AUTO_NOTE: &str = "회의록 작업기가 자동으로 붙임";
-/// 망설이거나 미루거나 묻는 말. 근거 줄(과 바로 다음 줄)에 이 말이나 부정하는 말
-/// ([`NEGATIONS`])이 있으면 기한·상태를 바꾸지 않는다. 글자로 세서 다른 낱말 속에 든 것도
-/// 센다: 잘못 바꾸는 것보다 하나 덜 바꾸는 편이 낫다.
-pub const HEDGES: [&str; 16] = [
+/// 망설이거나 미루거나 묻는 말. 근거 줄(과 바로 다음 줄)에 이 말이나 부정하는 말이 있으면
+/// 기한·상태를 바꾸지 않는다([`hedged`]). 이 말들은 글자로 찾는다(이 꼴로 쓰이는 다른 낱말이
+/// 드물다). 「아마」만은 「아마존」이 있어서 낱말 하나일 때만 센다([`HEDGE_WORDS`]).
+pub const HEDGES: [&str; 15] = [
     "어렵",
     "힘들",
     "근데",
@@ -76,7 +76,6 @@ pub const HEDGES: [&str; 16] = [
     "는데",
     "아직",
     "글쎄",
-    "아마",
     "혹시",
     "미정",
     "모르",
@@ -84,6 +83,22 @@ pub const HEDGES: [&str; 16] = [
     "듯",
     "?",
 ];
+/// 낱말 하나로 있을 때만 망설임으로 세는 말.
+pub const HEDGE_WORDS: [&str; 2] = ["아마", "아마도"];
+/// 짧은 부정 「안」 바로 뒤에 붙어 부정이 되는 말의 첫 글자(「안 돼」·「안돼요」·「안 했어요」·
+/// 「안 가요」 …). 「보안·제안·안드로이드·안건·안내·안녕」처럼 낱말 속 「안」은 부정으로 안 센다.
+const AFTER_SHORT_NEGATION: [char; 39] = [
+    '돼', '되', '됐', '됨', '됩', '될', '해', '하', '했', '할', '함', '합', '가', '갈', '간', '갔',
+    '와', '왔', '올', '줘', '주', '줄', '줬', '봐', '보', '볼', '봤', '써', '쓰', '쓸', '썼', '끝',
+    '나', '날', '났', '맞', '받', '먹', '넘',
+];
+/// 후보정의 부정하는 말 가운데 글자가 아니라 낱말로 보는 것([`hedged`]). 글자로 찾으면 다른 낱말
+/// 속에 걸린다: 「보안·잘못된」, 「금요일까지 마무리·말씀」, 「차질 없이·없애기」.
+const NEGATIONS_BY_WORD: [&str; 7] = ["안", "못", "없", "지 마", "지마", "지 말", "지말"];
+/// 「-지 마」의 「마」 바로 뒤에 오는 글자(「마요·마세요·마십시오·마시고·마셔요·마라」).
+const AFTER_MA: [char; 6] = ['요', '세', '십', '시', '셔', '라'];
+/// 「-지 말」의 「말」 바로 뒤에 오는 글자(「말고·말아요·말자·말라·말래·말죠·말지·말게·말까·말았」).
+const AFTER_MAL: [char; 10] = ['고', '아', '자', '라', '래', '죠', '지', '게', '까', '았'];
 /// 「나온 말」 한 줄의 글자 수 상한.
 const MAX_SAID_CHARS: usize = 300;
 /// 짝을 지은 까닭의 글자 수 상한.
@@ -95,13 +110,14 @@ const MAX_SAID_PER_TASK: usize = 3;
 pub mod task_property {
     /// title
     pub const TITLE: &str = "기능";
-    /// select(또는 status)
+    /// status(운영 DB, 묶음 to_do·in_progress·complete). select 여도 읽고 쓴다: 실행 때 스키마
+    /// 종류를 보고 필터·쓰기 꼴을 맞춘다.
     pub const STATUS: &str = "작업상태";
     /// people. 새 task 에만 쓴다(기존 task 의 담당자는 읽기만).
     pub const ASSIGNEES: &str = "담당자";
-    /// date
+    /// date. 끝 날짜(end)나 시각이 있는 값은 바꾸지 않는다(기록에 제안으로만).
     pub const DUE: &str = "종료일";
-    /// rich_text: 새 task 에 회의록 주소. 같은 회의가 두 번 만들지 않게 찾는 표시도 된다.
+    /// url: 새 task 에 회의록 주소. 같은 회의가 두 번 만들지 않게 찾는 표시도 된다.
     pub const RELATED_PAGE: &str = "관련 노션 페이지";
 }
 
@@ -155,8 +171,8 @@ pub struct TaskSchema {
     pub due: bool,
     /// `담당자`(people) 가 있다.
     pub assignees: bool,
-    /// `관련 노션 페이지`(rich_text) 가 있다. 없으면 새 task 를 만들지 않는다(같은 회의가 만든
-    /// task 를 찾을 표시가 없어서).
+    /// `관련 노션 페이지`(url) 가 있다. 없으면 새 task 를 만들지 않는다(같은 회의가 만든 task 를
+    /// 찾을 표시가 없어서).
     pub related_page: bool,
 }
 
@@ -218,7 +234,7 @@ pub async fn read_schema(
     }
     let status_kind = kind(p::STATUS);
     if !matches!(status_kind.as_str(), "select" | "status") {
-        return Err(schema_error("작업상태 is not a select"));
+        return Err(schema_error("작업상태 is not a status or select"));
     }
     let status_options = properties[p::STATUS][&status_kind]["options"]
         .as_array()
@@ -231,7 +247,7 @@ pub async fn read_schema(
         status_options,
         due: kind(p::DUE) == "date",
         assignees: kind(p::ASSIGNEES) == "people",
-        related_page: kind(p::RELATED_PAGE) == "rich_text",
+        related_page: kind(p::RELATED_PAGE) == "url",
         status_kind,
     })
 }
@@ -247,6 +263,9 @@ pub struct OpenTask {
     pub status: String,
     /// `종료일` 의 시작(비었으면 `None`).
     pub due: Option<String>,
+    /// `종료일` 의 끝(기간이면).
+    #[serde(default)]
+    pub due_end: Option<String>,
     /// `담당자` 노션 사용자 id(멘션에 쓴다).
     pub assignee_ids: Vec<String>,
     /// `담당자` 이름(노션이 주면).
@@ -278,6 +297,9 @@ fn open_task(page: &Value, schema: &TaskSchema) -> Option<OpenTask> {
         title: title.to_string(),
         status,
         due: properties[p::DUE]["date"]["start"]
+            .as_str()
+            .map(str::to_string),
+        due_end: properties[p::DUE]["date"]["end"]
             .as_str()
             .map(str::to_string),
         assignee_ids: people
@@ -651,12 +673,17 @@ struct AnswerStatus {
 /// 기존 task 의 칸 하나를 바꿈.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
-    /// 예전 값(비었으면 빈 글). 기록에 남겨 사람이 되돌릴 수 있게 한다.
+    /// 예전 값(비었으면 빈 글). 기록에 남겨 사람이 되돌릴 수 있게 한다. 쓰기 바로 앞에서 노션의
+    /// 지금 값이 이것과 다르면(계획 뒤에 사람이 바꿈) 바꾸지 않는다.
     pub from: String,
     /// 새 값.
     pub to: String,
     /// 근거 줄의 시각(ms).
     pub ms: u64,
+    /// 노션 칸은 안 바꾸고 기록에 「제안」으로만 남긴다: 지금 종료일에 끝 날짜나 시각이 있거나,
+    /// 그 상태를 말하는 말([`status_words`])이 근거 말에 없다.
+    #[serde(default)]
+    pub suggest: bool,
 }
 
 /// 확실한 짝으로 쓸 task 하나.
@@ -675,7 +702,7 @@ pub struct PlannedTask {
     pub due: Option<Change>,
     /// `작업상태` 바꿈(update 만).
     pub status: Option<Change>,
-    /// 그 task 의 담당자 노션 사용자 id(바꿈이 있으면 멘션한다).
+    /// 그 task 의 담당자 노션 사용자 id(실제로 바꾼 칸이 있으면 멘션한다).
     pub assignee_ids: Vec<String>,
 }
 
@@ -686,8 +713,11 @@ pub struct PlannedCreate {
     pub item: usize,
     /// `기능`: 할 일 글.
     pub title: String,
-    /// `종료일`: 요약이 근거 말로 확인한 기한.
-    pub due: String,
+    /// `종료일`: 요약이 근거 말로 확인한 기한. 그 근거에 망설이는 말이 있으면 비운다.
+    pub due: Option<String>,
+    /// 기한 근거에 망설이는 말이 있어 종료일을 비웠다(본문에 「기한 애매」).
+    #[serde(default)]
+    pub due_unsure: bool,
     /// 담당자 pubkey(요약이 확인한 사람). 담당자 연결 DB 에서 "확인됨"일 때만 `담당자` 칸에 넣는다.
     pub assignee: Option<String>,
     /// 「관련 할 일」 줄.
@@ -712,13 +742,16 @@ pub struct Dropped {
     pub unknown_task: u64,
     /// 요약에 없는 회의 항목 번호.
     pub unknown_item: u64,
+    /// 짝 시각이 그 회의 항목의 근거 시각이 아님.
+    #[serde(default)]
+    pub not_item_time: u64,
     /// 근거 시각이 원본 스크립트 줄에 없음.
     pub no_line: u64,
     /// 짝의 level 이 확실·애매가 아님.
     pub bad_level: u64,
     /// 확실한 짝이 없는 task 의 바꿈.
     pub no_sure_link: u64,
-    /// 근거 말에서 그 날짜를 읽을 수 없음(지어낸 날짜, 날짜가 둘, 지난 날).
+    /// 근거 말에서 그 날짜를 읽을 수 없음(지어낸 날짜, 날짜가 둘, 지난 날, 다른 사람 말의 날짜).
     pub date_not_in_words: u64,
     /// 근거 말이 그 task·짝 항목과 낱말이 안 겹침.
     pub not_about: u64,
@@ -743,6 +776,7 @@ impl Dropped {
     pub fn total(&self) -> u64 {
         self.unknown_task
             + self.unknown_item
+            + self.not_item_time
             + self.no_line
             + self.bad_level
             + self.no_sure_link
@@ -764,6 +798,7 @@ impl fmt::Display for Dropped {
         let all = [
             ("unknown task", self.unknown_task),
             ("unknown item", self.unknown_item),
+            ("not the item's time", self.not_item_time),
             ("no script line", self.no_line),
             ("bad level", self.bad_level),
             ("no sure link", self.no_sure_link),
@@ -817,13 +852,28 @@ impl<'a> Lines<'a> {
 
     /// 시각이 딱 같은 줄. 정수가 아니거나 없는 시각이면 `None`.
     fn at(&self, ms: Option<f64>) -> Option<usize> {
-        let ms = ms.filter(|ms| ms.is_finite() && *ms >= 0.0 && ms.fract() == 0.0)?;
-        let ms = ms as u64;
+        self.at_ms(whole_ms(ms)?)
+    }
+
+    fn at_ms(&self, ms: u64) -> Option<usize> {
         self.lines.iter().position(|line| line.start_ms == ms)
     }
 
-    /// 근거 줄과 바로 다음 줄의 글.
-    fn window(&self, j: usize) -> String {
+    /// 근거 말: 근거 줄, 그리고 같은 사람(pubkey 로 아는)이 이어 말한 바로 다음 줄(요약의 근거 글
+    /// 찾기와 같은 규칙). 날짜·상태 말은 이 안에서만 읽는다: 다음 줄이 다른 사람이면 그건 그 사람의
+    /// 말이다.
+    fn statement(&self, j: usize) -> String {
+        let line = &self.lines[j];
+        match self.lines.get(j + 1) {
+            Some(next) if line.speaker.is_some() && next.speaker == line.speaker => {
+                format!("{} {}", line.text, next.text)
+            }
+            _ => line.text.to_string(),
+        }
+    }
+
+    /// 망설임·거절을 볼 범위: 근거 줄과 바로 다음 줄(누가 말했든: 바로 뒤 다른 사람의 거절도 본다).
+    fn reply_window(&self, j: usize) -> String {
         self.lines[j..(j + 2).min(self.lines.len())]
             .iter()
             .map(|line| line.text)
@@ -838,24 +888,119 @@ impl<'a> Lines<'a> {
         Some((started + chrono::Duration::milliseconds(ms)).date_naive())
     }
 
-    /// 그 일에 대한 말인가: 근거 줄과 다음 줄, 또는 바로 앞의 다른 사람 줄(부탁)이 `keys` 와
-    /// 낱말이 겹친다(요약의 기한 검사와 같은 규칙).
+    /// 그 일에 대한 말인가: 근거 말([`statement`](Self::statement))이 `keys` 와 낱말이 겹친다.
     fn about(&self, j: usize, keys: &[String]) -> bool {
-        let before = j
-            .checked_sub(1)
-            .map(|i| &self.lines[i])
-            .filter(|line| line.speaker != self.lines[j].speaker);
-        summary::shares_words(keys, &self.window(j))
-            || before.is_some_and(|line| summary::shares_words(keys, line.text))
+        summary::shares_words(keys, &self.statement(j))
     }
 }
 
-/// 부정하거나 망설이는 말이 있나([`NEGATIONS`], [`HEDGES`]).
-fn hedged(text: &str) -> bool {
+/// 모델이 낸 ms 가 0 이상 정수면 그 값.
+fn whole_ms(ms: Option<f64>) -> Option<u64> {
+    let ms = ms.filter(|ms| ms.is_finite() && *ms >= 0.0 && ms.fract() == 0.0)?;
+    Some(ms as u64)
+}
+
+/// 그 회의 항목의 근거 시각(요약이 검사해 실제 줄에 붙인 값).
+fn item_ms(summary: &Summary, item: ItemRef) -> Option<u64> {
+    match item {
+        ItemRef::Decision(i) => summary.decisions[i].evidence_start_ms,
+        ItemRef::Action(i) => summary.action_items[i].evidence_start_ms,
+        ItemRef::Topic(i) => summary.topics[i].start_ms,
+    }
+}
+
+/// `rest` 가 「말다」의 꼴로 시작하나(「마세요」·「말고」·「맙시다」). 「마무리·마감·마지막·말씀」은
+/// 아니다.
+fn forbidding(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some('마'), next) => next.is_none_or(|c| AFTER_MA.contains(&c)),
+        (Some('말'), next) => next.is_none_or(|c| AFTER_MAL.contains(&c)),
+        (Some('맙'), _) => true,
+        _ => false,
+    }
+}
+
+/// 부정하거나 망설이는 말이 있나. 부정은 후보정의 [`NEGATIONS`] 를 쓰되 [`NEGATIONS_BY_WORD`] 는
+/// 낱말로 본다:
+/// - 「안」·「못」: 낱말이 「못」으로 시작하거나, 「안」 하나이거나, 「안」 바로 뒤에 동사가 붙은 꼴
+///   (「안돼요」, [`AFTER_SHORT_NEGATION`]). 「보안·제안·안드로이드·잘못된」은 아니다.
+/// - 「없」: 바로 뒤가 「이」(「차질 없이·문제없이」)나 「애」(「없애기」)가 아닌 꼴(「없어요·없는데」).
+/// - 「지 마·지 말」: 「지」 바로 뒤나 다음 낱말이 「말다」의 꼴(「하지 마세요·하지말고」). 「금요일까지
+///   마무리·말씀」은 아니다.
+///
+/// 망설임은 [`HEDGES`](글자)와 [`HEDGE_WORDS`](낱말).
+pub fn hedged(text: &str) -> bool {
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let short_negation = |word: &&str| {
+        let mut chars = word.chars();
+        match chars.next() {
+            Some('못') => true,
+            Some('안') => chars
+                .next()
+                .is_none_or(|next| AFTER_SHORT_NEGATION.contains(&next)),
+            _ => false,
+        }
+    };
+    let lacking = |word: &&str| {
+        word.split('없')
+            .skip(1)
+            .any(|after| !matches!(after.chars().next(), Some('이' | '애' | '앨' | '앴' | '앤')))
+    };
+    let forbids = |(i, word): (usize, &&str)| {
+        let mut parts = word.split('지').skip(1).peekable();
+        let mut hit = false;
+        while let Some(after) = parts.next() {
+            // 낱말이 「지」로 끝나면(「하지 마」) 다음 낱말을 본다.
+            hit |= match (after.is_empty(), parts.peek()) {
+                (true, None) => words.get(i + 1).is_some_and(|next| forbidding(next)),
+                _ => forbidding(after),
+            };
+        }
+        hit
+    };
     NEGATIONS
         .iter()
-        .chain(HEDGES.iter())
+        .filter(|word| !NEGATIONS_BY_WORD.contains(word))
         .any(|word| text.contains(word))
+        || words.iter().any(short_negation)
+        || words.iter().any(lacking)
+        || words.iter().enumerate().any(forbids)
+        || words.iter().any(|word| HEDGE_WORDS.contains(word))
+        || HEDGES.iter().any(|word| text.contains(word))
+}
+
+/// 그 상태로 실제로 바꾸려면 근거 말에 있어야 하는 말(글자·숫자만, 작은 글자로 견준다). 여기
+/// 없는 상태(미팅·시작 전·기획(A2D2)·디자인·개발·개발-토의필요)는 늘 제안으로만 남긴다.
+pub fn status_words(status: &str) -> &'static [&'static str] {
+    match status {
+        "완료" => &[
+            "끝났",
+            "끝냈",
+            "완료",
+            "마쳤",
+            "마무리했",
+            "배포했",
+            "머지",
+            "merge",
+            "닫았",
+        ],
+        "Dev QA" => &["qa", "큐에이"],
+        _ if status.starts_with("Production") => &["프로덕션", "production", "운영배포"],
+        _ if status.starts_with("Staging") => &["스테이징", "staging"],
+        _ => &[],
+    }
+}
+
+/// 근거 말에 그 상태를 말하는 말이 있나.
+fn says_status(status: &str, statement: &str) -> bool {
+    let squashed = summary::squash(statement);
+    status_words(status)
+        .iter()
+        .any(|word| squashed.contains(word))
 }
 
 /// 같은 task 로 모인 짝들.
@@ -881,7 +1026,7 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
     let lines = Lines::new(input.transcript);
     let mut dropped = Dropped::default();
 
-    // 1. 짝: task 마다 모은다(처음 나온 차례대로).
+    // 1. 짝: task 마다 모은다(처음 나온 차례대로). 짝 시각은 그 회의 항목의 근거 시각이어야 한다.
     let mut groups: Vec<Group> = Vec::new();
     let mut linked: HashSet<ItemRef> = HashSet::new();
     for link in answer.links {
@@ -901,6 +1046,11 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
                 continue;
             }
         };
+        let claimed = whole_ms(link.ms);
+        if claimed.is_none() || claimed != item_ms(summary, item) {
+            dropped.not_item_time += 1;
+            continue;
+        }
         let Some(j) = lines.at(link.ms) else {
             dropped.no_line += 1;
             continue;
@@ -951,7 +1101,8 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
         keys
     };
 
-    // 2. 기한 바꿈: 근거 말에서 코드가 읽은 날짜가 모델 날짜와 같을 때만.
+    // 2. 기한 바꿈: 근거 말(같은 사람이 이어 말한 줄까지)에서 코드가 읽은 날짜가 모델 날짜와
+    //    같을 때만. 지금 종료일에 끝 날짜나 시각이 있으면 제안으로만.
     let mut due: BTreeMap<usize, Change> = BTreeMap::new();
     for change in answer.due_changes {
         let Some(task) = parse_task(&change.task, input.tasks.len()) else {
@@ -966,8 +1117,7 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.no_line += 1;
             continue;
         };
-        let window = lines.window(j);
-        if hedged(&window) {
+        if hedged(&lines.reply_window(j)) {
             dropped.negation += 1;
             continue;
         }
@@ -975,9 +1125,10 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.not_about += 1;
             continue;
         }
-        let read = lines
-            .date(j)
-            .and_then(|base| summary::date_from_quote(&window, base).filter(|date| *date >= base));
+        let statement = lines.statement(j);
+        let read = lines.date(j).and_then(|base| {
+            summary::date_from_quote(&statement, base).filter(|date| *date >= base)
+        });
         let claimed = summary::parse_claimed_due(&change.due).map(|(day, _)| day);
         let (Some(read), Some(claimed)) = (read, claimed) else {
             dropped.date_not_in_words += 1;
@@ -987,19 +1138,22 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.date_not_in_words += 1;
             continue;
         }
-        let current = input.tasks[task].due.clone().unwrap_or_default();
+        let open = &input.tasks[task];
+        let current = open.due.clone().unwrap_or_default();
         if current.get(..10) == Some(read.format("%Y-%m-%d").to_string().as_str()) {
             dropped.same_value += 1;
             continue;
         }
         due.entry(task).or_insert(Change {
+            suggest: open.due_end.is_some() || current.contains('T'),
             from: current,
             to: read.format("%Y-%m-%d").to_string(),
             ms: lines.lines[j].start_ms,
         });
     }
 
-    // 3. 상태 바꿈: 선택지 안, 지금과 다름, 근거 말이 분명할 때만.
+    // 3. 상태 바꿈: 선택지 안, 지금과 다름, 근거 말이 분명할 때만. 그 상태를 말하는 말이 근거
+    //    말에 없으면 제안으로만.
     let mut status: BTreeMap<usize, Change> = BTreeMap::new();
     for change in answer.status_changes {
         let Some(task) = parse_task(&change.task, input.tasks.len()) else {
@@ -1024,7 +1178,7 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.bad_status += 1;
             continue;
         }
-        if hedged(&lines.window(j)) {
+        if hedged(&lines.reply_window(j)) {
             dropped.negation += 1;
             continue;
         }
@@ -1041,10 +1195,11 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             from: current.clone(),
             to: wanted.to_string(),
             ms: lines.lines[j].start_ms,
+            suggest: !says_status(wanted, &lines.statement(j)),
         });
     }
 
-    // 4. 새 task: 짝이 없는 확정 할 일만.
+    // 4. 새 task: 짝이 없는 확정 할 일만. 기한 근거에 망설이는 말이 있으면 종료일 없이.
     let titles: HashSet<String> = input
         .tasks
         .iter()
@@ -1078,10 +1233,15 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.not_new += 1;
             continue;
         }
+        let due_unsure = action
+            .evidence_start_ms
+            .and_then(|ms| lines.at_ms(ms))
+            .is_none_or(|j| hedged(&lines.reply_window(j)));
         creates.push(PlannedCreate {
             item: i,
             title,
-            due: due.clone(),
+            due: (!due_unsure).then(|| due.clone()),
+            due_unsure,
             assignee: action.assignee_pubkey.clone(),
             todo: todo_line(action, input.names),
             evidence_ms: action.evidence_start_ms,
@@ -1188,6 +1348,25 @@ pub async fn ask(
     Ok((plan, usage))
 }
 
+/// 쓰기 하나가 어떻게 됐나(장부에 남는다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// 썼다.
+    Written,
+    /// 노션에 이미 있었다: 기록·새 task·회의록 절은 표시를 찾았고, 칸은 이미 새 값이었다(전에
+    /// 쓰고 장부에 못 남긴 것).
+    AlreadyThere,
+    /// 계획 뒤에 사람이 그 칸을 바꿔서 덮어쓰지 않았다.
+    ChangedMeanwhile,
+    /// 그 task·페이지가 없어졌다(404). 그 task 의 남은 쓰기는 건너뛴다.
+    Gone,
+    /// 노션이 그 쓰기를 거절했다(400). 그 task 의 남은 쓰기는 건너뛴다.
+    Refused,
+    /// 안 했다: 그 상태가 지금 선택지에 없거나, 같은 task 의 앞 쓰기가 거절됐다.
+    Skipped,
+}
+
 /// 회의마다 하나인 장부(`{첫 세션}.tasks.json`, 스크립트 옆). 계획을 쓰기 전에 남겨서 Gemini 를
 /// 다시 부르지 않고, 끝낸 쓰기를 하나씩 더해 다시 돌 때 건너뛴다. 회의 내용(요약에서 나온 말)이
 /// 들어 있으니 0600 으로 쓴다.
@@ -1207,21 +1386,67 @@ pub struct TasksLedger {
     pub channel_id: Uuid,
     /// 회의 날(KST), 예: `2026-10-12`(기록 제목).
     pub meeting: String,
-    /// 계획을 세울 때 읽은 task DB 칸.
+    /// 계획을 세울 때 읽은 task DB 칸(쓸 때는 그 실행에서 다시 읽은 칸을 본다).
     pub schema: TaskSchema,
     /// 검사를 통과한 계획.
     pub plan: Plan,
     /// Gemini 사용량(부르지 않았으면 `None`).
     pub usage: Option<Usage>,
-    /// 끝낸 쓰기([`Write::key`]). 노션에 이미 있던 것·task 가 없어진 것도 끝낸 것으로 친다.
+    /// 끝낸 쓰기([`Write::key`])와 그 결과.
     #[serde(default)]
-    pub done: Vec<String>,
+    pub done: BTreeMap<String, Outcome>,
     /// 만든 task: 쓰기 열쇠 → page id.
     #[serde(default)]
     pub created: BTreeMap<String, String>,
     /// 다 썼다. 이 회의는 다시 하지 않는다.
     #[serde(default)]
     pub finished: bool,
+}
+
+impl TasksLedger {
+    /// 그 쓰기의 결과(아직 안 했으면 `None`).
+    pub fn outcome(&self, write: Write) -> Option<Outcome> {
+        self.done.get(&write.key(&self.plan)).copied()
+    }
+
+    /// 이 회의 덕에 그 칸이 새 값이 됐다(썼거나, 쓰고 장부에 못 남겨 이미 그 값이었다).
+    fn applied(&self, write: Write) -> bool {
+        matches!(
+            self.outcome(write),
+            Some(Outcome::Written | Outcome::AlreadyThere)
+        )
+    }
+
+    /// 칸을 바꿨는데 아직 기록을 못 붙인 task 의 기록 쓰기. 회의가 끝나고 24시간이 지나도 이것만은
+    /// 마저 붙인다(바꾼 것을 사람이 보고 되돌릴 수 있게). 칸 바꾸기는 다시 하지 않는다.
+    pub fn owed_records(&self) -> Vec<Write> {
+        (0..self.plan.tasks.len())
+            .filter(|&i| self.applied(Write::Due(i)) || self.applied(Write::Status(i)))
+            .map(Write::Append)
+            .filter(|write| self.outcome(*write).is_none())
+            .collect()
+    }
+
+    /// 그 쓰기를 건너뛸까: 같은 task 의 앞 쓰기가 없어짐(404)·거절(400)으로 끝났다. 다만 칸을 이미
+    /// 바꾼 task 의 기록은 건너뛰지 않는다(바꾼 것은 남겨야 한다).
+    pub fn blocked(&self, write: Write) -> bool {
+        let (Write::Due(i) | Write::Status(i) | Write::Append(i)) = write else {
+            return false;
+        };
+        if write == Write::Append(i)
+            && (self.applied(Write::Due(i)) || self.applied(Write::Status(i)))
+        {
+            return false;
+        }
+        [Write::Due(i), Write::Status(i), Write::Append(i)]
+            .into_iter()
+            .any(|earlier| {
+                matches!(
+                    self.outcome(earlier),
+                    Some(Outcome::Gone | Outcome::Refused)
+                )
+            })
+    }
 }
 
 /// 기록 제목에 쓸 회의 날(KST): `2026-10-12`.
@@ -1259,18 +1484,19 @@ impl Write {
     }
 }
 
-/// `mode` 로 할 쓰기, 차례대로.
+/// `mode` 로 할 쓰기, 차례대로. 제안뿐인 바꿈은 칸을 안 쓴다(기록에만 남는다).
 pub fn writes(plan: &Plan, mode: TasksMode) -> Vec<Write> {
     let mut out = Vec::new();
     if mode == TasksMode::Off {
         return out;
     }
+    let real = |change: &Option<Change>| change.as_ref().is_some_and(|change| !change.suggest);
     for (i, task) in plan.tasks.iter().enumerate() {
         if mode >= TasksMode::Update {
-            if task.due.is_some() {
+            if real(&task.due) {
                 out.push(Write::Due(i));
             }
-            if task.status.is_some() {
+            if real(&task.status) {
                 out.push(Write::Status(i));
             }
         }
@@ -1300,10 +1526,18 @@ pub struct TasksReport {
     pub due_changed: usize,
     /// `작업상태` 를 바꾼 수.
     pub status_changed: usize,
+    /// 기록에 「제안」으로만 남긴 바꿈 수.
+    pub suggested: usize,
+    /// 계획 뒤에 사람이 그 칸을 바꿔서 안 바꾼 수.
+    pub changed_meanwhile: usize,
     /// 노션에 이미 있어서 안 쓴 수(전에 쓰고 장부에 못 남긴 것).
     pub already_there: usize,
     /// task 가 없어져서(지워짐) 못 쓴 수.
     pub gone: usize,
+    /// 노션이 거절해서(400) 그 task 의 쓰기를 건너뛴 수.
+    pub refused: usize,
+    /// 안 한 쓰기 수(선택지에 없는 상태, 앞 쓰기가 막힌 task).
+    pub not_written: usize,
     /// 새 task 담당자를 담당자 연결 DB 에서 못 찾아본 수(담당자 칸만 비웠다).
     pub assignee_lookup_failed: usize,
     /// 검사·상한으로 버린 수.
@@ -1338,18 +1572,18 @@ impl fmt::Display for TasksReport {
             self.status_changed,
             self.skipped
         )?;
-        if self.already_there > 0 {
-            write!(f, " | already there {}", self.already_there)?;
-        }
-        if self.gone > 0 {
-            write!(f, " | task gone {}", self.gone)?;
-        }
-        if self.assignee_lookup_failed > 0 {
-            write!(
-                f,
-                " | assignee lookup failed {}",
-                self.assignee_lookup_failed
-            )?;
+        for (name, n) in [
+            ("suggested", self.suggested),
+            ("changed meanwhile", self.changed_meanwhile),
+            ("already there", self.already_there),
+            ("task gone", self.gone),
+            ("refused", self.refused),
+            ("not written", self.not_written),
+            ("assignee lookup failed", self.assignee_lookup_failed),
+        ] {
+            if n > 0 {
+                write!(f, " | {name} {n}")?;
+            }
         }
         Ok(())
     }
@@ -1422,7 +1656,8 @@ fn short_dates(from: &str, to: &str) -> (String, String) {
     (show(from, same_year), show(to, same_year))
 }
 
-/// 기록에 남기는 바꿈 한 줄: `기한: 10/20 → 10/24 (근거 [12:34])`.
+/// 기록에 남기는 바꿈 한 줄: `기한: 10/20 → 10/24 (근거 [12:34])`. 제안뿐인 바꿈은
+/// `기한 제안: …`·`상태 제안: …`.
 pub fn change_line(what: Write, change: &Change) -> String {
     let (label, from, to) = match what {
         Write::Due(_) => {
@@ -1437,6 +1672,11 @@ pub fn change_line(what: Write, change: &Change) -> String {
             };
             ("상태", from, change.to.clone())
         }
+    };
+    let label = if change.suggest {
+        format!("{label} 제안")
+    } else {
+        label.to_string()
     };
     format!("{label}: {from} → {to} (근거 {})", notion::clock(change.ms))
 }
@@ -1466,16 +1706,18 @@ pub struct Record<'a> {
     pub summary: &'a [String],
     /// 근거 시각 조각들.
     pub times: Vec<Value>,
-    /// 바꿈 줄.
+    /// 실제로 바꾼 칸 줄.
     pub changes: &'a [String],
-    /// 바꿈이 있을 때 멘션할 담당자.
+    /// 제안 줄(칸은 안 바꿈).
+    pub suggestions: &'a [String],
+    /// 실제로 바꾼 칸이 있을 때 멘션할 담당자.
     pub mention: &'a [String],
 }
 
 /// [`Record`] 의 블록들, 차례대로:
 /// 1. 제목 `허들 회의 기록 · 회의록 작업기가 자동으로 붙임 · 2026-10-12`(사람 손이 아님).
 /// 2. 바꾼 칸이 있으면 바로 그 아래 `기한: 10/20 → 10/24 (근거 [12:34])`(사람이 보고 되돌리게),
-///    그리고 그 task 담당자 멘션.
+///    제안(`기한 제안: …`·`상태 제안: …`, 칸은 안 바꿈), 실제로 바꾼 칸이 있으면 그 task 담당자 멘션.
 /// 3. `회의록: @회의록 페이지`(전문은 거기에 있다).
 /// 4. 짧은 요약(회의 요약 글)과 근거 시각.
 ///
@@ -1487,7 +1729,7 @@ pub fn record_blocks(record: &Record<'_>) -> Vec<Value> {
         "type": "heading_3",
         "heading_3": { "rich_text": notion::text_runs(&title, None) }
     })];
-    for change in record.changes {
+    for change in record.changes.iter().chain(record.suggestions) {
         out.extend(notion::blocks(
             "bulleted_list_item",
             notion::text_runs(change, None),
@@ -1546,105 +1788,155 @@ pub fn maybe_blocks(maybe: &[MaybeTask]) -> Vec<Value> {
     out
 }
 
-/// 쓰기 하나의 결과.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wrote {
-    /// 썼다.
-    Done,
-    /// 노션에 이미 있었다(표시를 찾음).
-    AlreadyThere,
-    /// task·페이지가 없어져서 못 썼다(건너뜀).
-    Gone,
-}
+/// 새 task 의 기한 근거에 망설이는 말이 있어 종료일을 비웠을 때 본문에 쓰는 말.
+pub const DUE_UNSURE_NOTE: &str = "기한 애매: 근거 말에 망설이는 말이 있어 종료일은 비워 뒀어요.";
 
-/// 없어진 페이지(404)면 [`Wrote::Gone`], 아니면 `doing` 을 하다 난 실패.
-fn gone_or(doing: &'static str) -> impl FnOnce(NotionError) -> Result<Wrote, TaskDbError> {
+/// 400·404 는 그 쓰기만의 일로 보고 결과로 돌려준다(그 task 의 남은 쓰기는 건너뛰고 다음으로
+/// 간다). 나머지는 `doing` 을 하다 난 실패로(다음 실행에 다시).
+fn settle(doing: &'static str) -> impl FnOnce(NotionError) -> Result<Outcome, TaskDbError> {
     move |error| match error.kind {
-        NotionErrorKind::NotFound => Ok(Wrote::Gone),
+        NotionErrorKind::NotFound => Ok(Outcome::Gone),
+        NotionErrorKind::BadRequest => Ok(Outcome::Refused),
         _ => Err(TaskDbError { error, doing }),
     }
 }
 
-/// 쓰기 하나를 하고 보고에 센다. 덧붙이기·만들기·회의록 절은 쓰기 전에 노션에 이미 있는지 늘
-/// 찾아본다(장부에 못 남기고 죽었어도 두 번 쓰지 않게). 칸 바꾸기는 같은 값을 다시 넣어도
-/// 같다. `link_template` 은 근거 시각의 재생 링크 모양.
+/// 쓰기 하나를 하고 보고에 센다. `schema` 는 이 실행에서 읽은 지금 task DB 칸이다(상태 이름이
+/// 지금 선택지에 있을 때만 쓴다: 노션이 옵션을 새로 만들지 않게). 덧붙이기·만들기·회의록 절은 쓰기
+/// 전에 노션에 이미 있는지 늘 찾아본다(장부에 못 남기고 죽었어도 두 번 쓰지 않게). 칸 바꾸기는
+/// 바로 앞에서 지금 값을 다시 읽어, 계획 뒤에 사람이 바꿨으면 덮어쓰지 않는다. `link_template` 은
+/// 근거 시각의 재생 링크 모양.
 pub async fn apply(
     client: &mut NotionClient<'_>,
     ledger: &mut TasksLedger,
+    schema: &TaskSchema,
     write: Write,
     link_template: &str,
     report: &mut TasksReport,
-) -> Result<(), TaskDbError> {
-    let wrote = write_one(client, ledger, write, link_template, report).await?;
-    match (wrote, write) {
-        (Wrote::AlreadyThere, _) => report.already_there += 1,
-        (Wrote::Gone, _) => report.gone += 1,
-        (Wrote::Done, Write::Due(_)) => report.due_changed += 1,
-        (Wrote::Done, Write::Status(_)) => report.status_changed += 1,
-        (Wrote::Done, Write::Append(_)) => report.appended += 1,
-        (Wrote::Done, Write::Create(_)) => report.created += 1,
-        (Wrote::Done, Write::Maybe) => {}
+) -> Result<Outcome, TaskDbError> {
+    let outcome = write_one(client, ledger, schema, write, link_template, report).await?;
+    count(report, write, outcome);
+    Ok(outcome)
+}
+
+/// 쓰기 결과를 보고에 센다.
+pub fn count(report: &mut TasksReport, write: Write, outcome: Outcome) {
+    match (outcome, write) {
+        (Outcome::Written, Write::Due(_)) => report.due_changed += 1,
+        (Outcome::Written, Write::Status(_)) => report.status_changed += 1,
+        (Outcome::Written, Write::Append(_)) => report.appended += 1,
+        (Outcome::Written, Write::Create(_)) => report.created += 1,
+        (Outcome::Written, Write::Maybe) => {}
+        (Outcome::AlreadyThere, _) => report.already_there += 1,
+        (Outcome::ChangedMeanwhile, _) => report.changed_meanwhile += 1,
+        (Outcome::Gone, _) => report.gone += 1,
+        (Outcome::Refused, _) => report.refused += 1,
+        (Outcome::Skipped, _) => report.not_written += 1,
     }
-    Ok(())
+}
+
+/// task 페이지의 지금 `종료일`(시작, 끝)과 `작업상태`.
+fn current_fields(page: &Value, schema: &TaskSchema) -> (Option<String>, Option<String>, String) {
+    use task_property as p;
+    let properties = &page["properties"];
+    let date = &properties[p::DUE]["date"];
+    let text = |value: &Value| value.as_str().map(str::to_string);
+    (
+        text(&date["start"]),
+        text(&date["end"]),
+        properties[p::STATUS][&schema.status_kind]["name"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    )
 }
 
 async fn write_one(
     client: &mut NotionClient<'_>,
     ledger: &mut TasksLedger,
+    schema: &TaskSchema,
     write: Write,
     link_template: &str,
     report: &mut TasksReport,
-) -> Result<Wrote, TaskDbError> {
+) -> Result<Outcome, TaskDbError> {
     use task_property as p;
     match write {
         Write::Due(i) | Write::Status(i) => {
             let task = &ledger.plan.tasks[i];
-            let (name, value, doing) = match write {
-                Write::Due(_) => {
-                    let Some(change) = &task.due else {
-                        return Ok(Wrote::Done);
-                    };
-                    let value = json!({ "date": { "start": change.to } });
-                    (p::DUE, value, "changing a task's due date")
+            let is_due = matches!(write, Write::Due(_));
+            let (change, doing) = match (is_due, &task.due, &task.status) {
+                (true, Some(change), _) => (change, "changing a task's due date"),
+                (false, _, Some(change)) => (change, "changing a task's status"),
+                _ => return Ok(Outcome::Skipped),
+            };
+            if change.suggest {
+                return Ok(Outcome::Skipped);
+            }
+            // 노션이 옵션을 새로 만들지 않게: 그 상태가 지금 선택지에 있을 때만 쓴다.
+            if !is_due && !schema.status_options.contains(&change.to) {
+                return Ok(Outcome::Skipped);
+            }
+            // 바로 앞에서 지금 값을 다시 읽는다. 계획 뒤에 사람이 바꿨으면 덮어쓰지 않는다.
+            let page = match client.get(&format!("/v1/pages/{}", task.id)).await {
+                Ok(page) => page,
+                Err(error) => return settle("reading a task before changing it")(error),
+            };
+            let (start, end, status) = current_fields(&page, schema);
+            if is_due {
+                let start = start.unwrap_or_default();
+                if end.is_none() && start == change.to {
+                    return Ok(Outcome::AlreadyThere);
                 }
-                _ => {
-                    let Some(change) = &task.status else {
-                        return Ok(Wrote::Done);
-                    };
-                    let kind = ledger.schema.status_kind.as_str();
-                    let value = json!({ kind: { "name": change.to } });
-                    (p::STATUS, value, "changing a task's status")
+                if end.is_some() || start != change.from {
+                    return Ok(Outcome::ChangedMeanwhile);
                 }
+            } else {
+                if status == change.to {
+                    return Ok(Outcome::AlreadyThere);
+                }
+                if status != change.from {
+                    return Ok(Outcome::ChangedMeanwhile);
+                }
+            }
+            let (name, value) = if is_due {
+                (p::DUE, json!({ "date": { "start": change.to } }))
+            } else {
+                let kind = schema.status_kind.as_str();
+                (p::STATUS, json!({ kind: { "name": change.to } }))
             };
             debug_assert!(CHANGEABLE.contains(&name));
             let mut properties = Map::new();
             properties.insert(name.to_string(), value);
             let body = json!({ "properties": properties });
             match client.update_page(&task.id, body, Notify::Silent).await {
-                Ok(()) => Ok(Wrote::Done),
-                Err(error) => gone_or(doing)(error),
+                Ok(()) => Ok(Outcome::Written),
+                Err(error) => settle(doing)(error),
             }
         }
         Write::Append(i) => {
             let task = &ledger.plan.tasks[i];
             let old = match client.list_children(&task.id).await {
                 Ok(old) => old,
-                Err(error) => return gone_or("reading a task page")(error),
+                Err(error) => return settle("reading a task page")(error),
             };
             if old
                 .iter()
                 .any(|block| mentions_page(block, &ledger.minutes_page_id))
             {
-                return Ok(Wrote::AlreadyThere);
+                return Ok(Outcome::AlreadyThere);
             }
-            // 이 회의에서 실제로 바꾼 칸만 남긴다(바꾸다 없어졌으면 안 남긴다).
-            let done = |what: Write| ledger.done.contains(&what.key(&ledger.plan));
+            // 이 회의로 실제로 바뀐 칸만 「A → B」로, 제안은 「… 제안: A → B」로 남긴다.
             let mut changes = Vec::new();
-            if let (Some(change), true) = (&task.due, done(Write::Due(i))) {
-                changes.push(change_line(Write::Due(i), change));
-            }
-            if let (Some(change), true) = (&task.status, done(Write::Status(i))) {
-                changes.push(change_line(Write::Status(i), change));
+            let mut suggestions = Vec::new();
+            for (what, change) in [(Write::Due(i), &task.due), (Write::Status(i), &task.status)] {
+                let Some(change) = change else {
+                    continue;
+                };
+                if change.suggest {
+                    suggestions.push(change_line(what, change));
+                } else if ledger.applied(what) {
+                    changes.push(change_line(what, change));
+                }
             }
             let blocks = record_blocks(&Record {
                 meeting: &ledger.meeting,
@@ -1652,66 +1944,76 @@ async fn write_one(
                 summary: &task.summary,
                 times: time_runs(&task.evidence_ms, link_template, ledger.channel_id),
                 changes: &changes,
+                suggestions: &suggestions,
                 mention: &task.assignee_ids,
             });
-            notion::validate_blocks(&blocks).map_err(at("building a record"))?;
-            // 바꿈이 있으면 기본 알림(담당자 멘션이 알림이 된다), 없으면 조용히.
+            if notion::validate_blocks(&blocks).is_err() {
+                return Ok(Outcome::Refused);
+            }
+            // 바꾼 칸이 있으면 기본 알림(담당자 멘션이 알림이 된다), 없으면 조용히.
             let notify = if changes.is_empty() {
                 Notify::Silent
             } else {
                 Notify::Default
             };
             match client.append_children(&task.id, &blocks, notify).await {
-                Ok(()) => Ok(Wrote::Done),
-                Err(error) => gone_or("appending a record to a task")(error),
+                Ok(()) => {
+                    report.suggested += suggestions.len();
+                    Ok(Outcome::Written)
+                }
+                Err(error) => settle("appending a record to a task")(error),
             }
         }
         Write::Create(i) => {
             let create = ledger.plan.creates[i].clone();
             let key = write.key(&ledger.plan);
             let url = page_url(&ledger.minutes_page_id);
-            // 이 회의가 이미 만든 task: 같은 제목이고 관련 노션 페이지에 이 회의록 주소.
+            // 이 회의가 이미 만든 task: 같은 제목이고 관련 노션 페이지(url)에 이 회의록 id.
             let filter = json!({ "and": [
                 { "property": p::TITLE, "title": { "equals": create.title } },
                 { "property": p::RELATED_PAGE,
-                  "rich_text": { "contains": compact(&ledger.minutes_page_id) } }
+                  "url": { "contains": compact(&ledger.minutes_page_id) } }
             ] });
-            let data_source = ledger.schema.data_source_id.clone();
+            let data_source = schema.data_source_id.clone();
             let looking = "looking for a task this meeting made";
-            let found = client
+            let found = match client
                 .query(&data_source, json!({ "filter": filter, "page_size": 10 }))
                 .await
-                .map_err(at(looking))?;
-            if let Some(page) = notion::live_results(&found).map_err(at(looking))?.first() {
+            {
+                Ok(found) => found,
+                Err(error) => return settle(looking)(error),
+            };
+            let found = notion::live_results(&found).map_err(at(looking))?;
+            if let Some(page) = found.first() {
                 let id = notion::page_id(page).map_err(at(looking))?;
                 ledger.created.insert(key, id);
-                return Ok(Wrote::AlreadyThere);
+                return Ok(Outcome::AlreadyThere);
+            }
+            if !schema.related_page {
+                // 이 회의가 만든 것을 다시 찾을 표시가 없으면 만들지 않는다.
+                return Ok(Outcome::Skipped);
             }
             let mut properties = Map::new();
             properties.insert(
                 p::TITLE.into(),
                 json!({ "title": notion::text_runs(&create.title, None) }),
             );
-            if ledger
-                .schema
+            if schema
                 .status_options
                 .iter()
                 .any(|option| option == NEW_TASK_STATUS)
             {
-                let kind = ledger.schema.status_kind.as_str();
+                let kind = schema.status_kind.as_str();
                 properties.insert(
                     p::STATUS.into(),
                     json!({ kind: { "name": NEW_TASK_STATUS } }),
                 );
             }
-            properties.insert(
-                p::RELATED_PAGE.into(),
-                json!({ "rich_text": notion::text_runs(&url, Some(&url)) }),
-            );
-            if ledger.schema.due {
-                properties.insert(p::DUE.into(), json!({ "date": { "start": create.due } }));
+            properties.insert(p::RELATED_PAGE.into(), json!({ "url": url }));
+            if let (true, Some(due)) = (schema.due, &create.due) {
+                properties.insert(p::DUE.into(), json!({ "date": { "start": due } }));
             }
-            if let (true, Some(pubkey)) = (ledger.schema.assignees, &create.assignee) {
+            if let (true, Some(pubkey)) = (schema.assignees, &create.assignee) {
                 // 담당자 연결 DB 를 못 읽으면 담당자 칸만 비우고 센다(할 일 줄에 이름이 있다).
                 match notion::confirmed_user_of(client, pubkey).await {
                     Ok(Some(user)) => {
@@ -1725,40 +2027,52 @@ async fn write_one(
                 }
             }
             let times: Vec<u64> = create.evidence_ms.into_iter().collect();
-            let line = format!("할 일: {}", create.todo);
+            let mut lines = vec![format!("할 일: {}", create.todo)];
+            if create.due_unsure {
+                lines.push(DUE_UNSURE_NOTE.to_string());
+            }
             let blocks = record_blocks(&Record {
                 meeting: &ledger.meeting,
                 minutes_page_id: &ledger.minutes_page_id,
-                summary: std::slice::from_ref(&line),
+                summary: &lines,
                 times: time_runs(&times, link_template, ledger.channel_id),
                 changes: &[],
+                suggestions: &[],
                 mention: &[],
             });
-            notion::validate_blocks(&blocks).map_err(at("building a new task"))?;
-            let id = client
+            if notion::validate_blocks(&blocks).is_err() {
+                return Ok(Outcome::Refused);
+            }
+            match client
                 .create_page_with_children(&data_source, &properties, &blocks)
                 .await
-                .map_err(at("creating a task"))?;
-            ledger.created.insert(key, id);
-            Ok(Wrote::Done)
+            {
+                Ok(id) => {
+                    ledger.created.insert(key, id);
+                    Ok(Outcome::Written)
+                }
+                Err(error) => settle("creating a task")(error),
+            }
         }
         Write::Maybe => {
             let page = ledger.minutes_page_id.clone();
             let old = match client.list_children(&page).await {
                 Ok(old) => old,
-                Err(error) => return gone_or("reading the minutes page")(error),
+                Err(error) => return settle("reading the minutes page")(error),
             };
             let there = old
                 .iter()
                 .any(|block| block["type"] == "heading_2" && block_text(block) == MAYBE_HEADING);
             if there {
-                return Ok(Wrote::AlreadyThere);
+                return Ok(Outcome::AlreadyThere);
             }
             let blocks = maybe_blocks(&ledger.plan.maybe);
-            notion::validate_blocks(&blocks).map_err(at("building the maybe links"))?;
+            if notion::validate_blocks(&blocks).is_err() {
+                return Ok(Outcome::Refused);
+            }
             match client.append_children(&page, &blocks, Notify::Silent).await {
-                Ok(()) => Ok(Wrote::Done),
-                Err(error) => gone_or("adding the maybe links to the minutes page")(error),
+                Ok(()) => Ok(Outcome::Written),
+                Err(error) => settle("adding the maybe links to the minutes page")(error),
             }
         }
     }
@@ -1860,7 +2174,7 @@ pub(crate) mod tests {
     pub(crate) fn schema() -> TaskSchema {
         TaskSchema {
             data_source_id: TASK_DS.into(),
-            status_kind: "select".into(),
+            status_kind: "status".into(),
             status_options: options(),
             due: true,
             assignees: true,
@@ -1877,6 +2191,7 @@ pub(crate) mod tests {
                 title: "견적서 자동화".into(),
                 status: "개발".into(),
                 due: Some("2026-10-20".into()),
+                due_end: None,
                 assignee_ids: vec!["user-9".into()],
                 assignee_names: vec!["담당 사람".into()],
             },
@@ -1885,6 +2200,7 @@ pub(crate) mod tests {
                 title: "로그인 오류 수정".into(),
                 status: "Dev QA".into(),
                 due: None,
+                due_end: None,
                 assignee_ids: Vec::new(),
                 assignee_names: Vec::new(),
             },
@@ -1893,6 +2209,7 @@ pub(crate) mod tests {
                 title: "결제 화면 개편".into(),
                 status: "기획(A2D2)".into(),
                 due: Some("2026-10-21".into()),
+                due_end: None,
                 assignee_ids: Vec::new(),
                 assignee_names: Vec::new(),
             },
@@ -1900,17 +2217,37 @@ pub(crate) mod tests {
     }
 
     /// task DB 스키마(`GET /v1/data_sources/{id}` 답). 쓰지 않는 칸도 실제처럼 다 있다.
-    fn schema_json() -> Value {
+    /// task DB 스키마(`GET /v1/data_sources/{id}` 답), 운영 data source 와 같은 모양: `작업상태` 는
+    /// status(묶음 셋), `관련 노션 페이지` 는 url, 관계 칸 여섯.
+    pub(crate) fn schema_json() -> Value {
+        let ids: Vec<String> = (0..options().len()).map(|i| format!("o{i}")).collect();
         let options: Vec<Value> = options()
             .iter()
-            .map(|name| json!({ "name": name }))
+            .zip(&ids)
+            .map(|(name, id)| json!({ "id": id, "name": name }))
             .collect();
+        let group = |names: &[&str]| -> Vec<String> {
+            options
+                .iter()
+                .filter(|option| names.contains(&option["name"].as_str().unwrap()))
+                .map(|option| option["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let groups = json!([
+            { "name": "To-do", "option_ids": group(&["미팅", "시작 전"]) },
+            { "name": "In progress", "option_ids": group(&[
+                "개발-토의필요", "기획(A2D2)", "디자인", "개발", "Dev QA", "Staging 배포예정",
+                "Staging QA", "Production 배포예정", "Production QA"
+            ]) },
+            { "name": "Complete", "option_ids": group(&["완료"]) }
+        ]);
+        let relation = json!({ "type": "relation", "relation": {} });
         json!({
             "object": "data_source",
             "id": TASK_DS,
             "properties": {
                 "기능": { "type": "title", "title": {} },
-                "작업상태": { "type": "select", "select": { "options": options } },
+                "작업상태": { "type": "status", "status": { "options": options, "groups": groups } },
                 "담당자": { "type": "people", "people": {} },
                 "협업담당자": { "type": "people", "people": {} },
                 "종료일": { "type": "date", "date": {} },
@@ -1918,9 +2255,13 @@ pub(crate) mod tests {
                 "우선순위": { "type": "select", "select": { "options": [
                     { "name": "높음" }, { "name": "중간" }, { "name": "낮음" }
                 ] } },
-                "상위 항목": { "type": "relation", "relation": {} },
-                "하위 항목": { "type": "relation", "relation": {} },
-                "관련 노션 페이지": { "type": "rich_text", "rich_text": {} },
+                "상위 항목": relation,
+                "하위 항목": relation,
+                "관련 버그": relation,
+                "연결 로드맵": relation,
+                "원본 백로그": relation,
+                "🛳️ 아이렉스 로드맵": relation,
+                "관련 노션 페이지": { "type": "url", "url": {} },
                 "repo": { "type": "rich_text", "rich_text": {} },
                 "commit id": { "type": "rich_text", "rich_text": {} },
                 "배포": { "type": "multi_select", "multi_select": { "options": [] } },
@@ -1939,10 +2280,11 @@ pub(crate) mod tests {
             .collect();
         json!({
             "기능": { "title": notion::text_runs(&task.title, None) },
-            "작업상태": { "select": { "name": task.status } },
+            "작업상태": { "status": { "name": task.status } },
             "담당자": { "people": people },
-            "종료일": { "date": task.due.as_ref().map(|due| json!({ "start": due })) },
+            "종료일": { "date": task.due.as_ref().map(|due| json!({ "start": due, "end": task.due_end })) },
             "우선순위": { "select": { "name": "높음" } },
+            "관련 노션 페이지": { "url": null },
             "repo": { "rich_text": notion::text_runs("a2d2-lab/buzz", None) }
         })
     }
@@ -2043,7 +2385,8 @@ pub(crate) mod tests {
             Some(Change {
                 from: "2026-10-20".into(),
                 to: "2026-10-16".into(),
-                ms: 5_000
+                ms: 5_000,
+                suggest: false,
             })
         );
         assert_eq!(k1.said, ["금요일까지 끝내기로 했다."]);
@@ -2060,7 +2403,8 @@ pub(crate) mod tests {
             Some(Change {
                 from: "Dev QA".into(),
                 to: "완료".into(),
-                ms: 9_000
+                ms: 9_000,
+                suggest: false,
             })
         );
         assert_eq!(k2.due, None);
@@ -2074,8 +2418,8 @@ pub(crate) mod tests {
         assert_eq!(plan.creates.len(), 1);
         let create = &plan.creates[0];
         assert_eq!(
-            (create.item, create.title.as_str(), create.due.as_str()),
-            (1, "회의록 공유 기능 만들기", "2026-10-15")
+            (create.item, create.title.as_str(), create.due.as_deref()),
+            (1, "회의록 공유 기능 만들기", Some("2026-10-15"))
         );
         assert_eq!(create.assignee.as_deref(), Some(A));
         assert_eq!(create.evidence_ms, Some(17_000));
@@ -2131,9 +2475,15 @@ pub(crate) mod tests {
         answer["status_changes"][0]["ms"] = json!(9_500);
         let plan = check(&answer);
         assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
-        assert_eq!(plan.dropped.no_line, 2);
+        assert_eq!(plan.dropped.not_item_time, 2);
         // 짝이 없어진 task 의 기한·상태 바꿈도 따라 빠진다(시각을 보기 전에).
         assert_eq!(plan.dropped.no_sure_link, 2);
+        // 짝 시각이 진짜 줄이어도 그 회의 항목의 근거 시각이 아니면 버린다(D1 은 9000 인데 5000).
+        let mut answer = good_answer();
+        answer["links"][1]["ms"] = json!(5_000);
+        let plan = check(&answer);
+        assert!(plan.tasks.iter().all(|task| task.id != "task-2"));
+        assert_eq!(plan.dropped.not_item_time, 1);
         // 짝이 살아 있으면 바꿈의 근거 시각도 줄에 딱 있어야 한다.
         let mut answer = good_answer();
         answer["status_changes"][0]["ms"] = json!(9_500);
@@ -2371,6 +2721,7 @@ pub(crate) mod tests {
             from: "2026-10-20".into(),
             to: "2026-10-24".into(),
             ms: 754_000,
+            suggest: false,
         };
         assert_eq!(
             change_line(Write::Due(0), &due),
@@ -2380,6 +2731,7 @@ pub(crate) mod tests {
             from: "개발".into(),
             to: "완료".into(),
             ms: 9_000,
+            suggest: false,
         };
         assert_eq!(
             change_line(Write::Status(0), &status),
@@ -2389,6 +2741,7 @@ pub(crate) mod tests {
             from: String::new(),
             to: "2026-10-24".into(),
             ms: 0,
+            suggest: false,
         };
         assert_eq!(
             change_line(Write::Due(0), &empty),
@@ -2405,6 +2758,7 @@ pub(crate) mod tests {
                 Uuid::nil(),
             ),
             changes: &changes,
+            suggestions: &[],
             mention: &["user-9".to_string()],
         });
         let texts: Vec<String> = blocks.iter().map(block_text).collect();
@@ -2433,9 +2787,289 @@ pub(crate) mod tests {
             summary: &[],
             times: Vec::new(),
             changes: &[],
+            suggestions: &[],
             mention: &["user-9".to_string()],
         });
         assert_eq!(quiet.len(), 2);
         assert!(!serde_json::to_string(&quiet).unwrap().contains("user-9"));
+    }
+
+    /// `lines` 회의와 결정 하나(D1, 근거 `ms`)뿐인 요약으로 검사한다. task 는 [`open`].
+    fn check_meeting(
+        lines: &[(u64, &str, &str)],
+        decision: &str,
+        ms: u64,
+        answer: &Value,
+        tasks: &[OpenTask],
+    ) -> Plan {
+        let transcript = transcript_with(lines);
+        let summary = Summary {
+            decisions: vec![crate::summary::Decision {
+                text: decision.into(),
+                evidence_start_ms: Some(ms),
+            }],
+            action_items: Vec::new(),
+            topics: Vec::new(),
+            ..summary()
+        };
+        let schema = schema();
+        let input = CheckInput {
+            summary: &summary,
+            tasks,
+            schema: &schema,
+            transcript: &transcript,
+            names: &PubkeyPrefixNames,
+            mode: TasksMode::Update,
+        };
+        check_answer(&answer.to_string(), &input).unwrap()
+    }
+
+    fn link_d1(task: &str, ms: u64) -> Value {
+        json!({ "item": "D1", "task": task, "level": "확실", "why": "", "said": "", "ms": ms })
+    }
+
+    /// 다음 줄의 다른 사람 날짜는 받지 않는다: A「견적서 자동화 진행 상황 공유할게요.」 +
+    /// B「결제 화면은 금요일까지예요.」 → K1 기한 안 바꿈. 같은 사람이 이어 말한 날짜는 받는다.
+    #[test]
+    fn another_persons_date_on_the_next_line_is_not_taken() {
+        let answer = |ms: u64| {
+            json!({
+                "links": [link_d1("K1", 5_000)],
+                "due_changes": [{ "task": "K1", "due": "2026-10-16", "ms": ms }],
+                "status_changes": [], "new_tasks": []
+            })
+        };
+        let lines = [
+            (5_000, A, "견적서 자동화 진행 상황 공유할게요."),
+            (9_000, B, "결제 화면은 금요일까지예요."),
+        ];
+        let plan = check_meeting(&lines, "견적서 자동화 공유", 5_000, &answer(5_000), &open());
+        assert_eq!(plan.tasks[0].due, None);
+        assert_eq!(plan.dropped.date_not_in_words, 1);
+        // 그 날짜 줄을 근거로 대도 그 줄은 견적서 자동화 이야기가 아니다.
+        let plan = check_meeting(&lines, "견적서 자동화 공유", 5_000, &answer(9_000), &open());
+        assert_eq!(plan.tasks[0].due, None);
+        assert_eq!(plan.dropped.not_about, 1);
+        // 같은 사람이 이어 말했으면 그 사람의 기한이다.
+        let same = [
+            (5_000, A, "견적서 자동화 진행 상황 공유할게요."),
+            (9_000, A, "금요일까지 끝낼게요."),
+        ];
+        let plan = check_meeting(&same, "견적서 자동화 공유", 5_000, &answer(5_000), &open());
+        assert_eq!(
+            plan.tasks[0].due.as_ref().map(|change| change.to.as_str()),
+            Some("2026-10-16")
+        );
+    }
+
+    /// 상태를 말하는 말이 근거 말에 없으면 바꾸지 않고 제안으로만: 「로그인 오류 수정 PR
+    /// 올렸어요.」 + 「네 볼게요.」 → 완료로 안 바꾼다. 「배포 끝났어요」면 바꾼다.
+    #[test]
+    fn a_status_without_its_words_is_only_suggested() {
+        let answer = json!({
+            "links": [link_d1("K2", 1_000)],
+            "due_changes": [],
+            "status_changes": [{ "task": "K2", "status": "완료", "ms": 1_000 }],
+            "new_tasks": []
+        });
+        let pr = [
+            (1_000, A, "로그인 오류 수정 PR 올렸어요."),
+            (5_000, B, "네 볼게요."),
+        ];
+        let plan = check_meeting(&pr, "로그인 오류 수정 PR", 1_000, &answer, &open());
+        let status = plan.tasks[0].status.clone().unwrap();
+        assert!(status.suggest, "{status:?}");
+        assert_eq!(writes(&plan, TasksMode::Update), [Write::Append(0)]);
+        assert_eq!(
+            change_line(Write::Status(0), &status),
+            "상태 제안: Dev QA → 완료 (근거 [00:01])"
+        );
+        let done = [
+            (1_000, A, "로그인 오류 수정은 배포 끝났어요."),
+            (5_000, B, "네 볼게요."),
+        ];
+        let plan = check_meeting(&done, "로그인 오류 수정 배포", 1_000, &answer, &open());
+        assert!(!plan.tasks[0].status.as_ref().unwrap().suggest);
+        assert_eq!(
+            writes(&plan, TasksMode::Update),
+            [Write::Status(0), Write::Append(0)]
+        );
+        for (status, words) in [
+            ("Production QA", "운영 배포 끝냈어요"),
+            ("Staging QA", "스테이징에 올렸어요"),
+            ("Dev QA", "QA 들어갔어요"),
+        ] {
+            assert!(says_status(status, words), "{status}: {words}");
+        }
+        for status in [
+            "개발",
+            "디자인",
+            "시작 전",
+            "미팅",
+            "기획(A2D2)",
+            "개발-토의필요",
+        ] {
+            assert!(
+                status_words(status).is_empty(),
+                "{status} is only suggested"
+            );
+        }
+    }
+
+    /// 지금 종료일에 끝 날짜나 시각이 있으면 바꾸지 않고 제안으로만.
+    #[test]
+    fn a_due_with_an_end_or_a_time_is_only_suggested() {
+        for (due, end) in [
+            ("2026-10-20", Some("2026-10-22")),
+            ("2026-10-20T15:00:00.000+09:00", None),
+        ] {
+            let mut tasks = open();
+            tasks[0].due = Some(due.into());
+            tasks[0].due_end = end.map(str::to_string);
+            let (summary, schema, transcript) = (summary(), schema(), meeting());
+            let input = CheckInput {
+                summary: &summary,
+                tasks: &tasks,
+                schema: &schema,
+                transcript: &transcript,
+                names: &PubkeyPrefixNames,
+                mode: TasksMode::Update,
+            };
+            let plan = check_answer(&good_answer().to_string(), &input).unwrap();
+            let k1 = plan
+                .tasks
+                .iter()
+                .position(|task| task.id == "task-1")
+                .unwrap();
+            assert!(plan.tasks[k1].due.as_ref().unwrap().suggest, "{due}");
+            assert!(!writes(&plan, TasksMode::Update).contains(&Write::Due(k1)));
+        }
+    }
+
+    /// 회의 날보다 앞선 날짜는 근거 말에 있어도 받지 않는다(「10월 9일까지였어요」).
+    #[test]
+    fn a_date_before_the_meeting_is_dropped() {
+        let answer = json!({
+            "links": [link_d1("K1", 5_000)],
+            "due_changes": [{ "task": "K1", "due": "2026-10-09", "ms": 5_000 }],
+            "status_changes": [], "new_tasks": []
+        });
+        let lines = [(5_000, B, "견적서 자동화는 10월 9일까지였어요.")];
+        let plan = check_meeting(&lines, "견적서 자동화 기한", 5_000, &answer, &open());
+        assert_eq!(plan.tasks[0].due, None);
+        assert_eq!(plan.dropped.date_not_in_words, 1);
+    }
+
+    /// 이미 그 날인 기한은 바꿀 것이 없다(같은 값을 다시 쓰지 않는다).
+    #[test]
+    fn a_due_already_on_that_day_is_not_changed() {
+        let mut tasks = open();
+        tasks[0].due = Some("2026-10-16".into());
+        let (summary, schema, transcript) = (summary(), schema(), meeting());
+        let input = CheckInput {
+            summary: &summary,
+            tasks: &tasks,
+            schema: &schema,
+            transcript: &transcript,
+            names: &PubkeyPrefixNames,
+            mode: TasksMode::Update,
+        };
+        let plan = check_answer(&good_answer().to_string(), &input).unwrap();
+        let k1 = plan.tasks.iter().find(|task| task.id == "task-1").unwrap();
+        assert_eq!(k1.due, None);
+        assert_eq!(plan.dropped.same_value, 1);
+    }
+
+    /// 새 task 의 기한 근거에 망설이는 말이 있으면 종료일 없이 만든다: 「…목요일까지 만들게요, 근데
+    /// 확실하진 않아요.」
+    #[test]
+    fn a_hedged_due_makes_a_new_task_without_its_due() {
+        let mut lines = meeting();
+        let at = lines
+            .segments
+            .iter()
+            .position(|segment| segment.start_ms == 17_000)
+            .unwrap();
+        lines.segments[at].text =
+            "회의록 공유 기능은 제가 목요일까지 만들게요, 근데 확실하진 않아요.".into();
+        let summary = check_summary(&summary_answer(), &lines, &PubkeyPrefixNames).unwrap();
+        assert_eq!(summary.action_items[1].status, ItemStatus::Firm);
+        let (tasks, schema) = (open(), schema());
+        let input = CheckInput {
+            summary: &summary,
+            tasks: &tasks,
+            schema: &schema,
+            transcript: &lines,
+            names: &PubkeyPrefixNames,
+            mode: TasksMode::Update,
+        };
+        let plan = check_answer(&good_answer().to_string(), &input).unwrap();
+        let create = &plan.creates[0];
+        assert_eq!((create.due.clone(), create.due_unsure), (None, true));
+        // 망설이지 않으면 종료일이 들어간다.
+        let plan = check(&good_answer());
+        assert_eq!(
+            (plan.creates[0].due.as_deref(), plan.creates[0].due_unsure),
+            (Some("2026-10-15"), false)
+        );
+    }
+
+    /// 부정은 낱말로 본다: 「보안·제안·안드로이드·잘못된」 은 부정이 아니다.
+    #[test]
+    fn negation_is_read_by_words() {
+        for fine in [
+            "보안 패치 금요일까지 할게요",
+            "제안드린 대로 금요일까지 할게요",
+            "안드로이드 앱은 금요일까지 할게요",
+            "잘못된 부분은 금요일까지 고칠게요",
+            "안건 정리는 금요일까지 할게요",
+            "아마존 연동은 금요일까지 할게요",
+            "금요일까지 마무리할게요",
+            "어제까지 마무리했어요",
+            "목요일까지 말씀하신 거 끝낼게요",
+            "차질 없이 금요일까지 할게요",
+            "문제없이 금요일에 배포할게요",
+            "중복 없애기는 금요일까지 할게요",
+            "마지막 화면은 금요일까지 할게요",
+        ] {
+            assert!(!hedged(fine), "{fine}");
+        }
+        for negated in [
+            "안 돼요",
+            "그건 안돼요",
+            "아직 안 했어요",
+            "못 해요",
+            "못했어요",
+            "하지 않아요",
+            "할 수 없어요",
+            "그건 아니에요",
+            "아마 금요일",
+            "금요일까지 될까요?",
+            "그건 하지 마세요",
+            "하지마",
+            "그건 하지 말고 다음 주에 해요",
+            "하지말자",
+            "시간이 없어요",
+            "아직 사람이 없는데",
+        ] {
+            assert!(hedged(negated), "{negated}");
+        }
+    }
+
+    /// 기한 말에 흔한 「~까지 마무리할게요」는 금지(「하지 마」)가 아니다: 기한을 받는다.
+    #[test]
+    fn a_due_said_as_wrapping_up_is_taken() {
+        let answer = json!({
+            "links": [link_d1("K1", 5_000)],
+            "due_changes": [{ "task": "K1", "due": "2026-10-16", "ms": 5_000 }],
+            "status_changes": [], "new_tasks": []
+        });
+        let lines = [(5_000, A, "견적서 자동화는 금요일까지 마무리할게요.")];
+        let plan = check_meeting(&lines, "견적서 자동화 마무리", 5_000, &answer, &open());
+        assert_eq!(plan.dropped.negation, 0);
+        assert_eq!(
+            plan.tasks[0].due.as_ref().map(|change| change.to.as_str()),
+            Some("2026-10-16")
+        );
     }
 }
