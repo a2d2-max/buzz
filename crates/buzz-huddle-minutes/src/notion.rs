@@ -259,7 +259,7 @@ impl NotionError {
 }
 
 impl NotionError {
-    fn new(kind: NotionErrorKind, code: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: NotionErrorKind, code: impl Into<String>) -> Self {
         Self {
             kind,
             code: code.into(),
@@ -457,14 +457,18 @@ impl<'a> NotionClient<'a> {
         }
     }
 
-    async fn query(&mut self, data_source: &str, body: Value) -> Result<Value, NotionError> {
+    pub(crate) async fn query(
+        &mut self,
+        data_source: &str,
+        body: Value,
+    ) -> Result<Value, NotionError> {
         let path = format!("/v1/data_sources/{data_source}/query");
         self.call(reqwest::Method::POST, &path, &body, Replay::Safe)
             .await
     }
 
     /// `data_source` 에서 글 칸 `property` 가 `value` 와 같은 페이지들(휴지통 뺌).
-    async fn find_by_text(
+    pub(crate) async fn find_by_text(
         &mut self,
         data_source: &str,
         property: &str,
@@ -546,7 +550,7 @@ impl<'a> NotionClient<'a> {
         page_id(&page)
     }
 
-    async fn update_page(
+    pub(crate) async fn update_page(
         &mut self,
         page_id: &str,
         body: Value,
@@ -580,7 +584,10 @@ impl<'a> NotionClient<'a> {
     }
 
     /// 페이지 바로 아래 블록 전부(차례대로).
-    async fn list_children(&mut self, block_id: &str) -> Result<Vec<Value>, NotionError> {
+    pub(crate) async fn list_children(
+        &mut self,
+        block_id: &str,
+    ) -> Result<Vec<Value>, NotionError> {
         let mut blocks = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -602,7 +609,7 @@ impl<'a> NotionClient<'a> {
         }
     }
 
-    async fn append_children(
+    pub(crate) async fn append_children(
         &mut self,
         block_id: &str,
         children: &[Value],
@@ -634,9 +641,44 @@ impl<'a> NotionClient<'a> {
             Err(error) => Err(error),
         }
     }
+
+    /// 읽기 하나(`GET {path}`, 예: `/v1/databases/{id}`). 일시 오류는 다시 한다.
+    pub(crate) async fn get(&mut self, path: &str) -> Result<Value, NotionError> {
+        self.call(reqwest::Method::GET, path, &Value::Null, Replay::Safe)
+            .await
+    }
+
+    /// 본문(`children`)까지 한 요청으로 페이지를 만든다(다시 보내지 않음). 503 이면서 노션이
+    /// 만든 id 를 알려 주면 그 id. 알림은 노션 기본값이다(새 task 의 담당자가 알게).
+    pub(crate) async fn create_page_with_children(
+        &mut self,
+        data_source: &str,
+        properties: &Map<String, Value>,
+        children: &[Value],
+    ) -> Result<String, NotionError> {
+        let body = json!({
+            "parent": { "type": "data_source_id", "data_source_id": data_source },
+            "properties": properties,
+            "children": children
+        });
+        let page = self
+            .call(
+                reqwest::Method::POST,
+                "/v1/pages",
+                &body,
+                Replay::RejectedOnly,
+            )
+            .await?;
+        page_id(&page)
+    }
+
+    /// 이 클라이언트의 설정.
+    pub(crate) fn settings(&self) -> &NotionSettings {
+        self.settings
+    }
 }
 
-fn page_id(page: &Value) -> Result<String, NotionError> {
+pub(crate) fn page_id(page: &Value) -> Result<String, NotionError> {
     page["id"]
         .as_str()
         .map(str::to_string)
@@ -644,7 +686,7 @@ fn page_id(page: &Value) -> Result<String, NotionError> {
 }
 
 /// query 결과에서 휴지통에 없는 페이지들.
-fn live_results(result: &Value) -> Result<Vec<Value>, NotionError> {
+pub(crate) fn live_results(result: &Value) -> Result<Vec<Value>, NotionError> {
     let results = result["results"].as_array().ok_or_else(|| {
         NotionError::new(NotionErrorKind::BadResponse, "query answer has no results")
     })?;
@@ -656,7 +698,7 @@ fn live_results(result: &Value) -> Result<Vec<Value>, NotionError> {
 }
 
 /// 칸 값의 글(`title`·`rich_text` 조각의 `plain_text` 를 이은 것).
-fn property_text(value: &Value) -> String {
+pub(crate) fn property_text(value: &Value) -> String {
     ["title", "rich_text"]
         .iter()
         .filter_map(|key| value[*key].as_array())
@@ -716,6 +758,9 @@ pub struct MeetingPage<'a> {
     pub kind: Option<MeetingKind>,
     /// 다 쓰고 나서 "처리 상태"에 넣을 값.
     pub status: ProcessingStatus,
+    /// 본문 맨 끝(전체 스크립트 뒤)에 붙일 블록. task 연결이 이미 붙인 「관련 있을 수 있는
+    /// task」 절을 페이지를 다시 쓸 때도 남기려고 쓴다([`crate::tasks::maybe_blocks`]).
+    pub tail: &'a [Value],
 }
 
 /// 노션 쓰기 결과(개수와 page id 만). 하는 대로 채워서, 중간에 실패해도 그때까지
@@ -801,7 +846,7 @@ pub fn text_runs(content: &str, link: Option<&str>) -> Vec<Value> {
 
 /// `kind` 블록. 조각이 100개를 넘으면 같은 종류 블록 여러 개로 나눈다.
 /// 할 일(`to_do`)이면 `checked` 를 넣는다.
-fn blocks(kind: &str, runs: Vec<Value>, checked: bool) -> Vec<Value> {
+pub(crate) fn blocks(kind: &str, runs: Vec<Value>, checked: bool) -> Vec<Value> {
     let make = |rich_text: &[Value]| {
         let mut inner = json!({ "rich_text": rich_text });
         if kind == "to_do" {
@@ -838,7 +883,7 @@ fn line_text(
     text.trim().to_string()
 }
 
-fn heading(text: &str) -> Value {
+pub(crate) fn heading(text: &str) -> Value {
     json!({
         "object": "block",
         "type": "heading_2",
@@ -853,8 +898,13 @@ pub fn clock(ms: u64) -> String {
 
 /// 앱 재생 링크.
 pub fn playback_link(template: &str, transcript: &Transcript, start_ms: u64) -> String {
+    playback_link_at(template, transcript.channel_id, start_ms)
+}
+
+/// `channel` 채널의 앱 재생 링크(스크립트 없이 채널 id 만 알 때).
+pub fn playback_link_at(template: &str, channel: Uuid, start_ms: u64) -> String {
     template
-        .replace("{channel_id}", &transcript.channel_id.to_string())
+        .replace("{channel_id}", &channel.to_string())
         .replace("{start_ms}", &start_ms.to_string())
 }
 
@@ -1102,6 +1152,7 @@ pub fn body_blocks(
         runs.extend(text_runs(&format!(" {name}: {text}"), None));
         out.extend(blocks("paragraph", runs, false));
     }
+    out.extend(page.tail.iter().cloned());
     out
 }
 
@@ -1177,9 +1228,7 @@ pub async fn link_people(
     for pubkey in attendee_pubkeys(transcript) {
         let rows = client.find_by_text(&data_source, p::PUBKEY, pubkey).await?;
         if let Some(row) = rows.first() {
-            let confirmed = row["properties"][p::CONFIRMED]["checkbox"] == Value::Bool(true);
-            let user = row["properties"][p::NOTION_USER]["people"][0]["id"].as_str();
-            if let (true, Some(user)) = (confirmed, user) {
+            if let Some(user) = confirmed_user(row) {
                 linked.insert(pubkey.to_string(), user.to_string());
             }
             rename_prefix_row(client, row, pubkey, names, report).await;
@@ -1212,6 +1261,28 @@ pub async fn link_people(
         report.people_rows_added.push(id);
     }
     Ok(linked)
+}
+
+/// 담당자 줄이 "확인됨"이고 "노션 사용자"가 있으면 그 노션 사용자 id. 멘션·담당자 칸에는
+/// 이 사람만 쓴다.
+fn confirmed_user(row: &Value) -> Option<&str> {
+    use people_property as p;
+    let confirmed = row["properties"][p::CONFIRMED]["checkbox"] == Value::Bool(true);
+    let user = row["properties"][p::NOTION_USER]["people"][0]["id"].as_str();
+    user.filter(|_| confirmed)
+}
+
+/// `pubkey` 의 "허들 담당자 연결" 줄이 "확인됨"이면 그 노션 사용자 id(읽기만 한다: 줄을
+/// 만들거나 고치지 않는다). task 연결이 새 task 의 담당자를 넣을 때 쓴다.
+pub(crate) async fn confirmed_user_of(
+    client: &mut NotionClient<'_>,
+    pubkey: &str,
+) -> Result<Option<String>, NotionError> {
+    let data_source = client.settings.people_data_source_id.clone();
+    let rows = client
+        .find_by_text(&data_source, people_property::PUBKEY, pubkey)
+        .await?;
+    Ok(rows.first().and_then(confirmed_user).map(str::to_string))
 }
 
 /// 있는 담당자 줄의 이름 칸이 `pubkey` 앞 8자 그대로(작업기가 넣은 그대로)이고 프로필
@@ -1681,12 +1752,21 @@ pub(crate) mod tests {
         cut_off_create: bool,
         /// 담당자 연결 DB 를 403 으로 막는다.
         people_forbidden: bool,
+        /// `GET /v1/databases/{id}` 의 답(task DB).
+        pub(crate) databases: HashMap<String, Value>,
+        /// `GET /v1/data_sources/{id}` 의 답(task DB 스키마).
+        pub(crate) data_sources: HashMap<String, Value>,
+        /// 경로에 이 글이 든 요청(새 페이지는 부모 data source)은 403 으로 막는다(통합이 그
+        /// DB 에 연결 안 됨). 노션 메시지에 회의 글을 넣어 로그로 새는지 본다.
+        pub(crate) forbidden_paths: Vec<String>,
+        /// 경로에 이 글이 든 쓰기(PATCH·POST)는 503 으로 답한다.
+        pub(crate) failing_paths: Vec<String>,
         next_id: usize,
     }
 
     pub(crate) struct FakePage {
         pub(crate) id: String,
-        data_source: String,
+        pub(crate) data_source: String,
         created_time: String,
         last_edited_time: String,
         pub(crate) properties: Map<String, Value>,
@@ -1749,11 +1829,17 @@ pub(crate) mod tests {
             .get(property)
             .cloned()
             .unwrap_or(Value::Null);
-        if let Some(select) = filter.get("select") {
-            return value["select"]["name"] == select["equals"];
+        for kind in ["select", "status"] {
+            if let Some(condition) = filter.get(kind) {
+                let name = &value[kind]["name"];
+                if let Some(other) = condition.get("does_not_equal") {
+                    return name != other;
+                }
+                return *name == condition["equals"];
+            }
         }
         let text = property_text(&value);
-        let condition = &filter["rich_text"];
+        let condition = filter.get("title").unwrap_or(&filter["rich_text"]);
         if let Some(wanted) = condition["equals"].as_str() {
             text == wanted
         } else if let Some(part) = condition["contains"].as_str() {
@@ -1800,12 +1886,46 @@ pub(crate) mod tests {
             self.pages.iter_mut().find(|page| page.id == id)
         }
 
+        /// 붙인 블록처럼: id 를 주고 글 조각에 `plain_text` 를 붙인다(응답 모양).
+        fn with_ids(&mut self, children: Vec<Value>) -> Vec<Value> {
+            let mut added = Vec::new();
+            for mut child in children {
+                self.next_id += 1;
+                child["id"] = json!(format!("block-{}", self.next_id));
+                let kind = child["type"].as_str().unwrap_or("").to_string();
+                if let Some(runs) = child[&kind]["rich_text"].as_array_mut() {
+                    for run in runs {
+                        run["plain_text"] = run["text"]["content"].clone();
+                    }
+                }
+                added.push(child);
+            }
+            added
+        }
+
         fn answer(&mut self, request: &Recorded) -> Reply {
             if !self.queued.is_empty() {
                 return self.queued.remove(0);
             }
             let body = request.json();
             let path = request.path.split('?').next().unwrap_or("");
+            let parent = body["parent"]["data_source_id"].as_str().unwrap_or("");
+            let hits = |list: &[String]| {
+                list.iter()
+                    .any(|part| path.contains(part.as_str()) || parent.contains(part.as_str()))
+            };
+            if hits(&self.forbidden_paths) {
+                return Reply::json(
+                    403,
+                    &json!({ "code": "restricted_resource", "message": "회의 글 조각 견적서" }),
+                );
+            }
+            if request.method != "GET" && hits(&self.failing_paths) {
+                return Reply::json(
+                    503,
+                    &json!({ "code": "service_unavailable", "message": "later" }),
+                );
+            }
             let query = request.path.split_once('?').map_or("", |(_, q)| q);
             let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
             let not_found = || Reply::json(404, &json!({ "code": "object_not_found" }));
@@ -1818,18 +1938,47 @@ pub(crate) mod tests {
                             &json!({ "code": "restricted_resource", "message": "회의 글 조각" }),
                         );
                     }
-                    let results: Vec<Value> = self
+                    let mut found: Vec<&FakePage> = self
                         .pages
                         .iter()
                         .filter(|page| page.data_source == *source)
-                        .filter(|page| matches(&body["filter"], page))
-                        .map(page_json)
+                        .filter(|page| body["filter"].is_null() || matches(&body["filter"], page))
+                        .collect();
+                    // 최근 고친 순(task 읽기). 다른 정렬은 만든 순 그대로.
+                    if body["sorts"][0]["timestamp"] == "last_edited_time"
+                        && body["sorts"][0]["direction"] == "descending"
+                    {
+                        found.sort_by(|a, b| b.last_edited_time.cmp(&a.last_edited_time));
+                    }
+                    let start: usize = body["start_cursor"]
+                        .as_str()
+                        .and_then(|cursor| cursor.parse().ok())
+                        .unwrap_or(0);
+                    let size = body["page_size"].as_u64().unwrap_or(100) as usize;
+                    let end = (start + size).min(found.len());
+                    let more = end < found.len();
+                    let results: Vec<Value> = found[start.min(end)..end]
+                        .iter()
+                        .map(|page| page_json(page))
                         .collect();
                     Reply::json(
                         200,
-                        &json!({ "object": "list", "results": results, "has_more": false }),
+                        &json!({
+                            "object": "list",
+                            "results": results,
+                            "has_more": more,
+                            "next_cursor": if more { json!(end.to_string()) } else { Value::Null }
+                        }),
                     )
                 }
+                ("GET", ["v1", "databases", id]) => match self.databases.get(*id) {
+                    Some(database) => Reply::json(200, database),
+                    None => not_found(),
+                },
+                ("GET", ["v1", "data_sources", id]) => match self.data_sources.get(*id) {
+                    Some(source) => Reply::json(200, source),
+                    None => not_found(),
+                },
                 ("POST", ["v1", "pages"]) => {
                     let source = body["parent"]["data_source_id"]
                         .as_str()
@@ -1843,6 +1992,12 @@ pub(crate) mod tests {
                         self.new_page(&source, &body["properties"]);
                     }
                     let id = self.new_page(&source, &body["properties"]);
+                    if let Some(children) = body["children"].as_array() {
+                        let children = self.with_ids(children.clone());
+                        if let Some(page) = self.page_mut(&id) {
+                            page.children = children;
+                        }
+                    }
                     if minutes && std::mem::take(&mut self.commit_then_503) {
                         return Reply::json(
                             503,
@@ -1917,19 +2072,7 @@ pub(crate) mod tests {
                             &json!({ "code": "validation_error", "message": "too big" }),
                         );
                     }
-                    let mut added = Vec::new();
-                    for mut child in children {
-                        self.next_id += 1;
-                        child["id"] = json!(format!("block-{}", self.next_id));
-                        // 응답처럼 글 조각에 plain_text 를 붙인다.
-                        let kind = child["type"].as_str().unwrap_or("").to_string();
-                        if let Some(runs) = child[&kind]["rich_text"].as_array_mut() {
-                            for run in runs {
-                                run["plain_text"] = run["text"]["content"].clone();
-                            }
-                        }
-                        added.push(child);
-                    }
+                    let added = self.with_ids(children);
                     let Some(page) = self.page_mut(id) else {
                         return not_found();
                     };
@@ -1947,6 +2090,29 @@ pub(crate) mod tests {
                 }
                 _ => Reply::json(404, &json!({ "code": "invalid_request_url" })),
             }
+        }
+    }
+
+    /// `data_source` 의 페이지 하나(요청 모양의 칸 값을 받는다). `edited` 는 마지막으로 고친 때.
+    pub(crate) fn fake_page(
+        id: &str,
+        data_source: &str,
+        edited: &str,
+        properties: &Value,
+    ) -> FakePage {
+        FakePage {
+            id: id.into(),
+            data_source: data_source.into(),
+            created_time: edited.into(),
+            last_edited_time: edited.into(),
+            properties: properties
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), as_response(value.clone())))
+                .collect(),
+            children: Vec::new(),
+            in_trash: false,
         }
     }
 
@@ -2087,6 +2253,7 @@ pub(crate) mod tests {
             channel_label: None,
             kind: Some(MeetingKind::Channel),
             status: ProcessingStatus::Done,
+            tail: &[],
         }
     }
 

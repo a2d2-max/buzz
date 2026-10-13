@@ -132,6 +132,11 @@ pub enum Beside {
     Corrected,
     /// The correction's failures for the current script.
     CorrectFailed,
+    /// 팀 task DB 연결 장부(`huddle-tasks/1`, [`crate::tasks::TasksLedger`]): 회의마다
+    /// 하나(스크립트가 바뀌어도 그대로).
+    Tasks,
+    /// task 연결의 실패 기록(현재 스크립트의 것).
+    TasksFailed,
 }
 
 impl Beside {
@@ -143,6 +148,8 @@ impl Beside {
             Self::NotionFailed => ".notion-failed.json",
             Self::Corrected => ".corrected.json",
             Self::CorrectFailed => ".correct-failed.json",
+            Self::Tasks => ".tasks.json",
+            Self::TasksFailed => ".tasks-failed.json",
         }
     }
 }

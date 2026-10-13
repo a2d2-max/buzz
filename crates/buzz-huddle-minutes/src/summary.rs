@@ -645,20 +645,21 @@ fn key_name(key: &str, known: &HashSet<&str>, names: &dyn DisplayNames) -> Strin
     }
 }
 
-/// 스크립트 줄 하나(받아쓰기에 성공한, 비지 않은 줄).
-struct Line<'a> {
-    start_ms: u64,
+/// 스크립트 줄 하나(받아쓰기에 성공한, 비지 않은 줄). task 연결([`crate::tasks`])의
+/// 검사도 이 줄로 근거를 본다.
+pub(crate) struct Line<'a> {
+    pub(crate) start_ms: u64,
     /// 말한 사람([`Segment::who`]); 누군지 모르면 `None`.
-    speaker: Option<&'a str>,
+    pub(crate) speaker: Option<&'a str>,
     /// 자기 기기 트랙의 줄(회의실 이름표 없음, 확실도 1). 목소리로 맞춘 회의실
     /// 줄은 아니다: 그 확실도는 자르지 않은 코사인이라 1 을 살짝 넘을 수 있다.
-    own: bool,
-    text: &'a str,
+    pub(crate) own: bool,
+    pub(crate) text: &'a str,
     /// 글자·숫자만, 소문자.
-    squashed: String,
+    pub(crate) squashed: String,
 }
 
-fn usable_lines(transcript: &Transcript) -> Vec<Line<'_>> {
+pub(crate) fn usable_lines(transcript: &Transcript) -> Vec<Line<'_>> {
     let mut lines: Vec<Line<'_>> = transcript
         .segments
         .iter()
@@ -676,7 +677,7 @@ fn usable_lines(transcript: &Transcript) -> Vec<Line<'_>> {
 }
 
 /// 회의 시작 시각(KST).
-fn meeting_start_kst(transcript: &Transcript) -> Option<DateTime<FixedOffset>> {
+pub(crate) fn meeting_start_kst(transcript: &Transcript) -> Option<DateTime<FixedOffset>> {
     DateTime::parse_from_rfc3339(&transcript.started_at)
         .ok()
         .map(|at| at.with_timezone(&kst()))
@@ -687,7 +688,7 @@ pub fn meeting_date_kst(transcript: &Transcript) -> Option<NaiveDate> {
     meeting_start_kst(transcript).map(|at| at.date_naive())
 }
 
-fn weekday_ko(day: Weekday) -> &'static str {
+pub(crate) fn weekday_ko(day: Weekday) -> &'static str {
     match day {
         Weekday::Mon => "월",
         Weekday::Tue => "화",
@@ -826,7 +827,7 @@ struct DraftTopic {
 }
 
 /// 글자·숫자만 남기고 소문자로(띄어쓰기·문장부호 차이를 무시하려고).
-fn squash(text: &str) -> String {
+pub(crate) fn squash(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
@@ -840,7 +841,7 @@ const COMMON_WORD_STARTS: [&str; 24] = [
 ];
 
 /// 낱말마다 앞 두 글자(한국어 낱말은 끝이 바뀌니 앞만 본다).
-fn word_keys(text: &str) -> Vec<String> {
+pub(crate) fn word_keys(text: &str) -> Vec<String> {
     text.split_whitespace()
         .map(squash)
         .filter(|word| word.chars().count() >= 2)
@@ -850,7 +851,7 @@ fn word_keys(text: &str) -> Vec<String> {
 }
 
 /// 할 일 내용과 낱말 하나라도 겹치나.
-fn shares_words(task_keys: &[String], text: &str) -> bool {
+pub(crate) fn shares_words(task_keys: &[String], text: &str) -> bool {
     let keys = word_keys(text);
     task_keys.iter().any(|key| keys.contains(key))
 }
@@ -1166,7 +1167,7 @@ impl<'a> Checker<'a> {
 }
 
 /// 모델이 낸 기한 글(`2026-10-16`, `2026-10-16T18:00` 등)을 KST 날짜·시각으로.
-fn parse_claimed_due(value: &str) -> Option<(NaiveDate, Option<NaiveTime>)> {
+pub(crate) fn parse_claimed_due(value: &str) -> Option<(NaiveDate, Option<NaiveTime>)> {
     let value = value.trim();
     if let Ok(at) = DateTime::parse_from_rfc3339(value) {
         let at = at.with_timezone(&kst());

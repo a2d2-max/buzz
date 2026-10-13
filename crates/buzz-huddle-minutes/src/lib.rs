@@ -16,6 +16,7 @@
 //! 7. [`summary`] 는 스크립트를 Gemini 로 요약하고 지어낸 담당자·기한을 걸러 낸다.
 //!    그 앞에 [`correct`] 가 문맥으로 잘못 들은 낱말을 고친다(원본은 그대로).
 //! 8. [`notion`] 은 회의록 페이지를 노션 DB 에 쓴다.
+//! 9. [`tasks`] 는 회의를 팀 task DB 와 잇는다(기록 덧붙이기·새 task·기한·상태).
 //!
 //! 사람 이름: [`profiles`] 가 회의마다 한 번 릴레이에서 참석자 프로필(kind 0)을 물어
 //! 붙인다. 못 찾은 사람은 pubkey 앞 8자.
@@ -50,6 +51,7 @@ pub mod speakers;
 pub mod store;
 pub mod stt;
 pub mod summary;
+pub mod tasks;
 #[cfg(test)]
 mod test_http;
 pub mod tracks;
