@@ -317,7 +317,13 @@ fn open_task(page: &Value, schema: &TaskSchema) -> Option<OpenTask> {
         .as_str()
         .unwrap_or("")
         .to_string();
-    if status == DONE_STATUS {
+    // 완료 그룹(노션이 주는 그룹의 맨 뒤)의 task 는 이름이 완료가 아니어도 읽지 않는다.
+    let finished = status == DONE_STATUS
+        || schema
+            .status_groups
+            .last()
+            .is_some_and(|complete| complete.contains(&status));
+    if finished {
         return None;
     }
     let people: Vec<&Value> = properties[p::ASSIGNEES]["people"]
@@ -897,17 +903,20 @@ impl<'a> Lines<'a> {
         self.lines.iter().position(|line| line.start_ms == ms)
     }
 
-    /// 근거 말: 근거 줄, 그리고 같은 사람(pubkey 로 아는)이 이어 말한 바로 다음 줄(요약의 근거 글
-    /// 찾기와 같은 규칙). 날짜·상태 말은 이 안에서만 읽는다: 다음 줄이 다른 사람이면 그건 그 사람의
-    /// 말이다.
-    fn statement(&self, j: usize) -> String {
+    /// 근거 말의 줄 가운데 그 일(`keys`)과 낱말이 겹치는 줄: 근거 줄, 그리고 같은 사람(pubkey 로
+    /// 아는)이 이어 말한 바로 다음 줄. 날짜·상태 말은 이 줄에서만 받는다: 다음 줄이 다른 사람이면 그
+    /// 사람의 말이고, 같은 사람이 이어 말해도 다른 일 이야기일 수 있다(「로그인 오류 수정은요,」 +
+    /// 「결제 쪽은 다 끝났어요.」).
+    fn about_lines(&self, j: usize, keys: &[String]) -> Vec<usize> {
         let line = &self.lines[j];
-        match self.lines.get(j + 1) {
-            Some(next) if line.speaker.is_some() && next.speaker == line.speaker => {
-                format!("{} {}", line.text, next.text)
-            }
-            _ => line.text.to_string(),
-        }
+        let next = self
+            .lines
+            .get(j + 1)
+            .filter(|next| line.speaker.is_some() && next.speaker == line.speaker);
+        std::iter::once(j)
+            .chain(next.map(|_| j + 1))
+            .filter(|&i| summary::shares_words(keys, self.lines[i].text))
+            .collect()
     }
 
     /// 망설임·거절을 볼 범위: 근거 줄과 바로 다음 줄(누가 말했든: 바로 뒤 다른 사람의 거절도 본다).
@@ -924,11 +933,6 @@ impl<'a> Lines<'a> {
         let started = self.started?;
         let ms = i64::try_from(self.lines[j].start_ms).ok()?;
         Some((started + chrono::Duration::milliseconds(ms)).date_naive())
-    }
-
-    /// 그 일에 대한 말인가: 근거 말([`statement`](Self::statement))이 `keys` 와 낱말이 겹친다.
-    fn about(&self, j: usize, keys: &[String]) -> bool {
-        summary::shares_words(keys, &self.statement(j))
     }
 }
 
@@ -1011,6 +1015,13 @@ pub fn hedged(text: &str) -> bool {
         || HEDGES.iter().any(|word| text.contains(word))
 }
 
+/// 부정하는 말이 글자로라도 있나(후보정의 [`NEGATIONS`] 그대로: 「완료안됐어요」·「완료못했어요」처럼
+/// 붙여 써도 걸린다). 완료로 바꿀 때만 쓴다: 완료 task 는 다시 읽지 않아 잘못 바꾸면 되돌릴 수 없어서,
+/// 「보안·잘못」 같은 낱말에 걸려 하나 덜 바꾸는 쪽을 고른다.
+fn negated_anywhere(text: &str) -> bool {
+    NEGATIONS.iter().any(|word| text.contains(word))
+}
+
 /// QA 말. 이름이 QA 로 끝나는 상태는 근거 말에 이 말이 있어야 실제로 바꾸고, 배포예정으로 끝나는
 /// 상태는 이 말이 있으면 제안만이다(「스테이징 배포 예정이에요」는 Staging QA 가 아니고, 「스테이징 QA
 /// 들어갔어요」는 Staging 배포예정이 아니다).
@@ -1018,10 +1029,21 @@ const QA_WORDS: [&str; 2] = ["qa", "큐에이"];
 
 /// 그 상태로 실제로 바꾸려면 근거 말에 있어야 하는 말(글자·숫자만, 작은 글자로 견준다). 여기
 /// 없는 상태(미팅·시작 전·기획(A2D2)·디자인·개발·개발-토의필요)는 늘 제안으로만 남긴다. 머지·배포는
-/// 중간 단계 이야기라 완료 말이 아니다. 이름이 QA 로 끝나는 상태는 [`QA_WORDS`] 도 있어야 한다.
+/// 중간 단계 이야기라 완료 말이 아니고, 완료는 끝낸 꼴만 받는다(「완료 예정」·「완료할게요」는 아니다).
+/// 이름이 QA 로 끝나는 상태는 [`QA_WORDS`] 도 있어야 한다.
 pub fn status_words(status: &str) -> &'static [&'static str] {
     match status {
-        "완료" => &["끝났", "끝냈", "완료", "마쳤", "마무리했", "닫았"],
+        "완료" => &[
+            "완료했",
+            "완료됐",
+            "완료되었",
+            "완료됨",
+            "끝났",
+            "끝냈",
+            "마쳤",
+            "마무리했",
+            "닫았",
+        ],
         "Dev QA" => &QA_WORDS,
         _ if status.starts_with("Production") => &["프로덕션", "production", "운영배포"],
         _ if status.starts_with("Staging") => &["스테이징", "staging"],
@@ -1031,8 +1053,8 @@ pub fn status_words(status: &str) -> &'static [&'static str] {
 
 /// 근거 말에 있으면 그 상태로는 제안만 하는 말(글자·숫자만, 작은 글자로 견준다). 우리 흐름은
 /// 개발 → Dev QA → Staging 배포예정 → Staging QA → Production 배포예정 → Production QA → 완료다.
-/// - 완료: 단계 말. 「개발 끝났어요」·「QA 끝났어요」·「스테이징에 배포했어요」·「PR 머지했어요」는 중간
-///   단계 이야기다.
+/// - 완료: 단계 말(「개발 끝났어요」·「QA 끝났어요」·「스테이징에 배포했어요」·「PR 머지했어요」는 중간
+///   단계 이야기다)과 아직 안 끝난 꼴(「끝났는지 볼게요」·「끝났으면」·「끝났을 거예요」·「완료 예정」).
 /// - Dev QA: 뒤 단계 말. 「스테이징 QA 들어갔어요」의 QA 는 Dev QA 가 아니다.
 /// - 이름이 배포예정으로 끝나는 상태: QA 말. 「스테이징 QA 들어갔어요」는 Staging 배포예정이 아니다.
 pub fn status_stop_words(status: &str) -> &'static [&'static str] {
@@ -1050,6 +1072,12 @@ pub fn status_stop_words(status: &str) -> &'static [&'static str] {
             "pr",
             "머지",
             "merge",
+            "예정",
+            "할게",
+            "하겠",
+            "는지",
+            "으면",
+            "을거",
         ],
         "Dev QA" => &["스테이징", "staging", "프로덕션", "production", "운영"],
         _ if status.ends_with("배포예정") => &QA_WORDS,
@@ -1066,20 +1094,21 @@ fn says_status(status: &str, statement: &str) -> bool {
     has(status_words(status)) && qa && !has(status_stop_words(status))
 }
 
-/// 상태가 앞으로 가나. 차례는 노션이 주는 그룹 차례(할 일 → 진행 중 → 완료)에 선택지 차례를 더해
-/// 매긴다. 차례를 못 매기면(select 칸이라 그룹이 없음, 그룹에 없는 이름) 앞으로 간다고 보지 않는다.
-/// 완료 task 는 읽지 않으니(진행 중만 읽는다) 다시 열 일은 없다.
+/// 상태가 앞으로 가나. 차례는 노션이 주는 그룹 차례(할 일 → 진행 중 → 완료)에 그 그룹 안 차례
+/// (`option_ids` 차례, 선택지 목록 차례가 아니다)를 더해 매긴다. 차례를 못 매기면(select 칸이라 그룹이
+/// 없음, 그룹에 없는 이름) 앞으로 간다고 보지 않는다. 완료 그룹 task 는 읽지 않으니 다시 열 일은 없다.
 pub fn moves_forward(schema: &TaskSchema, from: &str, to: &str) -> bool {
     let rank = |name: &str| {
-        let group = schema
+        schema
             .status_groups
             .iter()
-            .position(|group| group.iter().any(|option| option == name))?;
-        let option = schema
-            .status_options
-            .iter()
-            .position(|option| option == name)?;
-        Some((group, option))
+            .enumerate()
+            .find_map(|(group, options)| {
+                options
+                    .iter()
+                    .position(|option| option == name)
+                    .map(|at| (group, at))
+            })
     };
     matches!((rank(from), rank(to)), (Some(from), Some(to)) if to > from)
 }
@@ -1193,8 +1222,8 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
         keys
     };
 
-    // 2. 기한 바꿈: 근거 말(같은 사람이 이어 말한 줄까지)에서 코드가 읽은 날짜가 모델 날짜와
-    //    같을 때만. 지금 종료일에 끝 날짜나 시각이 있으면 제안으로만.
+    // 2. 기한 바꿈: 근거 말 가운데 그 일 이야기 줄에서 코드가 읽은 날짜가 하나이고 모델 날짜와 같을
+    //    때만. 지금 종료일에 끝 날짜나 시각이 있으면 제안으로만.
     let mut due: BTreeMap<usize, Change> = BTreeMap::new();
     for change in answer.due_changes {
         let Some(task) = parse_task(&change.task, input.tasks.len()) else {
@@ -1213,14 +1242,22 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.negation += 1;
             continue;
         }
-        if !lines.about(j, &keys_of(group)) {
+        let about = lines.about_lines(j, &keys_of(group));
+        if about.is_empty() {
             dropped.not_about += 1;
             continue;
         }
-        let statement = lines.statement(j);
-        let read = lines.date(j).and_then(|base| {
-            summary::date_from_quote(&statement, base).filter(|date| *date >= base)
-        });
+        let reads: BTreeSet<NaiveDate> = about
+            .iter()
+            .filter_map(|&i| {
+                let base = lines.date(i)?;
+                summary::date_from_quote(lines.lines[i].text, base).filter(|date| *date >= base)
+            })
+            .collect();
+        let read = match (reads.len(), reads.first()) {
+            (1, Some(read)) => Some(*read),
+            _ => None,
+        };
         let claimed = summary::parse_claimed_due(&change.due).map(|(day, _)| day);
         let (Some(read), Some(claimed)) = (read, claimed) else {
             dropped.date_not_in_words += 1;
@@ -1270,11 +1307,14 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.bad_status += 1;
             continue;
         }
-        if hedged(&lines.reply_window(j)) {
+        // 완료는 다시 읽지 않아 되돌릴 수 없으니, 부정하는 말을 글자로도 본다(「완료안됐어요」).
+        let window = lines.reply_window(j);
+        if hedged(&window) || (wanted == DONE_STATUS && negated_anywhere(&window)) {
             dropped.negation += 1;
             continue;
         }
-        if !lines.about(j, &keys_of(group)) {
+        let about = lines.about_lines(j, &keys_of(group));
+        if about.is_empty() {
             dropped.not_about += 1;
             continue;
         }
@@ -1288,7 +1328,9 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             to: wanted.to_string(),
             ms: lines.lines[j].start_ms,
             suggest: !(moves_forward(input.schema, current, wanted)
-                && says_status(wanted, &lines.statement(j))),
+                && about
+                    .iter()
+                    .any(|&i| says_status(wanted, lines.lines[i].text))),
         });
     }
 
@@ -2327,11 +2369,15 @@ pub(crate) mod tests {
             .zip(&ids)
             .map(|(name, id)| json!({ "id": id, "name": name }))
             .collect();
+        // 받은 차례 그대로(option_ids 차례는 선택지 목록 차례와 다를 수 있다: 진행 중 그룹은
+        // 「개발-토의필요」로 시작하지만 선택지 목록에서는 「기획(A2D2)」가 먼저다).
         let group = |names: &[&str]| -> Vec<String> {
-            options
+            names
                 .iter()
-                .filter(|option| names.contains(&option["name"].as_str().unwrap()))
-                .map(|option| option["id"].as_str().unwrap().to_string())
+                .map(|name| {
+                    let option = options.iter().find(|option| option["name"] == *name);
+                    option.unwrap()["id"].as_str().unwrap().to_string()
+                })
                 .collect()
         };
         let groups = json!([
@@ -2948,7 +2994,8 @@ pub(crate) mod tests {
     }
 
     /// 다음 줄의 다른 사람 날짜는 받지 않는다: A「견적서 자동화 진행 상황 공유할게요.」 +
-    /// B「결제 화면은 금요일까지예요.」 → K1 기한 안 바꿈. 같은 사람이 이어 말한 날짜는 받는다.
+    /// B「결제 화면은 금요일까지예요.」 → K1 기한 안 바꿈. 같은 사람이 이어 말한 날짜도 그 줄이 그 일
+    /// 이야기일 때만 받는다.
     #[test]
     fn another_persons_date_on_the_next_line_is_not_taken() {
         let answer = |ms: u64| {
@@ -2969,12 +3016,20 @@ pub(crate) mod tests {
         let plan = check_meeting(&lines, "견적서 자동화 공유", 5_000, &answer(9_000), &open());
         assert_eq!(plan.tasks[0].due, None);
         assert_eq!(plan.dropped.not_about, 1);
-        // 같은 사람이 이어 말했으면 그 사람의 기한이다.
+        // 같은 사람이 이어 말해도 그 줄에 그 일 낱말이 없으면 받지 않는다(다른 일 이야기일 수 있다).
         let same = [
             (5_000, A, "견적서 자동화 진행 상황 공유할게요."),
             (9_000, A, "금요일까지 끝낼게요."),
         ];
         let plan = check_meeting(&same, "견적서 자동화 공유", 5_000, &answer(5_000), &open());
+        assert_eq!(plan.tasks[0].due, None);
+        assert_eq!(plan.dropped.date_not_in_words, 1);
+        // 이어 말한 줄이 그 일 이야기면 받는다.
+        let named = [
+            (5_000, A, "견적서 자동화 진행 상황 공유할게요."),
+            (9_000, A, "견적서 자동화는 금요일까지 끝낼게요."),
+        ];
+        let plan = check_meeting(&named, "견적서 자동화 공유", 5_000, &answer(5_000), &open());
         assert_eq!(
             plan.tasks[0].due.as_ref().map(|change| change.to.as_str()),
             Some("2026-10-16")
@@ -3268,6 +3323,9 @@ pub(crate) mod tests {
         assert_eq!(schema.status_groups.len(), 3);
         assert_eq!(schema.status_groups[0], ["미팅", "시작 전"]);
         assert_eq!(schema.status_groups[2], ["완료"]);
+        // 그룹 안은 option_ids 차례 그대로(선택지 목록 차례와 다르다).
+        assert_eq!(schema.status_groups[1][0], "개발-토의필요");
+        assert_ne!(schema.status_options[2], "개발-토의필요");
         assert!(schema.status_groups[1]
             .iter()
             .any(|option| option == "Dev QA"));
@@ -3300,6 +3358,13 @@ pub(crate) mod tests {
         assert!(!moves_forward(&schema, "Production 배포예정", "Dev QA"));
         assert!(!moves_forward(&schema, "Dev QA", "시작 전"));
         assert!(!moves_forward(&schema, "완료", "개발"));
+        // 그룹 안 차례는 option_ids 차례다: 진행 중 그룹은 「개발-토의필요」로 시작하지만 선택지
+        // 목록에서는 「기획(A2D2)」가 먼저다.
+        let options = &schema.status_options;
+        let at = |name: &str| options.iter().position(|option| option == name).unwrap();
+        assert!(at("기획(A2D2)") < at("개발-토의필요"));
+        assert!(moves_forward(&schema, "개발-토의필요", "기획(A2D2)"));
+        assert!(!moves_forward(&schema, "기획(A2D2)", "개발-토의필요"));
         // 그룹이 선택지 차례보다 먼저다: 선택지 목록에서 완료가 맨 앞이어도 완료 그룹은 맨 뒤.
         let mut shuffled = schema.clone();
         shuffled.status_options.rotate_right(1);
@@ -3444,5 +3509,90 @@ pub(crate) mod tests {
         assert!(open_task(&page, &schema()).is_some());
         page["in_trash"] = json!(true);
         assert_eq!(open_task(&page, &schema()), None);
+    }
+
+    /// 완료로 바꿀 때는 부정하는 말을 글자로 본다(붙여 써도 걸린다): 완료는 다시 읽지 않아서 잘못
+    /// 바꾸면 되돌릴 수 없다.
+    #[test]
+    fn finishing_is_dropped_on_any_negation() {
+        let answer = k2_status_answer("완료");
+        for words in [
+            "로그인 오류 수정은 완료안됐어요.",
+            "로그인 오류 수정 완료못했어요.",
+        ] {
+            let lines = [(1_000, A, words)];
+            let plan = check_meeting(&lines, "로그인 오류 수정 완료", 1_000, &answer, &open());
+            assert_eq!(plan.tasks[0].status, None, "{words}");
+            assert_eq!(plan.dropped.negation, 1, "{words}");
+        }
+        // 낱말로만 보는 다른 검사에는 안 걸린다(그래서 완료에만 글자로 본다).
+        assert!(!hedged("로그인 오류 수정은 완료안됐어요."));
+        let lines = [(1_000, A, "로그인 오류 수정은 다 완료했어요.")];
+        let plan = check_meeting(&lines, "로그인 오류 수정 완료", 1_000, &answer, &open());
+        assert!(!plan.tasks[0].status.as_ref().unwrap().suggest);
+    }
+
+    /// 완료는 끝낸 꼴만 받는다. 예정·약속·물음·가정의 꼴은 제안만이다.
+    #[test]
+    fn only_a_finished_form_finishes_a_task() {
+        for words in [
+            "금요일 완료 예정이에요",
+            "완료할게요",
+            "끝났는지 볼게요",
+            "끝났으면 좋겠어요",
+            "끝났을 거예요",
+        ] {
+            assert!(!says_status("완료", words), "{words}");
+        }
+        for words in [
+            "다 완료했어요",
+            "완료됐어요",
+            "완료되었습니다",
+            "다 끝났어요",
+        ] {
+            assert!(says_status("완료", words), "{words}");
+        }
+        let planned = [(1_000, A, "로그인 오류 수정은 금요일 완료 예정이에요.")];
+        let answer = k2_status_answer("완료");
+        let plan = check_meeting(&planned, "로그인 오류 수정 완료", 1_000, &answer, &open());
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
+    }
+
+    /// 날짜·상태 말은 그 일 이야기 줄에서만 받는다. 같은 사람이 이어 말한 줄도 다른 일 이야기일 수 있다.
+    #[test]
+    fn a_word_on_a_line_about_something_else_is_not_taken() {
+        // 상태: A「로그인 오류 수정은요,」 + A「결제 쪽은 다 끝났어요.」 → 로그인 task 는 안 바꾼다.
+        let status = [
+            (1_000, A, "로그인 오류 수정은요,"),
+            (3_000, A, "결제 쪽은 다 끝났어요."),
+        ];
+        let answer = k2_status_answer("완료");
+        let plan = check_meeting(&status, "로그인 오류 수정", 1_000, &answer, &open());
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
+        // 기한: 「견적서 자동화는 다 됐고요,」 + 「결제 화면은 금요일까지 할게요.」 → 견적서 기한 안 바꿈.
+        let due = json!({
+            "links": [link_d1("K1", 5_000)],
+            "due_changes": [{ "task": "K1", "due": "2026-10-16", "ms": 5_000 }],
+            "status_changes": [], "new_tasks": []
+        });
+        let lines = [
+            (5_000, A, "견적서 자동화는 다 됐고요,"),
+            (7_000, A, "결제 화면은 금요일까지 할게요."),
+        ];
+        let plan = check_meeting(&lines, "견적서 자동화", 5_000, &due, &open());
+        assert_eq!(plan.tasks[0].due, None);
+        assert_eq!(plan.dropped.date_not_in_words, 1);
+    }
+
+    /// 완료 그룹(노션 그룹의 맨 뒤)의 task 는 이름이 「완료」가 아니어도 읽지 않는다.
+    #[test]
+    fn tasks_in_the_complete_group_are_not_read() {
+        let mut schema = schema();
+        schema.status_options.push("취소".into());
+        schema.status_groups.last_mut().unwrap().push("취소".into());
+        let mut task = open()[0].clone();
+        assert!(open_task(&task_page(&task), &schema).is_some());
+        task.status = "취소".into();
+        assert_eq!(open_task(&task_page(&task), &schema), None);
     }
 }
