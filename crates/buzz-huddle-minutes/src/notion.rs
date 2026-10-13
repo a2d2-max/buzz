@@ -1089,18 +1089,24 @@ pub fn body_blocks(
     out.push(heading("전체 스크립트"));
     let mut segments: Vec<_> = transcript.segments.iter().enumerate().collect();
     segments.sort_by_key(|(_, segment)| segment.start_ms);
-    if segments.is_empty() {
-        out.extend(paragraph("없음"));
-    }
+    let before = out.len();
     for (index, segment) in segments {
-        let mut runs = time_link(segment.start_ms);
-        let name = line_name(segment, page.names);
         let line = page
             .corrected
             .and_then(|corrected| corrected.lines.get(&index));
         let text = line_text(segment, line);
+        // 받아쓰기가 빈 글을 낸 조각은 "[00:20] 이름: " 같은 빈 줄이 되니 페이지에서는 뺀다.
+        // 스크립트 파일에는 그대로 남는다. "받아쓰기 실패" 줄은 글이 있어서 남는다.
+        if text.is_empty() {
+            continue;
+        }
+        let mut runs = time_link(segment.start_ms);
+        let name = line_name(segment, page.names);
         runs.extend(text_runs(&format!(" {name}: {text}"), None));
         out.extend(blocks("paragraph", runs, false));
+    }
+    if out.len() == before {
+        out.extend(paragraph("없음"));
     }
     out
 }
@@ -2663,6 +2669,43 @@ pub(crate) mod tests {
             minutes_pages(&state)[0].properties[minutes_property::STATUS]["select"]["name"],
             "완료"
         );
+    }
+
+    /// 받아쓰기가 빈 글을 낸 조각은 전체 스크립트에서 빠진다("[00:20] 이름: " 같은 빈 줄이 안
+    /// 생긴다). "받아쓰기 실패" 줄은 남고, 다 비면 "없음".
+    #[test]
+    fn empty_pieces_are_left_out_of_the_script() {
+        let script_lines = |transcript: &Transcript| -> Vec<String> {
+            let summary = summary_of(transcript);
+            let body = body_blocks(
+                &page(transcript, &summary),
+                &HashMap::new(),
+                DEFAULT_PLAYBACK_LINK,
+                &HashSet::new(),
+            );
+            let start = body
+                .iter()
+                .position(|block| {
+                    block["type"] == "heading_2" && block_text(block) == "전체 스크립트"
+                })
+                .unwrap();
+            body[start + 1..].iter().map(block_text).collect()
+        };
+        let transcript = transcript_with(&[
+            (1_000, A, "견적서 얘기해요."),
+            (20_000, B, ""),
+            (30_000, A, "   "),
+            (40_000, B, crate::stt::FAILED_TEXT),
+        ]);
+        assert_eq!(
+            script_lines(&transcript),
+            [
+                "[00:01] aaaaaaaa: 견적서 얘기해요.",
+                "[00:40] bbbbbbbb: 받아쓰기 실패"
+            ]
+        );
+        let empty = transcript_with(&[(1_000, A, ""), (2_000, B, " ")]);
+        assert_eq!(script_lines(&empty), ["없음"]);
     }
 
     /// 프로필 이름표로 쓰면 "참석자" 칸, 스크립트 줄, 연결 안 된 담당자 글, 새 담당자 줄
