@@ -1412,10 +1412,17 @@ async fn tasks_step<H: MinutesHome>(
         Step::Off => return Ok(Step::Skipped("the Notion page is off")),
         _ => return Ok(Step::Later(Later::Page)),
     }
+    // 끝난 지 오래된 회의는 지금 task 를 건드리지 않는다(계획도 쓰기도 안 한다). 다만 칸을 바꾸고
+    // 기록을 못 붙인 task 가 있으면 그 기록만은 마저 붙인다(칸 바꾸기는 다시 안 한다).
+    let now = steps.now();
+    let old = now.saturating_sub(held.meeting.ended_at_unix_ms()) > TASKS_MAX_AGE_MS;
     let ledger = match held.home.read_beside(held.meeting, Beside::Tasks).await? {
         None => None,
         Some(bytes) => match serde_json::from_slice::<TasksLedger>(&bytes) {
             Ok(ledger) => Some(ledger),
+            // 오래된 회의는 장부가 망가져도 건너뛴다: 망가진 장부 하나가 녹음이 남은 14일 동안 실행마다
+            // 경고를 내지 않게(붙일 기록이 남았는지도 알 수 없다).
+            Err(_) if old => return Ok(Step::Skipped("the meeting ended over 24 hours ago")),
             // Asking again would pay again, and what was written is not known.
             Err(_) => return Ok(Step::Failed("stored task links unreadable".into())),
         },
@@ -1423,10 +1430,6 @@ async fn tasks_step<H: MinutesHome>(
     if ledger.as_ref().is_some_and(|ledger| ledger.finished) {
         return Ok(Step::AlreadyDone);
     }
-    // 끝난 지 오래된 회의는 지금 task 를 건드리지 않는다(계획도 쓰기도 안 한다). 다만 칸을 바꾸고
-    // 기록을 못 붙인 task 가 있으면 그 기록만은 마저 붙인다(칸 바꾸기는 다시 안 한다).
-    let now = steps.now();
-    let old = now.saturating_sub(held.meeting.ended_at_unix_ms()) > TASKS_MAX_AGE_MS;
     if old
         && ledger
             .as_ref()
@@ -5309,6 +5312,33 @@ mod tests {
         );
         assert_eq!(link.records("task-1"), 0);
         assert_eq!(link.page("task-2").0["작업상태"]["status"]["name"], "완료");
+    }
+
+    /// 끝난 지 24시간 넘은 회의의 task 장부가 망가졌으면 실패로 두지 않고 건너뛴다(망가진 장부 하나가
+    /// 14일 동안 실행마다 경고를 내지 않게). 24시간 안이면 그대로 실패다(돈 낸 계획을 다시 안 산다).
+    #[tokio::test]
+    async fn a_broken_ledger_of_an_old_meeting_is_skipped() {
+        let link = linking().await;
+        std::fs::write(link.ledger_path(), b"{ not a ledger").unwrap();
+        let fresh = link.follow(TasksMode::Update).await;
+        assert_eq!(fresh.notion, Step::Done, "{fresh:?}");
+        assert_eq!(
+            fresh.tasks,
+            Step::Failed("stored task links unreadable".into()),
+            "{fresh:?}"
+        );
+        let ended = link.world.meeting.ended_at_unix_ms();
+        link.world
+            .clock
+            .store(ended + 25 * 60 * 60 * 1_000, Ordering::SeqCst);
+        let old = link.follow(TasksMode::Update).await;
+        assert_eq!(
+            old.tasks,
+            Step::Skipped("the meeting ended over 24 hours ago"),
+            "{old:?}"
+        );
+        assert!(!old.tasks_failed());
+        assert_eq!(link.tasks_asked(), 0);
     }
 
     /// task 하나의 쓰기가 400 이면 그 task 의 남은 쓰기만 건너뛰고 다음 task 로 간다.

@@ -370,7 +370,7 @@ rm {out}/{첫 세션 id}.summary-failed.json
   두 배씩 6시간까지 물러서기, 400·404 따로 세기, 인증·권한·429 는 그 실행 동안 끔). 다른 점: **task 연결의 실패는 회의의
   실패가 아니다.** 종료 코드에 안 들어가고 `warning: N meeting(s) with task linking failed …` 로만 남는다(예: 통합이 task DB
   에 연결 안 돼 404). 작업기 저장소(장부 읽기·쓰기, 잠금 잃음)만 회의를 실패로 센다. 장부가 망가져 형식이 틀리면
-  Gemini 를 다시 부르지 않고 task 연결 실패로 둔다. 로그에는 종류·HTTP 상태·노션 오류 코드와 **그때 하던 일**만 남는다(노션 메시지는 안
+  Gemini 를 다시 부르지 않고 task 연결 실패로 둔다(끝난 지 24시간 넘은 회의는 건너뛴다, 아래 "오래된 회의"). 로그에는 종류·HTTP 상태·노션 오류 코드와 **그때 하던 일**만 남는다(노션 메시지는 안
   찍는다). 그래서 같은 403 이라도 어느 요청이 막혔는지 갈라 본다:
   `permission HTTP 403 restricted_resource while reading the task database`. 하던 일은 `reading the task database`·
   `reading the task data source`·`checking the task db columns`·`reading open tasks`·`reading a task before changing it`·
@@ -388,7 +388,8 @@ rm {out}/{첫 세션 id}.summary-failed.json
 - **오래된 회의**: 회의가 끝난 지 24시간 넘었으면 task 연결을 안 한다(읽지도 묻지도 쓰지도 않고 남은 일로도 안 친다).
   칸을 바꾸고 기록을 못 붙인 task 의 기록만은 예외다(위 "쓰기"). 스위치를 처음 켰을 때 녹음이 남은 지난 14일 회의들이
   지금 task 의 기한·상태를 덮어쓰지 않게 하려는 것이다. 그래서 켜기 **24시간보다 전에** 끝난 회의는 잇지 않는다. 켜기 전
-  24시간 안에 끝난 회의는 켠 뒤 첫 실행에서 잇는다.
+  24시간 안에 끝난 회의는 켠 뒤 첫 실행에서 잇는다. 오래된 회의는 장부가 망가져 못 읽어도 실패로 두지 않고 건너뛴다
+  (망가진 장부 하나가 녹음이 남은 14일 동안 실행마다 경고를 내지 않게).
 - **로그**(수만: task 제목·사람 이름·pubkey·노션 id 없음):
   `tasks: matched 3 (sure 2, maybe 1), appended 2, created 1, due changed 1, status changed 0, skipped 1`.
   0 이 아닌 것만 뒤에 붙는다: `| suggested N`(기록에 제안으로만), `| changed meanwhile N`(계획 뒤에 사람이 고침),
@@ -985,8 +986,11 @@ DER 은 여유 구간 없이(collar 0), 회의실 트랙에서 잰다. 놓침·�
     만든 task 찾기·만들기)도 data source 가 읽히면 `task gone` 으로 센다.
   - `운영 QA` 처럼 「운영」 뒤에 「배포」가 없는 말은 Production 말로 안 친다(Production 말은 프로덕션·production·운영 배포).
     그때는 제안만이다.
-  - 휴지통에 넣은 task 가 읽기·쓰기에 어떻게 답하는지(200·400·404)는 노션 문서에 없어 못 쟀다. 어느 쪽이든 그 task 만
-    건너뛴다(400 은 `refused`, 404 는 `task gone`).
+  - 휴지통에 든 task 는 계획 때 읽기와 칸 바꾸기 직전 읽기에서 `in_trash` 로 알아보고 건너뛴다. 계획 뒤에 휴지통에 든
+    task 에 기록을 덧붙이면(칸 바꾸기가 없는 append) 노션이 어떻게 답하는지(200·400·404)는 문서에 없어 못 쟀다. 400 이면
+    `refused`, 404 면 `task gone` 으로 그 task 만 건너뛰고, 200 이면 휴지통 속 페이지에 붙는다.
+  - 회의록 페이지를 다시 쓸 때 task 장부를 잠깐 못 읽으면(저장소 일시 실패) 「관련 있을 수 있는 task」 절 없이 쓴다
+    (회의록이 task 연결 때문에 실패하지 않게). 장부엔 이미 붙였다고 적혀 있어서, 그 절은 페이지를 다시 쓸 때까지 빠진다.
 - **참석자 이름**(위 "참석자 이름"):
   - **"이름을 불러 부탁한 말 바로 뒤의 수락" 규칙은 꺼 뒀다**(`summary.rs` `ACCEPT_NAMED_REQUEST`). 앞 8자 이름일 때는 아무도
     그 이름을 부르지 않아 사실상 꺼져 있었고, 프로필 이름이 붙으면서 처음 켜지는데 판정이 헐겁다. 수락은 "네"로 시작하기만
