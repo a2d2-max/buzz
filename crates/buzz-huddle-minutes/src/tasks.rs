@@ -1113,6 +1113,34 @@ pub fn moves_forward(schema: &TaskSchema, from: &str, to: &str) -> bool {
     matches!((rank(from), rank(to)), (Some(from), Some(to)) if to > from)
 }
 
+/// 제목이 비슷해 새로 만들지 않은 task 를 회의록 페이지 링크에 달 때의 까닭.
+pub const SIMILAR_TITLE: &str = "제목이 비슷한 task 가 있어서 새로 만들지 않았어요";
+
+/// 새 task 와 같은 일로 볼 진행 중 task: 제목이 같거나(띄어쓰기·큰 글자는 안 본다), 짧은 쪽 제목의
+/// 낱말(앞 두 글자)이 둘 이상이고 그 낱말이 모두 긴 쪽에 있다(「회의록 공유 기능」 ↔ 「회의록 공유 기능
+/// 만들기」). 「결제 화면 수정」 ↔ 「로그인 화면 디자인 수정」처럼 일부만 겹치면 다른 일로 보고, 낱말 하나뿐인
+/// 제목(「결제」)은 너무 흔해서 같은 제목일 때만 같은 일로 본다. 여럿이면 가장 많이 겹치는 것.
+fn similar_task<'t>(tasks: &'t [OpenTask], title: &str) -> Option<&'t OpenTask> {
+    let squashed = summary::squash(title);
+    let keys: BTreeSet<String> = summary::word_keys(title).into_iter().collect();
+    tasks
+        .iter()
+        .filter_map(|task| {
+            if summary::squash(&task.title) == squashed {
+                return Some((usize::MAX, task));
+            }
+            let theirs: BTreeSet<String> = summary::word_keys(&task.title).into_iter().collect();
+            let (shorter, longer) = if theirs.len() <= keys.len() {
+                (&theirs, &keys)
+            } else {
+                (&keys, &theirs)
+            };
+            (shorter.len() >= 2 && shorter.is_subset(longer)).then_some((shorter.len(), task))
+        })
+        .min_by_key(|(shared, _)| std::cmp::Reverse(*shared))
+        .map(|(_, task)| task)
+}
+
 /// 같은 task 로 모인 짝들.
 struct Group {
     task: usize,
@@ -1334,13 +1362,10 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
         });
     }
 
-    // 4. 새 task: 짝이 없는 확정 할 일만. 기한 근거에 망설이는 말이 있으면 종료일 없이.
-    let titles: HashSet<String> = input
-        .tasks
-        .iter()
-        .map(|task| summary::squash(&task.title))
-        .collect();
+    // 4. 새 task: 짝이 없는 확정 할 일만. 기한 근거에 망설이는 말이 있으면 종료일 없이. 같은 일로
+    //    보이는 진행 중 task(제목이 같거나 비슷함)가 있으면 새로 만들지 않고 그 task 를 애매 링크로 단다.
     let mut creates: Vec<PlannedCreate> = Vec::new();
+    let mut similar: Vec<MaybeTask> = Vec::new();
     for id in answer.new_tasks {
         let Some(item) = parse_item(&id, summary) else {
             dropped.unknown_item += 1;
@@ -1362,10 +1387,17 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
         let title = clip(&action.text, MAX_SAID_CHARS);
         if title.is_empty()
             || linked.contains(&item)
-            || titles.contains(&summary::squash(&title))
             || creates.iter().any(|create| create.item == i)
         {
             dropped.not_new += 1;
+            continue;
+        }
+        if let Some(task) = similar_task(input.tasks, &title) {
+            dropped.not_new += 1;
+            similar.push(MaybeTask {
+                id: task.id.clone(),
+                why: SIMILAR_TITLE.to_string(),
+            });
             continue;
         }
         let due_unsure = action
@@ -1394,6 +1426,7 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
     }
     if input.mode < TasksMode::Create {
         creates.clear();
+        similar.clear();
     }
     if !input.schema.related_page && !creates.is_empty() {
         dropped.no_column += creates.len() as u64;
@@ -1443,6 +1476,14 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             why: group.why.clone(),
         })
         .collect();
+    // 제목이 비슷해 새로 만들지 않은 task: 확실한 짝이거나 이미 단 링크면 또 달지 않는다.
+    for link in similar {
+        let known = tasks.iter().any(|task| task.id == link.id)
+            || maybe.iter().any(|maybe| maybe.id == link.id);
+        if !known {
+            maybe.push(link);
+        }
+    }
     if maybe.len() > MAX_MAYBE_LINKS {
         dropped.cut += (maybe.len() - MAX_MAYBE_LINKS) as u64;
         maybe.truncate(MAX_MAYBE_LINKS);
@@ -3594,5 +3635,58 @@ pub(crate) mod tests {
         assert!(open_task(&task_page(&task), &schema).is_some());
         task.status = "취소".into();
         assert_eq!(open_task(&task_page(&task), &schema), None);
+    }
+
+    /// 새 task 후보와 같은 일로 보이는 진행 중 task(제목이 같거나, 짧은 쪽 낱말이 둘 이상이고 모두 긴 쪽에
+    /// 있음)가 있으면 새로 만들지 않고 그 task 를 애매 링크로 단다(create 일 때만).
+    #[test]
+    fn a_new_task_like_an_open_one_becomes_a_maybe_link() {
+        let task = |id: &str, title: &str| OpenTask {
+            id: id.into(),
+            title: title.into(),
+            status: "개발".into(),
+            ..OpenTask::default()
+        };
+        let tasks = [
+            task("a", "회의록 공유 기능"),
+            task("b", "결제 화면 수정"),
+            task("c", "결제"),
+        ];
+        let found = |title: &str| similar_task(&tasks, title).map(|task| task.id.clone());
+        assert_eq!(found("회의록 공유 기능 만들기").as_deref(), Some("a"));
+        assert_eq!(found("회의록공유 기능").as_deref(), Some("a"));
+        assert_eq!(found("공유 기능 회의록 정리").as_deref(), Some("a"));
+        assert_eq!(found("로그인 화면 디자인 수정"), None);
+        assert_eq!(found("결제 연동"), None, "one word is too common");
+        assert_eq!(found("결제").as_deref(), Some("c"));
+
+        // 검사 전체로: 「회의록 공유 기능」이 있으면 A2 「회의록 공유 기능 만들기」를 새로 안 만들고 링크로.
+        let mut open = open();
+        open.push(task("task-4", "회의록 공유 기능"));
+        let (summary, schema, transcript) = (summary(), schema(), meeting());
+        let input = CheckInput {
+            summary: &summary,
+            tasks: &open,
+            schema: &schema,
+            transcript: &transcript,
+            names: &PubkeyPrefixNames,
+            mode: TasksMode::Create,
+        };
+        let plan = check_answer(&good_answer().to_string(), &input).unwrap();
+        assert!(plan.creates.is_empty());
+        let linked: Vec<(&str, &str)> = plan
+            .maybe
+            .iter()
+            .map(|maybe| (maybe.id.as_str(), maybe.why.as_str()))
+            .collect();
+        assert!(linked.contains(&("task-4", SIMILAR_TITLE)), "{linked:?}");
+        assert_eq!(plan.dropped.not_new, 1);
+        // append 는 새 task 를 안 만드니 이 링크도 안 단다.
+        let input = CheckInput {
+            mode: TasksMode::Append,
+            ..input
+        };
+        let plan = check_answer(&good_answer().to_string(), &input).unwrap();
+        assert!(!plan.maybe.iter().any(|maybe| maybe.id == "task-4"));
     }
 }
