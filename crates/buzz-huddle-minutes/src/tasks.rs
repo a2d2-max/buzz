@@ -61,6 +61,8 @@ pub const DONE_STATUS: &str = "완료";
 pub const MAYBE_HEADING: &str = "관련 있을 수 있는 task";
 /// task 에 덧붙이는 기록의 제목 앞머리.
 pub const RECORD_HEADING: &str = "허들 회의 기록";
+/// 기록 제목에 붙여, 사람 손이 아니라 작업기가 붙였다는 것을 보인다.
+pub const AUTO_NOTE: &str = "회의록 작업기가 자동으로 붙임";
 /// 망설이거나 미루거나 묻는 말. 근거 줄(과 바로 다음 줄)에 이 말이나 부정하는 말
 /// ([`NEGATIONS`])이 있으면 기한·상태를 바꾸지 않는다. 글자로 세서 다른 낱말 속에 든 것도
 /// 센다: 잘못 바꾸는 것보다 하나 덜 바꾸는 편이 낫다.
@@ -158,12 +160,28 @@ pub struct TaskSchema {
     pub related_page: bool,
 }
 
+/// task 연결의 노션 실패와 그때 하던 일. 같은 403 이라도 어느 요청(task DB 읽기, task 페이지
+/// 쓰기, 회의록 페이지 …)이 막혔는지 로그에서 가른다(통합의 권한 문제인지 다른 까닭인지).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDbError {
+    /// 노션 실패(종류·코드).
+    pub error: NotionError,
+    /// 하던 일(로그용 영어 몇 낱말, 예: `reading the task database`).
+    pub doing: &'static str,
+}
+
+/// `doing` 을 하다 난 노션 실패로 묶는다.
+fn at(doing: &'static str) -> impl FnOnce(NotionError) -> TaskDbError {
+    move |error| TaskDbError { error, doing }
+}
+
 /// 스키마가 기대와 다를 때(설정 문제라 400 처럼 다룬다).
-fn schema_error(what: &str) -> NotionError {
-    NotionError::new(
+fn schema_error(what: &str) -> TaskDbError {
+    let error = NotionError::new(
         NotionErrorKind::BadRequest,
         format!("task db schema: {what}"),
-    )
+    );
+    at("checking the task db columns")(error)
 }
 
 /// task DB 의 data source 와 칸을 읽는다(`GET /v1/databases/{id}` →
@@ -171,11 +189,12 @@ fn schema_error(what: &str) -> NotionError {
 pub async fn read_schema(
     client: &mut NotionClient<'_>,
     database_id: &str,
-) -> Result<TaskSchema, NotionError> {
+) -> Result<TaskSchema, TaskDbError> {
     use task_property as p;
     let database = client
         .get(&format!("/v1/databases/{}", database_id.trim()))
-        .await?;
+        .await
+        .map_err(at("reading the task database"))?;
     let sources: Vec<&str> = database["data_sources"]
         .as_array()
         .into_iter()
@@ -188,7 +207,10 @@ pub async fn read_schema(
             sources.len()
         )));
     };
-    let data_source = client.get(&format!("/v1/data_sources/{source}")).await?;
+    let data_source = client
+        .get(&format!("/v1/data_sources/{source}"))
+        .await
+        .map_err(at("reading the task data source"))?;
     let properties = &data_source["properties"];
     let kind = |name: &str| properties[name]["type"].as_str().unwrap_or("").to_string();
     if kind(p::TITLE) != "title" {
@@ -274,7 +296,8 @@ fn open_task(page: &Value, schema: &TaskSchema) -> Option<OpenTask> {
 pub async fn open_tasks(
     client: &mut NotionClient<'_>,
     schema: &TaskSchema,
-) -> Result<Vec<OpenTask>, NotionError> {
+) -> Result<Vec<OpenTask>, TaskDbError> {
+    let reading = "reading open tasks";
     let mut body = json!({
         "sorts": [{ "timestamp": "last_edited_time", "direction": "descending" }],
         "page_size": 100
@@ -291,8 +314,11 @@ pub async fn open_tasks(
     }
     let mut tasks = Vec::new();
     loop {
-        let result = client.query(&schema.data_source_id, body.clone()).await?;
-        for page in notion::live_results(&result)? {
+        let result = client
+            .query(&schema.data_source_id, body.clone())
+            .await
+            .map_err(at(reading))?;
+        for page in notion::live_results(&result).map_err(at(reading))? {
             if let Some(task) = open_task(&page, schema) {
                 tasks.push(task);
             }
@@ -447,6 +473,16 @@ fn todo_line(item: &ActionItem, names: &dyn DisplayNames) -> String {
         one_line(&item.text),
         item.status.as_str()
     )
+}
+
+/// 기록에 쓰는 회의 항목 한 줄: `결정: …`, `할 일: …`([`todo_line`]), `주제: …`. 요약이 검사를
+/// 거쳐 회의록 페이지에도 쓴 글이고, 스크립트 원문 인용(담당자·기한 근거 글)은 넣지 않는다.
+fn summary_line(summary: &Summary, item: ItemRef, names: &dyn DisplayNames) -> String {
+    match item {
+        ItemRef::Decision(i) => format!("결정: {}", one_line(&summary.decisions[i].text)),
+        ItemRef::Action(i) => format!("할 일: {}", todo_line(&summary.action_items[i], names)),
+        ItemRef::Topic(i) => format!("주제: {}", one_line(&summary.topics[i].title)),
+    }
 }
 
 /// `text` 를 `max` 글자까지(넘으면 …).
@@ -628,10 +664,11 @@ pub struct Change {
 pub struct PlannedTask {
     /// 노션 page id.
     pub id: String,
-    /// 그 task 에 대해 나온 말 요약(모델 글, 짧게).
+    /// 모델이 그 task 에 대해 나온 말을 요약한 것(`said`). 장부에만 남겨 사람이 짝을 살펴볼 때
+    /// 쓰고 **노션에는 쓰지 않는다**: task 에는 검사를 거친 회의 요약 글만 간다.
     pub said: Vec<String>,
-    /// 짝 지은 할 일 줄([`todo_line`]).
-    pub todos: Vec<String>,
+    /// 기록에 쓰는 짧은 요약: 짝 지은 회의 항목의 요약 글(결정·할 일·주제, [`summary_line`]).
+    pub summary: Vec<String>,
     /// 근거 줄의 시각(ms), 차례대로.
     pub evidence_ms: Vec<u64>,
     /// `종료일` 바꿈(update 만).
@@ -1082,15 +1119,10 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             PlannedTask {
                 id: task.id.clone(),
                 said: group.said.clone(),
-                todos: group
+                summary: group
                     .items
                     .iter()
-                    .filter_map(|item| match item {
-                        ItemRef::Action(i) => {
-                            Some(todo_line(&summary.action_items[*i], input.names))
-                        }
-                        _ => None,
-                    })
+                    .map(|item| summary_line(summary, *item, input.names))
                     .collect(),
                 evidence_ms: group.evidence.iter().copied().collect(),
                 due: due.remove(&group.task),
@@ -1173,7 +1205,7 @@ pub struct TasksLedger {
     pub minutes_page_id: String,
     /// 채널 id(근거 시각의 재생 링크).
     pub channel_id: Uuid,
-    /// 회의 시작(KST), 예: `2026-10-12 (월) 14:00`.
+    /// 회의 날(KST), 예: `2026-10-12`(기록 제목).
     pub meeting: String,
     /// 계획을 세울 때 읽은 task DB 칸.
     pub schema: TaskSchema,
@@ -1192,17 +1224,11 @@ pub struct TasksLedger {
     pub finished: bool,
 }
 
-/// 회의 시작을 기록 제목에 쓸 글로(KST): `2026-10-12 (월) 14:00`.
+/// 기록 제목에 쓸 회의 날(KST): `2026-10-12`.
 pub fn meeting_label(transcript: &Transcript) -> String {
-    match summary::meeting_start_kst(transcript) {
-        Some(at) => format!(
-            "{} ({}) {}",
-            at.format("%Y-%m-%d"),
-            summary::weekday_ko(at.weekday()),
-            at.format("%H:%M")
-        ),
-        None => String::new(),
-    }
+    summary::meeting_date_kst(transcript)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
 }
 
 /// 쓰기 하나. 차례: task 마다 기한 → 상태 → 기록, 그다음 새 task, 마지막에 회의록 페이지 절.
@@ -1278,6 +1304,8 @@ pub struct TasksReport {
     pub already_there: usize,
     /// task 가 없어져서(지워짐) 못 쓴 수.
     pub gone: usize,
+    /// 새 task 담당자를 담당자 연결 DB 에서 못 찾아본 수(담당자 칸만 비웠다).
+    pub assignee_lookup_failed: usize,
     /// 검사·상한으로 버린 수.
     pub skipped: u64,
     /// 버린 까닭(수만).
@@ -1315,6 +1343,13 @@ impl fmt::Display for TasksReport {
         }
         if self.gone > 0 {
             write!(f, " | task gone {}", self.gone)?;
+        }
+        if self.assignee_lookup_failed > 0 {
+            write!(
+                f,
+                " | assignee lookup failed {}",
+                self.assignee_lookup_failed
+            )?;
         }
         Ok(())
     }
@@ -1423,14 +1458,12 @@ fn time_runs(ms: &[u64], link_template: &str, channel: Uuid) -> Vec<Value> {
 /// task 페이지에 붙이는 「허들 회의 기록」 한 덩어리. 회의록 페이지 멘션이 들어 있어서 다시
 /// 돌 때 이것으로 이미 쓴 것을 알아본다.
 pub struct Record<'a> {
-    /// 회의 시작(KST).
+    /// 회의 날(KST).
     pub meeting: &'a str,
     /// 회의록 페이지 id.
     pub minutes_page_id: &'a str,
-    /// 나온 말 요약.
-    pub said: &'a [String],
-    /// 관련 할 일 줄.
-    pub todos: &'a [String],
+    /// 짧은 요약 줄(회의 요약 글).
+    pub summary: &'a [String],
     /// 근거 시각 조각들.
     pub times: Vec<Value>,
     /// 바꿈 줄.
@@ -1439,37 +1472,21 @@ pub struct Record<'a> {
     pub mention: &'a [String],
 }
 
-/// [`Record`] 의 블록들.
+/// [`Record`] 의 블록들, 차례대로:
+/// 1. 제목 `허들 회의 기록 · 회의록 작업기가 자동으로 붙임 · 2026-10-12`(사람 손이 아님).
+/// 2. 바꾼 칸이 있으면 바로 그 아래 `기한: 10/20 → 10/24 (근거 [12:34])`(사람이 보고 되돌리게),
+///    그리고 그 task 담당자 멘션.
+/// 3. `회의록: @회의록 페이지`(전문은 거기에 있다).
+/// 4. 짧은 요약(회의 요약 글)과 근거 시각.
+///
+/// 스크립트 원문과 모델의 `said` 는 넣지 않는다(원문이 아닌 요약만 task 에).
 pub fn record_blocks(record: &Record<'_>) -> Vec<Value> {
+    let title = format!("{RECORD_HEADING} · {AUTO_NOTE} · {}", record.meeting);
     let mut out = vec![json!({
         "object": "block",
         "type": "heading_3",
-        "heading_3": {
-            "rich_text": notion::text_runs(&format!("{RECORD_HEADING} · {}", record.meeting), None)
-        }
+        "heading_3": { "rich_text": notion::text_runs(&title, None) }
     })];
-    let mut minutes = notion::text_runs("회의록: ", None);
-    minutes.push(page_mention(record.minutes_page_id));
-    out.extend(notion::blocks("paragraph", minutes, false));
-    for said in record.said {
-        out.extend(notion::blocks(
-            "bulleted_list_item",
-            notion::text_runs(&format!("나온 말: {said}"), None),
-            false,
-        ));
-    }
-    for todo in record.todos {
-        out.extend(notion::blocks(
-            "bulleted_list_item",
-            notion::text_runs(&format!("관련 할 일: {todo}"), None),
-            false,
-        ));
-    }
-    if !record.times.is_empty() {
-        let mut runs = notion::text_runs("근거: ", None);
-        runs.extend(record.times.iter().cloned());
-        out.extend(notion::blocks("bulleted_list_item", runs, false));
-    }
     for change in record.changes {
         out.extend(notion::blocks(
             "bulleted_list_item",
@@ -1486,6 +1503,21 @@ pub fn record_blocks(record: &Record<'_>) -> Vec<Value> {
             runs.push(user_mention(user));
         }
         out.extend(notion::blocks("paragraph", runs, false));
+    }
+    let mut minutes = notion::text_runs("회의록: ", None);
+    minutes.push(page_mention(record.minutes_page_id));
+    out.extend(notion::blocks("paragraph", minutes, false));
+    for line in record.summary {
+        out.extend(notion::blocks(
+            "bulleted_list_item",
+            notion::text_runs(line, None),
+            false,
+        ));
+    }
+    if !record.times.is_empty() {
+        let mut runs = notion::text_runs("근거: ", None);
+        runs.extend(record.times.iter().cloned());
+        out.extend(notion::blocks("bulleted_list_item", runs, false));
     }
     out
 }
@@ -1516,7 +1548,7 @@ pub fn maybe_blocks(maybe: &[MaybeTask]) -> Vec<Value> {
 
 /// 쓰기 하나의 결과.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wrote {
+enum Wrote {
     /// 썼다.
     Done,
     /// 노션에 이미 있었다(표시를 찾음).
@@ -1525,62 +1557,79 @@ pub enum Wrote {
     Gone,
 }
 
-/// 없어진 페이지(404)면 [`Wrote::Gone`].
-fn gone_or(error: NotionError) -> Result<Wrote, NotionError> {
-    match error.kind {
+/// 없어진 페이지(404)면 [`Wrote::Gone`], 아니면 `doing` 을 하다 난 실패.
+fn gone_or(doing: &'static str) -> impl FnOnce(NotionError) -> Result<Wrote, TaskDbError> {
+    move |error| match error.kind {
         NotionErrorKind::NotFound => Ok(Wrote::Gone),
-        _ => Err(error),
+        _ => Err(TaskDbError { error, doing }),
     }
 }
 
-/// 쓰기 하나를 한다. 덧붙이기·만들기·회의록 절은 쓰기 전에 노션에 이미 있는지 늘 찾아본다
-/// (장부에 못 남기고 죽었어도 두 번 쓰지 않게). 칸 바꾸기는 같은 값을 다시 넣어도 같다.
-/// `link_template` 은 근거 시각의 재생 링크 모양.
+/// 쓰기 하나를 하고 보고에 센다. 덧붙이기·만들기·회의록 절은 쓰기 전에 노션에 이미 있는지 늘
+/// 찾아본다(장부에 못 남기고 죽었어도 두 번 쓰지 않게). 칸 바꾸기는 같은 값을 다시 넣어도
+/// 같다. `link_template` 은 근거 시각의 재생 링크 모양.
 pub async fn apply(
     client: &mut NotionClient<'_>,
     ledger: &mut TasksLedger,
     write: Write,
     link_template: &str,
-) -> Result<Wrote, NotionError> {
+    report: &mut TasksReport,
+) -> Result<(), TaskDbError> {
+    let wrote = write_one(client, ledger, write, link_template, report).await?;
+    match (wrote, write) {
+        (Wrote::AlreadyThere, _) => report.already_there += 1,
+        (Wrote::Gone, _) => report.gone += 1,
+        (Wrote::Done, Write::Due(_)) => report.due_changed += 1,
+        (Wrote::Done, Write::Status(_)) => report.status_changed += 1,
+        (Wrote::Done, Write::Append(_)) => report.appended += 1,
+        (Wrote::Done, Write::Create(_)) => report.created += 1,
+        (Wrote::Done, Write::Maybe) => {}
+    }
+    Ok(())
+}
+
+async fn write_one(
+    client: &mut NotionClient<'_>,
+    ledger: &mut TasksLedger,
+    write: Write,
+    link_template: &str,
+    report: &mut TasksReport,
+) -> Result<Wrote, TaskDbError> {
     use task_property as p;
     match write {
         Write::Due(i) | Write::Status(i) => {
             let task = &ledger.plan.tasks[i];
-            let (name, value) = match write {
+            let (name, value, doing) = match write {
                 Write::Due(_) => {
                     let Some(change) = &task.due else {
                         return Ok(Wrote::Done);
                     };
-                    (p::DUE, json!({ "date": { "start": change.to } }))
+                    let value = json!({ "date": { "start": change.to } });
+                    (p::DUE, value, "changing a task's due date")
                 }
                 _ => {
                     let Some(change) = &task.status else {
                         return Ok(Wrote::Done);
                     };
                     let kind = ledger.schema.status_kind.as_str();
-                    (p::STATUS, json!({ kind: { "name": change.to } }))
+                    let value = json!({ kind: { "name": change.to } });
+                    (p::STATUS, value, "changing a task's status")
                 }
             };
             debug_assert!(CHANGEABLE.contains(&name));
             let mut properties = Map::new();
             properties.insert(name.to_string(), value);
-            match client
-                .update_page(
-                    &task.id,
-                    json!({ "properties": properties }),
-                    Notify::Silent,
-                )
-                .await
-            {
+            let body = json!({ "properties": properties });
+            match client.update_page(&task.id, body, Notify::Silent).await {
                 Ok(()) => Ok(Wrote::Done),
-                Err(error) => gone_or(error),
+                Err(error) => gone_or(doing)(error),
             }
         }
         Write::Append(i) => {
             let task = &ledger.plan.tasks[i];
             let old = match client.list_children(&task.id).await {
                 Ok(old) => old,
-                Err(error) => return gone_or(error),
+                Err(error) => return gone_or("reading a task page")(error),
             };
             if old
                 .iter()
@@ -1600,13 +1649,12 @@ pub async fn apply(
             let blocks = record_blocks(&Record {
                 meeting: &ledger.meeting,
                 minutes_page_id: &ledger.minutes_page_id,
-                said: &task.said,
-                todos: &task.todos,
+                summary: &task.summary,
                 times: time_runs(&task.evidence_ms, link_template, ledger.channel_id),
                 changes: &changes,
                 mention: &task.assignee_ids,
             });
-            notion::validate_blocks(&blocks)?;
+            notion::validate_blocks(&blocks).map_err(at("building a record"))?;
             // 바꿈이 있으면 기본 알림(담당자 멘션이 알림이 된다), 없으면 조용히.
             let notify = if changes.is_empty() {
                 Notify::Silent
@@ -1615,7 +1663,7 @@ pub async fn apply(
             };
             match client.append_children(&task.id, &blocks, notify).await {
                 Ok(()) => Ok(Wrote::Done),
-                Err(error) => gone_or(error),
+                Err(error) => gone_or("appending a record to a task")(error),
             }
         }
         Write::Create(i) => {
@@ -1629,11 +1677,14 @@ pub async fn apply(
                   "rich_text": { "contains": compact(&ledger.minutes_page_id) } }
             ] });
             let data_source = ledger.schema.data_source_id.clone();
+            let looking = "looking for a task this meeting made";
             let found = client
                 .query(&data_source, json!({ "filter": filter, "page_size": 10 }))
-                .await?;
-            if let Some(page) = notion::live_results(&found)?.first() {
-                ledger.created.insert(key, notion::page_id(page)?);
+                .await
+                .map_err(at(looking))?;
+            if let Some(page) = notion::live_results(&found).map_err(at(looking))?.first() {
+                let id = notion::page_id(page).map_err(at(looking))?;
+                ledger.created.insert(key, id);
                 return Ok(Wrote::AlreadyThere);
             }
             let mut properties = Map::new();
@@ -1661,28 +1712,33 @@ pub async fn apply(
                 properties.insert(p::DUE.into(), json!({ "date": { "start": create.due } }));
             }
             if let (true, Some(pubkey)) = (ledger.schema.assignees, &create.assignee) {
-                // 담당자 연결 DB 를 못 읽으면 담당자 칸만 비운다(할 일 줄에 이름이 있다).
-                if let Ok(Some(user)) = notion::confirmed_user_of(client, pubkey).await {
-                    properties.insert(
-                        p::ASSIGNEES.into(),
-                        json!({ "people": [{ "object": "user", "id": user }] }),
-                    );
+                // 담당자 연결 DB 를 못 읽으면 담당자 칸만 비우고 센다(할 일 줄에 이름이 있다).
+                match notion::confirmed_user_of(client, pubkey).await {
+                    Ok(Some(user)) => {
+                        properties.insert(
+                            p::ASSIGNEES.into(),
+                            json!({ "people": [{ "object": "user", "id": user }] }),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(_) => report.assignee_lookup_failed += 1,
                 }
             }
             let times: Vec<u64> = create.evidence_ms.into_iter().collect();
+            let line = format!("할 일: {}", create.todo);
             let blocks = record_blocks(&Record {
                 meeting: &ledger.meeting,
                 minutes_page_id: &ledger.minutes_page_id,
-                said: &[],
-                todos: std::slice::from_ref(&create.todo),
+                summary: std::slice::from_ref(&line),
                 times: time_runs(&times, link_template, ledger.channel_id),
                 changes: &[],
                 mention: &[],
             });
-            notion::validate_blocks(&blocks)?;
+            notion::validate_blocks(&blocks).map_err(at("building a new task"))?;
             let id = client
                 .create_page_with_children(&data_source, &properties, &blocks)
-                .await?;
+                .await
+                .map_err(at("creating a task"))?;
             ledger.created.insert(key, id);
             Ok(Wrote::Done)
         }
@@ -1690,7 +1746,7 @@ pub async fn apply(
             let page = ledger.minutes_page_id.clone();
             let old = match client.list_children(&page).await {
                 Ok(old) => old,
-                Err(error) => return gone_or(error),
+                Err(error) => return gone_or("reading the minutes page")(error),
             };
             let there = old
                 .iter()
@@ -1699,25 +1755,12 @@ pub async fn apply(
                 return Ok(Wrote::AlreadyThere);
             }
             let blocks = maybe_blocks(&ledger.plan.maybe);
-            notion::validate_blocks(&blocks)?;
+            notion::validate_blocks(&blocks).map_err(at("building the maybe links"))?;
             match client.append_children(&page, &blocks, Notify::Silent).await {
                 Ok(()) => Ok(Wrote::Done),
-                Err(error) => gone_or(error),
+                Err(error) => gone_or("adding the maybe links to the minutes page")(error),
             }
         }
-    }
-}
-
-/// 이번 쓰기 결과를 보고에 센다.
-pub fn count(report: &mut TasksReport, write: Write, wrote: Wrote) {
-    match (wrote, write) {
-        (Wrote::AlreadyThere, _) => report.already_there += 1,
-        (Wrote::Gone, _) => report.gone += 1,
-        (Wrote::Done, Write::Due(_)) => report.due_changed += 1,
-        (Wrote::Done, Write::Status(_)) => report.status_changed += 1,
-        (Wrote::Done, Write::Append(_)) => report.appended += 1,
-        (Wrote::Done, Write::Create(_)) => report.created += 1,
-        (Wrote::Done, Write::Maybe) => {}
     }
 }
 
@@ -2006,9 +2049,11 @@ pub(crate) mod tests {
         assert_eq!(k1.said, ["금요일까지 끝내기로 했다."]);
         assert_eq!(k1.evidence_ms, [5_000]);
         assert_eq!(k1.assignee_ids, ["user-9"]);
-        assert_eq!(k1.todos.len(), 1);
-        assert!(k1.todos[0]
-            .starts_with("견적서 자동화 마무리 · 담당: bbbbbbbb · 기한: 2026-10-16 · 확정"));
+        // 기록에 갈 요약은 회의 요약 글뿐이다(모델의 said 는 장부에만).
+        assert_eq!(
+            k1.summary,
+            ["할 일: 견적서 자동화 마무리 · 담당: bbbbbbbb · 기한: 2026-10-16 · 확정"]
+        );
         let k2 = &plan.tasks[1];
         assert_eq!(
             k2.status,
@@ -2351,10 +2396,9 @@ pub(crate) mod tests {
         );
         let changes = vec![change_line(Write::Due(0), &due)];
         let blocks = record_blocks(&Record {
-            meeting: "2026-10-12 (월) 14:00",
+            meeting: "2026-10-12",
             minutes_page_id: "minutes-1",
-            said: &["금요일까지 끝내기로 했다.".to_string()],
-            todos: &[],
+            summary: &["결정: 견적서 자동화는 금요일까지".to_string()],
             times: time_runs(
                 &[5_000],
                 "buzz://huddle/{channel_id}?t={start_ms}",
@@ -2363,28 +2407,35 @@ pub(crate) mod tests {
             changes: &changes,
             mention: &["user-9".to_string()],
         });
-        let text = serde_json::to_string(&blocks).unwrap();
-        assert!(
-            text.contains("허들 회의 기록 · 2026-10-12 (월) 14:00"),
-            "{text}"
+        let texts: Vec<String> = blocks.iter().map(block_text).collect();
+        // 머리: 작업기가 자동으로 붙였다는 것과 회의 날. 바로 아래에 바꾼 값, 그다음 담당자 멘션.
+        assert_eq!(
+            texts[0],
+            "허들 회의 기록 · 회의록 작업기가 자동으로 붙임 · 2026-10-12"
         );
-        assert!(
-            text.contains("기한: 10/20 → 10/24 (근거 [12:34])"),
-            "{text}"
+        assert_eq!(texts[1], "기한: 10/20 → 10/24 (근거 [12:34])");
+        assert_eq!(texts[2], "담당자: ");
+        assert_eq!(
+            blocks[2]["paragraph"]["rich_text"][1]["mention"]["user"]["id"],
+            "user-9"
         );
-        assert!(text.contains(r#""user":{"id":"user-9"}"#), "{text}");
-        assert!(blocks.iter().any(|block| mentions_page(block, "minutes-1")));
+        assert_eq!(texts[3], "회의록: ");
+        assert!(mentions_page(&blocks[3], "minutes-1"));
+        assert_eq!(
+            texts[4..],
+            ["결정: 견적서 자동화는 금요일까지", "근거: [00:05]"]
+        );
         assert!(notion::validate_blocks(&blocks).is_ok());
-        // 바꿈이 없으면 멘션도 없다.
+        // 바꿈이 없으면 바꾼 값도 멘션도 없다.
         let quiet = record_blocks(&Record {
-            meeting: "m",
+            meeting: "2026-10-12",
             minutes_page_id: "minutes-1",
-            said: &[],
-            todos: &[],
+            summary: &[],
             times: Vec::new(),
             changes: &[],
             mention: &["user-9".to_string()],
         });
+        assert_eq!(quiet.len(), 2);
         assert!(!serde_json::to_string(&quiet).unwrap().contains("user-9"));
     }
 }

@@ -227,10 +227,21 @@ rm {out}/{첫 세션 id}.summary-failed.json
   | 값 | 하는 일 |
   |---|---|
   | `off` | 안 한다(task DB 를 읽지도 않고 Gemini 도 안 부른다) |
-  | `append` ① | 확실한 짝 task 페이지에 「허들 회의 기록」 한 덩어리를 덧붙인다: 날짜, 회의록 페이지 링크, 그 task 에 대해 나온 말 요약, 관련 할 일, 근거 시각. 원본 스크립트는 안 붙인다. 애매한 짝은 task 에 안 쓰고 회의록 페이지 끝 「관련 있을 수 있는 task」 링크로만 보인다 |
+  | `append` ① | 확실한 짝 task 페이지에 「허들 회의 기록」 한 덩어리를 덧붙인다(아래 "기록 모양"). 애매한 짝은 task 에 안 쓰고 회의록 페이지 끝 「관련 있을 수 있는 task」 링크로만 보인다 |
   | `create` ② | ① + 어느 task 와도 짝이 없는 '확정' 할 일을 새 task 로 만든다: `기능` = 할 일, `작업상태` = 시작 전, `관련 노션 페이지` = 회의록 주소, `담당자` = 담당자 연결 DB 가 "확인됨"인 노션 사용자일 때만, `종료일` = 요약이 근거 말로 확인한 기한일 때만. 본문은 회의록 링크·근거 시각·할 일 줄 |
   | `update` ③ | ② + 확실한 짝 task 의 `종료일`·`작업상태`를 바꾼다. 바꾸면 기록에 `기한: 10/20 → 10/24 (근거 [12:34])` 처럼 예전 값과 새 값을 남기고(사람이 되돌릴 수 있게), 그 task 의 `담당자`를 멘션한다(알림) |
 
+- **기록 모양**(task 페이지에 덧붙이는 한 덩어리, 차례대로). **원문이 아닌 요약만** 쓴다: 스크립트 줄도, 담당자·기한
+  근거 인용도, 모델이 낸 `said`(그 task 에 대해 나온 말)도 노션에 안 쓴다. 전문은 회의록 페이지에 있으니 거기로 가는
+  멘션만 준다. `said` 는 장부에만 남아 사람이 짝을 살펴볼 때 쓴다.
+  1. 제목 `허들 회의 기록 · 회의록 작업기가 자동으로 붙임 · 2026-10-12`(사람 손이 아님을 보이고, 날짜는 회의 날 KST).
+  2. 바꾼 칸이 있으면 바로 그 아래 `기한: 10/20 → 10/24 (근거 [12:34])`, `상태: 개발 → 완료 (근거 [00:09])`(예전 값이
+     있어 사람이 보고 되돌린다), 그리고 `담당자: @그 task 담당자` 멘션(알림).
+  3. `회의록: @회의록 페이지`. 이 멘션이 "이 회의가 이미 쓴 기록" 표시도 된다.
+  4. 짧은 요약: 짝 지은 회의 항목의 요약 글(`결정: …`, `할 일: … · 담당: … · 기한: … · 확정`, `주제: …`). 요약 단계가
+     검사해서 회의록 페이지에도 쓴 글이다.
+  5. `근거: [00:05], [00:09]`(재생 링크를 걸 수 있으면 건다).
+  새 task 의 본문도 같은 모양이다(바꾼 칸 없이, 요약은 그 할 일 줄).
 - **단계**: 후보정 → 요약 → 노션 페이지 → tasks. 이 글의 요약과 끝난 회의록 페이지가 있는 회의에만 돈다(요약을
   포기했으면 건너뛴다). 차례:
   1. task DB 칸을 읽는다(`GET /v1/databases/{id}` 로 data source 를 찾고 `GET /v1/data_sources/{id}`, 실행마다 한 번).
@@ -279,14 +290,22 @@ rm {out}/{첫 세션 id}.summary-failed.json
   두 배씩 6시간까지 물러서기, 400·404 따로 세기, 인증·권한·429 는 그 실행 동안 끔). 다른 점: **task 연결의 실패는 회의의
   실패가 아니다.** 종료 코드에 안 들어가고 `warning: N meeting(s) with task linking failed …` 로만 남는다(예: 통합이 task DB
   에 연결 안 돼 403). 작업기 저장소(장부 읽기·쓰기, 잠금 잃음)만 회의를 실패로 센다. 장부를 못 읽으면 Gemini 를 다시
-  부르지 않고 실패로 둔다. 로그에는 종류·HTTP 상태·노션 오류 코드만 남는다.
+  부르지 않고 실패로 둔다. 로그에는 종류·HTTP 상태·노션 오류 코드와 **그때 하던 일**만 남는다(노션 메시지는 안
+  찍는다). 그래서 같은 403 이라도 어느 요청이 막혔는지 갈라 본다:
+  `permission HTTP 403 restricted_resource while reading the task database`. 하던 일은 `reading the task database`·
+  `reading the task data source`·`checking the task db columns`·`reading open tasks`·`changing a task's due date`·
+  `changing a task's status`·`reading a task page`·`appending a record to a task`·`looking for a task this meeting made`·
+  `creating a task`·`reading the minutes page`·`adding the maybe links to the minutes page` 중 하나다. 통합에 task DB 를
+  연결해 둔 뒤에도 403 이 나면 권한이 아니라 그 요청 쪽 까닭(그 페이지만의 제한 등)으로 본다. 노션은 연결 안 된 것을
+  대개 404 `object_not_found` 로 답한다. task 페이지 쓰기의 404 는 task 가 지워진 것으로 보고 건너뛴다(`task gone`).
 - **오래된 회의**: 회의가 끝난 지 24시간 넘었으면 task 연결을 안 한다(읽지도 보내지도 않고 남은 일로도 안 친다).
   스위치를 처음 켰을 때 녹음이 남은 지난 14일 회의들이 지금 task 의 기한·상태를 덮어쓰지 않게 하려는 것이다. 그래서
   켜기 전 회의는 연결되지 않는다.
 - **로그**(수만: task 제목·사람 이름·pubkey·노션 id 없음):
   `tasks: matched 3 (sure 2, maybe 1), appended 2, created 1, due changed 1, status changed 0, skipped 1`.
   버린 것이 있으면 `tasks checks dropped: negation 1, …`, Gemini 를 불렀으면 `tasks usage: input … tokens …, … s | cost $…`.
-  장부에 못 남긴 쓰기를 표시로 찾으면 `| already there N`, task 가 지워져 못 쓰면 `| task gone N`.
+  장부에 못 남긴 쓰기를 표시로 찾으면 `| already there N`, task 가 지워져 못 쓰면 `| task gone N`, 새 task 담당자를
+  담당자 연결 DB 에서 못 찾아봤으면(담당자 칸만 비움) `| assignee lookup failed N`.
 - **비용**: 회의마다 Gemini 한 번 더(요약과 같은 `gemini-3.8-flash`). 입력이 요약과 task 목록이라 요약 요청보다 작다.
   아직 실제 회의로 재지 않았다(`tasks usage` 줄로 잰다).
 - **되살리기**: `{첫 세션 id}.tasks-failed.json` 을 지우면 실패 수를 0부터 센다. 장부 `{첫 세션 id}.tasks.json` 을 지우면

@@ -73,8 +73,8 @@ use crate::collect::MeetingPlan;
 use crate::correct::{self, Corrected, Glossary};
 use crate::models::sha256_hex;
 use crate::notion::{
-    self, MeetingKind, MeetingPage, NotionClient, NotionError, NotionErrorKind, NotionRecord,
-    ProcessingStatus, PublishMeetingError, PublishReport, RecordStamp,
+    self, MeetingKind, MeetingPage, NotionClient, NotionErrorKind, NotionRecord, ProcessingStatus,
+    PublishMeetingError, PublishReport, RecordStamp,
 };
 use crate::profiles::{NamesReport, ProfileNames, ProfileSource};
 use crate::runner::{Beside, MeetingError, MinutesHome};
@@ -82,8 +82,8 @@ use crate::summary::{
     self, DisplayNames, GeminiSettings, Summary, SummaryError, SummaryErrorKind, Usage,
 };
 use crate::tasks::{
-    self, CheckInput, Plan, TaskSchema, TasksLedger, TasksMode, TasksReport, TASKS_FORMAT,
-    TASKS_MAX_AGE_MS,
+    self, CheckInput, Plan, TaskDbError, TaskSchema, TasksLedger, TasksMode, TasksReport,
+    TASKS_FORMAT, TASKS_MAX_AGE_MS,
 };
 use crate::transcript::Transcript;
 
@@ -1339,8 +1339,8 @@ async fn maybe_tail<H: MinutesHome>(held: &Held<'_, H>) -> Result<Vec<Value>, Me
 enum TasksError {
     /// Gemini(요약과 같은 규칙으로 센다).
     Gemini(SummaryError),
-    /// 노션 task DB·회의록 페이지.
-    Notion(NotionError),
+    /// 노션 task DB·회의록 페이지, 하던 일과 함께.
+    Notion(TaskDbError),
 }
 
 /// task 연결의 실패를 그 회의 몫으로 세고 기록을 쓴다. 로그 글에는 종류와 코드만 넣는다(노션
@@ -1361,13 +1361,14 @@ async fn tasks_failure<H: MinutesHome>(
             let (cost, signal) = summary_class(error);
             (cost, signal, error.kind.as_str(), error.code.clone())
         }
-        TasksError::Notion(error) => {
+        // 같은 403 이라도 어느 요청이 막혔는지 보이게 하던 일을 붙인다.
+        TasksError::Notion(TaskDbError { error, doing }) => {
             let (cost, signal) = notion_class(error.kind);
             (
                 cost,
                 signal,
                 error.kind.as_str(),
-                error.short_code().to_string(),
+                format!("{} while {doing}", error.short_code()),
             )
         }
     };
@@ -1490,9 +1491,8 @@ async fn tasks_step<H: MinutesHome>(
         if ledger.done.contains(&key) {
             continue;
         }
-        match tasks::apply(&mut step.client, &mut ledger, write, &link).await {
-            Ok(wrote) => {
-                tasks::count(report, write, wrote);
+        match tasks::apply(&mut step.client, &mut ledger, write, &link, report).await {
+            Ok(()) => {
                 ledger.done.push(key);
                 held.write(Beside::Tasks, ledger_json(&ledger)?).await?;
             }
@@ -4584,7 +4584,7 @@ mod tests {
         assert!(
             failed_with(
                 &first.tasks,
-                "transient HTTP 503 service_unavailable (free failure 1, next try in 10 min)"
+                "transient HTTP 503 service_unavailable while changing a task's status (free failure 1, next try in 10 min)"
             ),
             "{first:?}"
         );
@@ -4648,7 +4648,11 @@ mod tests {
         let Step::Failed(text) = &first.tasks else {
             panic!("{first:?}")
         };
-        assert_eq!(text, "permission HTTP 403 restricted_resource");
+        // 어느 요청이 막혔는지 보인다(통합 권한이면 task DB 읽기부터 막힌다).
+        assert_eq!(
+            text,
+            "permission HTTP 403 restricted_resource while reading the task database"
+        );
         assert!(!first.has_failure() && first.home_error.is_none());
         assert!(first.tasks_failed() && first.left_for_next_run());
         assert_eq!(link.tasks_asked(), 0, "nothing paid");
@@ -4720,8 +4724,16 @@ mod tests {
     /// 지금 task 를 덮어쓰지 않게). 남은 일로도 치지 않는다.
     #[tokio::test]
     async fn an_old_meeting_leaves_the_tasks_alone() {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        // 시계를 회의가 끝난 때(녹음 세션 끝)부터 잰다.
+        let since_end = |link: &Linking, hours: u64| {
+            let ended = link.world.meeting.ended_at_unix_ms();
+            link.world
+                .clock
+                .store(ended + hours * HOUR_MS, Ordering::SeqCst);
+        };
         let link = linking().await;
-        link.world.advance(Duration::from_secs(25 * 60 * 60));
+        since_end(&link, 25);
         let followed = link.follow(TasksMode::Update).await;
         assert_eq!(pair(&followed), (Step::Done, Step::Done));
         assert_eq!(
@@ -4731,6 +4743,61 @@ mod tests {
         assert_eq!(link.tasks_asked(), 0);
         assert!(link.task_requests().is_empty());
         assert!(link.follow(TasksMode::Update).await.nothing_left());
+
+        // 경계: 끝난 지 23시간이면 아직 잇는다.
+        let fresh = linking().await;
+        since_end(&fresh, 23);
+        assert_eq!(fresh.follow(TasksMode::Update).await.tasks, Step::Done);
+        assert_eq!(fresh.records("task-1"), 1);
+    }
+
+    /// task 에 붙는 기록은 짧은 요약 + 근거 시각 + 회의록 멘션뿐이다: 스크립트 원문 줄도, 모델의
+    /// `said` 도 안 들어간다(원문이 아닌 요약만 task 에). 머리는 작업기가 자동으로 붙였다고
+    /// 보이고, 바꾼 값은 바로 그 아래에 있다.
+    #[tokio::test]
+    async fn records_carry_no_script_words_and_say_they_are_automatic() {
+        let link = linking().await;
+        let followed = link.follow(TasksMode::Update).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        let mut written: Vec<(String, Vec<Value>)> = ["task-1", "task-2"]
+            .iter()
+            .map(|id| (id.to_string(), link.page(id).1))
+            .collect();
+        written.extend(link.created().into_iter().map(|id| {
+            let body = link.page(&id).1;
+            (id, body)
+        }));
+        let said = [
+            "금요일까지 끝내기로 했다.",
+            "어제 배포를 마쳤다.",
+            "목요일까지 만든다.",
+        ];
+        for (id, blocks) in &written {
+            let text: String = blocks.iter().map(block_text).collect::<Vec<_>>().join("\n");
+            for segment in &task_meeting().segments {
+                assert!(!text.contains(&segment.text), "{id}: script line in {text}");
+            }
+            for said in said {
+                assert!(!text.contains(said), "{id}: model said in {text}");
+            }
+            assert!(
+                block_text(&blocks[0])
+                    .starts_with("허들 회의 기록 · 회의록 작업기가 자동으로 붙임 · 2026-10-12"),
+                "{id}: {text}"
+            );
+            assert!(text.contains("근거: [00:"), "{id}: {text}");
+        }
+        // 바꾼 값은 머리 바로 아래.
+        let (_, task_1) = link.page("task-1");
+        assert_eq!(block_text(&task_1[1]), "기한: 10/20 → 10/16 (근거 [00:05])");
+        let (_, task_2) = link.page("task-2");
+        assert_eq!(block_text(&task_2[1]), "상태: Dev QA → 완료 (근거 [00:09])");
+        // 요약은 회의 요약 글이다.
+        let task_2_text: Vec<String> = task_2.iter().map(block_text).collect();
+        assert!(
+            task_2_text.contains(&"결정: 로그인 오류 수정 배포 완료".to_string()),
+            "{task_2_text:?}"
+        );
     }
 
     /// 애매한 짝만 있으면 task 에는 아무것도 안 쓰고 회의록 페이지에 링크만 남긴다.
