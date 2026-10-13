@@ -69,7 +69,7 @@ use crate::notion::{
     self, MeetingKind, MeetingPage, NotionClient, NotionErrorKind, NotionRecord, ProcessingStatus,
     PublishMeetingError, PublishReport, RecordStamp,
 };
-use crate::profiles::{NamesReport, ProfileNames, ProfileSource};
+use crate::profiles::{MeetingPlace, NamesReport, ProfileNames, ProfileSource};
 use crate::runner::{Beside, MeetingError, MinutesHome};
 use crate::summary::{
     self, DisplayNames, GeminiSettings, Summary, SummaryError, SummaryErrorKind, Usage,
@@ -706,15 +706,23 @@ impl<'a> MeetingNames<'a> {
 
     /// `transcript`(이 회의 스크립트)에 쓸 이름표.
     async fn get(&mut self, transcript: &Transcript) -> &dyn DisplayNames {
+        self.get_with_place(transcript).await.0
+    }
+
+    /// 이름표와, 같은 요청으로 알아낸 회의 자리(모르면 `None`).
+    async fn get_with_place(
+        &mut self,
+        transcript: &Transcript,
+    ) -> (&dyn DisplayNames, Option<&MeetingPlace>) {
         let Some(source) = self.source else {
-            return self.run;
+            return (self.run, None);
         };
         if self.asked.is_none() {
             self.asked = Some(source.names_for(transcript).await);
         }
         match &self.asked {
-            Some(names) => names,
-            None => self.run,
+            Some(names) => (names, names.place()),
+            None => (self.run, None),
         }
     }
 
@@ -1162,7 +1170,12 @@ async fn notion_step<H: MinutesHome>(
     };
     let (home, hold, meeting) = (held.home, held.hold, held.meeting);
     let transcript = held.script().await?;
-    let shown = names.get(transcript).await;
+    let (shown, place) = names.get_with_place(transcript).await;
+    // 「채널」·「종류」: 정해 둔 값이 없으면 릴레이에서 알아낸 회의 자리로 채운다. 못 알아냈으면
+    // 지금처럼 「채널」은 channel id, 「종류」는 비운다.
+    let place_label = place
+        .map(|place| place.label(shown))
+        .filter(|label| !label.is_empty());
     let page = MeetingPage {
         transcript,
         corrected: for_text.corrected(),
@@ -1170,8 +1183,8 @@ async fn notion_step<H: MinutesHome>(
         summary_note: given_up.then_some(SUMMARY_GIVEN_UP),
         names: shown,
         title_prefix: &step.title_prefix,
-        channel_label: step.channel_label.as_deref(),
-        kind: step.kind,
+        channel_label: step.channel_label.as_deref().or(place_label.as_deref()),
+        kind: step.kind.or(place.map(MeetingPlace::kind)),
         status: ProcessingStatus::Done,
     };
     let report = published.insert(PublishReport::default());
@@ -1220,8 +1233,10 @@ mod tests {
     };
     use crate::notion::{minutes_property, people_property, NotionSettings};
     use crate::pipeline::{MinutesSettings, SttPolicy};
-    use crate::profiles::tests::{profile_event, source_for as profile_source};
-    use crate::profiles::NamesTrouble;
+    use crate::profiles::tests::{
+        channel_event, is_query, nip11, profile_event, source_for as profile_source,
+    };
+    use crate::profiles::{NamesTrouble, PlaceFound};
     use crate::runner::{run_meeting, run_meeting_with, Done, LocalMinutes, RunOptions};
     use crate::store::LocalStore;
     use crate::stt::{SpeechToText, SttError, SttOutput, SttRequest};
@@ -3574,6 +3589,15 @@ mod tests {
         ])
     }
 
+    /// 가짜 릴레이가 받은 `/query` 수(NIP-11 읽기는 빼고).
+    fn queries(relay: &FakeServer) -> usize {
+        relay
+            .requests()
+            .iter()
+            .filter(|request| is_query(request))
+            .count()
+    }
+
     /// generateContent 요청의 프롬프트 글.
     fn prompt_of(request: &crate::test_http::Recorded) -> String {
         request.json()["contents"][0]["parts"][0]["text"]
@@ -3589,7 +3613,15 @@ mod tests {
         let person = nostr::Keys::generate();
         let pubkey = person.public_key().to_hex();
         let event = profile_event(&person, &json!({ "display_name": "김지영" }), 10);
-        let relay = FakeServer::start(move |_| Reply::json(200, &json!([event]))).await;
+        let info = nip11(&nostr::Keys::generate());
+        let relay = FakeServer::start(move |request| {
+            if is_query(request) {
+                Reply::json(200, &json!([event]))
+            } else {
+                info.clone()
+            }
+        })
+        .await;
         let source = profile_source(&relay.base, &nostr::Keys::generate());
         let fixture = correcting().await;
         let script = named_script(&pubkey);
@@ -3614,14 +3646,16 @@ mod tests {
             ),
             (Step::Done, Step::Done, Step::Done)
         );
-        assert_eq!(relay.requests().len(), 1, "one ask for the meeting");
+        assert_eq!(queries(&relay), 1, "one ask for the meeting");
         assert_eq!(
             followed.names,
             Some(NamesReport {
                 asked: 1,
                 found: 1,
                 clashed: 0,
-                trouble: None
+                trouble: None,
+                // 가짜 릴레이가 채널 메타데이터를 안 준다(봇이 못 읽는 채널과 같다).
+                place: Some(PlaceFound::NotReadable)
             })
         );
         // 담당자 연결 DB 에 한 일이 로그로 갈 보고에 실린다.
@@ -3668,7 +3702,84 @@ mod tests {
         assert!(again.nothing_left(), "{again:?}");
         assert_eq!(again.names, None);
         assert_eq!(again.notion_report, None);
-        assert_eq!(relay.requests().len(), 1);
+        assert_eq!(queries(&relay), 1);
+    }
+
+    /// 노션 「채널」·「종류」: 릴레이가 부모 채널 메타데이터를 주면 그 이름과 "채널"(DM 이면 그
+    /// 사람들의 프로필 이름과 "DM"), 봇이 못 읽는 채널이면 지금처럼 channel id·종류 비움.
+    /// 어느 쪽이든 회의는 된다.
+    #[tokio::test]
+    async fn channel_and_kind_come_from_the_parent_channel_when_readable() {
+        let parent = Uuid::from_u128(77);
+        let relay_keys = nostr::Keys::generate();
+        let (a, b) = (nostr::Keys::generate(), nostr::Keys::generate());
+        let (a_hex, b_hex) = (a.public_key().to_hex(), b.public_key().to_hex());
+        let profiles = vec![
+            profile_event(&a, &json!({ "display_name": "김지영" }), 10),
+            profile_event(&b, &json!({ "display_name": "민수" }), 10),
+        ];
+        let id = parent.to_string();
+        let stream = channel_event(
+            &relay_keys,
+            &[&["d", &id], &["name", "개발팀"], &["t", "stream"]],
+            10,
+        );
+        let dm = channel_event(
+            &relay_keys,
+            &[
+                &["d", &id],
+                &["name", "dm"],
+                &["hidden"],
+                &["p", &a_hex],
+                &["p", &b_hex],
+                &["t", "dm"],
+            ],
+            10,
+        );
+        let cases = [
+            (Some(stream), Some("개발팀"), Some("채널")),
+            (Some(dm), Some("김지영, 민수"), Some("DM")),
+            // 비공개 채널·DM: 봇에게는 답에 없다.
+            (None, None, None),
+        ];
+        for (channel, label, kind) in cases {
+            let world = world().await;
+            let mut answer = profiles.clone();
+            answer.extend(channel);
+            let info = nip11(&relay_keys);
+            let relay = FakeServer::start(move |request| {
+                if is_query(request) {
+                    Reply::json(200, &json!(answer))
+                } else {
+                    info.clone()
+                }
+            })
+            .await;
+            let source = profile_source(&relay.base, &nostr::Keys::generate());
+            let mut script = transcript_with(&[
+                (1_000, a_hex.as_str(), "견적서 얘기해요."),
+                (5_000, b_hex.as_str(), "금요일까지 보낼게요."),
+            ]);
+            script.parent_channel_id = Some(parent);
+            let followed = world
+                .follow_with(&script, &mut world.steps().with_profiles(&source))
+                .await;
+            assert_eq!(pair(&followed), (Step::Done, Step::Done));
+            assert_eq!(queries(&relay), 1, "names and place in one ask");
+            let state = world.state.lock().unwrap();
+            let props = &minutes_pages(&state)[0].properties;
+            let want = label.map_or_else(|| script.channel_id.to_string(), str::to_string);
+            assert_eq!(
+                props[minutes_property::CHANNEL]["rich_text"][0]["plain_text"],
+                json!(want)
+            );
+            assert_eq!(
+                props
+                    .get(minutes_property::KIND)
+                    .and_then(|kind| kind["select"]["name"].as_str()),
+                kind
+            );
+        }
     }
 
     /// 이름은 도장(sha256)에 안 섞인다: 1회차에 릴레이가 이름을 안 줘서(401) 앞 8자로 요약·
@@ -3711,7 +3822,7 @@ mod tests {
             "no Gemini or Notion request for names"
         );
         assert_eq!(again.names, None);
-        assert_eq!(relay.requests().len(), 1);
+        assert_eq!(queries(&relay), 1);
     }
 
     /// 릴레이가 이름을 안 주면(401) 그 사람만 pubkey 앞 8자로 두고, 단계는 다 되며 실패로
@@ -3734,10 +3845,11 @@ mod tests {
                 asked: 1,
                 found: 0,
                 clashed: 0,
-                trouble: Some(NamesTrouble::Refused(401))
+                trouble: Some(NamesTrouble::Refused(401)),
+                place: None
             })
         );
-        assert_eq!(relay.requests().len(), 1);
+        assert_eq!(queries(&relay), 1);
         for beside in [
             Beside::CorrectFailed,
             Beside::SummaryFailed,
