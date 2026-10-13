@@ -8,8 +8,8 @@
 # 작업기는 `process` 하나만 인자로 받고 나머지는 BUZZ_MINUTES_* 환경 변수로 받는다
 # (docs/huddle-minutes-worker.md "실행 (Cloud Run 작업)"). 값은 common.sh 의
 # job_env. 노션 토큰은 Secret Manager 를 NOTION_TOKEN 으로 붙인다.
-# 스케줄러는 기본으로 멈춘 채 만든다(common.sh scheduler_state). 그동안은 손으로 한
-# 번씩 돌린다(--all 이라 끝난 회의를 모두 처리한다):
+# 스케줄러는 기본으로 켠 채 만든다(common.sh scheduler_state). SCHEDULER_STATE=paused 로
+# 멈춰 둔 동안은 손으로 한 번씩 돌린다(--all 이라 끝난 회의를 모두 처리한다):
 #   gcloud run jobs execute a2d2-huddle-minutes --project a2d2-lab --region asia-northeast3 --wait
 set -Eeuo pipefail
 export LC_ALL=C
@@ -106,7 +106,7 @@ run gcloud run jobs deploy "$job" --project "$project" --region "$region" \
 run gcloud run jobs add-iam-policy-binding "$job" --project "$project" --region "$region" \
   --member "serviceAccount:$invoker" --role roles/run.invoker
 
-# ─── 5. Cloud Scheduler (10분마다, UTC; 기본은 멈춘 채) ─────────────────────
+# ─── 5. Cloud Scheduler (10분마다, UTC; 기본은 켠 채) ───────────────────────
 uri="https://run.googleapis.com/v2/projects/$project/locations/$region/jobs/$job:run"
 verb=create
 if gcloud scheduler jobs describe "$scheduler" --project "$project" --location "$region" >/dev/null 2>&1; then

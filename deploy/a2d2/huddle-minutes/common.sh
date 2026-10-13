@@ -10,9 +10,10 @@ job=a2d2-huddle-minutes
 scheduler=a2d2-huddle-minutes-every-10m
 schedule='*/10 * * * *' # UTC 기준. 실행끼리 겹치는 것은 docs/huddle-minutes-worker.md "실행" 절
 schedule_time_zone=Etc/UTC
-# 스케줄러 상태. 기본은 paused: 화자 분리·후보정이 붙은 회의록을 실제 허들로 확인하고
-# 사용자가 켜기로 정할 때까지 멈춰 둔다. 켤 때만 SCHEDULER_STATE=enabled.
-scheduler_state=${SCHEDULER_STATE:-paused}
+# 스케줄러 상태. 기본은 enabled: 화자 분리·후보정이 붙은 회의록을 실제 허들로 확인한 뒤
+# 켜기로 정했다(2026-10-13). 멈출 때만 SCHEDULER_STATE=paused.
+# 기본값이 운영 상태와 다르면 다음 배포가 켜 둔 스케줄러를 말없이 멈춘다(5단계가 상태를 맞춘다).
+scheduler_state=${SCHEDULER_STATE:-enabled}
 
 # 작업기가 도는 계정, 스케줄러가 작업을 부를 때 쓰는 계정(작업 하나만 부를 수 있음)
 sa_name=a2d2-huddle-minutes
