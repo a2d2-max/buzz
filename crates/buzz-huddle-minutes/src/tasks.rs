@@ -303,6 +303,10 @@ pub struct OpenTask {
 
 fn open_task(page: &Value, schema: &TaskSchema) -> Option<OpenTask> {
     use task_property as p;
+    // 휴지통에 든 task 는 읽지 않는다.
+    if page["in_trash"] == true {
+        return None;
+    }
     let properties = &page["properties"];
     let title = one_line(&notion::property_text(&properties[p::TITLE]));
     let title = title.trim();
@@ -774,6 +778,9 @@ pub struct Dropped {
     /// 짝 시각이 그 회의 항목의 근거 시각이 아님.
     #[serde(default)]
     pub not_item_time: u64,
+    /// 확실한 짝인데 task 제목과 짝 항목 글이 낱말 하나 안 겹쳐 애매로 내림.
+    #[serde(default)]
+    pub made_maybe: u64,
     /// 근거 시각이 원본 스크립트 줄에 없음.
     pub no_line: u64,
     /// 짝의 level 이 확실·애매가 아님.
@@ -806,6 +813,7 @@ impl Dropped {
         self.unknown_task
             + self.unknown_item
             + self.not_item_time
+            + self.made_maybe
             + self.no_line
             + self.bad_level
             + self.no_sure_link
@@ -828,6 +836,7 @@ impl fmt::Display for Dropped {
             ("unknown task", self.unknown_task),
             ("unknown item", self.unknown_item),
             ("not the item's time", self.not_item_time),
+            ("sure made maybe (no shared words)", self.made_maybe),
             ("no script line", self.no_line),
             ("bad level", self.bad_level),
             ("no sure link", self.no_sure_link),
@@ -1110,7 +1119,7 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.unknown_task += 1;
             continue;
         };
-        let sure = match link.level.trim() {
+        let mut sure = match link.level.trim() {
             "확실" => true,
             "애매" => false,
             _ => {
@@ -1127,6 +1136,17 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.no_line += 1;
             continue;
         };
+        // 확실한 짝이라도 task 제목과 짝 항목 글이 낱말 하나 안 겹치면 애매로 내린다(엉뚱한 task 에
+        // 기록이 붙지 않게). 낱말은 앞 두 글자로 맞대서 끝말이 붙어도 겹친다.
+        if sure
+            && !summary::shares_words(
+                &summary::word_keys(&input.tasks[task].title),
+                item_text(summary, item),
+            )
+        {
+            sure = false;
+            dropped.made_maybe += 1;
+        }
         linked.insert(item);
         let at = match groups.iter().position(|group| group.task == task) {
             Some(at) => at,
@@ -1964,6 +1984,10 @@ async fn write_one(
                 Ok(page) => page,
                 Err(error) => return settle("reading a task before changing it")(error),
             };
+            // 휴지통에 든 task 는 지워진 것으로 본다(칸을 안 바꾼다).
+            if page["in_trash"] == true {
+                return Ok(Outcome::Gone);
+            }
             let (start, end, status) = current_fields(&page, schema);
             if is_due {
                 let start = start.unwrap_or_default();
@@ -2366,6 +2390,14 @@ pub(crate) mod tests {
         })
     }
 
+    /// 노션이 돌려주는 꼴의 task 페이지(제목 글 조각에 `plain_text` 가 있다. 요청 꼴이면 제목이 비어
+    /// [`open_task`] 가 늘 버린다).
+    fn task_page(task: &OpenTask) -> Value {
+        let mut properties = task_properties(task);
+        properties["기능"]["title"][0]["plain_text"] = json!(task.title);
+        json!({ "id": task.id, "properties": properties })
+    }
+
     /// 가짜 노션에 task DB 를 둔다: 스키마, 진행 중 task 셋([`open`], 최근 고친 순이 K1·K2·K3),
     /// 끝난 task 하나(가장 최근에 고쳤지만 읽지 않는다), 그리고 A 의 담당자 연결 줄(확인됨,
     /// user-1).
@@ -2723,7 +2755,7 @@ pub(crate) mod tests {
         let tasks: Vec<OpenTask> = (0..14)
             .map(|i| OpenTask {
                 id: format!("t{i}"),
-                title: format!("작업 {i}"),
+                title: format!("로그인 견적서 작업 {i}"),
                 status: "개발".into(),
                 ..OpenTask::default()
             })
@@ -3283,15 +3315,11 @@ pub(crate) mod tests {
         assert!(!moves_forward(&schema, "개발", "없는 상태"));
         assert!(!moves_forward(&schema, "", "Dev QA"));
 
-        // 완료 task 는 읽지 않는다(진행 중만): 다시 열 일이 없다.
-        let finished = OpenTask {
-            id: "task-done".into(),
-            title: "끝난 일".into(),
-            status: DONE_STATUS.into(),
-            ..OpenTask::default()
-        };
-        let page = json!({ "id": "task-done", "properties": task_properties(&finished) });
-        assert_eq!(open_task(&page, &schema), None);
+        // 완료 task 는 읽지 않는다(진행 중만): 다시 열 일이 없다. 같은 꼴의 진행 중 task 는 읽힌다.
+        let mut finished = open()[0].clone();
+        assert!(open_task(&task_page(&finished), &schema).is_some());
+        finished.status = DONE_STATUS.into();
+        assert_eq!(open_task(&task_page(&finished), &schema), None);
     }
 
     /// 완료는 끝냈다는 말만으로 바꾸고, 단계 말(개발·QA·스테이징·배포·PR·머지 …)이 섞이면 제안만:
@@ -3381,5 +3409,40 @@ pub(crate) mod tests {
         let planned = k2_status_answer("Staging 배포예정");
         let plan = check_meeting(&lines, decision, 1_000, &planned, &open());
         assert!(!plan.tasks[0].status.as_ref().unwrap().suggest);
+    }
+
+    /// 확실한 짝이라도 task 제목과 짝 항목 글이 낱말 하나 안 겹치면 애매로 내린다(엉뚱한 task 에 기록이
+    /// 붙지 않게). 끝말이 붙어도 앞이 같으면 겹친다: 「로그인 오류 수정」 ↔ 「로그인할 때 에러 고치기」.
+    #[test]
+    fn a_sure_link_without_shared_words_is_made_maybe() {
+        let answer = |task: &str| {
+            json!({
+                "links": [link_d1(task, 1_000)],
+                "due_changes": [], "status_changes": [], "new_tasks": []
+            })
+        };
+        let lines = [(1_000, A, "로그인할 때 에러 고치기로 했어요.")];
+        let item = "로그인할 때 에러 고치기";
+        // 맞는 짝: K2 로그인 오류 수정 → 확실로 남는다.
+        let plan = check_meeting(&lines, item, 1_000, &answer("K2"), &open());
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].id, "task-2");
+        assert_eq!(plan.dropped.made_maybe, 0);
+        // 엉뚱한 짝: K1 견적서 자동화 → 애매(task 쓰기 없이 회의록 페이지 링크로만).
+        let plan = check_meeting(&lines, item, 1_000, &answer("K1"), &open());
+        assert!(plan.tasks.is_empty());
+        let maybe: Vec<&str> = plan.maybe.iter().map(|maybe| maybe.id.as_str()).collect();
+        assert_eq!(maybe, ["task-1"]);
+        assert_eq!(plan.dropped.made_maybe, 1);
+        assert_eq!(writes(&plan, TasksMode::Update), [Write::Maybe]);
+    }
+
+    /// 휴지통에 든 task 는 진행 중 task 로 읽지 않는다.
+    #[test]
+    fn a_task_in_the_trash_is_not_read() {
+        let mut page = task_page(&open()[0]);
+        assert!(open_task(&page, &schema()).is_some());
+        page["in_trash"] = json!(true);
+        assert_eq!(open_task(&page, &schema()), None);
     }
 }

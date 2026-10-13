@@ -1773,7 +1773,7 @@ pub(crate) mod tests {
         last_edited_time: String,
         pub(crate) properties: Map<String, Value>,
         pub(crate) children: Vec<Value>,
-        in_trash: bool,
+        pub(crate) in_trash: bool,
     }
 
     /// 요청 모양의 칸 값을 응답 모양으로: 글 조각에 `plain_text` 를 붙인다.

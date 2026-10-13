@@ -5276,6 +5276,41 @@ mod tests {
         );
     }
 
+    /// 칸을 바꾸기 직전에 다시 읽은 task 가 휴지통에 들었으면 지워진 것으로 보고 그 task 만 건너뛴다.
+    #[tokio::test]
+    async fn a_task_moved_to_the_trash_is_left_alone() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        {
+            let mut state = link.world.state.lock().unwrap();
+            state.failing_paths.clear();
+            let page = state
+                .pages
+                .iter_mut()
+                .find(|page| page.id == "task-1")
+                .unwrap();
+            page.in_trash = true;
+        }
+        link.world.advance(FIRST_BACKOFF);
+        let patched = link.patches("task-1");
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        let report = second.tasks_made.unwrap();
+        assert_eq!((report.gone, report.not_written), (1, 1));
+        assert_eq!(link.patches("task-1"), patched);
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-20"
+        );
+        assert_eq!(link.records("task-1"), 0);
+        assert_eq!(link.page("task-2").0["작업상태"]["status"]["name"], "완료");
+    }
+
     /// task 하나의 쓰기가 400 이면 그 task 의 남은 쓰기만 건너뛰고 다음 task 로 간다.
     #[tokio::test]
     async fn a_refused_task_is_skipped_and_the_rest_goes_on() {
