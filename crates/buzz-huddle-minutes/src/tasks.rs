@@ -1002,13 +1002,18 @@ pub fn hedged(text: &str) -> bool {
         || HEDGES.iter().any(|word| text.contains(word))
 }
 
+/// QA 말. 이름이 QA 로 끝나는 상태는 근거 말에 이 말이 있어야 실제로 바꾸고, 배포예정으로 끝나는
+/// 상태는 이 말이 있으면 제안만이다(「스테이징 배포 예정이에요」는 Staging QA 가 아니고, 「스테이징 QA
+/// 들어갔어요」는 Staging 배포예정이 아니다).
+const QA_WORDS: [&str; 2] = ["qa", "큐에이"];
+
 /// 그 상태로 실제로 바꾸려면 근거 말에 있어야 하는 말(글자·숫자만, 작은 글자로 견준다). 여기
 /// 없는 상태(미팅·시작 전·기획(A2D2)·디자인·개발·개발-토의필요)는 늘 제안으로만 남긴다. 머지·배포는
-/// 중간 단계 이야기라 완료 말이 아니다.
+/// 중간 단계 이야기라 완료 말이 아니다. 이름이 QA 로 끝나는 상태는 [`QA_WORDS`] 도 있어야 한다.
 pub fn status_words(status: &str) -> &'static [&'static str] {
     match status {
         "완료" => &["끝났", "끝냈", "완료", "마쳤", "마무리했", "닫았"],
-        "Dev QA" => &["qa", "큐에이"],
+        "Dev QA" => &QA_WORDS,
         _ if status.starts_with("Production") => &["프로덕션", "production", "운영배포"],
         _ if status.starts_with("Staging") => &["스테이징", "staging"],
         _ => &[],
@@ -1020,6 +1025,7 @@ pub fn status_words(status: &str) -> &'static [&'static str] {
 /// - 완료: 단계 말. 「개발 끝났어요」·「QA 끝났어요」·「스테이징에 배포했어요」·「PR 머지했어요」는 중간
 ///   단계 이야기다.
 /// - Dev QA: 뒤 단계 말. 「스테이징 QA 들어갔어요」의 QA 는 Dev QA 가 아니다.
+/// - 이름이 배포예정으로 끝나는 상태: QA 말. 「스테이징 QA 들어갔어요」는 Staging 배포예정이 아니다.
 pub fn status_stop_words(status: &str) -> &'static [&'static str] {
     match status {
         "완료" => &[
@@ -1037,16 +1043,18 @@ pub fn status_stop_words(status: &str) -> &'static [&'static str] {
             "merge",
         ],
         "Dev QA" => &["스테이징", "staging", "프로덕션", "production", "운영"],
+        _ if status.ends_with("배포예정") => &QA_WORDS,
         _ => &[],
     }
 }
 
-/// 근거 말이 그 상태를 말하나: 그 상태의 말이 있고([`status_words`]) 막는 말이 없다
-/// ([`status_stop_words`]).
+/// 근거 말이 그 상태를 말하나: 그 상태의 말이 있고([`status_words`], 이름이 QA 로 끝나면
+/// [`QA_WORDS`] 도) 막는 말이 없다([`status_stop_words`]).
 fn says_status(status: &str, statement: &str) -> bool {
     let squashed = summary::squash(statement);
     let has = |words: &[&str]| words.iter().any(|word| squashed.contains(word));
-    has(status_words(status)) && !has(status_stop_words(status))
+    let qa = !status.ends_with("QA") || has(&QA_WORDS);
+    has(status_words(status)) && qa && !has(status_stop_words(status))
 }
 
 /// 상태가 앞으로 가나. 차례는 노션이 주는 그룹 차례(할 일 → 진행 중 → 완료)에 선택지 차례를 더해
@@ -1871,6 +1879,10 @@ fn settle(doing: &'static str) -> impl FnOnce(NotionError) -> Result<Outcome, Ta
 /// 전에 노션에 이미 있는지 늘 찾아본다(장부에 못 남기고 죽었어도 두 번 쓰지 않게). 칸 바꾸기는
 /// 바로 앞에서 지금 값을 다시 읽어, 계획 뒤에 사람이 바꿨으면 덮어쓰지 않는다. `link_template` 은
 /// 근거 시각의 재생 링크 모양.
+///
+/// task 쪽 쓰기가 404(task gone)면 task DB data source 를 한 번 더 읽는다. 노션의 404 는 「없음」과
+/// 「통합이 못 봄」 둘 다라서, data source 도 못 읽으면(통합 연결이 끊김) gone 으로 굳히지 않고 실패로
+/// 돌려준다(다음 실행에 다시).
 pub async fn apply(
     client: &mut NotionClient<'_>,
     ledger: &mut TasksLedger,
@@ -1880,6 +1892,12 @@ pub async fn apply(
     report: &mut TasksReport,
 ) -> Result<Outcome, TaskDbError> {
     let outcome = write_one(client, ledger, schema, write, link_template, report).await?;
+    if outcome == Outcome::Gone && write != Write::Maybe {
+        client
+            .get(&format!("/v1/data_sources/{}", schema.data_source_id))
+            .await
+            .map_err(at("checking the task db after a task was not found"))?;
+    }
     count(report, write, outcome);
     Ok(outcome)
 }
@@ -2887,6 +2905,16 @@ pub(crate) mod tests {
         json!({ "item": "D1", "task": task, "level": "확실", "why": "", "said": "", "ms": ms })
     }
 
+    /// K2 를 D1 과 짝짓고 K2 의 상태를 `status` 로 바꾸자는 답(근거 1초 줄).
+    fn k2_status_answer(status: &str) -> Value {
+        json!({
+            "links": [link_d1("K2", 1_000)],
+            "due_changes": [],
+            "status_changes": [{ "task": "K2", "status": status, "ms": 1_000 }],
+            "new_tasks": []
+        })
+    }
+
     /// 다음 줄의 다른 사람 날짜는 받지 않는다: A「견적서 자동화 진행 상황 공유할게요.」 +
     /// B「결제 화면은 금요일까지예요.」 → K1 기한 안 바꿈. 같은 사람이 이어 말한 날짜는 받는다.
     #[test]
@@ -2970,8 +2998,10 @@ pub(crate) mod tests {
             [Write::Status(0), Write::Append(0)]
         );
         for (status, words) in [
-            ("Production QA", "운영 배포 끝냈어요"),
-            ("Staging QA", "스테이징에 올렸어요"),
+            ("Production QA", "프로덕션 QA 시작했어요"),
+            ("Production 배포예정", "운영 배포 예정이에요"),
+            ("Staging QA", "스테이징 QA 들어갔어요"),
+            ("Staging 배포예정", "스테이징에 올릴 예정이에요"),
             ("Dev QA", "QA 들어갔어요"),
         ] {
             assert!(says_status(status, words), "{status}: {words}");
@@ -3215,14 +3245,7 @@ pub(crate) mod tests {
     /// 차례를 못 매기면 제안만. 완료 task 는 읽지도 않아서 다시 열 일이 없다.
     #[test]
     fn a_status_only_moves_forward() {
-        let answer = |status: &str| {
-            json!({
-                "links": [link_d1("K2", 1_000)],
-                "due_changes": [],
-                "status_changes": [{ "task": "K2", "status": status, "ms": 1_000 }],
-                "new_tasks": []
-            })
-        };
+        let answer = k2_status_answer;
         let qa = [(1_000, A, "로그인 오류 수정은 QA 들어갔어요.")];
         let with_status = |status: &str| {
             let mut tasks = open();
@@ -3301,14 +3324,7 @@ pub(crate) mod tests {
         // 검사 전체로도: 지금 개발인 task 에 「스테이징 QA 들어갔어요」 + 모델이 Dev QA → 제안만.
         let mut tasks = open();
         tasks[1].status = "개발".into();
-        let answer = |status: &str| {
-            json!({
-                "links": [link_d1("K2", 1_000)],
-                "due_changes": [],
-                "status_changes": [{ "task": "K2", "status": status, "ms": 1_000 }],
-                "new_tasks": []
-            })
-        };
+        let answer = k2_status_answer;
         let staging = [(1_000, A, "로그인 오류 수정은 스테이징 QA 들어갔어요.")];
         let plan = check_meeting(
             &staging,
@@ -3328,5 +3344,42 @@ pub(crate) mod tests {
             &open(),
         );
         assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
+    }
+
+    /// 배포예정과 QA 는 같은 말(스테이징·프로덕션)을 나눠 쓴다: 이름이 QA 로 끝나는 상태는 QA 말이
+    /// 있어야 실제로 바꾸고, 배포예정은 QA 말이 있으면 제안만이다.
+    #[test]
+    fn a_planned_deploy_and_its_qa_are_told_apart() {
+        for (status, words) in [
+            ("Staging QA", "스테이징 배포 예정이에요"),
+            ("Production QA", "운영 배포 예정이에요"),
+            ("Staging 배포예정", "스테이징 QA 들어갔어요"),
+            ("Production 배포예정", "프로덕션 큐에이 시작했어요"),
+        ] {
+            assert!(!says_status(status, words), "{status}: {words}");
+        }
+        for (status, words) in [
+            ("Staging QA", "스테이징 QA 들어갔어요"),
+            ("Production QA", "프로덕션 큐에이 시작했어요"),
+            ("Staging 배포예정", "스테이징 배포 예정이에요"),
+            ("Production 배포예정", "운영 배포 예정이에요"),
+        ] {
+            assert!(says_status(status, words), "{status}: {words}");
+        }
+        // 검사 전체로도: 지금 Dev QA 인 task 에 「스테이징 배포 예정이에요」 → 모델이 Staging QA 를 내면
+        // 제안만, Staging 배포예정이면 실제로 바꾼다.
+        let lines = [(1_000, A, "로그인 오류 수정은 스테이징 배포 예정이에요.")];
+        let decision = "로그인 오류 수정 배포";
+        let plan = check_meeting(
+            &lines,
+            decision,
+            1_000,
+            &k2_status_answer("Staging QA"),
+            &open(),
+        );
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
+        let planned = k2_status_answer("Staging 배포예정");
+        let plan = check_meeting(&lines, decision, 1_000, &planned, &open());
+        assert!(!plan.tasks[0].status.as_ref().unwrap().suggest);
     }
 }

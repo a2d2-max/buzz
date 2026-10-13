@@ -296,14 +296,18 @@ rm {out}/{첫 세션 id}.summary-failed.json
     | 상태 | 있어야 하는 말 | 있으면 제안만인 말 |
     |---|---|---|
     | `완료` | 끝났·끝냈·완료·마쳤·마무리했·닫았 | 단계 말: 개발·QA·큐에이·스테이징·staging·프로덕션·production·운영·배포·PR·머지·merge |
-    | `Production …` | 프로덕션·production·운영 배포 | 없음 |
-    | `Staging …` | 스테이징·staging | 없음 |
+    | `Production QA` | 프로덕션·production·운영 배포 중 하나, **그리고** QA·큐에이 | 없음 |
+    | `Production 배포예정` | 프로덕션·production·운영 배포 | QA·큐에이 |
+    | `Staging QA` | 스테이징·staging 중 하나, **그리고** QA·큐에이 | 없음 |
+    | `Staging 배포예정` | 스테이징·staging | QA·큐에이 |
     | `Dev QA` | QA·큐에이 | 뒤 단계 말: 스테이징·staging·프로덕션·production·운영 |
     | 그 밖(미팅·시작 전·기획(A2D2)·디자인·개발·개발-토의필요) | 없음: 늘 제안 | — |
 
     예: 「로그인 오류 수정 PR 올렸어요.」 다음에 「네 볼게요.」, 「스테이징에 배포했어요」, 「PR 머지했어요」,
     「개발 끝났어요」, 「QA 끝났어요」는 완료로 안 바꾸고, 「스테이징 QA 들어갔어요」는 Dev QA 로 안 바꾸고, 지금
-    Production 배포예정인 task 를 「QA 들어갔어요」로 Dev QA 로 되돌리지 않는다(모두 제안만).
+    Production 배포예정인 task 를 「QA 들어갔어요」로 Dev QA 로 되돌리지 않는다(모두 제안만). 배포예정과 QA 는 같은 말
+    (스테이징·프로덕션)을 나눠 쓰니 QA 말로 가른다: 「스테이징 배포 예정이에요」는 Staging 배포예정으로 바꾸고 Staging QA
+    로는 안 바꾸고, 「스테이징 QA 들어갔어요」는 그 반대다.
   - 기한·상태 둘 다, 근거 줄과 바로 다음 줄(누가 말했든: 바로 뒤 다른 사람의 거절도 본다)에 부정하는 말이나 망설이는
     말이 있으면 버린다(`tasks::hedged`). 다른 낱말 속에 같은 글자가 있는 말은 낱말로 본다:
     - 「안」·「못」: 「못」으로 시작하는 낱말, 「안」 하나, 「안」 바로 뒤에 동사가 붙은 꼴(「안돼요」·「안 했어요」).
@@ -354,13 +358,16 @@ rm {out}/{첫 세션 id}.summary-failed.json
   `permission HTTP 403 restricted_resource while reading the task database`. 하던 일은 `reading the task database`·
   `reading the task data source`·`checking the task db columns`·`reading open tasks`·`reading a task before changing it`·
   `changing a task's due date`·`changing a task's status`·`reading a task page`·`appending a record to a task`·
-  `looking for a task this meeting made`·`creating a task`·`reading the minutes page`·`adding the maybe links to the minutes page`
-  열세 가지 중 하나다. 통합에 task DB 를 연결해 둔 뒤에도 403 이 나면 권한이 아니라 그 요청 쪽 까닭(그 페이지만의 제한
+  `looking for a task this meeting made`·`creating a task`·`checking the task db after a task was not found`·
+  `reading the minutes page`·`adding the maybe links to the minutes page` 열네 가지 중 하나다. 통합에 task DB 를 연결해 둔 뒤에도 403 이 나면 권한이 아니라 그 요청 쪽 까닭(그 페이지만의 제한
   등)으로 본다. 노션의 404 `object_not_found` 는 「없음」과 「통합에 공유 안 됨」 둘 다다(노션 문서). task 페이지 쓰기의
   400·404 는 위 "쓰기"처럼 그 task 만 건너뛴다: 지워졌거나 통합이 못 보는 곳으로 옮겨진 task 는 다시 해도 안 되고, 실패로
-  치면 같은 404 를 실행마다 되풀이하며 그 회의의 다른 task 쓰기까지 막는다. 통합 연결이 통째로 끊기면 쓰기보다 먼저 하는
-  실행마다의 task DB 칸 읽기가 404 로 실패해서 단계 실패로 남고 다음 실행에 다시 한다(task 가 gone 으로 굳지 않는다.
-  시험으로 묶었다).
+  치면 같은 404 를 실행마다 되풀이하며 그 회의의 다른 task 쓰기까지 막는다. 통합 연결이 통째로 끊긴 것과는 이렇게 가른다
+  (task 가 gone 으로 굳지 않게, 둘 다 시험으로 묶었다):
+  - 실행 처음: 쓰기보다 먼저 하는 실행마다의 task DB 칸 읽기가 404 로 실패해서 단계 실패로 남고 다음 실행에 다시 한다.
+  - 한 실행 도중(칸을 읽은 뒤): task 쪽 쓰기(칸 바꾸기·기록·이 회의가 만든 task 찾기·만들기)가 404 면 task DB data source
+    를 한 번 더 읽는다. 그것도 못 읽으면 `checking the task db after a task was not found` 로 단계 실패, 읽히면 그 task 만
+    지워진 것이다(`task gone`).
 - **오래된 회의**: 회의가 끝난 지 24시간 넘었으면 task 연결을 안 한다(읽지도 묻지도 쓰지도 않고 남은 일로도 안 친다).
   칸을 바꾸고 기록을 못 붙인 task 의 기록만은 예외다(위 "쓰기"). 스위치를 처음 켰을 때 녹음이 남은 지난 14일 회의들이
   지금 task 의 기한·상태를 덮어쓰지 않게 하려는 것이다. 그래서 켜기 **24시간보다 전에** 끝난 회의는 잇지 않는다. 켜기 전
@@ -941,9 +948,6 @@ DER 은 여유 구간 없이(collar 0), 회의실 트랙에서 잰다. 놓침·�
   - 상태 말(`tasks::status_words`)은 정해 둔 낱말 목록이다. 목록 밖의 말로 끝냈다고 하면(「다 됐어요」) 제안으로만
     남는다(놓치는 쪽으로 틀린다). 막는 말(`tasks::status_stop_words`)은 글자로 찾아서 다른 낱말 속에도 걸린다
     (「개발자」·「운영진」·영어 낱말 속 「pr」): 그때도 제안만으로 내려간다.
-  - Staging 배포예정 ↔ Staging QA, Production 배포예정 ↔ Production QA 는 같은 말(스테이징·프로덕션)을 나눠 쓴다.
-    앞으로 가는 한 모델이 고른 쪽으로 바뀐다(예: 지금 Dev QA, 「스테이징 배포 예정이에요」에 모델이 Staging QA 를
-    내면 Staging QA 로 간다). 둘을 가르는 말은 아직 안 정했다.
   - 완료 말에서 배포했·머지·merge 를 뺀 것과 완료의 막는 말(배포·머지·merge)은 겹친다: 막는 말이 있으면 어차피 제안이라,
     목록에서 뺀 것만 따로 재는 시험은 만들 수 없다.
   - 부정·망설임을 보는 창은 근거 줄과 바로 다음 줄이다. 다음 줄이 다른 이야기여도 거기 부정·망설임 말이 있으면 버리고,
@@ -960,10 +964,10 @@ DER 은 여유 구간 없이(collar 0), 회의실 트랙에서 잰다. 놓침·�
   - 실제 노션에서 `관련 노션 페이지`(url)의 `contains` 찾기와 `작업상태`(status)의 `does_not_equal` 필터가 가짜 노션과
     같이 도는지는 아직 확인하지 않았다(가짜 노션으로만 시험. 운영 첫 `append` 실행으로 본다).
   - 켜기 24시간보다 전에 끝난 회의는 잇지 않는다. 지난 회의를 잇고 싶으면 따로 정해야 한다.
-  - 한 실행 도중, task DB 칸을 읽은 뒤에 통합 연결이 끊기면 그 실행에서 남은 task 쓰기는 404 라 `task gone` 으로 굳는다
-    (다시 안 한다). 틈은 한 실행 길이다. 막으려면 task 404 때 data source 를 한 번 더 읽어 둘 다 404 면 단계 실패로 두면 된다
-    (아직 안 함).
-  - 회의록 페이지·task DB 쪽 404(이 회의가 만든 task 찾기·만들기, 회의록 절)도 같은 `task gone` 칸에 센다.
+  - 회의록 페이지 404(「관련 있을 수 있는 task」 절)는 다시 읽기 없이 같은 `task gone` 칸에 센다. task DB 쪽 404(이 회의가
+    만든 task 찾기·만들기)도 data source 가 읽히면 `task gone` 으로 센다.
+  - `운영 QA` 처럼 「운영」 뒤에 「배포」가 없는 말은 Production 말로 안 친다(Production 말은 프로덕션·production·운영 배포).
+    그때는 제안만이다.
   - 휴지통에 넣은 task 가 읽기·쓰기에 어떻게 답하는지(200·400·404)는 노션 문서에 없어 못 쟀다. 어느 쪽이든 그 task 만
     건너뛴다(400 은 `refused`, 404 는 `task gone`).
 - **참석자 이름**(위 "참석자 이름"):

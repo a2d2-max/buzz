@@ -5081,6 +5081,87 @@ mod tests {
         assert_eq!(link.maybe_sections(), 1);
     }
 
+    /// 통합이 task DB 를 통째로 못 보게 숨긴 것(되돌릴 때 쓴다).
+    struct HiddenTaskDb {
+        database: Value,
+        source: Value,
+        pages: Vec<crate::notion::tests::FakePage>,
+    }
+
+    impl Linking {
+        /// 통합 연결이 끊긴 것처럼 task DB·data source·task 페이지를 다 404 로 만든다.
+        fn hide_task_db(&self) -> HiddenTaskDb {
+            let mut state = self.world.state.lock().unwrap();
+            let database = state.databases.remove(TASK_DB).unwrap();
+            let source = state.data_sources.remove(TASK_DS).unwrap();
+            let (pages, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.pages)
+                .into_iter()
+                .partition(|page| page.data_source == TASK_DS);
+            state.pages = kept;
+            HiddenTaskDb {
+                database,
+                source,
+                pages,
+            }
+        }
+
+        /// 다시 연결한다.
+        fn show_task_db(&self, hidden: HiddenTaskDb) {
+            let mut state = self.world.state.lock().unwrap();
+            state.databases.insert(TASK_DB.into(), hidden.database);
+            state.data_sources.insert(TASK_DS.into(), hidden.source);
+            state.pages.extend(hidden.pages);
+        }
+    }
+
+    /// 한 실행 도중(task DB 칸을 읽은 뒤)에 통합 연결이 끊겨도 task 를 gone 으로 굳히지 않는다: task 가
+    /// 404 면 data source 를 한 번 더 읽고, 그것도 404 면 단계 실패로 두어 다음 실행에 다시 한다.
+    #[tokio::test]
+    async fn a_task_db_lost_mid_run_is_tried_again_not_skipped() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        link.world.state.lock().unwrap().failing_paths.clear();
+        // 이 실행은 칸을 이미 읽었다(실행마다 한 번). 그 뒤에 연결이 끊겼다.
+        let read = link.ledger().schema;
+        let hidden = link.hide_task_db();
+        link.world.advance(MAX_BACKOFF);
+        let mut steps = link.steps(TasksMode::Update);
+        steps.tasks.as_mut().unwrap().schema = Some(read);
+        let second = link.world.follow_with(&task_meeting(), &mut steps).await;
+        assert!(
+            failed_with(
+                &second.tasks,
+                "while checking the task db after a task was not found"
+            ),
+            "{second:?}"
+        );
+        let ledger = link.ledger();
+        assert!(!ledger.finished);
+        assert!(
+            !ledger
+                .done
+                .values()
+                .any(|outcome| *outcome == Outcome::Gone),
+            "{:?}",
+            ledger.done
+        );
+        // 다시 연결되면 마저 쓴다.
+        link.show_task_db(hidden);
+        link.world.advance(MAX_BACKOFF);
+        let third = link.follow(TasksMode::Update).await;
+        assert_eq!(third.tasks, Step::Done, "{third:?}");
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-16"
+        );
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+    }
+
     /// 노션의 404 는 「없음」과 「통합이 못 봄」 둘 다다. task 하나가 404 면 지워진 것으로 보고 그 task
     /// 만 건너뛰지만, 통합이 task DB 를 통째로 못 보게 되면(연결이 끊김) 쓰기보다 먼저 하는 실행마다의
     /// 칸 읽기가 404 로 실패해서 단계 실패로 남고 다음에 다시 한다(task 가 gone 으로 굳지 않는다).
@@ -5094,17 +5175,8 @@ mod tests {
             "{first:?}"
         );
         // 통합 연결이 끊겼다: task DB·data source·task 페이지가 다 404.
-        let (database, source, hidden) = {
-            let mut state = link.world.state.lock().unwrap();
-            state.failing_paths.clear();
-            let database = state.databases.remove(TASK_DB).unwrap();
-            let source = state.data_sources.remove(TASK_DS).unwrap();
-            let (hidden, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.pages)
-                .into_iter()
-                .partition(|page| page.data_source == TASK_DS);
-            state.pages = kept;
-            (database, source, hidden)
-        };
+        link.world.state.lock().unwrap().failing_paths.clear();
+        let hidden = link.hide_task_db();
         link.world.advance(MAX_BACKOFF);
         let second = link.follow(TasksMode::Update).await;
         assert!(
@@ -5122,12 +5194,7 @@ mod tests {
             ledger.done
         );
         // 다시 연결되면 남은 쓰기를 마저 한다.
-        {
-            let mut state = link.world.state.lock().unwrap();
-            state.databases.insert(TASK_DB.into(), database);
-            state.data_sources.insert(TASK_DS.into(), source);
-            state.pages.extend(hidden);
-        }
+        link.show_task_db(hidden);
         link.world.advance(MAX_BACKOFF);
         let third = link.follow(TasksMode::Update).await;
         assert_eq!(third.tasks, Step::Done, "{third:?}");
