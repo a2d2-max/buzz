@@ -4772,10 +4772,26 @@ mod tests {
             "어제 배포를 마쳤다.",
             "목요일까지 만든다.",
         ];
+        // 스크립트 줄에서 이어진 8글자(글자·숫자만 셈) 조각 하나라도 기록에 있으면 원문이 샌 것이다
+        // (근거 인용처럼 줄의 일부만 들어가도 잡는다). 요약 글은 줄과 7글자까지만 겹친다.
+        const WINDOW: usize = 8;
+        let squash = |text: &str| -> Vec<char> {
+            text.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect()
+        };
         for (id, blocks) in &written {
             let text: String = blocks.iter().map(block_text).collect::<Vec<_>>().join("\n");
+            let squashed: String = squash(&text).into_iter().collect();
             for segment in &task_meeting().segments {
-                assert!(!text.contains(&segment.text), "{id}: script line in {text}");
+                for piece in squash(&segment.text).windows(WINDOW) {
+                    let piece: String = piece.iter().collect();
+                    assert!(
+                        !squashed.contains(&piece),
+                        "{id}: script words {piece:?} in {text}"
+                    );
+                }
             }
             for said in said {
                 assert!(!text.contains(said), "{id}: model said in {text}");
