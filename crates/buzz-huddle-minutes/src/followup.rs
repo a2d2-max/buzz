@@ -572,6 +572,9 @@ pub struct FollowedUp {
     /// 이번에 참석자 프로필 이름을 물었으면 그 결과(수와 까닭의 종류만). 단계의 실패로
     /// 세지 않는다.
     pub names: Option<NamesReport>,
+    /// 이번에 노션 페이지를 써 봤으면 그 보고(담당자 연결 DB 에 한 일 포함). 로그에는
+    /// 수와 까닭의 종류만 찍는다.
+    pub notion_report: Option<PublishReport>,
 }
 
 impl FollowedUp {
@@ -802,6 +805,7 @@ pub async fn follow_up_held<H: MinutesHome>(
                 summary_usage: None,
                 correct_made: None,
                 names: names.report(),
+                notion_report: None,
             }
         }
     };
@@ -825,6 +829,7 @@ pub async fn follow_up_held<H: MinutesHome>(
                 summary_usage: None,
                 correct_made,
                 names: names.report(),
+                notion_report: None,
             }
         }
     };
@@ -832,7 +837,17 @@ pub async fn follow_up_held<H: MinutesHome>(
         (Step::Done, ForPage::Made(made, _)) => Some(made.usage.clone()),
         _ => None,
     };
-    match notion_step(&mut held, steps, for_page, &for_text, &mut names).await {
+    let mut notion_report = None;
+    let notion = notion_step(
+        &mut held,
+        steps,
+        for_page,
+        &for_text,
+        &mut names,
+        &mut notion_report,
+    )
+    .await;
+    match notion {
         Ok(notion) => FollowedUp {
             correct,
             summary,
@@ -841,6 +856,7 @@ pub async fn follow_up_held<H: MinutesHome>(
             summary_usage,
             correct_made,
             names: names.report(),
+            notion_report,
         },
         Err(error) => FollowedUp {
             correct,
@@ -850,6 +866,7 @@ pub async fn follow_up_held<H: MinutesHome>(
             summary_usage,
             correct_made,
             names: names.report(),
+            notion_report,
         },
     }
 }
@@ -1082,12 +1099,15 @@ fn given_up_page(earlier: Option<(Box<Summary>, String)>) -> ForPage {
     }
 }
 
+/// The Notion page. `published` gets the publish report once a page write
+/// is tried (also when it fails), for the log.
 async fn notion_step<H: MinutesHome>(
     held: &mut Held<'_, H>,
     steps: &mut FollowUps<'_>,
     for_page: ForPage,
     for_text: &ForText,
     names: &mut MeetingNames<'_>,
+    published: &mut Option<PublishReport>,
 ) -> Result<Step, MeetingError> {
     if steps.notion.is_none() {
         return Ok(Step::Off);
@@ -1154,18 +1174,10 @@ async fn notion_step<H: MinutesHome>(
         kind: step.kind,
         status: ProcessingStatus::Done,
     };
-    let mut report = PublishReport::default();
-    let published = notion::publish_held(
-        home,
-        hold,
-        meeting,
-        &mut step.client,
-        &page,
-        &stamp,
-        &mut report,
-    )
-    .await;
-    let error = match published {
+    let report = published.insert(PublishReport::default());
+    let result =
+        notion::publish_held(home, hold, meeting, &mut step.client, &page, &stamp, report).await;
+    let error = match result {
         Ok(()) => {
             steps.notion_run.heard(Signal::Answered);
             steps.notion_run.succeeded = true;
@@ -3611,6 +3623,10 @@ mod tests {
                 trouble: None
             })
         );
+        // 담당자 연결 DB 에 한 일이 로그로 갈 보고에 실린다.
+        let report = followed.notion_report.as_ref().expect("page written");
+        assert_eq!(report.people_rows_added.len(), 1);
+        assert_eq!(report.people_error, None);
 
         let requests = fixture.server.requests();
         let correction = requests.iter().find(|r| is_correction(r)).unwrap();
@@ -3649,6 +3665,50 @@ mod tests {
         // 다 된 회의: 이름이 필요한 단계가 없으니 묻지 않는다.
         let again = fixture.world.follow_with(&script, &mut steps()).await;
         assert!(again.nothing_left(), "{again:?}");
+        assert_eq!(again.names, None);
+        assert_eq!(again.notion_report, None);
+        assert_eq!(relay.requests().len(), 1);
+    }
+
+    /// 이름은 도장(sha256)에 안 섞인다: 1회차에 릴레이가 이름을 안 줘서(401) 앞 8자로 요약·
+    /// 페이지를 만들고, 2회차에 이름이 나와도 요약·페이지를 다시 하지 않는다(Gemini·노션 요청
+    /// 0개, 릴레이도 안 묻는다). 이름이 바뀔 때마다 돈 드는 요약을 다시 하지 않게 지킨다.
+    #[tokio::test]
+    async fn names_never_enter_the_stamps() {
+        let world = world().await;
+        let person = nostr::Keys::generate();
+        let pubkey = person.public_key().to_hex();
+        let event = profile_event(&person, &json!({ "display_name": "김지영" }), 10);
+        let answer_names = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&answer_names);
+        let relay = FakeServer::start(move |_| {
+            if gate.load(Ordering::SeqCst) {
+                Reply::json(200, &json!([event]))
+            } else {
+                Reply::json(401, &json!({ "error": "NIP-98: replay detected" }))
+            }
+        })
+        .await;
+        let source = profile_source(&relay.base, &nostr::Keys::generate());
+        let script = named_script(&pubkey);
+
+        let first = world
+            .follow_with(&script, &mut world.steps().with_profiles(&source))
+            .await;
+        assert_eq!(pair(&first), (Step::Done, Step::Done));
+        assert_eq!(first.names.as_ref().map(|names| names.found), Some(0));
+
+        answer_names.store(true, Ordering::SeqCst);
+        let before = world.counts();
+        let again = world
+            .follow_with(&script, &mut world.steps().with_profiles(&source))
+            .await;
+        assert_eq!(pair(&again), (Step::AlreadyDone, Step::AlreadyDone));
+        assert_eq!(
+            world.counts(),
+            before,
+            "no Gemini or Notion request for names"
+        );
         assert_eq!(again.names, None);
         assert_eq!(relay.requests().len(), 1);
     }

@@ -8,8 +8,9 @@
 //! - 근거 글은 근거 줄과 바로 다음 줄 안에 있어야 하고, 그 할 일에 대한 말이어야
 //!   한다(할 일 내용과 낱말이 겹침: 그 줄, 또는 바로 앞의 다른 사람 줄).
 //! - 담당자 근거는 담당자 본인의 말이면서, 맡겠다는 말("할게요", "하겠습니다",
-//!   "맡을게요")이거나 이름을 불러 부탁한 말 바로 뒤의 수락이어야 한다.
-//!   "네 좋아요" 같은 맞장구만으로는 안 된다.
+//!   "맡을게요")이어야 한다. "네 좋아요" 같은 맞장구만으로는 안 된다. 이름을 불러
+//!   부탁한 말 바로 뒤의 수락도 받는 규칙이 있지만 지금은 꺼 뒀다
+//!   (`ACCEPT_NAMED_REQUEST`).
 //! - 기한 날짜는 근거 글에서 코드가 직접 읽고(그 줄의 KST 날짜 기준), 모델이 낸
 //!   날짜와 같을 때만 남긴다. 다르거나 못 읽으면 비우고 "애매".
 //! - 담당자와 기한이 둘 다 남아야 "확정"이다(기한 없는 일도 "애매").
@@ -57,6 +58,14 @@ pub const EVIDENCE_SNAP_MS: u64 = 30_000;
 pub const QUOTE_NEXT_LINES: usize = 1;
 /// 담당자 근거 글의 최소 길이(글자·숫자만 셈). "제가" 같은 말은 누구인지 못 보여 준다.
 pub const MIN_ASSIGNEE_QUOTE_CHARS: usize = 4;
+/// "이름을 불러 부탁한 말 바로 뒤의 수락"("민수 씨, 해 줄래요?" → "네")을 담당자 근거로
+/// 받는가. **지금은 끈다.** 앞 8자 이름일 때는 아무도 그 이름을 부르지 않아 사실상 꺼져
+/// 있었는데, 프로필 이름이 붙으면서 처음 켜진다. 그런데 판정이 헐겁다: 수락은 "네"로
+/// 시작하기만 하면 되고("네, 근데 저는 어려워요"·"네트워크 비용은…"도 수락), 부름은 앞 줄
+/// 어디에 이름이 있기만 하면 된다(부르지 않고 이름만 나와도). 검토에서 거절·감사·다른 낱말
+/// 속 "네"가 확정 담당자가 되는 것을 재현했다. 수락 낱말과 부르는 꼴을 좁힌 뒤 실제 회의로
+/// 재 보고 켠다(docs/huddle-minutes-worker.md "알려진 한계").
+const ACCEPT_NAMED_REQUEST: bool = false;
 /// 모델 답의 목록 길이 상한: 결정, 주제, 주제마다 내용.
 /// 할 일에는 상한을 안 건다. Gemini 는 스키마 전체가 복잡하면 400 INVALID_ARGUMENT 로 거절하는데,
 /// 칸이 일곱 개인 할 일에 상한을 걸면 그 한도를 넘는다(2026-10-12 gemini-3.8-flash: 결정 30 +
@@ -1015,11 +1024,13 @@ impl<'a> Checker<'a> {
             return false;
         }
         let said = self.text_of(found);
-        let named_request = self.request_before(found.0).is_some_and(|request| {
-            self.names
-                .get(pubkey)
-                .is_some_and(|name| name.chars().count() >= 2 && request.squashed.contains(name))
-        });
+        // 이름을 불러 부탁한 말 + 수락: 지금은 꺼 둔다(`ACCEPT_NAMED_REQUEST` 설명).
+        let named_request = ACCEPT_NAMED_REQUEST
+            && self.request_before(found.0).is_some_and(|request| {
+                self.names.get(pubkey).is_some_and(|name| {
+                    name.chars().count() >= 2 && request.squashed.contains(name)
+                })
+            });
         let promised = is_commitment(&said) || (named_request && is_acceptance(&said));
         promised && self.about_task(found, task_keys)
     }
@@ -1470,7 +1481,8 @@ pub fn hours_from_quote(quote: &str) -> Option<(Vec<u32>, u32)> {
 }
 
 /// 모델 답(JSON 글)을 스크립트에 대 보고 고친다. 네트워크 없이 돈다.
-/// `names` 는 이름을 불러 부탁한 말을 알아보는 데 쓴다.
+/// `names` 는 모델이 담당자를 P 번호 대신 이름으로 냈을 때 사람을 찾는 데 쓴다(이름을
+/// 불러 부탁한 말을 알아보는 데도 쓰지만 그 규칙은 지금 꺼 뒀다).
 /// `model`·`usage` 는 비워 두고 부른 쪽이 채운다.
 pub fn check_answer(
     answer: &str,
@@ -2154,8 +2166,11 @@ pub(crate) mod tests {
         assert_eq!(summary.action_items[0].assignee_pubkey, None);
     }
 
+    /// 이름을 불러 부탁한 말 + 수락 규칙은 지금 꺼 뒀다(`ACCEPT_NAMED_REQUEST`). 이 장면은
+    /// 진짜 수락이라 규칙을 제대로 고쳐 켜면 B 가 맞다 — 그때 이 시험을 B 로 되돌린다. 지금은
+    /// 이름표가 무엇이든 앞 8자일 때와 같이 담당자가 없다.
     #[test]
-    fn acceptance_right_after_a_named_request_counts() {
+    fn acceptance_after_a_named_request_is_off_for_now() {
         let transcript = transcript_with(&[
             (1_000, A, "민수 씨, 견적서 좀 보내 줄 수 있어요?"),
             (5_000, B, "네 좋아요."),
@@ -2168,11 +2183,53 @@ pub(crate) mod tests {
             None,
             1_000
         )]));
-        let summary = check_answer(&answer, &transcript, &KoreanNames).unwrap();
-        assert_eq!(summary.action_items[0].assignee_pubkey.as_deref(), Some(B));
-        // 이름표가 pubkey 앞 8자뿐이면 이름을 부른 부탁인지 모른다.
-        let summary = check_answer(&answer, &transcript, &PubkeyPrefixNames).unwrap();
-        assert_eq!(summary.action_items[0].assignee_pubkey, None);
+        for names in [&KoreanNames as &dyn DisplayNames, &PubkeyPrefixNames] {
+            let summary = check_answer(&answer, &transcript, names).unwrap();
+            assert_eq!(summary.action_items[0].assignee_pubkey, None);
+        }
+    }
+
+    /// 검토에서 재현한 세 장면: 프로필 이름이 붙어도 거절(①)·감사(②)·다른 낱말 속 "네"(③)가
+    /// 확정 담당자가 되지 않는다. 앞 8자 이름표와 결과가 같아야 한다. 규칙을 지금 모양 그대로
+    /// 다시 켜면(`ACCEPT_NAMED_REQUEST = true`) 셋 다 B·확정이 되어 이 시험이 떨어진다.
+    #[test]
+    fn named_request_acceptance_stays_off_with_profile_names() {
+        let scenes = [
+            (
+                "민수 씨, 견적서 금요일까지 보내 줄 수 있어요?",
+                "네, 근데 저는 이번 주 휴가라 견적서는 어려워요.",
+            ),
+            (
+                "민수 씨가 지난번 견적서 정리한 거 좋더라고요. 이번 건 금요일까지면 돼요.",
+                "네 감사합니다.",
+            ),
+            (
+                "민수 씨, 견적서에 네트워크 비용 금요일까지 넣어 줄래요?",
+                "네트워크 비용 견적서는 지영 씨가 하기로 했잖아요.",
+            ),
+        ];
+        let found = HashMap::from([
+            (A.to_string(), "지영".to_string()),
+            (B.to_string(), "민수".to_string()),
+        ]);
+        let profiles = crate::profiles::ProfileNames::new(&[A, B], &found, None);
+        for (request, reply) in scenes {
+            let transcript = transcript_with(&[(2_000, A, request), (8_000, B, reply)]);
+            let answer = answer(json!([item(
+                "견적서 보내기",
+                Some("P2"),
+                Some(reply),
+                Some("2026-10-16"),
+                Some("금요일까지"),
+                2_000
+            )]));
+            for names in [&profiles as &dyn DisplayNames, &PubkeyPrefixNames] {
+                let summary = check_answer(&answer, &transcript, names).unwrap();
+                let got = &summary.action_items[0];
+                assert_eq!(got.assignee_pubkey, None, "{request} → {reply}");
+                assert_eq!(got.status, ItemStatus::Unsure, "{request} → {reply}");
+            }
+        }
     }
 
     #[test]

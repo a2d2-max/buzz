@@ -5,13 +5,16 @@
 //! (`EventBuilder::http_auth`)로 한다.
 //!
 //! - 고르는 순서: `display_name` → `name` → pubkey 앞 8자. 다듬어서 비면 없는 것으로 본다.
-//! - 다듬기: 줄바꿈·제어 문자·안 보이는 서식 문자를 빼고, 띄어쓰기는 하나로 줄이고, 쉼표는
-//!   띄어쓰기로 바꾸고(노션 multi_select 는 쉼표를 못 받는다), 길이는 UTF-16 100 단위까지
-//!   자른다(노션 선택지 이름 한도).
-//! - 한 회의 안에서 다른 pubkey 가 같은 이름이면 둘 다 `이름 (앞 8자)` 로 가른다. 요약에서
-//!   담당자를 이름으로 pubkey 에 되돌릴 때 두 사람이 섞이지 않는다.
+//! - 다듬기: 줄바꿈·제어 문자·안 보이는 서식 문자·빈칸처럼 보이는 채움 글자를 빼고,
+//!   띄어쓰기는 하나로 줄이고, 쉼표는 띄어쓰기로 바꾸고(노션 multi_select 는 쉼표를 못
+//!   받는다), NFC 로 맞추고, 길이는 UTF-16 100 단위까지 자른다(노션 선택지 이름 한도).
+//!   보이는 글자가 하나도 안 남으면 이름이 없는 것으로 본다.
+//! - 한 회의 안에서 다른 pubkey 가 같은 이름이면 둘 다 `이름 (앞 8자)` 로 가른다. 그래도
+//!   겹치면(남의 가른 이름을 제 이름으로 쓴 경우) 겹친 사람은 앞 8자. 요약에서 담당자를
+//!   이름으로 pubkey 에 되돌릴 때 두 사람이 섞이지 않는다.
 //! - 회의 하나에 요청 하나: 참석자 pubkey 를 모두 `authors` 하나에 넣고, 시간 상한
-//!   [`QUERY_TIMEOUT`] 을 둔다. 다시 하지 않는다.
+//!   [`QUERY_TIMEOUT`] 을 둔다. 다시 하지 않는다. 한 실행에서 시간 상한에 한 번 걸리면 그
+//!   실행 동안은 더 묻지 않는다.
 //! - 묻기가 안 돼도(릴레이 안 닿음·401·403·시간 초과·이상한 답) 회의는 그대로 간다. 그
 //!   사람들만 앞 8자로 두고, 몇 명인지와 까닭의 종류만 남긴다([`NamesReport`]). 돈 드는
 //!   단계의 실패 기록(`StepFailures`)에는 넣지 않는다.
@@ -20,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -28,6 +32,7 @@ use nostr::nips::nip98::{HttpData, HttpMethod};
 use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag, Url};
 use reqwest::header::HeaderValue;
 use serde_json::{json, Value};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::correct::is_format;
@@ -74,6 +79,8 @@ pub enum NamesTrouble {
     BadAnswer,
     /// 인증 이벤트에 서명하지 못했다.
     Unsigned,
+    /// 묻지 않았다: 이 실행에서 릴레이가 앞서 시간 상한에 걸렸다.
+    OffForRun,
 }
 
 impl fmt::Display for NamesTrouble {
@@ -85,6 +92,7 @@ impl fmt::Display for NamesTrouble {
             Self::Status(status) => write!(f, "relay answered HTTP {status}"),
             Self::BadAnswer => f.write_str("relay answer unreadable"),
             Self::Unsigned => f.write_str("could not sign the request"),
+            Self::OffForRun => f.write_str("not asked: the relay timed out earlier in this run"),
         }
     }
 }
@@ -157,7 +165,7 @@ impl ProfileNames {
             let name = own.get(*pubkey).cloned().unwrap_or_else(|| prefix(pubkey));
             *counts.entry(same_name(&name)).or_default() += 1;
         }
-        let shown = own
+        let mut shown: HashMap<String, String> = own
             .iter()
             .map(|(pubkey, name)| {
                 let shared = counts.get(&same_name(name)).is_some_and(|n| *n > 1);
@@ -169,6 +177,30 @@ impl ProfileNames {
                 (pubkey.clone(), shown)
             })
             .collect();
+        // 다 만든 이름끼리 한 번 더 본다. 누가 남의 가른 이름("민수 (aaaaaaaa)")을 제
+        // 이름으로 써 두면 여기서 또 겹친다: 겹친 사람은 앞 8자로 보인다(노션 "참석자" 칸에서
+        // 한 사람이 빠지지 않게). 돌 때마다 한 사람 이상이 앞 8자가 되니 반드시 끝난다.
+        loop {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for pubkey in &people {
+                let name = shown
+                    .get(*pubkey)
+                    .cloned()
+                    .unwrap_or_else(|| prefix(pubkey));
+                *counts.entry(same_name(&name)).or_default() += 1;
+            }
+            let clashing: Vec<String> = shown
+                .iter()
+                .filter(|(_, name)| counts.get(&same_name(name)).is_some_and(|n| *n > 1))
+                .map(|(pubkey, _)| pubkey.clone())
+                .collect();
+            if clashing.is_empty() {
+                break;
+            }
+            for pubkey in clashing {
+                shown.remove(&pubkey);
+            }
+        }
         let report = NamesReport {
             asked: people.len(),
             found: own.len(),
@@ -213,16 +245,47 @@ fn cut(text: &str, max_units: usize) -> String {
     kept.trim_end().to_string()
 }
 
-/// 노션 multi_select 선택지가 될 수 있게 다듬은 이름. 비면 `None`.
+/// 노션 multi_select 선택지가 될 수 있게 다듬은 이름. 보이는 글자가 하나도 없으면 `None`.
+/// 조합이 다른 같은 글자(가 = ᄀ+ᅡ)는 NFC 로 맞춘다.
 fn tidy_name(raw: &str) -> Option<String> {
     let kept: String = raw
         .chars()
-        .filter(|c| (!c.is_control() || c.is_whitespace()) && !is_format(*c))
+        .filter(|c| (!c.is_control() || c.is_whitespace()) && !is_format(*c) && !is_filler(*c))
         .map(|c| if c == ',' { ' ' } else { c })
         .collect();
-    let joined = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    let joined: String = kept
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .nfc()
+        .collect();
     let name = cut(&joined, MAX_NAME_UNITS);
-    (!name.is_empty()).then_some(name)
+    name.chars().any(shows).then_some(name)
+}
+
+/// 빈칸처럼 보이는 채움 글자: 한글 채움(U+115F·U+1160·U+3164·U+FFA0)과 빈 점자(U+2800).
+/// 서식 문자가 아니라 [`is_format`] 에 안 걸리지만, 이것만으로 이름을 비워 보이게 할 수 있다.
+fn is_filler(c: char) -> bool {
+    matches!(
+        c,
+        '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}'
+    )
+}
+
+/// 혼자서도 보이는 글자인가. 띄어쓰기, 결합 부호, 이체 선택자는 아니다(앞 글자에 붙어서만
+/// 보인다). 이름에는 이런 글자가 하나는 있어야 한다.
+fn shows(c: char) -> bool {
+    !c.is_whitespace()
+        && !matches!(
+            c,
+            '\u{0300}'..='\u{036F}'
+                | '\u{1AB0}'..='\u{1AFF}'
+                | '\u{1DC0}'..='\u{1DFF}'
+                | '\u{20D0}'..='\u{20FF}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FE20}'..='\u{FE2F}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
 }
 
 /// 같은 이름인지 볼 때 쓰는 열쇠: 띄어쓰기를 빼고 소문자로.
@@ -321,11 +384,15 @@ async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, NamesTr
 }
 
 /// 프로필 이름을 물을 곳: 릴레이 `/query` 주소, 회의록 봇 키, 시간 상한이 걸린 HTTP
-/// 클라이언트. 한 실행에서 하나를 만들어 회의마다 쓴다.
+/// 클라이언트. 한 실행에서 하나를 만들어 회의마다 쓴다. 그 실행에서 한 번이라도 시간
+/// 상한에 걸리면 그 뒤로는 묻지 않는다(답 없이 매달리는 릴레이에 회의마다 상한만큼 쓰지
+/// 않게). 바로 오는 거절(401 등)은 다음 회의에서 다시 묻는다.
 pub struct ProfileSource {
     query_url: Url,
     keys: Keys,
     http: reqwest::Client,
+    /// 이 실행에서 시간 상한에 걸린 적이 있다.
+    hung: AtomicBool,
 }
 
 impl fmt::Debug for ProfileSource {
@@ -357,6 +424,7 @@ impl ProfileSource {
             query_url,
             keys,
             http,
+            hung: AtomicBool::new(false),
         })
     }
 
@@ -386,9 +454,17 @@ impl ProfileSource {
         if authors.is_empty() {
             return ProfileNames::new(pubkeys, &HashMap::new(), None);
         }
+        if self.hung.load(Ordering::Relaxed) {
+            return ProfileNames::new(pubkeys, &HashMap::new(), Some(NamesTrouble::OffForRun));
+        }
         match self.ask(&authors).await {
             Ok(events) => ProfileNames::new(pubkeys, &newest_names(events, &authors), None),
-            Err(trouble) => ProfileNames::new(pubkeys, &HashMap::new(), Some(trouble)),
+            Err(trouble) => {
+                if trouble == NamesTrouble::TimedOut {
+                    self.hung.store(true, Ordering::Relaxed);
+                }
+                ProfileNames::new(pubkeys, &HashMap::new(), Some(trouble))
+            }
         }
     }
 
@@ -447,6 +523,8 @@ impl ProfileSource {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
     use std::time::Instant;
 
     use nostr::{TagKind, Timestamp, ToBech32};
@@ -574,6 +652,105 @@ pub(crate) mod tests {
             assert_eq!(shown.encode_utf16().count(), MAX_NAME_UNITS, "{shown}");
         }
         assert!(a.ends_with(" (aaaaaaaa)"), "{a}");
+    }
+
+    /// 빈칸처럼 보이는 채움 글자·결합 부호만 있는 이름은 이름이 없는 것(앞 8자). 이름 안의
+    /// 채움 글자는 빠진다. 조합이 다른 같은 글자는 NFC 로 같아진다.
+    #[test]
+    fn invisible_names_count_as_no_name() {
+        for blank in [
+            "\u{3164}",
+            "\u{115F}\u{1160}",
+            "\u{FFA0}\u{FFA0}",
+            "\u{2800}",
+            " \u{3164} \u{2800} ",
+            "\u{0301}",
+            "\u{FE0F}\u{200B}",
+        ] {
+            assert_eq!(tidy_name(blank), None, "{blank:?}");
+        }
+        assert_eq!(tidy_name("지\u{3164}영\u{2800}"), Some("지영".into()));
+        // 결합 부호는 보이는 글자에 붙어 있으면 남는다(NFC 로 합쳐진다).
+        assert_eq!(tidy_name("e\u{0301}"), Some("\u{E9}".into()));
+        // 조합형(ᄀ+ᅡ)과 완성형(가)은 같은 이름.
+        assert_eq!(tidy_name("\u{1100}\u{1161}"), Some("가".into()));
+        let content = json!({ "display_name": "\u{3164}", "name": "민수" }).to_string();
+        assert_eq!(profile_name(&content), Some("민수".into()));
+        let names = ProfileNames::new(&[A], &names_of(&[(A, "\u{3164}\u{3164}")]), None);
+        assert_eq!(names.display_name(A), "aaaaaaaa");
+        assert_eq!(names.profile_name(A), None);
+        assert_eq!(names.report().found, 0);
+        let names = ProfileNames::new(
+            &[A, B],
+            &names_of(&[(A, "\u{1100}\u{1161}"), (B, "가")]),
+            None,
+        );
+        assert_eq!(names.display_name(A), "가 (aaaaaaaa)");
+        assert_eq!(names.display_name(B), "가 (bbbbbbbb)");
+    }
+
+    /// 남의 가른 이름을 제 이름으로 써도 보일 이름은 서로 다르다: 겹친 사람은 앞 8자.
+    #[test]
+    fn shown_names_never_collide() {
+        let names = ProfileNames::new(
+            &[A, B, C],
+            &names_of(&[(A, "민수"), (B, "민수 (aaaaaaaa)"), (C, "민수")]),
+            None,
+        );
+        assert_eq!(names.display_name(A), "aaaaaaaa");
+        assert_eq!(names.display_name(B), "bbbbbbbb");
+        assert_eq!(names.display_name(C), "민수 (cccccccc)");
+        // 담당자 연결 DB 에 쓰는 프로필 이름은 그대로.
+        assert_eq!(names.profile_name(B).as_deref(), Some("민수 (aaaaaaaa)"));
+        let mut keys: Vec<String> = [A, B, C]
+            .iter()
+            .map(|pubkey| same_name(&names.display_name(pubkey)))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 3);
+    }
+
+    /// 시간 상한에 한 번 걸리면 그 실행(같은 ProfileSource)에서는 더 묻지 않는다. 바로 오는
+    /// 거절(401)은 다음 회의에서 다시 묻는다.
+    #[tokio::test]
+    async fn a_timeout_turns_asking_off_for_the_run() {
+        let pubkeys = hex_of(&[Keys::generate()]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        let bot = Keys::generate();
+        let source = ProfileSource::new(
+            &base,
+            &bot.secret_key().to_secret_hex(),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let first = source.names(&refs(&pubkeys)).await;
+        assert_eq!(first.report().trouble, Some(NamesTrouble::TimedOut));
+        let started = Instant::now();
+        let second = source.names(&refs(&pubkeys)).await;
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(second.report().trouble, Some(NamesTrouble::OffForRun));
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "asked only once");
+        assert_eq!(second.display_name(&pubkeys[0]), &pubkeys[0][..8]);
+        let line = second.report().to_string();
+        assert!(line.contains("not asked"), "{line}");
+
+        let relay = FakeServer::start(|_| Reply::json(401, &json!({}))).await;
+        let source = source_for(&relay.base, &Keys::generate());
+        for _ in 0..2 {
+            source.names(&refs(&pubkeys)).await;
+        }
+        assert_eq!(relay.requests().len(), 2);
     }
 
     #[tokio::test]

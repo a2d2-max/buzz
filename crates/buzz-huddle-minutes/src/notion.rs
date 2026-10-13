@@ -746,7 +746,8 @@ pub struct PublishReport {
     pub people_rename_failed: usize,
     /// "확인됨" 줄에 노션 사용자가 있어 멘션할 수 있는 참석자 수.
     pub people_linked: usize,
-    /// 담당자 연결 DB 를 못 다뤘을 때 그 까닭(회의록은 그래도 쓴다).
+    /// 담당자 연결 DB 를 못 다뤘을 때 그 까닭(회의록은 그래도 쓴다). 종류·HTTP 상태·노션
+    /// 오류 코드만([`NotionError::short`]): 작업기 로그에 찍힌다.
     pub people_error: Option<String>,
     /// 본문 쓰기에 실패했는데 "실패" 표시까지 못 해서 "처리 중"으로 남았을 수 있다.
     pub stuck_in_progress: bool,
@@ -1382,7 +1383,8 @@ pub async fn publish(
     let people = match link_people(client, transcript, page.names, report).await {
         Ok(people) => people,
         Err(error) => {
-            report.people_error = Some(error.to_string());
+            // 노션 메시지는 페이지 글을 옮겨 올 수 있어서 종류와 코드만 남긴다.
+            report.people_error = Some(error.short());
             HashMap::new()
         }
     };
@@ -1810,7 +1812,11 @@ pub(crate) mod tests {
             match (request.method.as_str(), &parts[..]) {
                 ("POST", ["v1", "data_sources", source, "query"]) => {
                     if self.people_forbidden && *source == PEOPLE_DATA_SOURCE_ID {
-                        return Reply::json(403, &json!({ "code": "restricted_resource" }));
+                        // 노션 메시지는 글 조각을 옮겨 올 수 있다(로그에 가면 안 된다).
+                        return Reply::json(
+                            403,
+                            &json!({ "code": "restricted_resource", "message": "회의 글 조각" }),
+                        );
                     }
                     let results: Vec<Value> = self
                         .pages
@@ -2646,10 +2652,11 @@ pub(crate) mod tests {
             ..FakeNotion::default()
         })
         .await;
-        assert!(report
-            .people_error
-            .as_deref()
-            .is_some_and(|error| error.contains("permission")));
+        // 작업기 로그에 찍히니 종류·상태·코드만(노션 메시지는 없다).
+        assert_eq!(
+            report.people_error.as_deref(),
+            Some("permission HTTP 403 restricted_resource")
+        );
         assert_eq!(report.people_linked, 0);
         let state = state.lock().unwrap();
         assert_eq!(
@@ -2789,6 +2796,36 @@ pub(crate) mod tests {
         assert!(!server.requests()[before..]
             .iter()
             .any(|r| r.path.contains("person-")));
+    }
+
+    /// 남의 가른 이름을 제 이름으로 쓴 사람이 있어도 "참석자" 칸에서 아무도 빠지지 않는다
+    /// (multi_select 는 같은 이름을 하나로 친다).
+    #[test]
+    fn attendees_keep_everyone_when_a_name_copies_a_split_name() {
+        const C: &str = "cccccccc00000000000000000000000000000000000000000000000000000003";
+        let transcript = transcript_with(&[
+            (1_000, A, "견적서 얘기해요."),
+            (2_000, B, "네."),
+            (3_000, C, "좋아요."),
+        ]);
+        let found = HashMap::from([
+            (A.to_string(), "민수".to_string()),
+            (B.to_string(), "민수 (aaaaaaaa)".to_string()),
+            (C.to_string(), "민수".to_string()),
+        ]);
+        let names = crate::profiles::ProfileNames::new(&[A, B, C], &found, None);
+        let summary = summary_of(&transcript);
+        let mut shown = page(&transcript, &summary);
+        shown.names = &names;
+        let properties = page_properties(&shown, ProcessingStatus::Done, DEFAULT_PLAYBACK_LINK);
+        assert_eq!(
+            properties[minutes_property::PARTICIPANTS]["multi_select"],
+            json!([
+                { "name": "aaaaaaaa" },
+                { "name": "bbbbbbbb" },
+                { "name": "민수 (cccccccc)" }
+            ])
+        );
     }
 
     /// 이름 고치기가 막혀도(고치기 권한 없음) 멘션과 회의록은 그대로고, 수만 센다.

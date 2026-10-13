@@ -34,6 +34,16 @@ gcloud storage buckets describe "gs://$recordings_bucket" --format='value(name)'
 gcloud storage buckets describe "gs://$minutes_bucket" --format='value(name)' >/dev/null
 gcloud secrets describe "$notion_secret" --project "$project" --format='value(name)' >/dev/null
 gcloud secrets describe "$scribe_secret" --project "$project" --format='value(name)' >/dev/null
+# 작업은 두 비밀을 :latest 로 붙인다. latest 판이 없거나 꺼져 있으면 Cloud Run 작업이 아예 안
+# 떠서 회의록 전체가 멈춘다(봇 키는 이름 꾸밈에만 쓰는데도). 키를 바꿀 때는 새 판을 먼저 넣고
+# 확인한 뒤 옛 판을 끈다(docs/huddle-minutes-worker.md "참석자 이름").
+for secret in "$notion_secret" "$scribe_secret"; do
+  latest_state="$(gcloud secrets versions describe latest --secret "$secret" --project "$project" --format='value(state)' 2>/dev/null || true)"
+  if [ "$latest_state" != ENABLED ]; then
+    echo "비밀 $secret 의 latest 판이 켜져 있지 않다(${latest_state:-없음}): 판을 넣거나 켠 뒤 다시 돌린다" >&2
+    exit 3
+  fi
+done
 
 # ─── 1. 서비스 계정 ──────────────────────────────────────────────────────────
 for pair in "$sa_name:Huddle minutes worker (Cloud Run job)" "$invoker_name:Huddle minutes invoker (Cloud Scheduler)"; do

@@ -1106,6 +1106,9 @@ async fn process_channels<H: MinutesHome>(
                     if let Some(names) = &followed.names {
                         eprintln!("  {}", names_line(names));
                     }
+                    if let Some(report) = &followed.notion_report {
+                        eprintln!("  {}", people_line(report));
+                    }
                     if let Some(usage) = &followed.summary_usage {
                         eprintln!("  {}", usage_line(usage));
                     }
@@ -1204,6 +1207,9 @@ async fn process_channels<H: MinutesHome>(
                 if let Some(names) = &followed.names {
                     eprintln!("  {}", names_line(names));
                 }
+                if let Some(report) = &followed.notion_report {
+                    eprintln!("  {}", people_line(report));
+                }
                 if let Some(made) = &followed.correct_made {
                     eprintln!("  {}", correct_line(made));
                 }
@@ -1287,6 +1293,24 @@ fn follow_line(followed: &FollowedUp) -> String {
 fn names_line(names: &NamesReport) -> String {
     let mark = if names.all_found() { "" } else { "warning: " };
     format!("{mark}{names}")
+}
+
+/// 노션 "허들 담당자 연결" DB 에 한 일 한 줄(수와 까닭의 종류만: 이름·pubkey·줄 id 없음).
+/// 이름 고치기가 막혔거나 DB 를 못 다뤘으면 경고로 찍는다(회의록은 그래도 썼다).
+fn people_line(report: &notion::PublishReport) -> String {
+    let trouble = report.people_rename_failed > 0 || report.people_error.is_some();
+    let mut line = format!(
+        "{}people db: added {}, renamed {}, rename failed {}, linked {}",
+        if trouble { "warning: " } else { "" },
+        report.people_rows_added.len(),
+        report.people_rows_renamed.len(),
+        report.people_rename_failed,
+        report.people_linked
+    );
+    if let Some(error) = &report.people_error {
+        line.push_str(&format!(" | skipped ({error})"));
+    }
+    line
 }
 
 /// What the correction made, numbers only.
@@ -1496,5 +1520,42 @@ mod tests {
         assert!(placeholder_allowed(false, None, Switch::On, Switch::Off, Switch::Off).is_err());
         assert!(placeholder_allowed(false, None, Switch::Off, Switch::On, Switch::Off).is_err());
         assert!(placeholder_allowed(false, None, Switch::Off, Switch::Off, Switch::On).is_err());
+    }
+
+    /// 담당자 연결 DB 줄에는 수와 까닭의 종류만 찍힌다(줄 id·페이지 id 없음).
+    #[test]
+    fn people_line_has_counts_and_kinds_only() {
+        let report = notion::PublishReport {
+            page_id: "page-1".into(),
+            people_rows_added: vec!["row-1".into()],
+            people_rows_renamed: vec!["row-2".into(), "row-3".into()],
+            people_rename_failed: 1,
+            people_linked: 2,
+            ..notion::PublishReport::default()
+        };
+        assert_eq!(
+            people_line(&report),
+            "warning: people db: added 1, renamed 2, rename failed 1, linked 2"
+        );
+        let refused = notion::PublishReport {
+            people_error: Some("permission HTTP 403 restricted_resource".into()),
+            ..notion::PublishReport::default()
+        };
+        let line = people_line(&refused);
+        assert_eq!(
+            line,
+            "warning: people db: added 0, renamed 0, rename failed 0, linked 0 | skipped (permission HTTP 403 restricted_resource)"
+        );
+        let fine = notion::PublishReport {
+            people_linked: 3,
+            ..notion::PublishReport::default()
+        };
+        assert_eq!(
+            people_line(&fine),
+            "people db: added 0, renamed 0, rename failed 0, linked 3"
+        );
+        for line in [people_line(&report), line] {
+            assert!(!line.contains("row-") && !line.contains("page-"), "{line}");
+        }
     }
 }
