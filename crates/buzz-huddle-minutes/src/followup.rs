@@ -4974,7 +4974,8 @@ mod tests {
         );
     }
 
-    /// 계획 뒤에 사람이 그 칸을 바꿨으면 덮어쓰지 않고 따로 센다. 기록에는 실제로 바꾼 것만 남는다.
+    /// 계획 뒤에 사람이 그 칸을 바꿨으면(기한도 상태도) 덮어쓰지 않고 따로 센다. 기록에는 실제로
+    /// 바꾼 것만 남는다.
     #[tokio::test]
     async fn a_field_changed_after_the_plan_is_left_alone() {
         let link = linking().await;
@@ -4984,31 +4985,171 @@ mod tests {
             failed_with(&first.tasks, "while changing a task's due date"),
             "{first:?}"
         );
-        // 그사이 사람이 기한을 고쳤다.
+        // 그사이 사람이 task-1 기한과 task-2 상태를 고쳤다.
         link.edit_task(
             "task-1",
             "종료일",
             json!({ "date": { "start": "2026-10-25" } }),
         );
+        link.edit_task(
+            "task-2",
+            "작업상태",
+            json!({ "status": { "name": "Staging QA" } }),
+        );
         link.world.state.lock().unwrap().failing_paths.clear();
         link.world.advance(FIRST_BACKOFF);
         // 첫 실행의 실패한 PATCH 도 가짜 노션에 남으니 두 번째 실행 몫만 센다.
-        let patched = link.patches("task-1");
+        let patched = (link.patches("task-1"), link.patches("task-2"));
         let second = link.follow(TasksMode::Update).await;
         assert_eq!(second.tasks, Step::Done, "{second:?}");
-        assert_eq!(second.tasks_made.unwrap().changed_meanwhile, 1);
+        assert_eq!(second.tasks_made.unwrap().changed_meanwhile, 2);
         assert_eq!(
-            link.patches("task-1"),
+            (link.patches("task-1"), link.patches("task-2")),
             patched,
             "no PATCH over a person's edit"
         );
         let (task_1, body_1) = link.page("task-1");
         assert_eq!(task_1["종료일"]["date"]["start"], "2026-10-25");
-        // 요약 줄에도 「기한:」 이 있으니 바꾼 줄은 화살표로 가려낸다.
-        let text = serde_json::to_string(&body_1).unwrap();
-        assert!(!text.contains('→') && !text.contains("user-9"), "{text}");
-        assert_eq!(link.records("task-1"), 1);
+        let (task_2, body_2) = link.page("task-2");
+        assert_eq!(task_2["작업상태"]["status"]["name"], "Staging QA");
+        // 요약 줄에도 「기한:」 이 있으니 바꾼 줄은 화살표로 가려낸다. 바꾼 게 없으니 멘션도 없다.
+        for body in [body_1, body_2] {
+            let text = serde_json::to_string(&body).unwrap();
+            assert!(
+                !text.contains('→') && !text.contains(r#""type":"user""#),
+                "{text}"
+            );
+        }
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
         assert_eq!(link.tasks_asked(), 1);
+    }
+
+    /// 칸을 바꾸고 장부에 못 남긴 채 죽었다: 다시 돌면 이미 새 값인 것을 알아보고(already there)
+    /// 다시 안 쓰고, 기록에는 바꾼 것을 A → B 로 남긴다(사람이 보고 되돌릴 수 있게).
+    #[tokio::test]
+    async fn a_change_made_before_a_crash_still_shows_in_the_record() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["blocks/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while appending a record"),
+            "{first:?}"
+        );
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-16"
+        );
+        // 바꾼 것을 장부에 못 남기고 죽은 것처럼.
+        let mut ledger = link.ledger();
+        assert_eq!(ledger.done.remove("due:task-1"), Some(Outcome::Written));
+        std::fs::write(link.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+        link.world.state.lock().unwrap().failing_paths.clear();
+        link.world.advance(FIRST_BACKOFF);
+        let patched = link.patches("task-1");
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        let report = second.tasks_made.unwrap();
+        assert_eq!((report.already_there, report.changed_meanwhile), (1, 0));
+        assert_eq!(link.patches("task-1"), patched, "not written again");
+        let (_, body_1) = link.page("task-1");
+        assert_eq!(block_text(&body_1[1]), "기한: 10/20 → 10/16 (근거 [00:05])");
+    }
+
+    /// task 가 그사이 지워졌으면(404) 그 task 의 남은 쓰기만 건너뛰고 나머지는 쓴다.
+    #[tokio::test]
+    async fn a_deleted_task_is_skipped_and_the_rest_goes_on() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        {
+            let mut state = link.world.state.lock().unwrap();
+            state.failing_paths.clear();
+            state.pages.retain(|page| page.id != "task-1");
+        }
+        link.world.advance(FIRST_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        let report = second.tasks_made.unwrap();
+        assert_eq!((report.gone, report.not_written), (1, 1));
+        assert_eq!(link.records("task-2"), 1);
+        assert_eq!(link.page("task-2").0["작업상태"]["status"]["name"], "완료");
+        assert_eq!(link.created().len(), 1);
+        assert_eq!(link.maybe_sections(), 1);
+    }
+
+    /// 새 task 의 기한 근거에 망설이는 말이 있으면 종료일 없이 만들고 본문에 「기한 애매」를 쓴다.
+    #[tokio::test]
+    async fn a_new_task_with_a_hedged_due_has_no_due_and_says_so() {
+        let link = linking().await;
+        let mut script = task_meeting();
+        let at = script
+            .segments
+            .iter()
+            .position(|segment| segment.start_ms == 17_000)
+            .unwrap();
+        script.segments[at].text =
+            "회의록 공유 기능은 제가 목요일까지 만들게요, 근데 확실하진 않아요.".into();
+        let followed = link.follow_script(TasksMode::Create, &script).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        let created = link.created();
+        assert_eq!(created.len(), 1);
+        let (properties, body) = link.page(&created[0]);
+        assert!(
+            properties
+                .get("종료일")
+                .is_none_or(|due| due["date"].is_null()),
+            "{properties:?}"
+        );
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(text.contains(crate::tasks::DUE_UNSURE_NOTE), "{text}");
+    }
+
+    /// 제안뿐인 바꿈은 누가 쓰라고 해도 칸을 안 쓴다: writes 가 거르고, apply 도 한 번 더 막는다
+    /// (두 곳 다 시험으로 잰다).
+    #[tokio::test]
+    async fn a_suggestion_is_never_written_even_if_asked() {
+        let link = linking().await;
+        *link.fixed.lock().unwrap() = Some(json!({
+            "links": [
+                { "item": "D1", "task": "K2", "level": "확실", "why": "", "said": "", "ms": 9_000 }
+            ],
+            "due_changes": [],
+            "status_changes": [{ "task": "K2", "status": "Production QA", "ms": 9_000 }],
+            "new_tasks": []
+        }));
+        assert_eq!(link.follow(TasksMode::Update).await.tasks, Step::Done);
+        let mut ledger = link.ledger();
+        let i = ledger
+            .plan
+            .tasks
+            .iter()
+            .position(|task| task.id == "task-2")
+            .unwrap();
+        assert!(ledger.plan.tasks[i].status.as_ref().unwrap().suggest);
+        let schema = ledger.schema.clone();
+        let mut client =
+            NotionClient::new(&link.world.http, &link.world.notion_settings, "t").unwrap();
+        let mut report = TasksReport::default();
+        let outcome = tasks::apply(
+            &mut client,
+            &mut ledger,
+            &schema,
+            tasks::Write::Status(i),
+            "",
+            &mut report,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Outcome::Skipped);
+        assert_eq!(link.patches("task-2"), 0);
+        assert_eq!(
+            link.page("task-2").0["작업상태"]["status"]["name"],
+            "Dev QA"
+        );
     }
 
     /// task 하나의 쓰기가 400 이면 그 task 의 남은 쓰기만 건너뛰고 다음 task 로 간다.

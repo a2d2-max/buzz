@@ -2860,6 +2860,14 @@ pub(crate) mod tests {
             plan.tasks[0].due.as_ref().map(|change| change.to.as_str()),
             Some("2026-10-16")
         );
+        // 무슨 일인지 없는 말에 다른 사람이 일 이름을 대도, 그 말을 그 일의 근거로 채우지 않는다.
+        let vague = [
+            (5_000, A, "그건 금요일까지 할게요."),
+            (9_000, B, "견적서 자동화 말씀이시죠."),
+        ];
+        let plan = check_meeting(&vague, "견적서 자동화 공유", 5_000, &answer(5_000), &open());
+        assert_eq!(plan.tasks[0].due, None);
+        assert_eq!((plan.dropped.not_about, plan.dropped.negation), (1, 0));
     }
 
     /// 상태를 말하는 말이 근거 말에 없으면 바꾸지 않고 제안으로만: 「로그인 오류 수정 PR
@@ -2884,6 +2892,13 @@ pub(crate) mod tests {
             change_line(Write::Status(0), &status),
             "상태 제안: Dev QA → 완료 (근거 [00:01])"
         );
+        // 다른 사람이 이어서 한 말의 상태 말은 이 근거 말이 아니다.
+        let other = [
+            (1_000, A, "로그인 오류 수정 PR 올렸어요."),
+            (5_000, B, "제가 머지했어요."),
+        ];
+        let plan = check_meeting(&other, "로그인 오류 수정 PR", 1_000, &answer, &open());
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
         let done = [
             (1_000, A, "로그인 오류 수정은 배포 끝났어요."),
             (5_000, B, "네 볼게요."),
@@ -3083,5 +3098,42 @@ pub(crate) mod tests {
             plan.tasks[0].due.as_ref().map(|change| change.to.as_str()),
             Some("2026-10-16")
         );
+    }
+
+    /// 앞 쓰기가 400·404 로 끝난 task 의 남은 쓰기는 건너뛴다. 다만 칸을 이미 바꿨으면 그 기록은
+    /// 막지 않고, 24시간이 지나도 붙일 남은 기록으로 잡는다.
+    #[test]
+    fn a_refused_task_still_gets_the_record_of_a_change() {
+        let plan = check(&good_answer());
+        assert!(plan.tasks.len() >= 2);
+        let mut ledger = TasksLedger {
+            format: TASKS_FORMAT.into(),
+            mode: TasksMode::Update,
+            script_sha256: String::new(),
+            summary_sha256: String::new(),
+            minutes_page_id: "page-1".into(),
+            channel_id: Uuid::nil(),
+            meeting: String::new(),
+            schema: schema(),
+            plan,
+            usage: None,
+            done: BTreeMap::new(),
+            created: BTreeMap::new(),
+            finished: false,
+        };
+        let due = Write::Due(0).key(&ledger.plan);
+        let status = Write::Status(0).key(&ledger.plan);
+        // 기한은 바꿨고 상태는 거절됐다: 기록은 막지 않는다(바꾼 기한을 남겨야 한다).
+        ledger.done.insert(due.clone(), Outcome::Written);
+        ledger.done.insert(status, Outcome::Refused);
+        assert!(!ledger.blocked(Write::Append(0)));
+        assert_eq!(ledger.owed_records(), [Write::Append(0)]);
+        // 기한이 거절됐으면 그 task 의 남은 쓰기는 다 건너뛰고, 붙일 기록도 없다.
+        ledger.done.clear();
+        ledger.done.insert(due, Outcome::Refused);
+        assert!(ledger.blocked(Write::Status(0)) && ledger.blocked(Write::Append(0)));
+        assert!(ledger.owed_records().is_empty());
+        // 다른 task 는 막지 않는다.
+        assert!(!ledger.blocked(Write::Append(1)));
     }
 }
