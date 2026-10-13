@@ -3593,6 +3593,8 @@ pub(crate) mod tests {
         ] {
             assert!(says_status("완료", words), "{words}");
         }
+        // 맨 「완료」는 「금요일 완료 목표」 같은 계획에도 쓰여서 끝낸 꼴로 안 본다.
+        assert!(!says_status("완료", "로그인 오류 수정 완료"));
         let planned = [(1_000, A, "로그인 오류 수정은 금요일 완료 예정이에요.")];
         let answer = k2_status_answer("완료");
         let plan = check_meeting(&planned, "로그인 오류 수정 완료", 1_000, &answer, &open());
@@ -3688,5 +3690,16 @@ pub(crate) mod tests {
         };
         let plan = check_answer(&good_answer().to_string(), &input).unwrap();
         assert!(!plan.maybe.iter().any(|maybe| maybe.id == "task-4"));
+        // 모델이 그 task 를 이미 애매 링크로 냈으면 또 달지 않는다.
+        let mut answer = good_answer();
+        answer["links"][2]["task"] = json!("K4");
+        let input = CheckInput {
+            mode: TasksMode::Create,
+            ..input
+        };
+        let plan = check_answer(&answer.to_string(), &input).unwrap();
+        assert!(plan.creates.is_empty());
+        let task_4 = plan.maybe.iter().filter(|maybe| maybe.id == "task-4");
+        assert_eq!(task_4.count(), 1);
     }
 }
