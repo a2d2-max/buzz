@@ -85,6 +85,8 @@ pub(crate) struct Reply {
     pub body: String,
     /// 본문 길이를 실제보다 길게 알려 주고 끊는다(본문 읽기 실패 흉내).
     pub cut_off: bool,
+    /// 답하지 않고 연결만 쥐고 있는다(시간 초과 흉내).
+    pub hang: bool,
 }
 
 impl Reply {
@@ -95,6 +97,15 @@ impl Reply {
             headers: vec![("content-type".into(), "application/json".into())],
             body: body.to_string(),
             cut_off: false,
+            hang: false,
+        }
+    }
+
+    /// 아무 답도 하지 않는다(요청은 받아 적고 연결만 쥐고 있는다).
+    pub fn silent() -> Self {
+        Self {
+            hang: true,
+            ..Self::json(0, &serde_json::Value::Null)
         }
     }
 
@@ -138,6 +149,11 @@ impl FakeServer {
                     };
                     let reply = handler(&request);
                     seen.lock().expect("lock").push(request);
+                    if reply.hang {
+                        // 시험이 끝나 런타임이 내려갈 때까지 연결을 쥐고 있는다.
+                        tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+                        return;
+                    }
                     let declared = reply.body.len() + if reply.cut_off { 1_000 } else { 0 };
                     let mut head = format!(
                         "HTTP/1.1 {} X\r\ncontent-length: {declared}\r\nconnection: close\r\n",
