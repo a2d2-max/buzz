@@ -2958,6 +2958,18 @@ pub(crate) mod tests {
         let plan = check_meeting(&lines, "견적서 자동화 기한", 5_000, &answer, &open());
         assert_eq!(plan.tasks[0].due, None);
         assert_eq!(plan.dropped.date_not_in_words, 1);
+        // 그 줄을 말한 날 당일은 받는다(지난 날만 버린다).
+        let answer = json!({
+            "links": [link_d1("K1", 5_000)],
+            "due_changes": [{ "task": "K1", "due": "2026-10-12", "ms": 5_000 }],
+            "status_changes": [], "new_tasks": []
+        });
+        let lines = [(5_000, B, "견적서 자동화는 10월 12일까지 할게요.")];
+        let plan = check_meeting(&lines, "견적서 자동화 기한", 5_000, &answer, &open());
+        assert_eq!(
+            plan.tasks[0].due.as_ref().map(|change| change.to.as_str()),
+            Some("2026-10-12")
+        );
     }
 
     /// 이미 그 날인 기한은 바꿀 것이 없다(같은 값을 다시 쓰지 않는다).
