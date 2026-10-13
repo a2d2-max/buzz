@@ -30,6 +30,9 @@ use buzz_huddle_minutes::models::{
     SPEAKER_EMBEDDING, SPEAKER_SEGMENTATION,
 };
 use buzz_huddle_minutes::pipeline::{MinutesSettings, SttPolicy};
+use buzz_huddle_minutes::profiles::{
+    NamesReport, ProfileSource, QUERY_TIMEOUT as PROFILE_QUERY_TIMEOUT, SCRIBE_KEY_ENV,
+};
 use buzz_huddle_minutes::runner::{
     create_private_dir, run_meeting_with, write_private, Done, LocalMinutes, MeetingError,
     MinutesHome, RunOptions,
@@ -173,6 +176,11 @@ enum Command {
         /// use it.
         #[arg(long, env = "BUZZ_MINUTES_CORRECT", value_enum, default_value_t = Switch::Off)]
         correct: Switch,
+        /// 참석자 프로필 이름(kind 0)을 물을 릴레이 주소(예: https://buzz.a2d2lab.com).
+        /// 회의록 봇 키(환경 변수 BUZZ_MINUTES_SCRIBE_NSEC)와 같이 있을 때만 묻고, 하나라도
+        /// 없으면 pubkey 앞 8자를 보인다.
+        #[arg(long, env = "BUZZ_MINUTES_RELAY_URL")]
+        relay_url: Option<String>,
         /// Make every N-th piece fail transcription (fake transcriber).
         #[arg(long)]
         stt_fail_every: Option<usize>,
@@ -360,6 +368,42 @@ fn token_from_env(name: &str) -> anyhow::Result<String> {
     }
 }
 
+/// 참석자 프로필 이름을 물을 곳. 릴레이 주소와 봇 키(환경 변수 [`SCRIBE_KEY_ENV`])가 둘 다
+/// 있어야 켠다. 하나라도 없거나 쓸 수 없으면 pubkey 앞 8자를 보이고 실행은 그대로 간다
+/// (이름 때문에 회의록을 막지 않는다). 키 값은 어디에도 찍지 않는다.
+fn profile_source(relay_url: Option<&str>) -> Option<ProfileSource> {
+    let relay_url = relay_url.map(str::trim).filter(|url| !url.is_empty());
+    let key = std::env::var(SCRIBE_KEY_ENV)
+        .ok()
+        .filter(|key| !key.trim().is_empty());
+    let (relay_url, key) = match (relay_url, key) {
+        (Some(relay_url), Some(key)) => (relay_url, key),
+        (None, None) => return None,
+        (Some(_), None) => {
+            eprintln!(
+                "profile names: off ({SCRIBE_KEY_ENV} is not set); pubkey prefixes are shown"
+            );
+            return None;
+        }
+        (None, Some(_)) => {
+            eprintln!(
+                "profile names: off (BUZZ_MINUTES_RELAY_URL is not set); pubkey prefixes are shown"
+            );
+            return None;
+        }
+    };
+    match ProfileSource::new(relay_url, &key, PROFILE_QUERY_TIMEOUT) {
+        Ok(source) => {
+            eprintln!("profile names: asked from {}", source.query_url());
+            Some(source)
+        }
+        Err(error) => {
+            eprintln!("profile names: off ({error}); pubkey prefixes are shown");
+            None
+        }
+    }
+}
+
 /// `--gcp-auth` values.
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum GcpAuth {
@@ -518,6 +562,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             summary_model,
             notion: notion_switch,
             correct: correct_switch,
+            relay_url,
             stt_fail_every,
             stt_fail_kind,
             stt_fail_attempts,
@@ -660,6 +705,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let mut notion_settings = notion::NotionSettings::default();
             notion_settings.retry.max_retry_after_ms = WORKER_MAX_RETRY_AFTER_MS;
             let names = summary::PubkeyPrefixNames;
+            let profiles = profile_source(relay_url.as_deref());
             let mut follow = FollowUps::new(
                 summary_tokens.as_ref().map(|tokens| SummaryStep {
                     http: &gemini_http,
@@ -678,6 +724,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 &names,
             )
             .with_deadline(deadline);
+            if let Some(source) = &profiles {
+                follow = follow.with_profiles(source);
+            }
             if let Some(tokens) = &correct_tokens {
                 follow = follow.with_correct(CorrectStep {
                     http: &gemini_http,
@@ -1054,6 +1103,12 @@ async fn process_channels<H: MinutesHome>(
                         "{channel_id} meeting {m}: script already there | {}",
                         follow_line(&followed)
                     );
+                    if let Some(names) = &followed.names {
+                        eprintln!("  {}", names_line(names));
+                    }
+                    if let Some(report) = &followed.notion_report {
+                        eprintln!("  {}", people_line(report));
+                    }
                     if let Some(usage) = &followed.summary_usage {
                         eprintln!("  {}", usage_line(usage));
                     }
@@ -1149,6 +1204,12 @@ async fn process_channels<H: MinutesHome>(
             );
             if let Some(followed) = followed {
                 eprintln!("  {}", follow_line(&followed));
+                if let Some(names) = &followed.names {
+                    eprintln!("  {}", names_line(names));
+                }
+                if let Some(report) = &followed.notion_report {
+                    eprintln!("  {}", people_line(report));
+                }
                 if let Some(made) = &followed.correct_made {
                     eprintln!("  {}", correct_line(made));
                 }
@@ -1225,6 +1286,31 @@ fn follow_line(followed: &FollowedUp) -> String {
         ),
         step(&followed.notion, "")
     )
+}
+
+/// 참석자 이름 묻기 결과 한 줄(수와 까닭의 종류만: 이름·pubkey 없음). pubkey 앞 8자로
+/// 남은 사람이 있으면 경고로 찍는다. 회의 처리의 실패로는 세지 않는다.
+fn names_line(names: &NamesReport) -> String {
+    let mark = if names.all_found() { "" } else { "warning: " };
+    format!("{mark}{names}")
+}
+
+/// 노션 "허들 담당자 연결" DB 에 한 일 한 줄(수와 까닭의 종류만: 이름·pubkey·줄 id 없음).
+/// 이름 고치기가 막혔거나 DB 를 못 다뤘으면 경고로 찍는다(회의록은 그래도 썼다).
+fn people_line(report: &notion::PublishReport) -> String {
+    let trouble = report.people_rename_failed > 0 || report.people_error.is_some();
+    let mut line = format!(
+        "{}people db: added {}, renamed {}, rename failed {}, linked {}",
+        if trouble { "warning: " } else { "" },
+        report.people_rows_added.len(),
+        report.people_rows_renamed.len(),
+        report.people_rename_failed,
+        report.people_linked
+    );
+    if let Some(error) = &report.people_error {
+        line.push_str(&format!(" | skipped ({error})"));
+    }
+    line
 }
 
 /// What the correction made, numbers only.
@@ -1434,5 +1520,42 @@ mod tests {
         assert!(placeholder_allowed(false, None, Switch::On, Switch::Off, Switch::Off).is_err());
         assert!(placeholder_allowed(false, None, Switch::Off, Switch::On, Switch::Off).is_err());
         assert!(placeholder_allowed(false, None, Switch::Off, Switch::Off, Switch::On).is_err());
+    }
+
+    /// 담당자 연결 DB 줄에는 수와 까닭의 종류만 찍힌다(줄 id·페이지 id 없음).
+    #[test]
+    fn people_line_has_counts_and_kinds_only() {
+        let report = notion::PublishReport {
+            page_id: "page-1".into(),
+            people_rows_added: vec!["row-1".into()],
+            people_rows_renamed: vec!["row-2".into(), "row-3".into()],
+            people_rename_failed: 1,
+            people_linked: 2,
+            ..notion::PublishReport::default()
+        };
+        assert_eq!(
+            people_line(&report),
+            "warning: people db: added 1, renamed 2, rename failed 1, linked 2"
+        );
+        let refused = notion::PublishReport {
+            people_error: Some("permission HTTP 403 restricted_resource".into()),
+            ..notion::PublishReport::default()
+        };
+        let line = people_line(&refused);
+        assert_eq!(
+            line,
+            "warning: people db: added 0, renamed 0, rename failed 0, linked 0 | skipped (permission HTTP 403 restricted_resource)"
+        );
+        let fine = notion::PublishReport {
+            people_linked: 3,
+            ..notion::PublishReport::default()
+        };
+        assert_eq!(
+            people_line(&fine),
+            "people db: added 0, renamed 0, rename failed 0, linked 3"
+        );
+        for line in [people_line(&report), line] {
+            assert!(!line.contains("row-") && !line.contains("page-"), "{line}");
+        }
     }
 }

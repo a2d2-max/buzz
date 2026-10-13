@@ -15,10 +15,12 @@
 //!   새 본문을 먼저 다 붙인 뒤 옛 블록을 지운다(중간에 끊겨도 빈 페이지가 안 된다).
 //!   같은 글의 할 일은 체크 상태를 이어받는다.
 //! - 처음 만들 때만 기본 알림, 다시 게시·다시 쓰기는 조용히(`notifications.mode = silent`).
-//! - "허들 담당자 연결" DB 에 참석자를 pubkey 로 넣는다. 없으면 한 줄 더하고,
-//!   있는 줄은 **절대 고치지 않는다**. 사람 멘션은 "확인됨"이 체크된 줄의
-//!   "노션 사용자"만 쓰고, 나머지는 이름 글자로. 이 DB 를 못 읽어도(403 등)
-//!   회의록은 쓴다(멘션만 빠진다).
+//! - "허들 담당자 연결" DB 에 참석자를 pubkey 로 넣는다. 없으면 한 줄 더한다(이름은
+//!   프로필 이름, 모르면 pubkey 앞 8자). 있는 줄은 이름 칸이 pubkey 앞 8자 그대로일
+//!   때(작업기가 넣은 그대로)만 프로필 이름으로 고치고, 사람이 고친 이름과 다른 칸은
+//!   **절대 고치지 않는다**. 고치기가 안 돼도 멘션은 그대로 한다(이름 칸이 그대로라 다음
+//!   회의에서 다시 해 본다). 사람 멘션은 "확인됨"이 체크된 줄의 "노션 사용자"만 쓰고,
+//!   나머지는 이름 글자로. 이 DB 를 못 읽어도(403 등) 회의록은 쓴다(멘션만 빠진다).
 //! - 노션 한도: 요청당 블록 100개, 글 조각 하나에 2000자, 배열 100개,
 //!   요청 500KB, 연결마다 평균 초당 3번. 429·529 는 `Retry-After` 를 지켜 다시 한다.
 //! - 녹음 파일은 올리지 않는다. 링크만 건다.
@@ -37,7 +39,9 @@ use uuid::Uuid;
 use crate::collect::MeetingPlan;
 use crate::correct::{self, Corrected, Piece};
 use crate::runner::{MeetingError, MinutesHome};
-use crate::summary::{huddle_id, kst, line_name, DisplayNames, ItemStatus, RetryPolicy, Summary};
+use crate::summary::{
+    huddle_id, kst, line_name, DisplayNames, ItemStatus, PubkeyPrefixNames, RetryPolicy, Summary,
+};
 use crate::transcript::Transcript;
 
 /// 노션 API 주소.
@@ -736,9 +740,14 @@ pub struct PublishReport {
     pub body_attempts: u32,
     /// 담당자 연결 DB 에 새로 더한 줄 id.
     pub people_rows_added: Vec<String>,
+    /// 담당자 연결 DB 에서 이름 칸이 pubkey 앞 8자 그대로라 프로필 이름으로 고친 줄 id.
+    pub people_rows_renamed: Vec<String>,
+    /// 이름을 고치려다 못 한 줄 수(권한·일시 오류). 다음 회의에서 다시 해 본다.
+    pub people_rename_failed: usize,
     /// "확인됨" 줄에 노션 사용자가 있어 멘션할 수 있는 참석자 수.
     pub people_linked: usize,
-    /// 담당자 연결 DB 를 못 다뤘을 때 그 까닭(회의록은 그래도 쓴다).
+    /// 담당자 연결 DB 를 못 다뤘을 때 그 까닭(회의록은 그래도 쓴다). 종류·HTTP 상태·노션
+    /// 오류 코드만([`NotionError::short`]): 작업기 로그에 찍힌다.
     pub people_error: Option<String>,
     /// 본문 쓰기에 실패했는데 "실패" 표시까지 못 해서 "처리 중"으로 남았을 수 있다.
     pub stuck_in_progress: bool,
@@ -1151,15 +1160,16 @@ pub fn chunk_blocks(blocks: Vec<Value>) -> Vec<Vec<Value>> {
     chunks
 }
 
-/// 참석자마다 "허들 담당자 연결" 줄을 찾고, 없으면 이름과 pubkey 만 넣어 한 줄
-/// 만든다. 있는 줄은 읽기만 한다. "확인됨"이 체크되고 "노션 사용자"가 있는 줄만
-/// pubkey → 노션 사용자 id 로 돌려준다. 새로 만든 줄 id 는 만들 때마다 `added`
-/// 에 더한다(중간에 실패해도 남게).
+/// 참석자마다 "허들 담당자 연결" 줄을 찾고, 없으면 이름(프로필 이름, 모르면 pubkey
+/// 앞 8자)과 pubkey 만 넣어 한 줄 만든다. 있는 줄은 읽기만 하되, 이름 칸이 pubkey 앞
+/// 8자 그대로면 프로필 이름으로 고친다([`rename_prefix_row`]). "확인됨"이 체크되고
+/// "노션 사용자"가 있는 줄만 pubkey → 노션 사용자 id 로 돌려준다. 새로 만든 줄·고친 줄
+/// id 는 할 때마다 `report` 에 더한다(중간에 실패해도 남게).
 pub async fn link_people(
     client: &mut NotionClient<'_>,
     transcript: &Transcript,
     names: &dyn DisplayNames,
-    added: &mut Vec<String>,
+    report: &mut PublishReport,
 ) -> Result<HashMap<String, String>, NotionError> {
     use people_property as p;
     let data_source = client.settings.people_data_source_id.clone();
@@ -1172,13 +1182,14 @@ pub async fn link_people(
             if let (true, Some(user)) = (confirmed, user) {
                 linked.insert(pubkey.to_string(), user.to_string());
             }
+            rename_prefix_row(client, row, pubkey, names, report).await;
             continue;
         }
+        let name = names
+            .profile_name(pubkey)
+            .unwrap_or_else(|| names.display_name(pubkey));
         let mut properties = Map::new();
-        properties.insert(
-            p::NAME.into(),
-            json!({ "title": text_runs(&names.display_name(pubkey), None) }),
-        );
+        properties.insert(p::NAME.into(), json!({ "title": text_runs(&name, None) }));
         properties.insert(
             p::PUBKEY.into(),
             json!({ "rich_text": text_runs(pubkey, None) }),
@@ -1198,9 +1209,38 @@ pub async fn link_people(
             }
             Err(error) => return Err(error),
         };
-        added.push(id);
+        report.people_rows_added.push(id);
     }
     Ok(linked)
+}
+
+/// 있는 담당자 줄의 이름 칸이 `pubkey` 앞 8자 그대로(작업기가 넣은 그대로)이고 프로필
+/// 이름을 알면 그 이름으로 고친다(조용히). 사람이 고친 이름과 다른 칸은 건드리지 않는다.
+/// 못 고쳐도(고치기 권한이 없거나 일시 오류) 실패로 넘기지 않고 수만 센다: 이름 칸이 그대로
+/// 남아서 그 사람이 나오는 다음 회의가 다시 해 본다.
+async fn rename_prefix_row(
+    client: &mut NotionClient<'_>,
+    row: &Value,
+    pubkey: &str,
+    names: &dyn DisplayNames,
+    report: &mut PublishReport,
+) {
+    use people_property as p;
+    let Some(name) = names.profile_name(pubkey) else {
+        return;
+    };
+    let current = property_text(&row["properties"][p::NAME]);
+    if current.trim() != PubkeyPrefixNames.display_name(pubkey) || current.trim() == name {
+        return;
+    }
+    let Ok(id) = page_id(row) else {
+        return;
+    };
+    let body = json!({ "properties": { p::NAME: { "title": text_runs(&name, None) } } });
+    match client.update_page(&id, body, Notify::Silent).await {
+        Ok(()) => report.people_rows_renamed.push(id),
+        Err(_) => report.people_rename_failed += 1,
+    }
 }
 
 /// 같은 회의 페이지들 가운데 가장 먼저 만든 것(만든 시각, 그다음 id 순)만 남기고
@@ -1340,17 +1380,11 @@ pub async fn publish(
     let (channel, sessions) = (transcript.channel_id, &transcript.session_ids);
 
     // 담당자 연결 DB 를 못 다뤄도 회의록은 쓴다(멘션만 빠진다).
-    let people = match link_people(
-        client,
-        transcript,
-        page.names,
-        &mut report.people_rows_added,
-    )
-    .await
-    {
+    let people = match link_people(client, transcript, page.names, report).await {
         Ok(people) => people,
         Err(error) => {
-            report.people_error = Some(error.to_string());
+            // 노션 메시지는 페이지 글을 옮겨 올 수 있어서 종류와 코드만 남긴다.
+            report.people_error = Some(error.short());
             HashMap::new()
         }
     };
@@ -1778,7 +1812,11 @@ pub(crate) mod tests {
             match (request.method.as_str(), &parts[..]) {
                 ("POST", ["v1", "data_sources", source, "query"]) => {
                     if self.people_forbidden && *source == PEOPLE_DATA_SOURCE_ID {
-                        return Reply::json(403, &json!({ "code": "restricted_resource" }));
+                        // 노션 메시지는 글 조각을 옮겨 올 수 있다(로그에 가면 안 된다).
+                        return Reply::json(
+                            403,
+                            &json!({ "code": "restricted_resource", "message": "회의 글 조각" }),
+                        );
                     }
                     let results: Vec<Value> = self
                         .pages
@@ -1962,6 +2000,30 @@ pub(crate) mod tests {
             children: Vec::new(),
             in_trash: false,
         }
+    }
+
+    /// `pubkey` 의 담당자 줄(이름 칸 `name`, 확인됨, 노션 사용자 user-1).
+    fn person_row(id: &str, pubkey: &str, name: &str) -> FakePage {
+        let mut row = person_a(true);
+        row.id = id.into();
+        row.properties.insert(
+            people_property::NAME.into(),
+            as_response(json!({ "title": text_runs(name, None) })),
+        );
+        row.properties.insert(
+            people_property::PUBKEY.into(),
+            as_response(json!({ "rich_text": text_runs(pubkey, None) })),
+        );
+        row
+    }
+
+    /// A 는 "김,지영"(쉼표는 다듬어진다), B 는 "민수" 인 프로필 이름표.
+    fn profile_names() -> crate::profiles::ProfileNames {
+        let found = HashMap::from([
+            (A.to_string(), "김,지영".to_string()),
+            (B.to_string(), "민수".to_string()),
+        ]);
+        crate::profiles::ProfileNames::new(&[A, B], &found, None)
     }
 
     fn meeting() -> Transcript {
@@ -2590,15 +2652,222 @@ pub(crate) mod tests {
             ..FakeNotion::default()
         })
         .await;
-        assert!(report
-            .people_error
-            .as_deref()
-            .is_some_and(|error| error.contains("permission")));
+        // 작업기 로그에 찍히니 종류·상태·코드만(노션 메시지는 없다).
+        assert_eq!(
+            report.people_error.as_deref(),
+            Some("permission HTTP 403 restricted_resource")
+        );
         assert_eq!(report.people_linked, 0);
         let state = state.lock().unwrap();
         assert_eq!(
             minutes_pages(&state)[0].properties[minutes_property::STATUS]["select"]["name"],
             "완료"
+        );
+    }
+
+    /// 프로필 이름표로 쓰면 "참석자" 칸, 스크립트 줄, 연결 안 된 담당자 글, 새 담당자 줄
+    /// 이름 칸에 프로필 이름이 들어간다(쉼표는 다듬어서).
+    #[tokio::test]
+    async fn profile_names_fill_attendees_lines_and_new_people_rows() {
+        let names = profile_names();
+        let (server, state) = fake_notion(FakeNotion::default()).await;
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let transcript = meeting();
+        let summary = summary_of(&transcript);
+        let mut shown = page(&transcript, &summary);
+        shown.names = &names;
+        let report = run(&mut client, &shown).await.unwrap();
+        assert_eq!(report.people_rows_added.len(), 2);
+        assert!(report.people_rows_renamed.is_empty());
+
+        let state = state.lock().unwrap();
+        let minutes = minutes_pages(&state);
+        assert_eq!(
+            minutes[0].properties[minutes_property::PARTICIPANTS]["multi_select"],
+            json!([{ "name": "김 지영" }, { "name": "민수" }])
+        );
+        let body = &minutes[0].children;
+        assert_eq!(
+            block_text(body.last().unwrap()),
+            "[01:05] 민수: 네, 제가 금요일까지 보낼게요."
+        );
+        let todos: Vec<String> = body
+            .iter()
+            .filter(|block| block["type"] == "to_do")
+            .map(block_text)
+            .collect();
+        assert!(todos[0].contains("담당: 김 지영 ("), "{}", todos[0]);
+        assert!(todos[1].contains("담당: 민수 · 기한"), "{}", todos[1]);
+        let rows: Vec<String> = state
+            .pages
+            .iter()
+            .filter(|page| page.data_source == PEOPLE_DATA_SOURCE_ID)
+            .map(|page| property_text(&page.properties[people_property::NAME]))
+            .collect();
+        assert_eq!(rows, ["김 지영", "민수"]);
+    }
+
+    /// 있는 담당자 줄: 이름 칸이 pubkey 앞 8자 그대로(작업기가 넣은 그대로)면 프로필
+    /// 이름으로 조용히 고치고, 사람이 고친 이름과 다른 칸은 그대로 둔다. 앞 8자 이름표로
+    /// 쓸 때는 아무것도 안 고친다.
+    #[tokio::test]
+    async fn only_prefix_named_people_rows_get_the_profile_name() {
+        let rows = || {
+            vec![
+                person_row("person-a", A, "aaaaaaaa"),
+                person_row("person-b", B, "사람이 고친 이름"),
+            ]
+        };
+        let names = profile_names();
+        let transcript = meeting();
+        let summary = summary_of(&transcript);
+        let http = reqwest::Client::new();
+
+        // 앞 8자 이름표: 프로필 이름을 모르니 고칠 것이 없다.
+        let (server, _state) = fake_notion(FakeNotion {
+            pages: rows(),
+            ..FakeNotion::default()
+        })
+        .await;
+        let settings = settings_for(&server);
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let report = run(&mut client, &page(&transcript, &summary))
+            .await
+            .unwrap();
+        assert!(report.people_rows_renamed.is_empty());
+        assert!(!server.requests().iter().any(|r| r.path.contains("person-")));
+
+        // 프로필 이름표: A 의 줄만 고친다.
+        let (server, state) = fake_notion(FakeNotion {
+            pages: rows(),
+            ..FakeNotion::default()
+        })
+        .await;
+        let settings = settings_for(&server);
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let mut shown = page(&transcript, &summary);
+        shown.names = &names;
+        let report = run(&mut client, &shown).await.unwrap();
+        assert_eq!(report.people_rows_renamed, ["person-a"]);
+        assert_eq!(report.people_rename_failed, 0);
+        assert!(report.people_rows_added.is_empty());
+        assert_eq!(report.people_linked, 2);
+        let touched: Vec<Recorded> = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.contains("person-"))
+            .collect();
+        assert_eq!(touched.len(), 1);
+        assert_eq!(
+            (touched[0].method.as_str(), touched[0].path.as_str()),
+            ("PATCH", "/v1/pages/person-a")
+        );
+        assert!(silent(&touched[0]));
+        let changed: Vec<String> = touched[0].json()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(changed, [people_property::NAME]);
+        {
+            let state = state.lock().unwrap();
+            let row = |id: &str| state.pages.iter().find(|page| page.id == id).unwrap();
+            assert_eq!(
+                property_text(&row("person-a").properties[people_property::NAME]),
+                "김 지영"
+            );
+            let mut kept = person_row("person-a", A, "aaaaaaaa").properties;
+            kept.remove(people_property::NAME);
+            for (key, value) in kept {
+                assert_eq!(row("person-a").properties[&key], value, "{key}");
+            }
+            assert_eq!(
+                row("person-b").properties,
+                person_row("person-b", B, "사람이 고친 이름").properties
+            );
+        }
+
+        // 고친 뒤에는 앞 8자가 아니니 다시 고치지 않는다.
+        let before = server.requests().len();
+        run(&mut client, &shown).await.unwrap();
+        assert!(!server.requests()[before..]
+            .iter()
+            .any(|r| r.path.contains("person-")));
+    }
+
+    /// 남의 가른 이름을 제 이름으로 쓴 사람이 있어도 "참석자" 칸에서 아무도 빠지지 않는다
+    /// (multi_select 는 같은 이름을 하나로 친다).
+    #[test]
+    fn attendees_keep_everyone_when_a_name_copies_a_split_name() {
+        const C: &str = "cccccccc00000000000000000000000000000000000000000000000000000003";
+        let transcript = transcript_with(&[
+            (1_000, A, "견적서 얘기해요."),
+            (2_000, B, "네."),
+            (3_000, C, "좋아요."),
+        ]);
+        let found = HashMap::from([
+            (A.to_string(), "민수".to_string()),
+            (B.to_string(), "민수 (aaaaaaaa)".to_string()),
+            (C.to_string(), "민수".to_string()),
+        ]);
+        let names = crate::profiles::ProfileNames::new(&[A, B, C], &found, None);
+        let summary = summary_of(&transcript);
+        let mut shown = page(&transcript, &summary);
+        shown.names = &names;
+        let properties = page_properties(&shown, ProcessingStatus::Done, DEFAULT_PLAYBACK_LINK);
+        assert_eq!(
+            properties[minutes_property::PARTICIPANTS]["multi_select"],
+            json!([
+                { "name": "aaaaaaaa" },
+                { "name": "bbbbbbbb" },
+                { "name": "민수 (cccccccc)" }
+            ])
+        );
+    }
+
+    /// 이름 고치기가 막혀도(고치기 권한 없음) 멘션과 회의록은 그대로고, 수만 센다.
+    #[tokio::test]
+    async fn a_refused_rename_keeps_the_mention_and_the_minutes() {
+        let (server, state) = fake_notion(FakeNotion {
+            pages: vec![person_row("person-a", A, "aaaaaaaa")],
+            page_patch_failures: vec![Reply::json(403, &json!({ "code": "restricted_resource" }))],
+            ..FakeNotion::default()
+        })
+        .await;
+        let settings = settings_for(&server);
+        let http = reqwest::Client::new();
+        let mut client = NotionClient::new(&http, &settings, "t").unwrap();
+        let names = profile_names();
+        let transcript = meeting();
+        let summary = summary_of(&transcript);
+        let mut shown = page(&transcript, &summary);
+        shown.names = &names;
+        let report = run(&mut client, &shown).await.unwrap();
+        assert_eq!(report.people_rename_failed, 1);
+        assert!(report.people_rows_renamed.is_empty());
+        assert!(report.people_error.is_none());
+        assert_eq!(report.people_linked, 1);
+        let state = state.lock().unwrap();
+        let minutes = minutes_pages(&state);
+        assert_eq!(
+            minutes[0].properties[minutes_property::STATUS]["select"]["name"],
+            "완료"
+        );
+        assert!(minutes[0]
+            .children
+            .iter()
+            .any(|block| block.to_string().contains("\"user\":{\"id\":\"user-1\"}")));
+        let row = state
+            .pages
+            .iter()
+            .find(|page| page.id == "person-a")
+            .unwrap();
+        assert_eq!(
+            property_text(&row.properties[people_property::NAME]),
+            "aaaaaaaa"
         );
     }
 
