@@ -20,12 +20,16 @@
 //!   사람들만 앞 8자로 두고, 몇 명인지와 까닭의 종류만 남긴다([`NamesReport`]). 돈 드는
 //!   단계의 실패 기록(`StepFailures`)에는 넣지 않는다.
 //! - 같은 요청에 회의 자리(노션 「채널」·「종류」)도 묻는다: 부모 채널(없으면 회의 채널)의
-//!   NIP-29 메타데이터(kind 39000). 릴레이 자기 서명 키(NIP-11 `self`, 실행마다 한 번 읽음)로
-//!   서명한 것만 믿는다: 필터 `authors` 에 그 키를 넣고, 받은 이벤트의 서명자도 다시 본다.
-//!   그 키를 모르면(NIP-11 을 못 읽음, `self` 없음) 39000 은 묻지 않는다
-//!   ([`PlaceFound::NoRelayKey`]). 릴레이는 봇이 멤버인 채널과 공개(open) 채널만 돌려주므로
-//!   비공개 채널·DM 은 못 읽는다([`PlaceFound::NotReadable`]). 못 읽으면 페이지는 지금처럼
-//!   channel id·종류 비움이다. 로그에는 종류만 남기고 채널 이름은 안 찍는다.
+//!   NIP-29 메타데이터(kind 39000). 릴레이 자기 서명 키(NIP-11 `self`)로 서명한 것만 믿는다:
+//!   필터 `authors` 에 그 키를 넣고, 받은 이벤트의 서명자도 다시 본다. 그 키를 모르면 39000 은
+//!   묻지 않는다(이름은 그대로 묻는다). NIP-11 은 확실한 답(2xx 로 끝까지 받은 문서)만 실행
+//!   동안 기억한다: `self` 가 있으면 그 키, 없거나 틀리면 키 없음([`PlaceFound::NoRelayKey`]).
+//!   문서를 못 받았으면 기억하지 않고 다음 회의에서 다시 읽는다
+//!   ([`PlaceFound::RelayInfoUnread`]). 연달아 [`TROUBLE_IN_A_ROW`] 회의 못 받으면 그 실행
+//!   동안은 더 읽지 않는다([`PlaceFound::RelayInfoOffForRun`]). 이름 묻기와는 따로 센다.
+//!   릴레이는 봇이 멤버인 채널과 공개(open) 채널만 돌려주므로 비공개 채널·DM 은 못 읽는다
+//!   ([`PlaceFound::NotReadable`]). 못 읽으면 페이지는 지금처럼 channel id·종류 비움이다.
+//!   로그에는 종류만 남기고 채널 이름은 안 찍는다.
 //! - 봇 비밀 키는 밖(환경 변수 [`SCRIBE_KEY_ENV`])에서 받는다. 로그·오류·Debug 어디에도
 //!   찍지 않는다.
 
@@ -142,18 +146,33 @@ pub enum PlaceFound {
     /// 봇이 그 채널 정보를 못 읽었다: 비공개 채널·DM(봇은 멤버가 아니다)이거나, 부모를
     /// 모르는 허들용 임시 채널이다.
     NotReadable,
-    /// 릴레이 서명 키(NIP-11 `self`)를 몰라서 채널 정보를 믿을 수 없어 묻지 않았다.
+    /// 릴레이 NIP-11 문서에 서명 키(`self`)가 없거나 틀려서 채널 정보를 믿을 수 없어 묻지
+    /// 않았다. 확실한 답이라 그 실행 동안 NIP-11 을 다시 읽지 않는다.
     NoRelayKey,
+    /// 이번 회의에서는 NIP-11 문서를 못 받아(2xx 가 아닌 상태·연결 안 됨·시간 초과·끊김)
+    /// 릴레이 키를 몰라서 묻지 않았다. 다음 회의에서 다시 읽는다.
+    RelayInfoUnread(NamesTrouble),
+    /// 묻지 않았다: 이 실행에서 NIP-11 문서를 연달아 [`TROUBLE_IN_A_ROW`] 회의 못 받아서
+    /// 그 실행 동안은 더 읽지 않는다.
+    RelayInfoOffForRun,
 }
 
 impl fmt::Display for PlaceFound {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Channel => "named",
-            Self::Dm => "DM",
-            Self::NotReadable => "not readable by the scribe bot",
-            Self::NoRelayKey => "not asked: relay signing key unknown (NIP-11 self)",
-        })
+        match self {
+            Self::Channel => f.write_str("named"),
+            Self::Dm => f.write_str("DM"),
+            Self::NotReadable => f.write_str("not readable by the scribe bot"),
+            Self::NoRelayKey => f.write_str("not asked: relay signing key unknown (NIP-11 self)"),
+            Self::RelayInfoUnread(trouble) => write!(
+                f,
+                "not asked: relay info (NIP-11) not received this time ({trouble})"
+            ),
+            Self::RelayInfoOffForRun => write!(
+                f,
+                "not asked: relay info (NIP-11) not received on {TROUBLE_IN_A_ROW} meetings in a row in this run"
+            ),
+        }
     }
 }
 
@@ -576,9 +595,11 @@ pub struct ProfileSource {
     http: reqwest::Client,
     /// 이 실행에서 시간 상한에 연달아 걸린 회의 수.
     timeouts_in_a_row: AtomicU32,
-    /// 릴레이 자기 서명 키(NIP-11 `self`). 실행마다 처음 필요할 때 한 번 읽고, 못 읽었으면
-    /// `None` 을 그 실행 동안 그대로 쓴다(회의마다 묻지 않는다).
+    /// 릴레이 자기 서명 키(NIP-11 `self`). 확실한 답(2xx 로 끝까지 받은 문서)이 오면 그 답
+    /// (`self` 가 없거나 틀리면 `None`)을 실행 동안 쓴다. 문서를 못 받은 것은 담지 않는다.
     relay_key: OnceCell<Option<PublicKey>>,
+    /// 이 실행에서 NIP-11 문서를 연달아 못 받은 회의 수. 이름 묻기의 시간 초과와 따로 센다.
+    info_trouble_in_a_row: AtomicU32,
 }
 
 impl fmt::Debug for ProfileSource {
@@ -615,31 +636,63 @@ impl ProfileSource {
             http,
             timeouts_in_a_row: AtomicU32::new(0),
             relay_key: OnceCell::new(),
+            info_trouble_in_a_row: AtomicU32::new(0),
         })
     }
 
-    /// 릴레이 자기 서명 키(NIP-11 `self`). 실행 동안 한 번만 읽는다.
-    async fn relay_key(&self) -> Option<PublicKey> {
-        *self.relay_key.get_or_init(|| self.read_relay_key()).await
+    /// 릴레이 자기 서명 키(NIP-11 `self`). 확실한 답만 실행 동안 기억한다: 키가 있으면 그
+    /// 키, 문서에 없거나 틀리면 [`PlaceFound::NoRelayKey`]. 문서를 못 받았으면 기억하지 않고
+    /// ([`PlaceFound::RelayInfoUnread`]) 다음 회의에서 다시 읽는다. 연달아
+    /// [`TROUBLE_IN_A_ROW`] 회의 못 받으면 그 실행 동안은 더 읽지 않는다
+    /// ([`PlaceFound::RelayInfoOffForRun`]). 릴레이가 재시작하는 동안 한 번 못 받은 것으로 그
+    /// 실행의 회의 전부가 「채널」을 못 채우지 않게 하려는 것이다(페이지는 이 칸 때문에 다시
+    /// 쓰지 않는다).
+    async fn relay_key(&self) -> Result<PublicKey, PlaceFound> {
+        if let Some(known) = self.relay_key.get() {
+            return known.ok_or(PlaceFound::NoRelayKey);
+        }
+        if self.info_trouble_in_a_row.load(Ordering::Relaxed) >= TROUBLE_IN_A_ROW {
+            return Err(PlaceFound::RelayInfoOffForRun);
+        }
+        match self
+            .relay_key
+            .get_or_try_init(|| self.read_relay_key())
+            .await
+        {
+            Ok(known) => known.ok_or(PlaceFound::NoRelayKey),
+            Err(trouble) => {
+                self.info_trouble_in_a_row.fetch_add(1, Ordering::Relaxed);
+                Err(PlaceFound::RelayInfoUnread(trouble))
+            }
+        }
     }
 
-    /// NIP-11 문서(`Accept: application/nostr+json`)의 `self`. 못 읽거나 없으면 `None`.
+    /// NIP-11 문서(`Accept: application/nostr+json`)의 `self`. 2xx 로 끝까지 받은 문서는
+    /// 확실한 답이다: `self` 가 있으면 그 키, 없거나 틀리면(JSON 이 아닌 것 포함) `None`.
+    /// 문서를 못 받았으면(2xx 가 아닌 상태·연결 안 됨·시간 초과·본문 끊김) 그 까닭.
     /// NIP-11 의 `pubkey` 는 운영자 키(Buzz 는 비워 둔다)라서 쓰지 않는다. 39000 에 서명하는
     /// 키는 `self` 다(릴레이 nip11.rs).
-    async fn read_relay_key(&self) -> Option<PublicKey> {
+    async fn read_relay_key(&self) -> Result<Option<PublicKey>, NamesTrouble> {
         let response = self
             .http
             .get(self.info_url.as_str())
             .header(reqwest::header::ACCEPT, "application/nostr+json")
             .send()
             .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
+            .map_err(|error| {
+                if error.is_timeout() {
+                    NamesTrouble::TimedOut
+                } else {
+                    NamesTrouble::Unreachable
+                }
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(NamesTrouble::Status(status.as_u16()));
         }
-        let bytes = read_capped(response).await.ok()?;
-        let info: Value = serde_json::from_slice(&bytes).ok()?;
-        PublicKey::from_hex(info.get("self")?.as_str()?).ok()
+        let bytes = read_capped(response).await?;
+        let info: Option<Value> = serde_json::from_slice(&bytes).ok();
+        Ok(info.and_then(|info| PublicKey::from_hex(info.get("self")?.as_str()?).ok()))
     }
 
     /// 묻는 주소(`…/query`).
@@ -680,10 +733,12 @@ impl ProfileSource {
         // 39000 은 릴레이 자기 키로 서명한 것만 믿는다. 그 키를 모르면 39000 은 묻지 않는다
         // (이름은 그대로 묻는다).
         let relay_key = match place {
-            Some(_) => self.relay_key().await,
+            Some(_) => Some(self.relay_key().await),
             None => None,
         };
-        let asked = self.ask(&authors, place.zip(relay_key)).await;
+        let asked = self
+            .ask(&authors, place.zip(relay_key.and_then(Result::ok)))
+            .await;
         // 시간 초과만 연달아 센다. 다른 결과가 오면 0부터.
         if matches!(asked, Err(NamesTrouble::TimedOut)) {
             self.timeouts_in_a_row.fetch_add(1, Ordering::Relaxed);
@@ -693,10 +748,10 @@ impl ProfileSource {
         match asked {
             Ok(events) => {
                 let mut names = ProfileNames::new(pubkeys, &newest_names(&events, &authors), None);
-                if let Some(place) = place {
-                    let (found, kind) = match &relay_key {
-                        Some(relay_key) => place_in(&events, place, relay_key),
-                        None => (None, PlaceFound::NoRelayKey),
+                if let (Some(place), Some(relay_key)) = (place, relay_key) {
+                    let (found, kind) = match relay_key {
+                        Ok(relay_key) => place_in(&events, place, &relay_key),
+                        Err(why) => (None, why),
                     };
                     names.place = found;
                     names.report.place = Some(kind);
@@ -1133,9 +1188,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// 릴레이 서명 키(NIP-11 `self`)를 모르면 39000 을 묻지도 믿지도 않는다: 「채널」·
-    /// 「종류」는 못 읽은 것으로 두고 이름은 그대로 묻는다. 못 읽은 결과도 실행 동안 그대로
-    /// 써서 회의마다 NIP-11 을 다시 묻지 않는다.
+    /// 릴레이 NIP-11 문서는 200 으로 왔는데 서명 키(`self`)가 없거나 틀리면 39000 을 묻지도
+    /// 믿지도 않는다: 「채널」·「종류」는 못 읽은 것으로 두고 이름은 그대로 묻는다. 이것은
+    /// 확실한 답이라 실행 동안 기억해서 회의마다 NIP-11 을 다시 묻지 않는다.
     #[tokio::test]
     async fn channel_metadata_is_not_trusted_without_the_relay_key() {
         let (jiyoung, relay_keys) = (Keys::generate(), Keys::generate());
@@ -1144,11 +1199,18 @@ pub(crate) mod tests {
         let mut script =
             crate::test_http::transcript_with(&[(1_000, pubkey.as_str(), "안녕하세요.")]);
         script.parent_channel_id = Some(parent);
+        let html = Reply {
+            status: 200,
+            headers: vec![("content-type".into(), "text/html".into())],
+            body: "<html>relay</html>".into(),
+            cut_off: false,
+            hang: false,
+        };
         let bad_infos = [
-            Reply::json(404, &json!({})),
             Reply::json(200, &json!({ "name": "Buzz Relay", "pubkey": null })),
             Reply::json(200, &json!({ "self": "not-a-key" })),
             Reply::json(200, &json!(["not", "an", "object"])),
+            html,
         ];
         for info in bad_infos {
             // 릴레이 키로 서명한 39000 이 답에 섞여 와도 쓰지 않는다.
@@ -1169,7 +1231,7 @@ pub(crate) mod tests {
             })
             .await;
             let source = source_for(&relay.base, &Keys::generate());
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let names = source.names_for(&script).await;
                 assert_eq!(names.display_name(&pubkey), "김지영");
                 assert_eq!(names.place(), None);
@@ -1181,14 +1243,174 @@ pub(crate) mod tests {
                 );
             }
             let requests = relay.requests();
-            assert_eq!(requests.iter().filter(|r| !is_query(r)).count(), 1);
+            assert_eq!(
+                requests.iter().filter(|r| !is_query(r)).count(),
+                1,
+                "a sure answer is not read again"
+            );
             let queries: Vec<_> = requests.iter().filter(|r| is_query(r)).collect();
-            assert_eq!(queries.len(), 2);
+            assert_eq!(queries.len(), 3);
+            for query in queries {
+                assert_eq!(query.json(), json!([{ "kinds": [0], "authors": [pubkey] }]));
+            }
+        }
+    }
+
+    /// 이름 하나·채널 하나 릴레이: `/query` 에는 김지영 프로필과 `relay_keys` 가 서명한
+    /// 「개발팀」 39000 을, NIP-11(`GET /`)에는 `info(몇 번째 NIP-11 요청인지, 0부터)` 를 답한다.
+    async fn relay_with_info(
+        relay_keys: &Keys,
+        info: impl Fn(usize) -> Reply + Send + Sync + 'static,
+    ) -> (FakeServer, Transcript, String) {
+        let jiyoung = Keys::generate();
+        let parent = Uuid::from_u128(77);
+        let events = json!([
+            profile_event(&jiyoung, &json!({ "display_name": "김지영" }), 10),
+            channel_event(
+                relay_keys,
+                &[&["d", &parent.to_string()], &["name", "개발팀"]],
+                10,
+            ),
+        ]);
+        let infos = AtomicUsize::new(0);
+        let relay = FakeServer::start(move |request| {
+            if is_query(request) {
+                Reply::json(200, &events)
+            } else {
+                info(infos.fetch_add(1, Ordering::SeqCst))
+            }
+        })
+        .await;
+        let pubkey = jiyoung.public_key().to_hex();
+        let mut script =
+            crate::test_http::transcript_with(&[(1_000, pubkey.as_str(), "안녕하세요.")]);
+        script.parent_channel_id = Some(parent);
+        (relay, script, pubkey)
+    }
+
+    /// NIP-11 문서를 못 받은 것(5xx·4xx·본문 끊김·시간 초과)은 기억하지 않는다: 그 회의는
+    /// 「채널」·「종류」를 못 읽은 것으로 두고(이름은 그대로 묻는다), 다음 회의에서 다시 읽어
+    /// 채운다. 받은 뒤로는 다시 읽지 않는다.
+    #[tokio::test]
+    async fn a_missed_relay_info_is_read_again_at_the_next_meeting() {
+        let relay_keys = Keys::generate();
+        let good = nip11(&relay_keys);
+        let misses = [
+            (Reply::json(503, &json!({})), NamesTrouble::Status(503)),
+            (Reply::json(404, &json!({})), NamesTrouble::Status(404)),
+            (good.clone().cut_off(), NamesTrouble::BadAnswer),
+            (Reply::silent(), NamesTrouble::TimedOut),
+        ];
+        for (miss, trouble) in misses {
+            let good = good.clone();
+            let (relay, script, pubkey) = relay_with_info(&relay_keys, move |n| {
+                if n == 0 {
+                    miss.clone()
+                } else {
+                    good.clone()
+                }
+            })
+            .await;
+            let source = ProfileSource::new(
+                &relay.base,
+                &Keys::generate().secret_key().to_secret_hex(),
+                Duration::from_millis(300),
+            )
+            .unwrap();
+            let first = source.names_for(&script).await;
+            assert_eq!(first.display_name(&pubkey), "김지영");
+            assert_eq!(first.place(), None);
+            assert_eq!(
+                first.report().place,
+                Some(PlaceFound::RelayInfoUnread(trouble))
+            );
+            assert_eq!(
+                first.report().to_string(),
+                format!(
+                    "profile names: 1 of 1 found | channel: not asked: relay info (NIP-11) not received this time ({trouble})"
+                )
+            );
+            // 다음 회의 둘: 다시 읽어 채우고, 그 뒤로는 기억한다.
+            for _ in 0..2 {
+                let names = source.names_for(&script).await;
+                assert_eq!(
+                    names.place(),
+                    Some(&MeetingPlace::Channel("개발팀".into())),
+                    "{trouble}"
+                );
+                assert_eq!(names.report().place, Some(PlaceFound::Channel));
+            }
+            let requests = relay.requests();
+            assert_eq!(
+                requests.iter().filter(|r| !is_query(r)).count(),
+                2,
+                "{trouble}: read again once, then kept"
+            );
+            let queries: Vec<_> = requests.iter().filter(|r| is_query(r)).collect();
+            assert_eq!(queries.len(), 3);
+            // 키를 모르던 첫 회의는 39000 을 묻지 않았다.
             assert_eq!(
                 queries[0].json(),
                 json!([{ "kinds": [0], "authors": [pubkey] }])
             );
+            assert_eq!(queries[1].json().as_array().map(Vec::len), Some(2));
         }
+    }
+
+    /// NIP-11 을 연달아 `TROUBLE_IN_A_ROW`(2) 회의 못 받으면 그 실행 동안은 더 읽지 않는다.
+    /// 까닭이 섞여도(시간 초과 뒤 503) 연달아 센다. 이름 묻기와 따로 세서, 이름은 그 뒤로도
+    /// 회의마다 묻는다.
+    #[tokio::test]
+    async fn relay_info_misses_in_a_row_stop_reading_it_for_the_run() {
+        let relay_keys = Keys::generate();
+        let good = nip11(&relay_keys);
+        let (relay, script, pubkey) = relay_with_info(&relay_keys, move |n| match n {
+            0 => Reply::silent(),
+            1 => Reply::json(503, &json!({})),
+            // 세 번째로 읽으면 받는다: 끄지 않았다면 「채널」이 채워져 드러난다.
+            _ => good.clone(),
+        })
+        .await;
+        let source = ProfileSource::new(
+            &relay.base,
+            &Keys::generate().secret_key().to_secret_hex(),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let mut places = Vec::new();
+        let mut last_line = String::new();
+        for _ in 0..4 {
+            let names = source.names_for(&script).await;
+            assert_eq!(names.display_name(&pubkey), "김지영", "names still asked");
+            assert_eq!(names.place(), None);
+            places.push(names.report().place);
+            last_line = names.report().to_string();
+        }
+        use PlaceFound::{RelayInfoOffForRun, RelayInfoUnread};
+        assert_eq!(
+            places,
+            [
+                Some(RelayInfoUnread(NamesTrouble::TimedOut)),
+                Some(RelayInfoUnread(NamesTrouble::Status(503))),
+                Some(RelayInfoOffForRun),
+                Some(RelayInfoOffForRun),
+            ]
+        );
+        let requests = relay.requests();
+        assert_eq!(
+            requests.iter().filter(|r| !is_query(r)).count(),
+            2,
+            "not read once off"
+        );
+        assert_eq!(
+            requests.iter().filter(|r| is_query(r)).count(),
+            4,
+            "one ask per meeting all along"
+        );
+        assert_eq!(
+            last_line,
+            "profile names: 1 of 1 found | channel: not asked: relay info (NIP-11) not received on 2 meetings in a row in this run"
+        );
     }
 
     /// DM 이면 그 사람들(`p`)을 이름표로 보이고, 봇이 못 읽는 채널·다른 채널 것·위조·부모를
