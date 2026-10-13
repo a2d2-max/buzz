@@ -13,8 +13,9 @@
 //!   겹치면(남의 가른 이름을 제 이름으로 쓴 경우) 겹친 사람은 앞 8자. 요약에서 담당자를
 //!   이름으로 pubkey 에 되돌릴 때 두 사람이 섞이지 않는다.
 //! - 회의 하나에 요청 하나: 참석자 pubkey 를 모두 `authors` 하나에 넣고, 시간 상한
-//!   [`QUERY_TIMEOUT`] 을 둔다. 다시 하지 않는다. 한 실행에서 시간 상한에 한 번 걸리면 그
-//!   실행 동안은 더 묻지 않는다.
+//!   [`QUERY_TIMEOUT`] 을 둔다. 다시 하지 않는다. 한 실행에서 시간 상한에 연달아
+//!   [`TROUBLE_IN_A_ROW`] 회의 걸리면 그 실행 동안은 더 묻지 않는다(다른 단계와 같은 수).
+//!   그 사이 다른 결과(답·거절·연결 안 됨)가 오면 0부터 다시 센다.
 //! - 묻기가 안 돼도(릴레이 안 닿음·401·403·시간 초과·이상한 답) 회의는 그대로 간다. 그
 //!   사람들만 앞 8자로 두고, 몇 명인지와 까닭의 종류만 남긴다([`NamesReport`]). 돈 드는
 //!   단계의 실패 기록(`StepFailures`)에는 넣지 않는다.
@@ -23,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -36,6 +37,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::correct::is_format;
+use crate::followup::TROUBLE_IN_A_ROW;
 use crate::summary::{known_pubkeys, DisplayNames, PubkeyPrefixNames};
 use crate::transcript::Transcript;
 
@@ -79,7 +81,8 @@ pub enum NamesTrouble {
     BadAnswer,
     /// 인증 이벤트에 서명하지 못했다.
     Unsigned,
-    /// 묻지 않았다: 이 실행에서 릴레이가 앞서 시간 상한에 걸렸다.
+    /// 묻지 않았다: 이 실행에서 릴레이가 연달아 [`TROUBLE_IN_A_ROW`] 회의 시간 상한에
+    /// 걸렸다.
     OffForRun,
 }
 
@@ -92,7 +95,10 @@ impl fmt::Display for NamesTrouble {
             Self::Status(status) => write!(f, "relay answered HTTP {status}"),
             Self::BadAnswer => f.write_str("relay answer unreadable"),
             Self::Unsigned => f.write_str("could not sign the request"),
-            Self::OffForRun => f.write_str("not asked: the relay timed out earlier in this run"),
+            Self::OffForRun => write!(
+                f,
+                "not asked: the relay timed out on {TROUBLE_IN_A_ROW} meetings in a row in this run"
+            ),
         }
     }
 }
@@ -102,8 +108,12 @@ impl fmt::Display for NamesTrouble {
 pub struct NamesReport {
     /// 이름을 찾으려던 사람 수.
     pub asked: usize,
-    /// 프로필 이름을 찾은 사람 수. 나머지는 pubkey 앞 8자로 보인다.
+    /// 프로필 이름이 그대로(같은 이름이면 앞 8자를 붙여) 보이는 사람 수. 나머지는 pubkey
+    /// 앞 8자로 보인다.
     pub found: usize,
+    /// 프로필 이름은 있었는데 다른 사람 이름과 겹쳐서 앞 8자로 보이는 사람 수(`found` 에
+    /// 안 든다).
+    pub clashed: usize,
     /// 묻기가 통째로 안 됐으면 그 까닭. 프로필이 없는 사람은 까닭 없이 수에만 든다.
     pub trouble: Option<NamesTrouble>,
 }
@@ -122,8 +132,15 @@ impl fmt::Display for NamesReport {
         if kept > 0 {
             write!(f, ", {kept} shown as pubkey prefix")?;
         }
+        let mut why = Vec::new();
+        if self.clashed > 0 {
+            why.push(format!("{} with a clashing name", self.clashed));
+        }
         if let Some(trouble) = &self.trouble {
-            write!(f, " ({trouble})")?;
+            why.push(trouble.to_string());
+        }
+        if !why.is_empty() {
+            write!(f, " ({})", why.join("; "))?;
         }
         Ok(())
     }
@@ -201,9 +218,11 @@ impl ProfileNames {
                 shown.remove(&pubkey);
             }
         }
+        // 겹쳐서 앞 8자로 밀린 사람은 찾은 수에 안 넣고 따로 센다.
         let report = NamesReport {
             asked: people.len(),
-            found: own.len(),
+            found: shown.len(),
+            clashed: own.len() - shown.len(),
             trouble,
         };
         Self { shown, own, report }
@@ -384,15 +403,17 @@ async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, NamesTr
 }
 
 /// 프로필 이름을 물을 곳: 릴레이 `/query` 주소, 회의록 봇 키, 시간 상한이 걸린 HTTP
-/// 클라이언트. 한 실행에서 하나를 만들어 회의마다 쓴다. 그 실행에서 한 번이라도 시간
-/// 상한에 걸리면 그 뒤로는 묻지 않는다(답 없이 매달리는 릴레이에 회의마다 상한만큼 쓰지
-/// 않게). 바로 오는 거절(401 등)은 다음 회의에서 다시 묻는다.
+/// 클라이언트. 한 실행에서 하나를 만들어 회의마다 쓴다. 그 실행에서 시간 상한에 연달아
+/// [`TROUBLE_IN_A_ROW`] 회의 걸리면 그 뒤로는 묻지 않는다(답 없이 매달리는 릴레이에 회의마다
+/// 상한만큼 쓰지 않게). 한 번만 걸렸으면 다음 회의에서 다시 묻고, 그 사이 다른 결과(답·
+/// 거절·연결 안 됨)가 오면 0부터 다시 센다. 한 번 버벅인 것으로 밀린 회의 전부가 앞 8자로
+/// 굳지 않게 하려는 것이다(페이지는 이름 때문에 다시 쓰지 않는다).
 pub struct ProfileSource {
     query_url: Url,
     keys: Keys,
     http: reqwest::Client,
-    /// 이 실행에서 시간 상한에 걸린 적이 있다.
-    hung: AtomicBool,
+    /// 이 실행에서 시간 상한에 연달아 걸린 회의 수.
+    timeouts_in_a_row: AtomicU32,
 }
 
 impl fmt::Debug for ProfileSource {
@@ -424,7 +445,7 @@ impl ProfileSource {
             query_url,
             keys,
             http,
-            hung: AtomicBool::new(false),
+            timeouts_in_a_row: AtomicU32::new(0),
         })
     }
 
@@ -454,17 +475,19 @@ impl ProfileSource {
         if authors.is_empty() {
             return ProfileNames::new(pubkeys, &HashMap::new(), None);
         }
-        if self.hung.load(Ordering::Relaxed) {
+        if self.timeouts_in_a_row.load(Ordering::Relaxed) >= TROUBLE_IN_A_ROW {
             return ProfileNames::new(pubkeys, &HashMap::new(), Some(NamesTrouble::OffForRun));
         }
-        match self.ask(&authors).await {
+        let asked = self.ask(&authors).await;
+        // 시간 초과만 연달아 센다. 다른 결과가 오면 0부터.
+        if matches!(asked, Err(NamesTrouble::TimedOut)) {
+            self.timeouts_in_a_row.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.timeouts_in_a_row.store(0, Ordering::Relaxed);
+        }
+        match asked {
             Ok(events) => ProfileNames::new(pubkeys, &newest_names(events, &authors), None),
-            Err(trouble) => {
-                if trouble == NamesTrouble::TimedOut {
-                    self.hung.store(true, Ordering::Relaxed);
-                }
-                ProfileNames::new(pubkeys, &HashMap::new(), Some(trouble))
-            }
+            Err(trouble) => ProfileNames::new(pubkeys, &HashMap::new(), Some(trouble)),
         }
     }
 
@@ -524,7 +547,6 @@ impl ProfileSource {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
     use std::time::Instant;
 
     use nostr::{TagKind, Timestamp, ToBech32};
@@ -602,6 +624,7 @@ pub(crate) mod tests {
             &NamesReport {
                 asked: 2,
                 found: 1,
+                clashed: 0,
                 trouble: None
             }
         );
@@ -709,48 +732,78 @@ pub(crate) mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), 3);
+        // 겹쳐서 앞 8자로 밀린 둘은 찾은 수에 안 들고 따로 센다(로그엔 숫자만).
+        let report = names.report();
+        assert_eq!(
+            report,
+            &NamesReport {
+                asked: 3,
+                found: 1,
+                clashed: 2,
+                trouble: None
+            }
+        );
+        assert!(!report.all_found());
+        assert_eq!(
+            report.to_string(),
+            "profile names: 1 of 3 found, 2 shown as pubkey prefix (2 with a clashing name)"
+        );
     }
 
-    /// 시간 상한에 한 번 걸리면 그 실행(같은 ProfileSource)에서는 더 묻지 않는다. 바로 오는
-    /// 거절(401)은 다음 회의에서 다시 묻는다.
+    /// 한 실행(같은 ProfileSource)에서 시간 상한은 연달아 센다. 한 번이면 다음 회의에서 다시
+    /// 묻고, 그 사이 답(200)이나 거절(401)이 오면 0부터 다시 세고, 연달아
+    /// `TROUBLE_IN_A_ROW`(2) 회의면 그 실행 동안 안 묻는다.
     #[tokio::test]
-    async fn a_timeout_turns_asking_off_for_the_run() {
-        let pubkeys = hex_of(&[Keys::generate()]);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&accepted);
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((socket, _)) = listener.accept().await {
-                count.fetch_add(1, Ordering::SeqCst);
-                held.push(socket);
-            }
-        });
+    async fn timeouts_turn_asking_off_only_when_in_a_row() {
+        // 회의(요청)마다 릴레이가 할 일: 매달림·답·매달림·거절·매달림·매달림.
+        let script = [
+            Reply::silent(),
+            Reply::json(200, &json!([])),
+            Reply::silent(),
+            Reply::json(401, &json!({})),
+            Reply::silent(),
+            Reply::silent(),
+        ];
+        let next = AtomicUsize::new(0);
+        let relay = FakeServer::start(move |_: &Recorded| {
+            let n = next.fetch_add(1, Ordering::SeqCst);
+            script.get(n).cloned().unwrap_or_else(Reply::silent)
+        })
+        .await;
         let bot = Keys::generate();
         let source = ProfileSource::new(
-            &base,
+            &relay.base,
             &bot.secret_key().to_secret_hex(),
             Duration::from_millis(300),
         )
         .unwrap();
-        let first = source.names(&refs(&pubkeys)).await;
-        assert_eq!(first.report().trouble, Some(NamesTrouble::TimedOut));
-        let started = Instant::now();
-        let second = source.names(&refs(&pubkeys)).await;
-        assert!(started.elapsed() < Duration::from_millis(250));
-        assert_eq!(second.report().trouble, Some(NamesTrouble::OffForRun));
-        assert_eq!(accepted.load(Ordering::SeqCst), 1, "asked only once");
-        assert_eq!(second.display_name(&pubkeys[0]), &pubkeys[0][..8]);
-        let line = second.report().to_string();
-        assert!(line.contains("not asked"), "{line}");
-
-        let relay = FakeServer::start(|_| Reply::json(401, &json!({}))).await;
-        let source = source_for(&relay.base, &Keys::generate());
-        for _ in 0..2 {
-            source.names(&refs(&pubkeys)).await;
+        let pubkeys = hex_of(&[Keys::generate()]);
+        let mut troubles = Vec::new();
+        for _ in 0..6 {
+            troubles.push(source.names(&refs(&pubkeys)).await.report().trouble);
         }
-        assert_eq!(relay.requests().len(), 2);
+        use NamesTrouble::{Refused, TimedOut};
+        assert_eq!(
+            troubles,
+            [
+                Some(TimedOut),     // 한 번: 다음 회의에서 다시 묻는다
+                None,               // 답이 왔다: 0부터
+                Some(TimedOut),     // 다시 한 번
+                Some(Refused(401)), // 거절도 답이다: 0부터
+                Some(TimedOut),     // 한 번
+                Some(TimedOut),     // 연달아 두 번: 이제 끈다
+            ]
+        );
+        assert_eq!(relay.requests().len(), 6);
+
+        let started = Instant::now();
+        let off = source.names(&refs(&pubkeys)).await;
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(off.report().trouble, Some(NamesTrouble::OffForRun));
+        assert_eq!(relay.requests().len(), 6, "not asked once off");
+        assert_eq!(off.display_name(&pubkeys[0]), &pubkeys[0][..8]);
+        let line = off.report().to_string();
+        assert!(line.contains("not asked"), "{line}");
     }
 
     #[tokio::test]
@@ -778,6 +831,7 @@ pub(crate) mod tests {
             &NamesReport {
                 asked: 3,
                 found: 2,
+                clashed: 0,
                 trouble: None
             }
         );
@@ -911,6 +965,7 @@ pub(crate) mod tests {
             headers: vec![("content-type".into(), "text/html".into())],
             body: "<html>relay</html>".into(),
             cut_off: false,
+            hang: false,
         };
         let cases = [
             (
@@ -1003,6 +1058,7 @@ pub(crate) mod tests {
             headers: vec![("content-type".into(), "application/json".into())],
             body: format!("[\"{}\"]", "x".repeat(MAX_ANSWER_BYTES)),
             cut_off: false,
+            hang: false,
         };
         let relay = FakeServer::start(move |_: &Recorded| big.clone()).await;
         let pubkeys = hex_of(&[Keys::generate()]);

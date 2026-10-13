@@ -3620,6 +3620,7 @@ mod tests {
             Some(NamesReport {
                 asked: 1,
                 found: 1,
+                clashed: 0,
                 trouble: None
             })
         );
@@ -3732,6 +3733,7 @@ mod tests {
             Some(NamesReport {
                 asked: 1,
                 found: 0,
+                clashed: 0,
                 trouble: Some(NamesTrouble::Refused(401))
             })
         );
