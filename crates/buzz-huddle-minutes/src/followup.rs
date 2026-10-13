@@ -5081,6 +5081,63 @@ mod tests {
         assert_eq!(link.maybe_sections(), 1);
     }
 
+    /// 노션의 404 는 「없음」과 「통합이 못 봄」 둘 다다. task 하나가 404 면 지워진 것으로 보고 그 task
+    /// 만 건너뛰지만, 통합이 task DB 를 통째로 못 보게 되면(연결이 끊김) 쓰기보다 먼저 하는 실행마다의
+    /// 칸 읽기가 404 로 실패해서 단계 실패로 남고 다음에 다시 한다(task 가 gone 으로 굳지 않는다).
+    #[tokio::test]
+    async fn a_task_db_out_of_sight_is_tried_again_not_skipped() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        // 통합 연결이 끊겼다: task DB·data source·task 페이지가 다 404.
+        let (database, source, hidden) = {
+            let mut state = link.world.state.lock().unwrap();
+            state.failing_paths.clear();
+            let database = state.databases.remove(TASK_DB).unwrap();
+            let source = state.data_sources.remove(TASK_DS).unwrap();
+            let (hidden, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.pages)
+                .into_iter()
+                .partition(|page| page.data_source == TASK_DS);
+            state.pages = kept;
+            (database, source, hidden)
+        };
+        link.world.advance(MAX_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&second.tasks, "while reading the task database"),
+            "{second:?}"
+        );
+        let ledger = link.ledger();
+        assert!(!ledger.finished);
+        assert!(
+            !ledger
+                .done
+                .values()
+                .any(|outcome| *outcome == Outcome::Gone),
+            "{:?}",
+            ledger.done
+        );
+        // 다시 연결되면 남은 쓰기를 마저 한다.
+        {
+            let mut state = link.world.state.lock().unwrap();
+            state.databases.insert(TASK_DB.into(), database);
+            state.data_sources.insert(TASK_DS.into(), source);
+            state.pages.extend(hidden);
+        }
+        link.world.advance(MAX_BACKOFF);
+        let third = link.follow(TasksMode::Update).await;
+        assert_eq!(third.tasks, Step::Done, "{third:?}");
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-16"
+        );
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+    }
+
     /// 새 task 의 기한 근거에 망설이는 말이 있으면 종료일 없이 만들고 본문에 「기한 애매」를 쓴다.
     #[tokio::test]
     async fn a_new_task_with_a_hedged_due_has_no_due_and_says_so() {
