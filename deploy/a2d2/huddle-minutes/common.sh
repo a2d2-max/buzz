@@ -86,9 +86,10 @@ job_env=(
   "BUZZ_MINUTES_VAD_LEVEL=on"    # 말소리 찾기에만 크기 맞춘 소리를 준다
   "BUZZ_MINUTES_CORRECT=on"      # 요약 전에 Gemini 로 잘못 들은 말 후보정
   "BUZZ_MINUTES_RELAY_URL=$relay_url" # 참석자 이름을 묻는 곳. 봇 키는 scribe_env 비밀
-  # 노션 페이지 뒤에 팀 task DB 「AiLex 제품 내부 개발(Operation)」과 잇는다(기록·새 task·종료일·작업상태).
+  # 노션 페이지 뒤에 팀 task DB 「AiLex 제품 내부 개발(Operation)」과 잇는다. 처음엔 기록만 붙인다(append).
+  # append → create → update 차례로, 실제 회의로 확인한 뒤에 넓힌다(docs/huddle-minutes-worker.md "task 연결").
   # 노션 토큰은 회의록과 같은 notion_env 비밀이고, 그 통합을 이 DB 에 연결해야 한다(안 하면 403 경고만).
-  "BUZZ_MINUTES_TASKS=update"
+  "BUZZ_MINUTES_TASKS=append"
   "BUZZ_MINUTES_TASK_DB=$task_db"
 )
 notion_env=NOTION_TOKEN
