@@ -1233,7 +1233,9 @@ mod tests {
     };
     use crate::notion::{minutes_property, people_property, NotionSettings};
     use crate::pipeline::{MinutesSettings, SttPolicy};
-    use crate::profiles::tests::{channel_event, profile_event, source_for as profile_source};
+    use crate::profiles::tests::{
+        channel_event, is_query, nip11, profile_event, source_for as profile_source,
+    };
     use crate::profiles::{NamesTrouble, PlaceFound};
     use crate::runner::{run_meeting, run_meeting_with, Done, LocalMinutes, RunOptions};
     use crate::store::LocalStore;
@@ -3587,6 +3589,15 @@ mod tests {
         ])
     }
 
+    /// 가짜 릴레이가 받은 `/query` 수(NIP-11 읽기는 빼고).
+    fn queries(relay: &FakeServer) -> usize {
+        relay
+            .requests()
+            .iter()
+            .filter(|request| is_query(request))
+            .count()
+    }
+
     /// generateContent 요청의 프롬프트 글.
     fn prompt_of(request: &crate::test_http::Recorded) -> String {
         request.json()["contents"][0]["parts"][0]["text"]
@@ -3602,7 +3613,15 @@ mod tests {
         let person = nostr::Keys::generate();
         let pubkey = person.public_key().to_hex();
         let event = profile_event(&person, &json!({ "display_name": "김지영" }), 10);
-        let relay = FakeServer::start(move |_| Reply::json(200, &json!([event]))).await;
+        let info = nip11(&nostr::Keys::generate());
+        let relay = FakeServer::start(move |request| {
+            if is_query(request) {
+                Reply::json(200, &json!([event]))
+            } else {
+                info.clone()
+            }
+        })
+        .await;
         let source = profile_source(&relay.base, &nostr::Keys::generate());
         let fixture = correcting().await;
         let script = named_script(&pubkey);
@@ -3627,7 +3646,7 @@ mod tests {
             ),
             (Step::Done, Step::Done, Step::Done)
         );
-        assert_eq!(relay.requests().len(), 1, "one ask for the meeting");
+        assert_eq!(queries(&relay), 1, "one ask for the meeting");
         assert_eq!(
             followed.names,
             Some(NamesReport {
@@ -3683,7 +3702,7 @@ mod tests {
         assert!(again.nothing_left(), "{again:?}");
         assert_eq!(again.names, None);
         assert_eq!(again.notion_report, None);
-        assert_eq!(relay.requests().len(), 1);
+        assert_eq!(queries(&relay), 1);
     }
 
     /// 노션 「채널」·「종류」: 릴레이가 부모 채널 메타데이터를 주면 그 이름과 "채널"(DM 이면 그
@@ -3727,7 +3746,15 @@ mod tests {
             let world = world().await;
             let mut answer = profiles.clone();
             answer.extend(channel);
-            let relay = FakeServer::start(move |_| Reply::json(200, &json!(answer))).await;
+            let info = nip11(&relay_keys);
+            let relay = FakeServer::start(move |request| {
+                if is_query(request) {
+                    Reply::json(200, &json!(answer))
+                } else {
+                    info.clone()
+                }
+            })
+            .await;
             let source = profile_source(&relay.base, &nostr::Keys::generate());
             let mut script = transcript_with(&[
                 (1_000, a_hex.as_str(), "견적서 얘기해요."),
@@ -3738,7 +3765,7 @@ mod tests {
                 .follow_with(&script, &mut world.steps().with_profiles(&source))
                 .await;
             assert_eq!(pair(&followed), (Step::Done, Step::Done));
-            assert_eq!(relay.requests().len(), 1, "names and place in one ask");
+            assert_eq!(queries(&relay), 1, "names and place in one ask");
             let state = world.state.lock().unwrap();
             let props = &minutes_pages(&state)[0].properties;
             let want = label.map_or_else(|| script.channel_id.to_string(), str::to_string);
@@ -3795,7 +3822,7 @@ mod tests {
             "no Gemini or Notion request for names"
         );
         assert_eq!(again.names, None);
-        assert_eq!(relay.requests().len(), 1);
+        assert_eq!(queries(&relay), 1);
     }
 
     /// 릴레이가 이름을 안 주면(401) 그 사람만 pubkey 앞 8자로 두고, 단계는 다 되며 실패로
@@ -3822,7 +3849,7 @@ mod tests {
                 place: None
             })
         );
-        assert_eq!(relay.requests().len(), 1);
+        assert_eq!(queries(&relay), 1);
         for beside in [
             Beside::CorrectFailed,
             Beside::SummaryFailed,
