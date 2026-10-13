@@ -345,7 +345,7 @@ fn changes_any(edit: &Edit, words: &[&str]) -> bool {
 }
 
 /// 서식 문자(유니코드 Cf): 보이지 않게 글의 방향·이음을 바꾼다.
-fn is_format(c: char) -> bool {
+pub(crate) fn is_format(c: char) -> bool {
     matches!(
         c,
         '\u{AD}'

@@ -47,9 +47,15 @@
 //! that would end after it. Before writing the summary or a record the
 //! worker checks it still holds the meeting.
 //!
-//! Who said what is shown through [`DisplayNames`]: today pubkey prefixes;
-//! a map that also knows a diarized `speaker_label` can take its place
-//! without touching this flow.
+//! Who said what is shown through [`DisplayNames`]: pubkey prefixes unless
+//! profile names are on (below); a map that also knows a diarized
+//! `speaker_label` can take its place without touching this flow.
+//!
+//! 프로필 이름([`FollowUps::with_profiles`])을 켜면 회의마다 한 번, 어느 단계든 처음
+//! 이름이 필요할 때 릴레이에 묻고 그 회의의 후보정·요약·페이지가 같은 이름표를 쓴다.
+//! 묻기가 안 되면 그 사람들만 pubkey 앞 8자로 두고 단계는 그대로 간다. 이름 묻기는 단계의
+//! 실패로 세지 않고 실패 기록(`StepFailures`)에도 넣지 않는다([`FollowedUp::names`] 에
+//! 수만 남긴다).
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -63,6 +69,7 @@ use crate::notion::{
     self, MeetingKind, MeetingPage, NotionClient, NotionErrorKind, NotionRecord, ProcessingStatus,
     PublishMeetingError, PublishReport, RecordStamp,
 };
+use crate::profiles::{NamesReport, ProfileNames, ProfileSource};
 use crate::runner::{Beside, MeetingError, MinutesHome};
 use crate::summary::{
     self, DisplayNames, GeminiSettings, Summary, SummaryError, SummaryErrorKind, Usage,
@@ -410,6 +417,9 @@ pub struct FollowUps<'a> {
     pub notion: Option<NotionStep<'a>>,
     /// pubkey → name, for the summary and the page.
     pub names: &'a dyn DisplayNames,
+    /// 참석자 프로필 이름을 물을 곳([`with_profiles`](Self::with_profiles)). 있으면 회의마다
+    /// 한 번 묻고 그 회의에서는 `names` 대신 그 이름표를 쓴다.
+    pub profiles: Option<&'a ProfileSource>,
     deadline: Option<Instant>,
     clock: &'a dyn Fn() -> u64,
     correct_run: ForRun,
@@ -429,6 +439,7 @@ impl<'a> FollowUps<'a> {
             summary,
             notion,
             names,
+            profiles: None,
             deadline: None,
             clock: &system_now_ms,
             correct_run: ForRun::default(),
@@ -440,6 +451,13 @@ impl<'a> FollowUps<'a> {
     /// Also correct the script before the summary.
     pub fn with_correct(mut self, step: CorrectStep<'a>) -> Self {
         self.correct = Some(step);
+        self
+    }
+
+    /// 사람 이름을 `source` 에서 회의마다 한 번 물은 프로필 이름으로 보인다. 못 찾은
+    /// 사람은 pubkey 앞 8자.
+    pub fn with_profiles(mut self, source: &'a ProfileSource) -> Self {
+        self.profiles = Some(source);
         self
     }
 
@@ -551,6 +569,9 @@ pub struct FollowedUp {
     pub summary_usage: Option<Usage>,
     /// What the correction made this run (none when none was made now).
     pub correct_made: Option<CorrectReport>,
+    /// 이번에 참석자 프로필 이름을 물었으면 그 결과(수와 까닭의 종류만). 단계의 실패로
+    /// 세지 않는다.
+    pub names: Option<NamesReport>,
 }
 
 impl FollowedUp {
@@ -662,6 +683,44 @@ impl<H: MinutesHome> Held<'_, H> {
     }
 }
 
+/// 회의 하나의 이름표. 프로필 이름을 켰으면 어느 단계든 처음 이름이 필요할 때 한 번만
+/// 묻고, 그 회의의 남은 단계가 같은 이름표를 쓴다.
+struct MeetingNames<'a> {
+    /// 실행 전체의 이름표(`FollowUps::names`).
+    run: &'a dyn DisplayNames,
+    source: Option<&'a ProfileSource>,
+    asked: Option<ProfileNames>,
+}
+
+impl<'a> MeetingNames<'a> {
+    fn new(steps: &FollowUps<'a>) -> Self {
+        Self {
+            run: steps.names,
+            source: steps.profiles,
+            asked: None,
+        }
+    }
+
+    /// `transcript`(이 회의 스크립트)에 쓸 이름표.
+    async fn get(&mut self, transcript: &Transcript) -> &dyn DisplayNames {
+        let Some(source) = self.source else {
+            return self.run;
+        };
+        if self.asked.is_none() {
+            self.asked = Some(source.names_for(transcript).await);
+        }
+        match &self.asked {
+            Some(names) => names,
+            None => self.run,
+        }
+    }
+
+    /// 물었으면 그 결과.
+    fn report(&self) -> Option<NamesReport> {
+        self.asked.as_ref().map(|names| names.report().clone())
+    }
+}
+
 /// Which text the summary and the page use.
 enum ForText {
     /// The correction is off: the original, and stamps are not compared.
@@ -724,6 +783,7 @@ pub async fn follow_up_held<H: MinutesHome>(
         given: transcript,
         read: None,
     };
+    let mut names = MeetingNames::new(steps);
     let later = |on: bool| {
         if on {
             Step::Later(Later::Home)
@@ -731,7 +791,7 @@ pub async fn follow_up_held<H: MinutesHome>(
             Step::Off
         }
     };
-    let (correct, for_text) = match correct_step(&mut held, steps).await {
+    let (correct, for_text) = match correct_step(&mut held, steps, &mut names).await {
         Ok(done) => done,
         Err(error) => {
             return FollowedUp {
@@ -741,6 +801,7 @@ pub async fn follow_up_held<H: MinutesHome>(
                 home_error: Some(error),
                 summary_usage: None,
                 correct_made: None,
+                names: names.report(),
             }
         }
     };
@@ -753,7 +814,7 @@ pub async fn follow_up_held<H: MinutesHome>(
         }),
         _ => None,
     };
-    let (summary, for_page) = match summary_step(&mut held, steps, &for_text).await {
+    let (summary, for_page) = match summary_step(&mut held, steps, &for_text, &mut names).await {
         Ok(done) => done,
         Err(error) => {
             return FollowedUp {
@@ -763,6 +824,7 @@ pub async fn follow_up_held<H: MinutesHome>(
                 home_error: Some(error),
                 summary_usage: None,
                 correct_made,
+                names: names.report(),
             }
         }
     };
@@ -770,7 +832,7 @@ pub async fn follow_up_held<H: MinutesHome>(
         (Step::Done, ForPage::Made(made, _)) => Some(made.usage.clone()),
         _ => None,
     };
-    match notion_step(&mut held, steps, for_page, &for_text).await {
+    match notion_step(&mut held, steps, for_page, &for_text, &mut names).await {
         Ok(notion) => FollowedUp {
             correct,
             summary,
@@ -778,6 +840,7 @@ pub async fn follow_up_held<H: MinutesHome>(
             home_error: None,
             summary_usage,
             correct_made,
+            names: names.report(),
         },
         Err(error) => FollowedUp {
             correct,
@@ -786,6 +849,7 @@ pub async fn follow_up_held<H: MinutesHome>(
             home_error: Some(error),
             summary_usage,
             correct_made,
+            names: names.report(),
         },
     }
 }
@@ -820,6 +884,7 @@ async fn gemini_failure<H: MinutesHome>(
 async fn correct_step<H: MinutesHome>(
     held: &mut Held<'_, H>,
     steps: &mut FollowUps<'_>,
+    names: &mut MeetingNames<'_>,
 ) -> Result<(Step, ForText), MeetingError> {
     if steps.correct.is_none() {
         return Ok((Step::Off, ForText::Off));
@@ -864,12 +929,13 @@ async fn correct_step<H: MinutesHome>(
     let mut settings = step.settings.clone();
     settings.deadline = steps.deadline;
     let transcript = held.script().await?;
+    let shown = names.get(transcript).await;
     let asked = correct::correct(
         step.http,
         &settings,
         step.tokens,
         transcript,
-        steps.names,
+        shown,
         step.glossary,
     )
     .await;
@@ -906,6 +972,7 @@ async fn summary_step<H: MinutesHome>(
     held: &mut Held<'_, H>,
     steps: &mut FollowUps<'_>,
     for_text: &ForText,
+    names: &mut MeetingNames<'_>,
 ) -> Result<(Step, ForPage), MeetingError> {
     if steps.summary.is_none() {
         return Ok((Step::Off, ForPage::Off));
@@ -956,6 +1023,7 @@ async fn summary_step<H: MinutesHome>(
     let mut settings = step.settings.clone();
     settings.deadline = steps.deadline;
     let script = held.script().await?;
+    let shown = names.get(script).await;
     let fixed;
     let transcript = match for_text.corrected() {
         Some(corrected) => {
@@ -965,16 +1033,9 @@ async fn summary_step<H: MinutesHome>(
         None => script,
     };
     // The model reads the corrected text; its evidence is checked against
-    // the original.
-    let asked = summary::summarize_from(
-        step.http,
-        &settings,
-        step.tokens,
-        script,
-        transcript,
-        steps.names,
-    )
-    .await;
+    // the original. 프롬프트와 담당자 검사는 같은 이름표(`shown`)를 쓴다.
+    let asked =
+        summary::summarize_from(step.http, &settings, step.tokens, script, transcript, shown).await;
     let error = match asked {
         Ok(mut made) => {
             steps.summary_run.heard(Signal::Answered);
@@ -1026,6 +1087,7 @@ async fn notion_step<H: MinutesHome>(
     steps: &mut FollowUps<'_>,
     for_page: ForPage,
     for_text: &ForText,
+    names: &mut MeetingNames<'_>,
 ) -> Result<Step, MeetingError> {
     if steps.notion.is_none() {
         return Ok(Step::Off);
@@ -1080,12 +1142,13 @@ async fn notion_step<H: MinutesHome>(
     };
     let (home, hold, meeting) = (held.home, held.hold, held.meeting);
     let transcript = held.script().await?;
+    let shown = names.get(transcript).await;
     let page = MeetingPage {
         transcript,
         corrected: for_text.corrected(),
         summary: summary.as_deref(),
         summary_note: given_up.then_some(SUMMARY_GIVEN_UP),
-        names: steps.names,
+        names: shown,
         title_prefix: &step.title_prefix,
         channel_label: step.channel_label.as_deref(),
         kind: step.kind,
@@ -1143,8 +1206,10 @@ mod tests {
     use crate::notion::tests::{
         fake_notion, minutes_pages, plan_for, plan_in, settings_for as notion_settings, FakeNotion,
     };
-    use crate::notion::{minutes_property, NotionSettings};
+    use crate::notion::{minutes_property, people_property, NotionSettings};
     use crate::pipeline::{MinutesSettings, SttPolicy};
+    use crate::profiles::tests::{profile_event, source_for as profile_source};
+    use crate::profiles::NamesTrouble;
     use crate::runner::{run_meeting, run_meeting_with, Done, LocalMinutes, RunOptions};
     use crate::store::LocalStore;
     use crate::stt::{SpeechToText, SttError, SttOutput, SttRequest};
@@ -3485,5 +3550,143 @@ mod tests {
         let item = &stored.action_items[0];
         assert_eq!(item.assignee_pubkey, None);
         assert_eq!(item.status, summary::ItemStatus::Unsure);
+    }
+
+    // ---- 참석자 프로필 이름.
+
+    /// 한 사람(진짜 키)이 말한 회의: 첫 줄은 [`SPOKEN`].
+    fn named_script(pubkey: &str) -> Transcript {
+        transcript_with(&[
+            (1_000, pubkey, SPOKEN),
+            (5_000, pubkey, "금요일까지 보낼게요."),
+        ])
+    }
+
+    /// generateContent 요청의 프롬프트 글.
+    fn prompt_of(request: &crate::test_http::Recorded) -> String {
+        request.json()["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// 프로필 이름은 회의마다 한 번만 묻고, 후보정·요약 프롬프트와 노션 페이지·담당자
+    /// 줄이 같은 이름을 쓴다. 할 게 없는 다음 실행은 묻지 않는다.
+    #[tokio::test]
+    async fn profile_names_are_asked_once_and_reach_every_step() {
+        let person = nostr::Keys::generate();
+        let pubkey = person.public_key().to_hex();
+        let event = profile_event(&person, &json!({ "display_name": "김지영" }), 10);
+        let relay = FakeServer::start(move |_| Reply::json(200, &json!([event]))).await;
+        let source = profile_source(&relay.base, &nostr::Keys::generate());
+        let fixture = correcting().await;
+        let script = named_script(&pubkey);
+        let steps = || {
+            fixture
+                .world
+                .run(Some(&fixture.settings), true)
+                .with_correct(CorrectStep {
+                    http: &fixture.world.http,
+                    settings: &fixture.settings,
+                    tokens: &fixture.world.tokens,
+                    glossary: &fixture.glossary,
+                })
+                .with_profiles(&source)
+        };
+        let followed = fixture.world.follow_with(&script, &mut steps()).await;
+        assert_eq!(
+            (
+                followed.correct.clone(),
+                followed.summary.clone(),
+                followed.notion.clone()
+            ),
+            (Step::Done, Step::Done, Step::Done)
+        );
+        assert_eq!(relay.requests().len(), 1, "one ask for the meeting");
+        assert_eq!(
+            followed.names,
+            Some(NamesReport {
+                asked: 1,
+                found: 1,
+                trouble: None
+            })
+        );
+
+        let requests = fixture.server.requests();
+        let correction = requests.iter().find(|r| is_correction(r)).unwrap();
+        assert!(
+            prompt_of(correction).contains("(김지영) "),
+            "{}",
+            prompt_of(correction)
+        );
+        let summary = requests.iter().find(|r| !is_correction(r)).unwrap();
+        assert!(
+            prompt_of(summary).contains(r#"{"id":"P1","name":"김지영"}"#),
+            "{}",
+            prompt_of(summary)
+        );
+        {
+            let state = fixture.world.state.lock().unwrap();
+            let pages = minutes_pages(&state);
+            assert_eq!(
+                pages[0].properties[minutes_property::PARTICIPANTS]["multi_select"],
+                json!([{ "name": "김지영" }])
+            );
+            let body = serde_json::to_string(&pages[0].children).unwrap();
+            assert!(body.contains(" 김지영: "), "{body}");
+            assert!(!body.contains(&pubkey[..8]), "{body}");
+            let row = state
+                .pages
+                .iter()
+                .find(|page| page.properties.contains_key(people_property::PUBKEY))
+                .unwrap();
+            assert_eq!(
+                row.properties[people_property::NAME]["title"][0]["plain_text"],
+                "김지영"
+            );
+        }
+
+        // 다 된 회의: 이름이 필요한 단계가 없으니 묻지 않는다.
+        let again = fixture.world.follow_with(&script, &mut steps()).await;
+        assert!(again.nothing_left(), "{again:?}");
+        assert_eq!(again.names, None);
+        assert_eq!(relay.requests().len(), 1);
+    }
+
+    /// 릴레이가 이름을 안 주면(401) 그 사람만 pubkey 앞 8자로 두고, 단계는 다 되며 실패로
+    /// 세지도 실패 기록을 남기지도 않는다.
+    #[tokio::test]
+    async fn refused_names_fall_back_without_failing_the_meeting() {
+        let world = world().await;
+        let relay =
+            FakeServer::start(|_| Reply::json(401, &json!({ "error": "NIP-98: replay detected" })))
+                .await;
+        let source = profile_source(&relay.base, &nostr::Keys::generate());
+        let pubkey = nostr::Keys::generate().public_key().to_hex();
+        let mut steps = world.steps().with_profiles(&source);
+        let followed = world.follow_with(&named_script(&pubkey), &mut steps).await;
+        assert_eq!(pair(&followed), (Step::Done, Step::Done));
+        assert!(!followed.has_failure() && !followed.left_for_next_run());
+        assert_eq!(
+            followed.names,
+            Some(NamesReport {
+                asked: 1,
+                found: 0,
+                trouble: Some(NamesTrouble::Refused(401))
+            })
+        );
+        assert_eq!(relay.requests().len(), 1);
+        for beside in [
+            Beside::CorrectFailed,
+            Beside::SummaryFailed,
+            Beside::NotionFailed,
+        ] {
+            assert!(!world.home.beside_path(FIRST, beside).exists());
+        }
+        let state = world.state.lock().unwrap();
+        assert_eq!(
+            minutes_pages(&state)[0].properties[minutes_property::PARTICIPANTS]["multi_select"],
+            json!([{ "name": &pubkey[..8] }])
+        );
     }
 }

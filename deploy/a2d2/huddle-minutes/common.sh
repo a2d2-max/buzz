@@ -32,6 +32,11 @@ role_permissions=speech.recognizers.recognize,aiplatform.endpoints.predict
 recordings_bucket=a2d2-huddle-recordings
 minutes_bucket=a2d2-huddle-minutes
 notion_secret=a2d2-buzz-notion-token
+# 회의록 봇 비밀 키(nsec). 참석자 프로필 이름(kind 0)을 운영 릴레이에 물을 때 NIP-98 인증에
+# 서명한다(봇은 그 릴레이 멤버). 읽기 권한은 작업기 계정에만 준다.
+scribe_secret=a2d2-buzz-huddle-scribe-nsec
+# 참석자 프로필 이름을 물을 운영 릴레이
+relay_url=https://buzz.a2d2lab.com
 
 # 섞은 오디오는 {prefix}/{community}/{channel}/mixed/{첫 세션}.wav
 # (crates/buzz-huddle-minutes/src/pipeline.rs mixed_audio_key). 녹음 객체는
@@ -78,8 +83,10 @@ job_env=(
   "BUZZ_MINUTES_ROOM_PIECES=cut" # 화자 토막마다 받아쓰기(작업기 기본값과 같지만 일부러 적는다)
   "BUZZ_MINUTES_VAD_LEVEL=on"    # 말소리 찾기에만 크기 맞춘 소리를 준다
   "BUZZ_MINUTES_CORRECT=on"      # 요약 전에 Gemini 로 잘못 들은 말 후보정
+  "BUZZ_MINUTES_RELAY_URL=$relay_url" # 참석자 이름을 묻는 곳. 봇 키는 scribe_env 비밀
 )
 notion_env=NOTION_TOKEN
+scribe_env=BUZZ_MINUTES_SCRIBE_NSEC
 
 # ─── 같이 쓰는 함수 ─────────────────────────────────────────────────────────
 

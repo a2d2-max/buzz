@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 futures-util = { workspace = true }
 hex = { workspace = true }
+nostr = { workspace = true }
 opus = "0.3"
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -33,5 +34,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+# 릴레이가 /query 에서 부르는 NIP-98 검사 함수로 우리 헤더를 시험한다.
+buzz-auth = { workspace = true }
 buzz-gcp = { workspace = true, features = ["fake"] }
 tempfile = "3"

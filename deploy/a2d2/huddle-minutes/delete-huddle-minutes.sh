@@ -30,11 +30,13 @@ else
 fi
 
 # ─── 3. 권한 바인딩 ──────────────────────────────────────────────────────────
-if gcloud secrets get-iam-policy "$notion_secret" --project "$project" --format=json | has_binding "$member" roles/secretmanager.secretAccessor; then
-  run gcloud secrets remove-iam-policy-binding "$notion_secret" --project "$project" --member "$member" --role roles/secretmanager.secretAccessor
-else
-  log "비밀 $notion_secret 읽기 바인딩 없음"
-fi
+for secret in "$notion_secret" "$scribe_secret"; do
+  if gcloud secrets get-iam-policy "$secret" --project "$project" --format=json | has_binding "$member" roles/secretmanager.secretAccessor; then
+    run gcloud secrets remove-iam-policy-binding "$secret" --project "$project" --member "$member" --role roles/secretmanager.secretAccessor
+  else
+    log "비밀 $secret 읽기 바인딩 없음"
+  fi
+done
 
 bucket_unbind() { # 버킷 역할 [조건 제목 조건]
   local bucket=$1 role=$2 title=${3:-} condition=${4:-}

@@ -88,10 +88,17 @@ pub fn huddle_id(transcript: &Transcript) -> String {
     format!("{}:{first}", transcript.channel_id)
 }
 
-/// pubkey 로 사람 이름을 찾는 곳. 진짜 이름표는 나중에 붙인다.
+/// pubkey 로 사람 이름을 찾는 곳. 기본은 pubkey 앞 8자([`PubkeyPrefixNames`]),
+/// 프로필 이름은 [`crate::profiles::ProfileNames`].
 pub trait DisplayNames {
     /// `pubkey`(hex) 의 표시 이름.
     fn display_name(&self, pubkey: &str) -> String;
+
+    /// 그 사람의 프로필 이름(같은 이름끼리 가르기 전). 모르면 `None`.
+    /// 노션 "허들 담당자 연결" DB 의 이름 칸에 쓴다.
+    fn profile_name(&self, _pubkey: &str) -> Option<String> {
+        None
+    }
 }
 
 /// 기본 이름표: pubkey 앞 8자.
@@ -596,7 +603,7 @@ pub fn attending(transcript: &Transcript) -> impl Iterator<Item = &str> {
 }
 
 /// pubkey 로 아는 사람들(참석자와 화자가 정해진 줄). 회의실 화자 이름표는 아니다.
-fn known_pubkeys(transcript: &Transcript) -> HashSet<&str> {
+pub(crate) fn known_pubkeys(transcript: &Transcript) -> HashSet<&str> {
     transcript
         .participants
         .iter()
@@ -2293,6 +2300,37 @@ pub(crate) mod tests {
         given["assignee_id"] = json!("같은이름");
         let summary = check_answer(&answer(json!([given])), &meeting(), &SameName).unwrap();
         assert_eq!(summary.action_items[0].assignee_pubkey, None);
+    }
+
+    /// 프로필 이름표(작업기가 쓰는 그것)로도 담당자가 바른 pubkey 로 돌아온다. 같은 이름은
+    /// 프롬프트에서부터 갈려 있어서, 가른 이름은 그 사람만, 가르기 전 이름은 아무도 아니다.
+    #[test]
+    fn assignees_map_back_through_profile_names() {
+        let found = HashMap::from([
+            (A.to_string(), "김지영".to_string()),
+            (B.to_string(), "민수".to_string()),
+            (C.to_string(), "민수".to_string()),
+        ]);
+        let names = crate::profiles::ProfileNames::new(&[A, B, C], &found, None);
+        let prompt = build_prompt(&meeting(), &names);
+        for shown in ["김지영", "민수 (bbbbbbbb)", "민수 (cccccccc)"] {
+            assert!(prompt.contains(&format!(r#""name":"{shown}""#)), "{prompt}");
+        }
+        let assignee = |id: &str| {
+            let mut given = quote_item(14_000);
+            given["assignee_id"] = json!(id);
+            check_answer(&answer(json!([given])), &meeting(), &names)
+                .unwrap()
+                .action_items[0]
+                .assignee_pubkey
+                .clone()
+        };
+        assert_eq!(assignee("P2").as_deref(), Some(B));
+        assert_eq!(assignee("민수 (bbbbbbbb)").as_deref(), Some(B));
+        // 두 사람 이름이라 아무도 아니다(담당자를 비우고 애매).
+        assert_eq!(assignee("민수"), None);
+        // C 의 이름으로 B 가 한 약속을 가져가지 못한다.
+        assert_eq!(assignee("민수 (cccccccc)"), None);
     }
 
     #[test]

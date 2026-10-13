@@ -17,6 +17,9 @@
 //!    그 앞에 [`correct`] 가 문맥으로 잘못 들은 낱말을 고친다(원본은 그대로).
 //! 8. [`notion`] 은 회의록 페이지를 노션 DB 에 쓴다.
 //!
+//! 사람 이름: [`profiles`] 가 회의마다 한 번 릴레이에서 참석자 프로필(kind 0)을 물어
+//! 붙인다. 못 찾은 사람은 pubkey 앞 8자.
+//!
 //! [`sim`] builds fake recordings with an answer sheet and [`check`]
 //! compares a script against it.
 //!
@@ -38,6 +41,7 @@ pub mod media;
 pub mod models;
 pub mod notion;
 pub mod pipeline;
+pub mod profiles;
 pub mod runner;
 pub mod sim;
 pub mod sim_room;
