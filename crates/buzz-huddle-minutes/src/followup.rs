@@ -56,11 +56,18 @@
 //! 묻기가 안 되면 그 사람들만 pubkey 앞 8자로 두고 단계는 그대로 간다. 이름 묻기는 단계의
 //! 실패로 세지 않고 실패 기록(`StepFailures`)에도 넣지 않는다([`FollowedUp::names`] 에
 //! 수만 남긴다).
+//!
+//! 페이지 뒤의 task 연결([`FollowUps::with_tasks`], [`crate::tasks`])은 이 글의 요약과 끝난
+//! 페이지가 있는 회의에만 돈다. 회의마다 한 번이다: 장부(`{first}.tasks.json`)가 끝남이면
+//! 스크립트가 바뀌어도 다시 하지 않는다. 실패 기록(`{first}.tasks-failed.json`)과 실행 끄기는
+//! 요약과 같은 모양이지만, task 연결의 실패는 회의의 실패로 세지 않는다
+//! ([`FollowedUp::has_failure`] 에 안 든다). 작업기 저장소가 실패할 때만 회의가 실패한다.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use buzz_gcp::token::Tokens;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::collect::MeetingPlan;
 use crate::correct::{self, Corrected, Glossary};
@@ -73,6 +80,10 @@ use crate::profiles::{MeetingPlace, NamesReport, ProfileNames, ProfileSource};
 use crate::runner::{Beside, MeetingError, MinutesHome};
 use crate::summary::{
     self, DisplayNames, GeminiSettings, Summary, SummaryError, SummaryErrorKind, Usage,
+};
+use crate::tasks::{
+    self, CheckInput, Outcome, Plan, TaskDbError, TaskSchema, TasksLedger, TasksMode, TasksReport,
+    TASKS_FORMAT, TASKS_MAX_AGE_MS,
 };
 use crate::transcript::Transcript;
 
@@ -399,6 +410,46 @@ pub struct NotionStep<'a> {
     pub kind: Option<MeetingKind>,
 }
 
+/// 팀 task DB 와 잇는 법([`crate::tasks`]). Gemini 는 요약과 같은 모델·클라이언트를 쓴다.
+pub struct TasksStep<'a> {
+    /// 어디까지 쓰나(off 가 아닌 것).
+    pub mode: TasksMode,
+    /// Gemini HTTP client.
+    pub http: &'a reqwest::Client,
+    /// 요약과 같은 Gemini 설정(모델·생각 수준·요청 시간 상한·다시 하기).
+    pub settings: &'a GeminiSettings,
+    /// Google access tokens.
+    pub tokens: &'a Tokens,
+    /// task DB 를 읽고 쓰는 노션 클라이언트(회의록 페이지와 같은 토큰).
+    pub client: NotionClient<'a>,
+    /// task DB(노션 database id).
+    pub database_id: String,
+    /// 이 실행에서 읽은 task DB 칸(실행마다 한 번 읽는다).
+    schema: Option<TaskSchema>,
+}
+
+impl<'a> TasksStep<'a> {
+    /// `database_id` 의 task 와 `mode` 만큼 잇는다.
+    pub fn new(
+        mode: TasksMode,
+        http: &'a reqwest::Client,
+        settings: &'a GeminiSettings,
+        tokens: &'a Tokens,
+        client: NotionClient<'a>,
+        database_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            mode,
+            http,
+            settings,
+            tokens,
+            client,
+            database_id: database_id.into(),
+            schema: None,
+        }
+    }
+}
+
 fn system_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -420,11 +471,14 @@ pub struct FollowUps<'a> {
     /// 참석자 프로필 이름을 물을 곳([`with_profiles`](Self::with_profiles)). 있으면 회의마다
     /// 한 번 묻고 그 회의에서는 `names` 대신 그 이름표를 쓴다.
     pub profiles: Option<&'a ProfileSource>,
+    /// 페이지 뒤 팀 task DB 연결([`with_tasks`](Self::with_tasks)).
+    pub tasks: Option<TasksStep<'a>>,
     deadline: Option<Instant>,
     clock: &'a dyn Fn() -> u64,
     correct_run: ForRun,
     summary_run: ForRun,
     notion_run: ForRun,
+    tasks_run: ForRun,
 }
 
 impl<'a> FollowUps<'a> {
@@ -440,17 +494,25 @@ impl<'a> FollowUps<'a> {
             notion,
             names,
             profiles: None,
+            tasks: None,
             deadline: None,
             clock: &system_now_ms,
             correct_run: ForRun::default(),
             summary_run: ForRun::default(),
             notion_run: ForRun::default(),
+            tasks_run: ForRun::default(),
         }
     }
 
     /// Also correct the script before the summary.
     pub fn with_correct(mut self, step: CorrectStep<'a>) -> Self {
         self.correct = Some(step);
+        self
+    }
+
+    /// 페이지 뒤에 팀 task DB 와 잇는다(요약과 노션 페이지가 있어야 돈다).
+    pub fn with_tasks(mut self, step: TasksStep<'a>) -> Self {
+        self.tasks = Some(step);
         self
     }
 
@@ -476,7 +538,10 @@ impl<'a> FollowUps<'a> {
 
     /// Some step is on.
     pub fn any(&self) -> bool {
-        self.correct.is_some() || self.summary.is_some() || self.notion.is_some()
+        self.correct.is_some()
+            || self.summary.is_some()
+            || self.notion.is_some()
+            || self.tasks.is_some()
     }
 
     fn now(&self) -> u64 {
@@ -504,6 +569,8 @@ pub enum Later {
     Backoff,
     /// The minutes home failed in an earlier step.
     Home,
+    /// task 연결이 노션 회의록 페이지를 기다린다.
+    Page,
 }
 
 impl Later {
@@ -515,6 +582,7 @@ impl Later {
             Self::OffForRun => "off for this run (refused, rate-limited or in trouble)",
             Self::Backoff => "waiting after earlier failures",
             Self::Home => "the minutes home failed",
+            Self::Page => "waiting for the Notion page",
         }
     }
 }
@@ -536,6 +604,9 @@ pub enum Step {
     /// Failed now. Kind and codes only, never meeting text, and how it was
     /// counted.
     Failed(String),
+    /// 이 회의에는 하지 않는다(task 연결: 맞대 볼 요약이 없음, 끝난 지 오래된 회의). 보낸 것도
+    /// 남은 것도 없다.
+    Skipped(&'static str),
 }
 
 /// What the correction made this run, numbers only (for the log).
@@ -575,6 +646,10 @@ pub struct FollowedUp {
     /// 이번에 노션 페이지를 써 봤으면 그 보고(담당자 연결 DB 에 한 일 포함). 로그에는
     /// 수와 까닭의 종류만 찍는다.
     pub notion_report: Option<PublishReport>,
+    /// 팀 task DB 연결.
+    pub tasks: Step,
+    /// 이번에 task 연결을 해 봤으면 그 보고(수만).
+    pub tasks_made: Option<TasksReport>,
 }
 
 impl FollowedUp {
@@ -585,24 +660,33 @@ impl FollowedUp {
     /// A later run has something to do.
     pub fn left_for_next_run(&self) -> bool {
         self.steps()
-            .iter()
+            .into_iter()
+            .chain([&self.tasks])
             .any(|step| matches!(step, Step::Failed(_) | Step::Later(_)))
     }
 
-    /// A step failed this run.
+    /// A step failed this run. task 연결의 실패는 넣지 않는다: 회의록은 그래도 됐다
+    /// ([`tasks_failed`](Self::tasks_failed) 로 따로 본다).
     pub fn has_failure(&self) -> bool {
         self.steps()
             .iter()
             .any(|step| matches!(step, Step::Failed(_)))
     }
 
+    /// task 연결이 이번에 실패했다(회의 실패로는 안 센다. 다음 실행에 다시 한다).
+    pub fn tasks_failed(&self) -> bool {
+        matches!(self.tasks, Step::Failed(_))
+    }
+
     /// Nothing was done, tried or left this run.
     pub fn nothing_left(&self) -> bool {
         self.home_error.is_none()
-            && self
-                .steps()
-                .iter()
-                .all(|step| matches!(step, Step::Off | Step::AlreadyDone | Step::GaveUp))
+            && self.steps().into_iter().chain([&self.tasks]).all(|step| {
+                matches!(
+                    step,
+                    Step::Off | Step::AlreadyDone | Step::GaveUp | Step::Skipped(_)
+                )
+            })
     }
 }
 
@@ -774,10 +858,11 @@ enum ForPage {
 }
 
 /// The summary and the Notion page of `meeting`, whose script's bytes have
-/// the sha256 `script_sha256`. Call it while holding the meeting (`hold`).
-/// `transcript` is that script when the caller has it; otherwise it is read
-/// only if a step needs it. Steps that fail are reported, never returned:
-/// the script and its report stand whatever happens here.
+/// the sha256 `script_sha256`, then the team's task DB. Call it while
+/// holding the meeting (`hold`). `transcript` is that script when the caller
+/// has it; otherwise it is read only if a step needs it. Steps that fail are
+/// reported, never returned: the script and its report stand whatever
+/// happens here.
 pub async fn follow_up_held<H: MinutesHome>(
     home: &H,
     hold: &H::Hold,
@@ -802,6 +887,7 @@ pub async fn follow_up_held<H: MinutesHome>(
             Step::Off
         }
     };
+    let tasks_on = steps.tasks.is_some();
     let (correct, for_text) = match correct_step(&mut held, steps, &mut names).await {
         Ok(done) => done,
         Err(error) => {
@@ -814,6 +900,8 @@ pub async fn follow_up_held<H: MinutesHome>(
                 correct_made: None,
                 names: names.report(),
                 notion_report: None,
+                tasks: later(tasks_on),
+                tasks_made: None,
             }
         }
     };
@@ -838,6 +926,8 @@ pub async fn follow_up_held<H: MinutesHome>(
                 correct_made,
                 names: names.report(),
                 notion_report: None,
+                tasks: later(tasks_on),
+                tasks_made: None,
             }
         }
     };
@@ -849,33 +939,54 @@ pub async fn follow_up_held<H: MinutesHome>(
     let notion = notion_step(
         &mut held,
         steps,
-        for_page,
+        &for_page,
         &for_text,
         &mut names,
         &mut notion_report,
     )
     .await;
-    match notion {
-        Ok(notion) => FollowedUp {
-            correct,
-            summary,
-            notion,
-            home_error: None,
-            summary_usage,
-            correct_made,
-            names: names.report(),
-            notion_report,
-        },
-        Err(error) => FollowedUp {
-            correct,
-            summary,
-            notion: Step::Failed(format!("minutes home: {error}")),
-            home_error: Some(error),
-            summary_usage,
-            correct_made,
-            names: names.report(),
-            notion_report,
-        },
+    let notion = match notion {
+        Ok(notion) => notion,
+        Err(error) => {
+            return FollowedUp {
+                correct,
+                summary,
+                notion: Step::Failed(format!("minutes home: {error}")),
+                home_error: Some(error),
+                summary_usage,
+                correct_made,
+                names: names.report(),
+                notion_report,
+                tasks: later(tasks_on),
+                tasks_made: None,
+            }
+        }
+    };
+    let mut tasks_made = None;
+    let tasks = tasks_step(
+        &mut held,
+        steps,
+        &for_page,
+        &notion,
+        &mut names,
+        &mut tasks_made,
+    )
+    .await;
+    let (tasks, home_error) = match tasks {
+        Ok(tasks) => (tasks, None),
+        Err(error) => (Step::Failed(format!("minutes home: {error}")), Some(error)),
+    };
+    FollowedUp {
+        correct,
+        summary,
+        notion,
+        home_error,
+        summary_usage,
+        correct_made,
+        names: names.report(),
+        notion_report,
+        tasks,
+        tasks_made,
     }
 }
 
@@ -1112,7 +1223,7 @@ fn given_up_page(earlier: Option<(Box<Summary>, String)>) -> ForPage {
 async fn notion_step<H: MinutesHome>(
     held: &mut Held<'_, H>,
     steps: &mut FollowUps<'_>,
-    for_page: ForPage,
+    for_page: &ForPage,
     for_text: &ForText,
     names: &mut MeetingNames<'_>,
     published: &mut Option<PublishReport>,
@@ -1124,7 +1235,7 @@ async fn notion_step<H: MinutesHome>(
         ForPage::Missing => return Ok(Step::Later(Later::Summary)),
         // Not compared: the page keeps what it was written with.
         ForPage::Off => (None, None),
-        ForPage::Made(summary, sha) => (Some(summary), Some(sha)),
+        ForPage::Made(summary, sha) => (Some(summary.as_ref()), Some(sha.clone())),
         ForPage::GivenUp => (None, Some(SUMMARY_GIVEN_UP_STAMP.to_string())),
     };
     let done = held
@@ -1159,6 +1270,12 @@ async fn notion_step<H: MinutesHome>(
     if steps.short_of_time() {
         return Ok(Step::Later(Later::TimeLimit));
     }
+    // task 연결이 이미 붙인 「관련 있을 수 있는 task」 절은 다시 써도 남긴다. 그 장부를 못 읽어도
+    // 페이지는 쓴다(절만 빠진다): task 연결 때문에 회의록이 실패하지 않게.
+    let tail = match steps.tasks.is_some() {
+        true => maybe_tail(held).await.unwrap_or_default(),
+        false => Vec::new(),
+    };
     let Some(step) = steps.notion.as_mut() else {
         return Ok(Step::Off);
     };
@@ -1179,13 +1296,14 @@ async fn notion_step<H: MinutesHome>(
     let page = MeetingPage {
         transcript,
         corrected: for_text.corrected(),
-        summary: summary.as_deref(),
+        summary,
         summary_note: given_up.then_some(SUMMARY_GIVEN_UP),
         names: shown,
         title_prefix: &step.title_prefix,
         channel_label: step.channel_label.as_deref().or(place_label.as_deref()),
         kind: step.kind.or(place.map(MeetingPlace::kind)),
         status: ProcessingStatus::Done,
+        tail: &tail,
     };
     let report = published.insert(PublishReport::default());
     let result =
@@ -1215,6 +1333,301 @@ async fn notion_step<H: MinutesHome>(
     )))
 }
 
+/// 회의록 페이지를 다시 쓸 때 끝에 붙일 「관련 있을 수 있는 task」 절: task 연결이 그 절을 이미
+/// 붙였을 때만(장부에 끝낸 쓰기로 있을 때). 아직 안 붙였으면 task 연결이 붙인다.
+async fn maybe_tail<H: MinutesHome>(held: &Held<'_, H>) -> Result<Vec<Value>, MeetingError> {
+    let Some(bytes) = held.home.read_beside(held.meeting, Beside::Tasks).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(serde_json::from_slice::<TasksLedger>(&bytes)
+        .ok()
+        .filter(|ledger| ledger.outcome(tasks::Write::Maybe).is_some())
+        .map(|ledger| tasks::maybe_blocks(&ledger.plan.maybe))
+        .unwrap_or_default())
+}
+
+/// task 연결이 실패한 곳.
+enum TasksError {
+    /// Gemini(요약과 같은 규칙으로 센다).
+    Gemini(SummaryError),
+    /// 노션 task DB·회의록 페이지, 하던 일과 함께.
+    Notion(TaskDbError),
+}
+
+/// task 연결의 실패를 그 회의 몫으로 세고 기록을 쓴다. 로그 글에는 종류와 코드만 넣는다(노션
+/// 메시지는 페이지 글을 옮겨 올 수 있다).
+async fn tasks_failure<H: MinutesHome>(
+    held: &Held<'_, H>,
+    run: &mut ForRun,
+    now: u64,
+    mut failures: StepFailures,
+    error: TasksError,
+) -> Result<Step, MeetingError> {
+    let (cost, signal, kind, code) = match &error {
+        TasksError::Gemini(error) => {
+            // Nothing sent: the deadline came first.
+            if error.kind == SummaryErrorKind::OutOfTime && !error.may_have_cost() {
+                return Ok(Step::Later(Later::TimeLimit));
+            }
+            let (cost, signal) = summary_class(error);
+            (cost, signal, error.kind.as_str(), error.code.clone())
+        }
+        // 같은 403 이라도 어느 요청이 막혔는지 보이게 하던 일을 붙인다.
+        TasksError::Notion(TaskDbError { error, doing }) => {
+            let (cost, signal) = notion_class(error.kind);
+            (
+                cost,
+                signal,
+                error.kind.as_str(),
+                format!("{} while {doing}", error.short_code()),
+            )
+        }
+    };
+    let cost = run.count_as(cost, signal);
+    failures.count(cost, kind, &code, now);
+    if cost != Cost::Uncounted {
+        held.write_failures(Beside::TasksFailed, &failures).await?;
+    }
+    let given_up = failures.summary_given_up();
+    Ok(Step::Failed(format!(
+        "{kind} {code}{}",
+        failures.tally(cost, given_up, now)
+    )))
+}
+
+/// 팀 task DB 연결([`crate::tasks`]). 이 글의 요약과 끝난 노션 페이지가 있을 때만 돈다. 회의마다
+/// 한 번: 장부가 끝남이면 다시 하지 않는다. 장부가 없으면 계획을 세워(Gemini 한 번) 쓰기 전에
+/// 남기고, 쓰기를 하나 할 때마다 끝낸 것을 더한다. 실패는 [`FollowedUp::has_failure`] 에 안
+/// 들어간다(회의록은 됐다). 작업기 저장소가 실패하면 `Err`(회의 실패).
+async fn tasks_step<H: MinutesHome>(
+    held: &mut Held<'_, H>,
+    steps: &mut FollowUps<'_>,
+    for_page: &ForPage,
+    notion: &Step,
+    names: &mut MeetingNames<'_>,
+    made: &mut Option<TasksReport>,
+) -> Result<Step, MeetingError> {
+    if steps
+        .tasks
+        .as_ref()
+        .is_none_or(|step| step.mode == TasksMode::Off)
+    {
+        return Ok(Step::Off);
+    }
+    let (summary, summary_sha) = match for_page {
+        ForPage::Made(summary, sha) => (summary.as_ref(), sha.as_str()),
+        ForPage::Missing => return Ok(Step::Later(Later::Summary)),
+        ForPage::GivenUp => return Ok(Step::Skipped("no summary to match")),
+        ForPage::Off => return Ok(Step::Skipped("the summary is off")),
+    };
+    match notion {
+        Step::Done | Step::AlreadyDone => {}
+        Step::Off => return Ok(Step::Skipped("the Notion page is off")),
+        _ => return Ok(Step::Later(Later::Page)),
+    }
+    // 끝난 지 오래된 회의는 지금 task 를 건드리지 않는다(계획도 쓰기도 안 한다). 다만 칸을 바꾸고
+    // 기록을 못 붙인 task 가 있으면 그 기록만은 마저 붙인다(칸 바꾸기는 다시 안 한다).
+    let now = steps.now();
+    let old = now.saturating_sub(held.meeting.ended_at_unix_ms()) > TASKS_MAX_AGE_MS;
+    let ledger = match held.home.read_beside(held.meeting, Beside::Tasks).await? {
+        None => None,
+        Some(bytes) => match serde_json::from_slice::<TasksLedger>(&bytes) {
+            Ok(ledger) => Some(ledger),
+            // 오래된 회의는 장부가 망가져도 건너뛴다: 망가진 장부 하나가 녹음이 남은 14일 동안 실행마다
+            // 경고를 내지 않게(붙일 기록이 남았는지도 알 수 없다).
+            Err(_) if old => return Ok(Step::Skipped("the meeting ended over 24 hours ago")),
+            // Asking again would pay again, and what was written is not known.
+            Err(_) => return Ok(Step::Failed("stored task links unreadable".into())),
+        },
+    };
+    if ledger.as_ref().is_some_and(|ledger| ledger.finished) {
+        return Ok(Step::AlreadyDone);
+    }
+    if old
+        && ledger
+            .as_ref()
+            .is_none_or(|ledger| ledger.owed_records().is_empty())
+    {
+        return Ok(Step::Skipped("the meeting ended over 24 hours ago"));
+    }
+    let Ok(failures) = held.failures(Beside::TasksFailed).await? else {
+        // Its paid tries are not known: not paid for again.
+        return Ok(Step::Failed("stored task link failures unreadable".into()));
+    };
+    if failures.summary_given_up() {
+        return Ok(Step::GaveUp);
+    }
+    if failures.waiting(now) {
+        return Ok(Step::Later(Later::Backoff));
+    }
+    if steps.tasks_run.off {
+        return Ok(Step::Later(Later::OffForRun));
+    }
+    if steps.short_of_time() {
+        return Ok(Step::Later(Later::TimeLimit));
+    }
+    let deadline = steps.deadline;
+    let FollowUps {
+        tasks: Some(step),
+        tasks_run: run,
+        ..
+    } = steps
+    else {
+        return Ok(Step::Off);
+    };
+    let report = made.insert(TasksReport::default());
+    let mut asked = None;
+    let mut ledger = match ledger {
+        Some(ledger) => ledger,
+        None => {
+            // 회의록 페이지: 앞 단계가 끝냈다고 본 기록.
+            let page_id = held
+                .home
+                .read_notion_record(held.meeting)
+                .await?
+                .and_then(|bytes| serde_json::from_slice::<NotionRecord>(&bytes).ok())
+                .filter(|record| record.done && !record.page_id.is_empty())
+                .map(|record| record.page_id);
+            let Some(page_id) = page_id else {
+                return Ok(Step::Later(Later::Page));
+            };
+            let planned =
+                plan_tasks(held, step, deadline, summary, summary_sha, page_id, names).await?;
+            match planned {
+                Ok(ledger) => {
+                    asked = ledger.usage.clone();
+                    ledger
+                }
+                Err(error) => return tasks_failure(held, run, now, failures, error).await,
+            }
+        }
+    };
+    report.plan(&ledger.plan);
+    report.usage = asked;
+    // 쓸 때는 이 실행에서 읽은 지금 칸을 본다(상태 선택지가 바뀌었을 수 있다).
+    let schema = match current_schema(step).await {
+        Ok(schema) => schema,
+        Err(error) => {
+            return tasks_failure(held, run, now, failures, TasksError::Notion(error)).await
+        }
+    };
+    let link = step.client.settings().playback_link.clone();
+    let writes = match old {
+        true => ledger.owed_records(),
+        false => tasks::writes(&ledger.plan, ledger.mode.min(step.mode)),
+    };
+    let mut failed = None;
+    for write in writes {
+        let key = write.key(&ledger.plan);
+        if ledger.done.contains_key(&key) {
+            continue;
+        }
+        // 같은 task 의 앞 쓰기가 400·404 로 끝났으면 그 task 의 남은 쓰기는 건너뛴다.
+        let outcome = if ledger.blocked(write) {
+            tasks::count(report, write, Outcome::Skipped);
+            Ok(Outcome::Skipped)
+        } else {
+            tasks::apply(&mut step.client, &mut ledger, &schema, write, &link, report).await
+        };
+        match outcome {
+            Ok(outcome) => {
+                ledger.done.insert(key, outcome);
+                held.write(Beside::Tasks, ledger_json(&ledger)?).await?;
+            }
+            Err(error) => {
+                failed = Some(error);
+                break;
+            }
+        }
+    }
+    if let Some(error) = failed {
+        return tasks_failure(held, run, now, failures, TasksError::Notion(error)).await;
+    }
+    ledger.finished = true;
+    held.write(Beside::Tasks, ledger_json(&ledger)?).await?;
+    run.heard(Signal::Answered);
+    run.succeeded = true;
+    Ok(Step::Done)
+}
+
+/// 이 실행의 task DB 칸(실행마다 한 번 읽고 같은 실행의 회의들이 같이 쓴다).
+async fn current_schema(step: &mut TasksStep<'_>) -> Result<TaskSchema, TaskDbError> {
+    if let Some(schema) = &step.schema {
+        return Ok(schema.clone());
+    }
+    let schema = tasks::read_schema(&mut step.client, &step.database_id).await?;
+    Ok(step.schema.insert(schema).clone())
+}
+
+fn ledger_json(ledger: &TasksLedger) -> Result<Vec<u8>, MeetingError> {
+    serde_json::to_vec_pretty(ledger).map_err(io)
+}
+
+/// task 연결 계획: task DB 칸(실행마다 한 번)과 진행 중 task 를 읽고, 물을 거리가 있으면 Gemini 에
+/// 한 번 묻고 검사해서, 쓰기 전에 장부에 남긴다. 회의 안의 글은 원본 스크립트로 검사한다.
+#[allow(clippy::too_many_arguments)]
+async fn plan_tasks<H: MinutesHome>(
+    held: &mut Held<'_, H>,
+    step: &mut TasksStep<'_>,
+    deadline: Option<Instant>,
+    summary: &Summary,
+    summary_sha: &str,
+    page_id: String,
+    names: &mut MeetingNames<'_>,
+) -> Result<Result<TasksLedger, TasksError>, MeetingError> {
+    let schema = match current_schema(step).await {
+        Ok(schema) => schema,
+        Err(error) => return Ok(Err(TasksError::Notion(error))),
+    };
+    let open = match tasks::open_tasks(&mut step.client, &schema).await {
+        Ok(open) => open,
+        Err(error) => return Ok(Err(TasksError::Notion(error))),
+    };
+    let script_sha256 = held.script_sha256.to_string();
+    let (plan, usage, meeting, channel_id) = {
+        let transcript = held.script().await?;
+        let shown = names.get(transcript).await;
+        let input = CheckInput {
+            summary,
+            tasks: &open,
+            schema: &schema,
+            transcript,
+            names: shown,
+            mode: step.mode,
+        };
+        let meeting = tasks::meeting_label(transcript);
+        let channel_id = transcript.channel_id;
+        if tasks::worth_asking(&input) {
+            // No request or wait past the run's deadline.
+            let mut settings = step.settings.clone();
+            settings.deadline = deadline;
+            match tasks::ask(step.http, &settings, step.tokens, &input).await {
+                Ok((plan, usage)) => (plan, Some(usage), meeting, channel_id),
+                Err(error) => return Ok(Err(TasksError::Gemini(error))),
+            }
+        } else {
+            (Plan::default(), None, meeting, channel_id)
+        }
+    };
+    let ledger = TasksLedger {
+        format: TASKS_FORMAT.into(),
+        mode: step.mode,
+        script_sha256,
+        summary_sha256: summary_sha.to_string(),
+        minutes_page_id: page_id,
+        channel_id,
+        meeting,
+        schema,
+        plan,
+        usage,
+        done: Default::default(),
+        created: Default::default(),
+        finished: false,
+    };
+    held.write(Beside::Tasks, ledger_json(&ledger)?).await?;
+    Ok(Ok(ledger))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1231,7 +1644,9 @@ mod tests {
     use crate::notion::tests::{
         fake_notion, minutes_pages, plan_for, plan_in, settings_for as notion_settings, FakeNotion,
     };
-    use crate::notion::{minutes_property, people_property, NotionSettings};
+    use crate::notion::{
+        minutes_property, people_property, NotionSettings, MINUTES_DATA_SOURCE_ID,
+    };
     use crate::pipeline::{MinutesSettings, SttPolicy};
     use crate::profiles::tests::{
         channel_event, is_query, nip11, profile_event, source_for as profile_source,
@@ -1242,7 +1657,11 @@ mod tests {
     use crate::stt::{SpeechToText, SttError, SttOutput, SttRequest};
     use crate::summary::tests::{answer, gemini_reply, settings_for as gemini_settings};
     use crate::summary::PubkeyPrefixNames;
-    use crate::test_http::{transcript_with, FakeServer, Reply};
+    use crate::tasks::tests::{
+        add_task_db, meeting as task_meeting, summary_answer, TASK_DB, TASK_DS,
+    };
+    use crate::tasks::{page_url, MAYBE_HEADING, RECORD_HEADING};
+    use crate::test_http::{transcript_with, FakeServer, Recorded, Reply};
     use crate::transcript::SttInfo;
     use crate::vad::{SegmentPlan, SpeechDetector, SpeechSpan, VadError};
 
@@ -3862,5 +4281,1321 @@ mod tests {
             minutes_pages(&state)[0].properties[minutes_property::PARTICIPANTS]["multi_select"],
             json!([{ "name": &pubkey[..8] }])
         );
+    }
+
+    // ---- 팀 task DB 연결.
+
+    /// task 연결 요청인가(시스템 지시로 가린다).
+    fn is_tasks_request(request: &Recorded) -> bool {
+        String::from_utf8_lossy(&request.body).contains("task 목록을 맞대어")
+    }
+
+    /// 블록의 글(멘션은 빼고).
+    fn block_text(block: &Value) -> String {
+        let kind = block["type"].as_str().unwrap_or("");
+        block[kind]["rich_text"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|run| run["text"]["content"].as_str())
+            .collect()
+    }
+
+    /// 모델이 낼 법한 답을 프롬프트의 task 목록에서 만든다(제목으로 K 번호를 찾는다): 견적서
+    /// 자동화는 확실 + 기한, 로그인 오류 수정은 확실 + 완료, 결제 화면 개편은 애매, 회의록 공유
+    /// 할 일은 그런 task 가 있으면 확실한 짝, 없으면 새 task.
+    fn answer_for(request: &Recorded) -> Value {
+        let prompt = request.json()["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let list = prompt.split("진행 중 task(JSON 배열):\n").nth(1).unwrap();
+        let tasks: Vec<Value> = serde_json::from_str(list.trim()).unwrap();
+        let id = |title: &str| {
+            tasks
+                .iter()
+                .find(|task| task["title"] == title)
+                .map(|task| task["id"].as_str().unwrap().to_string())
+        };
+        let (mut links, mut due, mut status, mut new) = (vec![], vec![], vec![], vec![]);
+        if let Some(k) = id("견적서 자동화") {
+            links.push(
+                json!({ "item": "A1", "task": k, "level": "확실", "why": "견적서 자동화",
+                               "said": "금요일까지 끝내기로 했다.", "ms": 5_000 }),
+            );
+            due.push(json!({ "task": k, "due": "2026-10-16", "ms": 5_000 }));
+        }
+        if let Some(k) = id("로그인 오류 수정") {
+            links.push(
+                json!({ "item": "D1", "task": k, "level": "확실", "why": "로그인 오류",
+                               "said": "어제 배포를 마쳤다.", "ms": 9_000 }),
+            );
+            status.push(json!({ "task": k, "status": "완료", "ms": 9_000 }));
+        }
+        if let Some(k) = id("결제 화면 개편") {
+            links.push(json!({ "item": "T1", "task": k, "level": "애매",
+                               "why": "결제 화면 이야기일 수 있다", "said": "", "ms": 13_000 }));
+        }
+        match id("회의록 공유 기능 만들기") {
+            Some(k) => links.push(json!({ "item": "A2", "task": k, "level": "확실",
+                                          "why": "같은 일", "said": "목요일까지 만든다.", "ms": 17_000 })),
+            None => new.push(json!("A2")),
+        }
+        json!({ "links": links, "due_changes": due, "status_changes": status, "new_tasks": new })
+    }
+
+    /// task 연결 시험의 세상: 요약과 task 연결에 답하는 가짜 Gemini, task DB 가 있는 가짜 노션.
+    struct Linking {
+        world: World,
+        gemini: FakeServer,
+        settings: GeminiSettings,
+        /// 있으면 task 연결에 이 답을 준다(없으면 [`answer_for`]).
+        fixed: Arc<std::sync::Mutex<Option<Value>>>,
+    }
+
+    async fn linking() -> Linking {
+        let world = world().await;
+        add_task_db(&mut world.state.lock().unwrap());
+        let fixed = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let shared = Arc::clone(&fixed);
+        let gemini = FakeServer::start(move |request| {
+            if !is_tasks_request(request) {
+                return gemini_reply(&summary_answer(), "STOP");
+            }
+            let answer = shared
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| answer_for(request));
+            gemini_reply(&answer.to_string(), "STOP")
+        })
+        .await;
+        Linking {
+            settings: gemini_settings(&gemini),
+            world,
+            gemini,
+            fixed,
+        }
+    }
+
+    impl Linking {
+        /// 요약·페이지에 `mode` 의 task 연결(off 면 없음).
+        fn steps(&self, mode: TasksMode) -> FollowUps<'_> {
+            let steps = self.world.run(Some(&self.settings), true);
+            if mode == TasksMode::Off {
+                return steps;
+            }
+            let client = NotionClient::new(&self.world.http, &self.world.notion_settings, "t");
+            steps.with_tasks(TasksStep::new(
+                mode,
+                &self.world.http,
+                &self.settings,
+                &self.world.tokens,
+                client.unwrap(),
+                TASK_DB,
+            ))
+        }
+
+        async fn follow(&self, mode: TasksMode) -> FollowedUp {
+            self.follow_script(mode, &task_meeting()).await
+        }
+
+        async fn follow_script(&self, mode: TasksMode, script: &Transcript) -> FollowedUp {
+            let mut steps = self.steps(mode);
+            self.world.follow_with(script, &mut steps).await
+        }
+
+        /// task 연결로 Gemini 에 물은 수.
+        fn tasks_asked(&self) -> usize {
+            self.gemini
+                .requests()
+                .iter()
+                .filter(|request| is_tasks_request(request))
+                .count()
+        }
+
+        /// task DB 로 간 노션 요청(읽기 포함).
+        fn task_requests(&self) -> Vec<Recorded> {
+            self.world
+                .notion
+                .requests()
+                .into_iter()
+                .filter(|request| {
+                    request.path.contains("task-")
+                        || request.json()["parent"]["data_source_id"] == TASK_DS
+                })
+                .collect()
+        }
+
+        /// task 쪽 쓰기(칸 고치기·덧붙이기·만들기).
+        fn task_writes(&self) -> Vec<Recorded> {
+            self.task_requests()
+                .into_iter()
+                .filter(|request| request.method != "GET" && !request.path.ends_with("/query"))
+                .collect()
+        }
+
+        fn page(&self, id: &str) -> (serde_json::Map<String, Value>, Vec<Value>) {
+            let state = self.world.state.lock().unwrap();
+            let page = state.pages.iter().find(|page| page.id == id).unwrap();
+            (page.properties.clone(), page.children.clone())
+        }
+
+        /// 그 task 페이지의 「허들 회의 기록」 수.
+        fn records(&self, id: &str) -> usize {
+            self.page(id)
+                .1
+                .iter()
+                .filter(|block| {
+                    block["type"] == "heading_3" && block_text(block).starts_with(RECORD_HEADING)
+                })
+                .count()
+        }
+
+        /// 회의가 만든 task(시험 task 가 아닌 task DB 페이지) id.
+        fn created(&self) -> Vec<String> {
+            let state = self.world.state.lock().unwrap();
+            state
+                .pages
+                .iter()
+                .filter(|page| page.data_source == TASK_DS && !page.id.starts_with("task-"))
+                .map(|page| page.id.clone())
+                .collect()
+        }
+
+        fn minutes_id(&self) -> String {
+            minutes_pages(&self.world.state.lock().unwrap())[0]
+                .id
+                .clone()
+        }
+
+        /// 회의록 페이지의 「관련 있을 수 있는 task」 절 수.
+        fn maybe_sections(&self) -> usize {
+            self.page(&self.minutes_id())
+                .1
+                .iter()
+                .filter(|block| block["type"] == "heading_2" && block_text(block) == MAYBE_HEADING)
+                .count()
+        }
+
+        fn ledger_path(&self) -> std::path::PathBuf {
+            self.world.home.beside_path(FIRST, Beside::Tasks)
+        }
+
+        fn ledger(&self) -> TasksLedger {
+            serde_json::from_slice(&std::fs::read(self.ledger_path()).unwrap()).unwrap()
+        }
+    }
+
+    /// 스위치 넷이 각각 할 일만 한다. off 는 task DB 를 보지도 않고 Gemini 도 안 부른다.
+    /// append 는 확실한 짝에 기록만(애매한 짝은 회의록 페이지 절), create 는 짝 없는 확정 할 일을
+    /// 새 task 로, update 는 종료일·작업상태까지 바꾼다.
+    #[tokio::test]
+    async fn each_tasks_mode_does_only_its_own_writes() {
+        let off = linking().await;
+        let followed = off.follow(TasksMode::Off).await;
+        assert_eq!(pair(&followed), (Step::Done, Step::Done));
+        assert_eq!(
+            (followed.tasks.clone(), followed.tasks_made),
+            (Step::Off, None)
+        );
+        assert_eq!(off.tasks_asked(), 0);
+        assert!(off.task_requests().is_empty());
+
+        let append = linking().await;
+        let followed = append.follow(TasksMode::Append).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        assert_eq!(
+            (
+                append.records("task-1"),
+                append.records("task-2"),
+                append.records("task-3")
+            ),
+            (1, 1, 0)
+        );
+        let writes = append.task_writes();
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        assert!(writes
+            .iter()
+            .all(|write| write.method == "PATCH" && write.path.ends_with("/children")));
+        assert!(append.created().is_empty());
+        assert_eq!(append.maybe_sections(), 1);
+        assert_eq!(append.tasks_asked(), 1);
+
+        let create = linking().await;
+        let followed = create.follow(TasksMode::Create).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        let created = create.created();
+        assert_eq!(created.len(), 1);
+        let (properties, body) = create.page(&created[0]);
+        assert_eq!(
+            notion::property_text(&properties["기능"]),
+            "회의록 공유 기능 만들기"
+        );
+        assert_eq!(properties["작업상태"]["status"]["name"], "시작 전");
+        assert_eq!(properties["종료일"]["date"]["start"], "2026-10-15");
+        assert_eq!(properties["담당자"]["people"][0]["id"], "user-1");
+        assert_eq!(
+            properties["관련 노션 페이지"]["url"],
+            page_url(&create.minutes_id())
+        );
+        assert!(
+            serde_json::to_string(&body)
+                .unwrap()
+                .contains(&format!(r#""page":{{"id":"{}"}}"#, create.minutes_id())),
+            "the body links the minutes"
+        );
+        assert!(
+            create
+                .task_writes()
+                .iter()
+                .all(|write| !write.path.starts_with("/v1/pages/task-")),
+            "no property changes"
+        );
+
+        let update = linking().await;
+        let followed = update.follow(TasksMode::Update).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        let report = followed.tasks_made.clone().unwrap();
+        assert_eq!(
+            (
+                report.appended,
+                report.created,
+                report.due_changed,
+                report.status_changed
+            ),
+            (2, 1, 1, 1)
+        );
+        let (task_1, body_1) = update.page("task-1");
+        assert_eq!(task_1["종료일"]["date"]["start"], "2026-10-16");
+        let (task_2, body_2) = update.page("task-2");
+        assert_eq!(task_2["작업상태"]["status"]["name"], "완료");
+        // 기록에 예전 값 → 새 값과 근거, 그 task 의 담당자 멘션.
+        let body_1 = serde_json::to_string(&body_1).unwrap();
+        assert!(
+            body_1.contains("기한: 10/20 → 10/16 (근거 [00:05])"),
+            "{body_1}"
+        );
+        assert!(body_1.contains(r#""user":{"id":"user-9"}"#), "{body_1}");
+        let body_2 = serde_json::to_string(&body_2).unwrap();
+        assert!(
+            body_2.contains("상태: Dev QA → 완료 (근거 [00:09])"),
+            "{body_2}"
+        );
+        assert!(
+            !body_2.contains(r#""user":"#),
+            "task-2 has no 담당자: {body_2}"
+        );
+        // 칸 고치기는 조용히, 바꿈이 든 기록은 알림이 가게(멘션).
+        for write in update.task_writes() {
+            let silent = write.json()["notifications"]["mode"] == "silent";
+            if write.path.starts_with("/v1/pages/task-") {
+                assert!(silent, "{}", write.path);
+            }
+            if write.path.ends_with("/children") && write.path.contains("task-") {
+                assert!(!silent, "a change is told: {}", write.path);
+            }
+        }
+    }
+
+    /// 기존 task 에서는 종료일·작업상태만 고친다. 담당자·협업담당자·관계·우선순위·repo·commit
+    /// id·배포·실제진행률은 어느 요청에도 안 들어간다.
+    #[tokio::test]
+    async fn only_due_and_status_are_ever_changed() {
+        let link = linking().await;
+        link.follow(TasksMode::Update).await;
+        let allowed_new = ["기능", "작업상태", "관련 노션 페이지", "종료일", "담당자"];
+        let mut patched = 0;
+        for write in link.task_writes() {
+            let body = write.json();
+            let names: Vec<String> = body["properties"]
+                .as_object()
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default();
+            if write.path.starts_with("/v1/pages/task-") {
+                patched += 1;
+                assert!(
+                    names
+                        .iter()
+                        .all(|name| crate::tasks::CHANGEABLE.contains(&name.as_str())),
+                    "{names:?}"
+                );
+            } else if write.path == "/v1/pages" {
+                assert!(
+                    names
+                        .iter()
+                        .all(|name| allowed_new.contains(&name.as_str())),
+                    "{names:?}"
+                );
+            } else {
+                assert!(names.is_empty(), "{}: {names:?}", write.path);
+            }
+        }
+        assert_eq!(patched, 2);
+        let (task_1, _) = link.page("task-1");
+        assert_eq!(task_1["담당자"]["people"][0]["id"], "user-9");
+        assert_eq!(task_1["우선순위"]["select"]["name"], "높음");
+        assert_eq!(notion::property_text(&task_1["repo"]), "a2d2-lab/buzz");
+    }
+
+    /// 다시 돌려도(10분마다, --overwrite 로 스크립트가 바뀌어도) 같은 task 에 두 번 쓰지 않고
+    /// Gemini 도 회의마다 한 번만 부른다. 다시 쓴 회의록 페이지에도 애매한 짝 절은 하나다.
+    #[tokio::test]
+    async fn rerunning_writes_nothing_twice_and_asks_gemini_once() {
+        let link = linking().await;
+        assert_eq!(link.follow(TasksMode::Update).await.tasks, Step::Done);
+        let writes = link.task_writes().len();
+        let again = link.follow(TasksMode::Update).await;
+        assert_eq!(again.tasks, Step::AlreadyDone);
+        assert!(again.nothing_left(), "{again:?}");
+
+        let mut other = task_meeting();
+        other.segments.pop();
+        let rewritten = link.follow_script(TasksMode::Update, &other).await;
+        assert_eq!(pair(&rewritten), (Step::Done, Step::Done));
+        assert_eq!(rewritten.tasks, Step::AlreadyDone);
+
+        assert_eq!(link.tasks_asked(), 1);
+        assert_eq!(link.task_writes().len(), writes);
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+        assert_eq!(link.created().len(), 1);
+        assert_eq!(
+            link.maybe_sections(),
+            1,
+            "kept once on the page written again"
+        );
+    }
+
+    /// 노션에 쓰고 장부에 남기기 전에 죽었다: 기록은 회의록 페이지 멘션으로, 새 task 는 관련
+    /// 노션 페이지 칸으로, 회의록 절은 제목으로 알아보고 다시 안 쓴다(계획은 장부 것을 써서
+    /// Gemini 도 다시 안 부른다). 장부를 통째로 잃어도 두 번 쓰지 않는다.
+    #[tokio::test]
+    async fn a_crash_before_the_ledger_writes_nothing_twice() {
+        let link = linking().await;
+        link.follow(TasksMode::Update).await;
+        let mut ledger = link.ledger();
+        ledger.done.retain(|key, _| {
+            key != "append:task-1" && !key.starts_with("create:") && key != "maybe"
+        });
+        ledger.created.clear();
+        ledger.finished = false;
+        std::fs::write(link.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+        let resumed = link.follow(TasksMode::Update).await;
+        assert_eq!(resumed.tasks, Step::Done, "{resumed:?}");
+        let report = resumed.tasks_made.clone().unwrap();
+        assert_eq!(
+            (report.already_there, report.appended, report.created),
+            (3, 0, 0)
+        );
+        assert_eq!(link.tasks_asked(), 1, "the stored plan was used");
+        let counts = |link: &Linking| {
+            (
+                link.records("task-1"),
+                link.records("task-2"),
+                link.created().len(),
+                link.maybe_sections(),
+            )
+        };
+        assert_eq!(counts(&link), (1, 1, 1, 1));
+        assert!(link.ledger().finished);
+
+        // 장부를 잃음: 다시 계획한다(Gemini 한 번 더). 그래도 두 번 쓰는 것은 없다.
+        std::fs::remove_file(link.ledger_path()).unwrap();
+        let replanned = link.follow(TasksMode::Update).await;
+        assert_eq!(replanned.tasks, Step::Done, "{replanned:?}");
+        assert_eq!(link.tasks_asked(), 2);
+        let report = replanned.tasks_made.clone().unwrap();
+        assert_eq!(
+            (
+                report.appended,
+                report.created,
+                report.due_changed,
+                report.status_changed
+            ),
+            (0, 0, 0, 0),
+            "{report:?}"
+        );
+        assert_eq!(counts(&link), (1, 1, 1, 1));
+    }
+
+    /// 쓰기 하나가 실패하면(503) 거기서 멈추고 물러선다. 다음 시도는 남은 쓰기만 하고, 회의는
+    /// 실패로 안 센다.
+    #[tokio::test]
+    async fn a_failed_write_is_tried_again_without_doubles() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["task-2".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(
+                &first.tasks,
+                "transient HTTP 503 service_unavailable while changing a task's status (free failure 1, next try in 10 min)"
+            ),
+            "{first:?}"
+        );
+        assert!(!first.has_failure() && first.home_error.is_none() && first.tasks_failed());
+        assert!(first.left_for_next_run());
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 0));
+        assert!(!link.ledger().finished);
+
+        link.world.state.lock().unwrap().failing_paths.clear();
+        let waiting = link.follow(TasksMode::Update).await;
+        assert_eq!(waiting.tasks, Step::Later(Later::Backoff));
+        link.world.advance(FIRST_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        assert_eq!(
+            (
+                link.records("task-1"),
+                link.records("task-2"),
+                link.created().len()
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(link.page("task-2").0["작업상태"]["status"]["name"], "완료");
+        assert_eq!(link.tasks_asked(), 1);
+    }
+
+    /// 계획은 쓰기 전에 장부에 남는다: 첫 쓰기부터 실패해도 다음 시도는 그 계획을 이어 쓰고
+    /// Gemini 를 다시 부르지 않는다(돈 한 번).
+    #[tokio::test]
+    async fn the_plan_is_kept_when_the_first_write_fails() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(failed_with(&first.tasks, "transient HTTP 503"), "{first:?}");
+        let ledger = link.ledger();
+        assert!(ledger.done.is_empty() && !ledger.finished, "{ledger:?}");
+        assert_eq!(ledger.plan.tasks.len(), 2);
+
+        link.world.state.lock().unwrap().failing_paths.clear();
+        link.world.advance(FIRST_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        assert_eq!(link.tasks_asked(), 1);
+        assert_eq!(
+            second.tasks_made.unwrap().usage,
+            None,
+            "nothing paid this run"
+        );
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+    }
+
+    /// 통합이 task DB 에 연결 안 됨(403): 회의록은 그대로 성공이고, 회의 몫으로 세지 않으며,
+    /// 그 실행의 남은 회의는 task DB 를 다시 묻지 않는다. 로그 글에 노션 메시지가 없다.
+    #[tokio::test]
+    async fn a_task_db_the_integration_cannot_see_does_not_fail_the_meeting() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().forbidden_paths = vec!["task-".into()];
+        let mut run = link.steps(TasksMode::Update);
+        let first = link.world.follow_with(&task_meeting(), &mut run).await;
+        assert_eq!(pair(&first), (Step::Done, Step::Done));
+        let Step::Failed(text) = &first.tasks else {
+            panic!("{first:?}")
+        };
+        // 어느 요청이 막혔는지 보인다(통합 권한이면 task DB 읽기부터 막힌다).
+        assert_eq!(
+            text,
+            "permission HTTP 403 restricted_resource while reading the task database"
+        );
+        assert!(!first.has_failure() && first.home_error.is_none());
+        assert!(first.tasks_failed() && first.left_for_next_run());
+        assert_eq!(link.tasks_asked(), 0, "nothing paid");
+        assert!(!link
+            .world
+            .home
+            .beside_path(FIRST, Beside::TasksFailed)
+            .exists());
+
+        let asked = link.task_requests().len();
+        let b = link
+            .world
+            .follow_meeting(&link.world.meeting_b, &b_script(), &mut run)
+            .await;
+        assert_eq!(b.notion, Step::Done);
+        assert_eq!(b.tasks, Step::Later(Later::OffForRun));
+        assert_eq!(link.task_requests().len(), asked);
+    }
+
+    /// 로그 줄은 수뿐이다(task 제목·사람 이름·pubkey·노션 id 없음).
+    #[tokio::test]
+    async fn task_logs_have_numbers_only() {
+        let link = linking().await;
+        *link.fixed.lock().unwrap() = Some(json!({
+            "links": [
+                { "item": "A1", "task": "K1", "level": "확실", "why": "견적서",
+                  "said": "견적서 자동화를 금요일까지.", "ms": 5_000 },
+                { "item": "D1", "task": "K9", "level": "확실", "why": "", "said": "", "ms": 9_000 }
+            ],
+            "due_changes": [{ "task": "K1", "due": "2026-10-23", "ms": 5_000 }],
+            "status_changes": [],
+            "new_tasks": []
+        }));
+        let followed = link.follow(TasksMode::Update).await;
+        let report = followed.tasks_made.clone().unwrap();
+        let lines = [
+            report.to_string(),
+            report.dropped.to_string(),
+            format!("{:?}", followed.tasks),
+        ];
+        assert_eq!(
+            lines[0],
+            "tasks: matched 1 (sure 1, maybe 0), appended 1, created 0, due changed 0, status changed 0, skipped 2"
+        );
+        assert_eq!(
+            lines[1],
+            "tasks checks dropped: unknown task 1, date not in the words 1"
+        );
+        for line in &lines {
+            for secret in [
+                "견적",
+                "로그인",
+                "회의록",
+                "결제",
+                "담당 사람",
+                "지영",
+                "aaaaaaaa",
+                "bbbbbbbb",
+                "task-",
+                "user-",
+                "page-",
+            ] {
+                assert!(!line.contains(secret), "{secret} in {line}");
+            }
+        }
+    }
+
+    /// 끝난 지 24시간 넘은 회의는 task 를 건드리지 않는다(스위치를 처음 켰을 때 지난 회의들이
+    /// 지금 task 를 덮어쓰지 않게). 남은 일로도 치지 않는다.
+    #[tokio::test]
+    async fn an_old_meeting_leaves_the_tasks_alone() {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        // 시계를 회의가 끝난 때(녹음 세션 끝)부터 잰다.
+        let since_end = |link: &Linking, hours: u64| {
+            let ended = link.world.meeting.ended_at_unix_ms();
+            link.world
+                .clock
+                .store(ended + hours * HOUR_MS, Ordering::SeqCst);
+        };
+        let link = linking().await;
+        since_end(&link, 25);
+        let followed = link.follow(TasksMode::Update).await;
+        assert_eq!(pair(&followed), (Step::Done, Step::Done));
+        assert_eq!(
+            followed.tasks,
+            Step::Skipped("the meeting ended over 24 hours ago")
+        );
+        assert_eq!(link.tasks_asked(), 0);
+        assert!(link.task_requests().is_empty());
+        assert!(link.follow(TasksMode::Update).await.nothing_left());
+
+        // 경계: 끝난 지 23시간이면 아직 잇는다.
+        let fresh = linking().await;
+        since_end(&fresh, 23);
+        assert_eq!(fresh.follow(TasksMode::Update).await.tasks, Step::Done);
+        assert_eq!(fresh.records("task-1"), 1);
+    }
+
+    /// task 에 붙는 기록은 짧은 요약 + 근거 시각 + 회의록 멘션뿐이다: 스크립트 원문 줄도, 모델의
+    /// `said` 도 안 들어간다(원문이 아닌 요약만 task 에). 머리는 작업기가 자동으로 붙였다고
+    /// 보이고, 바꾼 값은 바로 그 아래에 있다.
+    #[tokio::test]
+    async fn records_carry_no_script_words_and_say_they_are_automatic() {
+        let link = linking().await;
+        let followed = link.follow(TasksMode::Update).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        let mut written: Vec<(String, Vec<Value>)> = ["task-1", "task-2"]
+            .iter()
+            .map(|id| (id.to_string(), link.page(id).1))
+            .collect();
+        written.extend(link.created().into_iter().map(|id| {
+            let body = link.page(&id).1;
+            (id, body)
+        }));
+        let said = [
+            "금요일까지 끝내기로 했다.",
+            "어제 배포를 마쳤다.",
+            "목요일까지 만든다.",
+        ];
+        // 스크립트 줄에서 이어진 8글자(글자·숫자만 셈) 조각 하나라도 기록에 있으면 원문이 샌 것이다
+        // (근거 인용처럼 줄의 일부만 들어가도 잡는다). 요약 글은 줄과 7글자까지만 겹친다.
+        const WINDOW: usize = 8;
+        let squash = |text: &str| -> Vec<char> {
+            text.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect()
+        };
+        for (id, blocks) in &written {
+            let text: String = blocks.iter().map(block_text).collect::<Vec<_>>().join("\n");
+            let squashed: String = squash(&text).into_iter().collect();
+            for segment in &task_meeting().segments {
+                for piece in squash(&segment.text).windows(WINDOW) {
+                    let piece: String = piece.iter().collect();
+                    assert!(
+                        !squashed.contains(&piece),
+                        "{id}: script words {piece:?} in {text}"
+                    );
+                }
+            }
+            for said in said {
+                assert!(!text.contains(said), "{id}: model said in {text}");
+            }
+            assert!(
+                block_text(&blocks[0])
+                    .starts_with("허들 회의 기록 · 회의록 작업기가 자동으로 붙임 · 2026-10-12"),
+                "{id}: {text}"
+            );
+            assert!(text.contains("근거: [00:"), "{id}: {text}");
+        }
+        // 바꾼 값은 머리 바로 아래.
+        let (_, task_1) = link.page("task-1");
+        assert_eq!(block_text(&task_1[1]), "기한: 10/20 → 10/16 (근거 [00:05])");
+        let (_, task_2) = link.page("task-2");
+        assert_eq!(block_text(&task_2[1]), "상태: Dev QA → 완료 (근거 [00:09])");
+        // 요약은 회의 요약 글이다.
+        let task_2_text: Vec<String> = task_2.iter().map(block_text).collect();
+        assert!(
+            task_2_text.contains(&"결정: 로그인 오류 수정 배포 완료".to_string()),
+            "{task_2_text:?}"
+        );
+    }
+
+    /// 애매한 짝만 있으면 task 에는 아무것도 안 쓰고 회의록 페이지에 링크만 남긴다.
+    #[tokio::test]
+    async fn maybe_links_only_reach_the_minutes_page() {
+        let link = linking().await;
+        *link.fixed.lock().unwrap() = Some(json!({
+            "links": [
+                { "item": "A1", "task": "K1", "level": "애매", "why": "아마 같은 일",
+                  "said": "금요일까지", "ms": 5_000 },
+                { "item": "T1", "task": "K3", "level": "애매", "why": "결제 화면", "said": "", "ms": 13_000 }
+            ],
+            "due_changes": [{ "task": "K1", "due": "2026-10-16", "ms": 5_000 }],
+            "status_changes": [],
+            "new_tasks": ["A1"]
+        }));
+        let followed = link.follow(TasksMode::Update).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        assert!(link.task_writes().is_empty(), "{:?}", link.task_writes());
+        assert_eq!(link.maybe_sections(), 1);
+        let (_, minutes) = link.page(&link.minutes_id());
+        let minutes = serde_json::to_string(&minutes).unwrap();
+        assert!(minutes.contains(r#""page":{"id":"task-1"}"#), "{minutes}");
+        assert!(minutes.contains(r#""page":{"id":"task-3"}"#), "{minutes}");
+    }
+
+    impl Linking {
+        /// 가짜 노션의 task 페이지 칸 하나를 사람이 고친 것처럼 바꾼다.
+        fn edit_task(&self, id: &str, name: &str, value: Value) {
+            let mut state = self.world.state.lock().unwrap();
+            let page = state.pages.iter_mut().find(|page| page.id == id).unwrap();
+            page.properties.insert(name.into(), value);
+        }
+
+        /// 그 task 페이지 칸을 고친 요청(PATCH /v1/pages/{id}) 수.
+        fn patches(&self, id: &str) -> usize {
+            let path = format!("/v1/pages/{id}");
+            self.task_writes()
+                .iter()
+                .filter(|write| write.method == "PATCH" && write.path == path)
+                .count()
+        }
+    }
+
+    /// 실제 task DB 는 `작업상태` 가 status, `관련 노션 페이지` 가 url 이다. 가짜 노션도 그 꼴만
+    /// 받는다: 옛 select 가정의 필터·고치기, rich_text 로 쓴 관련 노션 페이지, 선택지에 없는 상태는
+    /// 400 이다(이 꼴로 쓰는 코드는 시험에서 막힌다).
+    #[tokio::test]
+    async fn the_task_db_takes_only_its_real_shapes() {
+        let link = linking().await;
+        let mut client =
+            NotionClient::new(&link.world.http, &link.world.notion_settings, "t").unwrap();
+        let select = json!({ "filter": { "property": "작업상태",
+                                          "select": { "does_not_equal": "완료" } } });
+        let error = client.query(TASK_DS, select).await.unwrap_err();
+        assert_eq!(error.kind, NotionErrorKind::BadRequest);
+        let status = json!({ "filter": { "property": "작업상태",
+                                          "status": { "does_not_equal": "완료" } } });
+        assert!(client.query(TASK_DS, status).await.is_ok());
+        let as_select = json!({ "properties": { "작업상태": { "select": { "name": "완료" } } } });
+        let error = client
+            .update_page("task-1", as_select, notion::Notify::Silent)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, NotionErrorKind::BadRequest);
+        let new_option = json!({ "properties": { "작업상태": { "status": { "name": "보류" } } } });
+        let error = client
+            .update_page("task-1", new_option, notion::Notify::Silent)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, NotionErrorKind::BadRequest, "no new options");
+        let mut text_link = serde_json::Map::new();
+        text_link.insert(
+            "기능".into(),
+            json!({ "title": notion::text_runs("새 일", None) }),
+        );
+        text_link.insert(
+            "관련 노션 페이지".into(),
+            json!({ "rich_text": notion::text_runs("https://www.notion.so/x", None) }),
+        );
+        let error = client
+            .create_page_with_children(TASK_DS, &text_link, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, NotionErrorKind::BadRequest);
+    }
+
+    /// 지금 종료일에 끝 날짜가 있으면 칸을 안 바꾸고 기록에 「기한 제안」으로만 남긴다(멘션도 안
+    /// 한다). 상태를 말하는 말이 없는 상태 바꿈도 「상태 제안」.
+    #[tokio::test]
+    async fn suggestions_go_only_into_the_record() {
+        let link = linking().await;
+        link.edit_task(
+            "task-1",
+            "종료일",
+            json!({ "date": { "start": "2026-10-20", "end": "2026-10-22" } }),
+        );
+        *link.fixed.lock().unwrap() = Some(json!({
+            "links": [
+                { "item": "A1", "task": "K1", "level": "확실", "why": "", "said": "", "ms": 5_000 },
+                { "item": "D1", "task": "K2", "level": "확실", "why": "", "said": "", "ms": 9_000 }
+            ],
+            "due_changes": [{ "task": "K1", "due": "2026-10-16", "ms": 5_000 }],
+            "status_changes": [{ "task": "K2", "status": "Production QA", "ms": 9_000 }],
+            "new_tasks": []
+        }));
+        let followed = link.follow(TasksMode::Update).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        assert_eq!((link.patches("task-1"), link.patches("task-2")), (0, 0));
+        let report = followed.tasks_made.unwrap();
+        assert_eq!(
+            (report.due_changed, report.status_changed, report.suggested),
+            (0, 0, 2)
+        );
+        let (task_1, body_1) = link.page("task-1");
+        assert_eq!(task_1["종료일"]["date"]["end"], "2026-10-22");
+        assert_eq!(
+            block_text(&body_1[1]),
+            "기한 제안: 10/20 → 10/16 (근거 [00:05])"
+        );
+        assert!(
+            !serde_json::to_string(&body_1).unwrap().contains("user-9"),
+            "a suggestion mentions nobody"
+        );
+        let (task_2, body_2) = link.page("task-2");
+        assert_eq!(task_2["작업상태"]["status"]["name"], "Dev QA");
+        assert_eq!(
+            block_text(&body_2[1]),
+            "상태 제안: Dev QA → Production QA (근거 [00:09])"
+        );
+    }
+
+    /// 계획 뒤에 사람이 그 칸을 바꿨으면(기한도 상태도) 덮어쓰지 않고 따로 센다. 기록에는 실제로
+    /// 바꾼 것만 남는다.
+    #[tokio::test]
+    async fn a_field_changed_after_the_plan_is_left_alone() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        // 그사이 사람이 task-1 기한과 task-2 상태를 고쳤다.
+        link.edit_task(
+            "task-1",
+            "종료일",
+            json!({ "date": { "start": "2026-10-25" } }),
+        );
+        link.edit_task(
+            "task-2",
+            "작업상태",
+            json!({ "status": { "name": "Staging QA" } }),
+        );
+        link.world.state.lock().unwrap().failing_paths.clear();
+        link.world.advance(FIRST_BACKOFF);
+        // 첫 실행의 실패한 PATCH 도 가짜 노션에 남으니 두 번째 실행 몫만 센다.
+        let patched = (link.patches("task-1"), link.patches("task-2"));
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        assert_eq!(second.tasks_made.unwrap().changed_meanwhile, 2);
+        assert_eq!(
+            (link.patches("task-1"), link.patches("task-2")),
+            patched,
+            "no PATCH over a person's edit"
+        );
+        let (task_1, body_1) = link.page("task-1");
+        assert_eq!(task_1["종료일"]["date"]["start"], "2026-10-25");
+        let (task_2, body_2) = link.page("task-2");
+        assert_eq!(task_2["작업상태"]["status"]["name"], "Staging QA");
+        // 요약 줄에도 「기한:」 이 있으니 바꾼 줄은 화살표로 가려낸다. 바꾼 게 없으니 멘션도 없다.
+        for body in [body_1, body_2] {
+            let text = serde_json::to_string(&body).unwrap();
+            assert!(
+                !text.contains('→') && !text.contains(r#""type":"user""#),
+                "{text}"
+            );
+        }
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+        assert_eq!(link.tasks_asked(), 1);
+    }
+
+    /// 칸을 바꾸고 장부에 못 남긴 채 죽었다: 다시 돌면 이미 새 값인 것을 알아보고(already there)
+    /// 다시 안 쓰고, 기록에는 바꾼 것을 A → B 로 남긴다(사람이 보고 되돌릴 수 있게).
+    #[tokio::test]
+    async fn a_change_made_before_a_crash_still_shows_in_the_record() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["blocks/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while appending a record"),
+            "{first:?}"
+        );
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-16"
+        );
+        // 바꾼 것을 장부에 못 남기고 죽은 것처럼.
+        let mut ledger = link.ledger();
+        assert_eq!(ledger.done.remove("due:task-1"), Some(Outcome::Written));
+        std::fs::write(link.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+        link.world.state.lock().unwrap().failing_paths.clear();
+        link.world.advance(FIRST_BACKOFF);
+        let patched = link.patches("task-1");
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        let report = second.tasks_made.unwrap();
+        assert_eq!((report.already_there, report.changed_meanwhile), (1, 0));
+        assert_eq!(link.patches("task-1"), patched, "not written again");
+        let (_, body_1) = link.page("task-1");
+        assert_eq!(block_text(&body_1[1]), "기한: 10/20 → 10/16 (근거 [00:05])");
+    }
+
+    /// task 가 그사이 지워졌으면(404) 그 task 의 남은 쓰기만 건너뛰고 나머지는 쓴다.
+    #[tokio::test]
+    async fn a_deleted_task_is_skipped_and_the_rest_goes_on() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        {
+            let mut state = link.world.state.lock().unwrap();
+            state.failing_paths.clear();
+            state.pages.retain(|page| page.id != "task-1");
+        }
+        link.world.advance(FIRST_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        let report = second.tasks_made.unwrap();
+        assert_eq!((report.gone, report.not_written), (1, 1));
+        assert_eq!(link.records("task-2"), 1);
+        assert_eq!(link.page("task-2").0["작업상태"]["status"]["name"], "완료");
+        assert_eq!(link.created().len(), 1);
+        assert_eq!(link.maybe_sections(), 1);
+    }
+
+    /// 통합이 task DB 를 통째로 못 보게 숨긴 것(되돌릴 때 쓴다).
+    struct HiddenTaskDb {
+        database: Value,
+        source: Value,
+        pages: Vec<crate::notion::tests::FakePage>,
+    }
+
+    impl Linking {
+        /// 통합 연결이 끊긴 것처럼 task DB·data source·task 페이지를 다 404 로 만든다.
+        fn hide_task_db(&self) -> HiddenTaskDb {
+            let mut state = self.world.state.lock().unwrap();
+            let database = state.databases.remove(TASK_DB).unwrap();
+            let source = state.data_sources.remove(TASK_DS).unwrap();
+            let (pages, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.pages)
+                .into_iter()
+                .partition(|page| page.data_source == TASK_DS);
+            state.pages = kept;
+            HiddenTaskDb {
+                database,
+                source,
+                pages,
+            }
+        }
+
+        /// 다시 연결한다.
+        fn show_task_db(&self, hidden: HiddenTaskDb) {
+            let mut state = self.world.state.lock().unwrap();
+            state.databases.insert(TASK_DB.into(), hidden.database);
+            state.data_sources.insert(TASK_DS.into(), hidden.source);
+            state.pages.extend(hidden.pages);
+        }
+    }
+
+    /// 한 실행 도중(task DB 칸을 읽은 뒤)에 통합 연결이 끊겨도 task 를 gone 으로 굳히지 않는다: task 가
+    /// 404 면 data source 를 한 번 더 읽고, 그것도 404 면 단계 실패로 두어 다음 실행에 다시 한다.
+    #[tokio::test]
+    async fn a_task_db_lost_mid_run_is_tried_again_not_skipped() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        link.world.state.lock().unwrap().failing_paths.clear();
+        // 이 실행은 칸을 이미 읽었다(실행마다 한 번). 그 뒤에 연결이 끊겼다.
+        let read = link.ledger().schema;
+        let hidden = link.hide_task_db();
+        link.world.advance(MAX_BACKOFF);
+        let mut steps = link.steps(TasksMode::Update);
+        steps.tasks.as_mut().unwrap().schema = Some(read);
+        let second = link.world.follow_with(&task_meeting(), &mut steps).await;
+        assert!(
+            failed_with(
+                &second.tasks,
+                "while checking the task db after a task was not found"
+            ),
+            "{second:?}"
+        );
+        let ledger = link.ledger();
+        assert!(!ledger.finished);
+        assert!(
+            !ledger
+                .done
+                .values()
+                .any(|outcome| *outcome == Outcome::Gone),
+            "{:?}",
+            ledger.done
+        );
+        // 다시 연결되면 마저 쓴다.
+        link.show_task_db(hidden);
+        link.world.advance(MAX_BACKOFF);
+        let third = link.follow(TasksMode::Update).await;
+        assert_eq!(third.tasks, Step::Done, "{third:?}");
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-16"
+        );
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+    }
+
+    /// 회의록 절을 붙일 회의록 페이지가 404 면 회의록 data source 를 한 번 더 읽는다. 그것도 못 읽으면
+    /// (통합이 회의록 DB 를 못 봄) gone 으로 굳히지 않고 단계 실패로 두어 다음에 다시 하고, 읽히면 그
+    /// 페이지만 지워진 것으로 보고 건너뛴다.
+    #[tokio::test]
+    async fn a_minutes_db_out_of_sight_is_tried_again_not_skipped() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        // 회의록 페이지가 사라졌고, 회의록 data source 도 못 읽는다(가짜 노션은 처음부터 안 둔다).
+        let minutes = link.minutes_id();
+        {
+            let mut state = link.world.state.lock().unwrap();
+            state.failing_paths.clear();
+            state.pages.retain(|page| page.id != minutes);
+            assert!(!state.data_sources.contains_key(MINUTES_DATA_SOURCE_ID));
+        }
+        link.world.advance(FIRST_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(
+                &second.tasks,
+                "while checking the minutes db after the minutes page was not found"
+            ),
+            "{second:?}"
+        );
+        let ledger = link.ledger();
+        assert!(!ledger.finished);
+        assert_eq!(ledger.outcome(tasks::Write::Maybe), None);
+        // 회의록 DB 는 보이고 페이지만 지워졌으면 그 절만 건너뛰고 끝낸다.
+        link.world.state.lock().unwrap().data_sources.insert(
+            MINUTES_DATA_SOURCE_ID.into(),
+            json!({ "object": "data_source", "id": MINUTES_DATA_SOURCE_ID, "properties": {} }),
+        );
+        link.world.advance(MAX_BACKOFF);
+        let third = link.follow(TasksMode::Update).await;
+        assert_eq!(third.tasks, Step::Done, "{third:?}");
+        assert_eq!(third.tasks_made.unwrap().gone, 1);
+        assert_eq!(
+            link.ledger().outcome(tasks::Write::Maybe),
+            Some(Outcome::Gone)
+        );
+    }
+
+    /// 노션의 404 는 「없음」과 「통합이 못 봄」 둘 다다. task 하나가 404 면 지워진 것으로 보고 그 task
+    /// 만 건너뛰지만, 통합이 task DB 를 통째로 못 보게 되면(연결이 끊김) 쓰기보다 먼저 하는 실행마다의
+    /// 칸 읽기가 404 로 실패해서 단계 실패로 남고 다음에 다시 한다(task 가 gone 으로 굳지 않는다).
+    #[tokio::test]
+    async fn a_task_db_out_of_sight_is_tried_again_not_skipped() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        // 통합 연결이 끊겼다: task DB·data source·task 페이지가 다 404.
+        link.world.state.lock().unwrap().failing_paths.clear();
+        let hidden = link.hide_task_db();
+        link.world.advance(MAX_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&second.tasks, "while reading the task database"),
+            "{second:?}"
+        );
+        let ledger = link.ledger();
+        assert!(!ledger.finished);
+        assert!(
+            !ledger
+                .done
+                .values()
+                .any(|outcome| *outcome == Outcome::Gone),
+            "{:?}",
+            ledger.done
+        );
+        // 다시 연결되면 남은 쓰기를 마저 한다.
+        link.show_task_db(hidden);
+        link.world.advance(MAX_BACKOFF);
+        let third = link.follow(TasksMode::Update).await;
+        assert_eq!(third.tasks, Step::Done, "{third:?}");
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-16"
+        );
+        assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+    }
+
+    /// 새 task 의 기한 근거에 망설이는 말이 있으면 종료일 없이 만들고 본문에 「기한 애매」를 쓴다.
+    #[tokio::test]
+    async fn a_new_task_with_a_hedged_due_has_no_due_and_says_so() {
+        let link = linking().await;
+        let mut script = task_meeting();
+        let at = script
+            .segments
+            .iter()
+            .position(|segment| segment.start_ms == 17_000)
+            .unwrap();
+        script.segments[at].text =
+            "회의록 공유 기능은 제가 목요일까지 만들게요, 근데 확실하진 않아요.".into();
+        let followed = link.follow_script(TasksMode::Create, &script).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        let created = link.created();
+        assert_eq!(created.len(), 1);
+        let (properties, body) = link.page(&created[0]);
+        assert!(
+            properties
+                .get("종료일")
+                .is_none_or(|due| due["date"].is_null()),
+            "{properties:?}"
+        );
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(text.contains(crate::tasks::DUE_UNSURE_NOTE), "{text}");
+    }
+
+    /// 제안뿐인 바꿈은 누가 쓰라고 해도 칸을 안 쓴다: writes 가 거르고, apply 도 한 번 더 막는다
+    /// (두 곳 다 시험으로 잰다).
+    #[tokio::test]
+    async fn a_suggestion_is_never_written_even_if_asked() {
+        let link = linking().await;
+        *link.fixed.lock().unwrap() = Some(json!({
+            "links": [
+                { "item": "D1", "task": "K2", "level": "확실", "why": "", "said": "", "ms": 9_000 }
+            ],
+            "due_changes": [],
+            "status_changes": [{ "task": "K2", "status": "Production QA", "ms": 9_000 }],
+            "new_tasks": []
+        }));
+        assert_eq!(link.follow(TasksMode::Update).await.tasks, Step::Done);
+        let mut ledger = link.ledger();
+        let i = ledger
+            .plan
+            .tasks
+            .iter()
+            .position(|task| task.id == "task-2")
+            .unwrap();
+        assert!(ledger.plan.tasks[i].status.as_ref().unwrap().suggest);
+        let schema = ledger.schema.clone();
+        let mut client =
+            NotionClient::new(&link.world.http, &link.world.notion_settings, "t").unwrap();
+        let mut report = TasksReport::default();
+        let outcome = tasks::apply(
+            &mut client,
+            &mut ledger,
+            &schema,
+            tasks::Write::Status(i),
+            "",
+            &mut report,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Outcome::Skipped);
+        assert_eq!(link.patches("task-2"), 0);
+        assert_eq!(
+            link.page("task-2").0["작업상태"]["status"]["name"],
+            "Dev QA"
+        );
+    }
+
+    /// 칸을 바꾸기 직전에 다시 읽은 task 가 휴지통에 들었으면 지워진 것으로 보고 그 task 만 건너뛴다.
+    #[tokio::test]
+    async fn a_task_moved_to_the_trash_is_left_alone() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        {
+            let mut state = link.world.state.lock().unwrap();
+            state.failing_paths.clear();
+            let page = state
+                .pages
+                .iter_mut()
+                .find(|page| page.id == "task-1")
+                .unwrap();
+            page.in_trash = true;
+        }
+        link.world.advance(FIRST_BACKOFF);
+        let patched = link.patches("task-1");
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        let report = second.tasks_made.unwrap();
+        assert_eq!((report.gone, report.not_written), (1, 1));
+        assert_eq!(link.patches("task-1"), patched);
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-20"
+        );
+        assert_eq!(link.records("task-1"), 0);
+        assert_eq!(link.page("task-2").0["작업상태"]["status"]["name"], "완료");
+    }
+
+    /// 끝난 지 24시간 넘은 회의의 task 장부가 망가졌으면 실패로 두지 않고 건너뛴다(망가진 장부 하나가
+    /// 14일 동안 실행마다 경고를 내지 않게). 24시간 안이면 그대로 실패다(돈 낸 계획을 다시 안 산다).
+    #[tokio::test]
+    async fn a_broken_ledger_of_an_old_meeting_is_skipped() {
+        let link = linking().await;
+        std::fs::write(link.ledger_path(), b"{ not a ledger").unwrap();
+        let fresh = link.follow(TasksMode::Update).await;
+        assert_eq!(fresh.notion, Step::Done, "{fresh:?}");
+        assert_eq!(
+            fresh.tasks,
+            Step::Failed("stored task links unreadable".into()),
+            "{fresh:?}"
+        );
+        let ended = link.world.meeting.ended_at_unix_ms();
+        link.world
+            .clock
+            .store(ended + 25 * 60 * 60 * 1_000, Ordering::SeqCst);
+        let old = link.follow(TasksMode::Update).await;
+        assert_eq!(
+            old.tasks,
+            Step::Skipped("the meeting ended over 24 hours ago"),
+            "{old:?}"
+        );
+        assert!(!old.tasks_failed());
+        assert_eq!(link.tasks_asked(), 0);
+    }
+
+    /// task 하나의 쓰기가 400 이면 그 task 의 남은 쓰기만 건너뛰고 다음 task 로 간다.
+    #[tokio::test]
+    async fn a_refused_task_is_skipped_and_the_rest_goes_on() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().refusing_paths = vec!["pages/task-1".into()];
+        let followed = link.follow(TasksMode::Update).await;
+        assert_eq!(followed.tasks, Step::Done, "{followed:?}");
+        let report = followed.tasks_made.unwrap();
+        assert_eq!((report.refused, report.not_written), (1, 1));
+        assert_eq!((link.records("task-1"), link.records("task-2")), (0, 1));
+        assert_eq!(link.page("task-2").0["작업상태"]["status"]["name"], "완료");
+        assert_eq!(link.created().len(), 1);
+        assert_eq!(link.maybe_sections(), 1);
+    }
+
+    /// 칸을 바꾼 task 의 기록이 못 붙었으면, 회의가 끝나고 24시간이 지나도 그 기록만은 마저
+    /// 붙인다(칸 바꾸기·다른 쓰기는 다시 안 한다).
+    #[tokio::test]
+    async fn the_record_of_a_changed_field_is_added_even_after_a_day() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["blocks/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while appending a record"),
+            "{first:?}"
+        );
+        assert_eq!(
+            link.page("task-1").0["종료일"]["date"]["start"],
+            "2026-10-16"
+        );
+        link.world.state.lock().unwrap().failing_paths.clear();
+        let ended = link.world.meeting.ended_at_unix_ms();
+        link.world
+            .clock
+            .store(ended + 25 * 60 * 60 * 1_000, Ordering::SeqCst);
+        let later = link.follow(TasksMode::Update).await;
+        assert_eq!(later.tasks, Step::Done, "{later:?}");
+        assert_eq!(link.records("task-1"), 1);
+        let (_, body_1) = link.page("task-1");
+        assert_eq!(block_text(&body_1[1]), "기한: 10/20 → 10/16 (근거 [00:05])");
+        // 나머지는 하지 않았다.
+        assert_eq!(link.records("task-2"), 0);
+        assert_eq!(
+            link.page("task-2").0["작업상태"]["status"]["name"],
+            "Dev QA"
+        );
+        assert!(link.created().is_empty());
+        assert_eq!(link.maybe_sections(), 0);
+        assert!(link.follow(TasksMode::Update).await.nothing_left());
+    }
+
+    /// task 장부를 못 읽어도 노션 페이지는 쓴다(그 장부 때문에 회의록이 실패하지 않게).
+    #[tokio::test]
+    async fn an_unreadable_tasks_ledger_does_not_stop_the_page() {
+        let link = linking().await;
+        std::fs::create_dir(link.ledger_path()).unwrap();
+        let followed = link.follow(TasksMode::Update).await;
+        assert_eq!(followed.summary, Step::Done);
+        assert_eq!(followed.notion, Step::Done, "{followed:?}");
+        assert_eq!(minutes_pages(&link.world.state.lock().unwrap()).len(), 1);
+    }
+
+    /// 쓸 때 그 상태가 지금 선택지에 없으면 쓰지 않는다(노션이 옵션을 새로 만들지 않게).
+    #[tokio::test]
+    async fn a_status_no_longer_an_option_is_not_written() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-2".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's status"),
+            "{first:?}"
+        );
+        {
+            let mut state = link.world.state.lock().unwrap();
+            state.failing_paths.clear();
+            let schema = state.data_sources.get_mut(TASK_DS).unwrap();
+            let options = schema["properties"]["작업상태"]["status"]["options"]
+                .as_array_mut()
+                .unwrap();
+            options.retain(|option| option["name"] != "완료");
+        }
+        link.world.advance(FIRST_BACKOFF);
+        let patched = link.patches("task-2");
+        let second = link.follow(TasksMode::Update).await;
+        assert_eq!(second.tasks, Step::Done, "{second:?}");
+        assert_eq!(second.tasks_made.unwrap().not_written, 1);
+        assert_eq!(
+            link.patches("task-2"),
+            patched,
+            "no PATCH for a gone option"
+        );
+        let (task_2, body_2) = link.page("task-2");
+        assert_eq!(task_2["작업상태"]["status"]["name"], "Dev QA");
+        assert!(!serde_json::to_string(&body_2).unwrap().contains('→'));
+        assert_eq!(link.records("task-2"), 1);
     }
 }

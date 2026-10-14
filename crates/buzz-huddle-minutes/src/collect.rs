@@ -275,7 +275,8 @@ impl MeetingPlan {
             .unwrap_or_default()
     }
 
-    fn ended_at_unix_ms(&self) -> u64 {
+    /// Meeting end (latest session end), UTC ms.
+    pub fn ended_at_unix_ms(&self) -> u64 {
         self.sessions
             .iter()
             .map(|session| session.ended_at_unix_ms)

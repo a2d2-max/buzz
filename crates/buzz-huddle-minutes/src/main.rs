@@ -21,7 +21,7 @@ use buzz_huddle_minutes::collect::{find_channels, plan_meetings, CollectError};
 use buzz_huddle_minutes::correct;
 use buzz_huddle_minutes::followup::{
     CorrectReport, CorrectStep, FollowUps, FollowedUp, NotionStep, Step as FollowStep, SummaryStep,
-    WORKER_GEMINI_TIMEOUT, WORKER_MAX_RETRY_AFTER_MS,
+    TasksStep, WORKER_GEMINI_TIMEOUT, WORKER_MAX_RETRY_AFTER_MS,
 };
 use buzz_huddle_minutes::gcs_minutes::GcsMinutes;
 use buzz_huddle_minutes::ledger::LEDGER_KEY_FORMAT;
@@ -47,6 +47,7 @@ use buzz_huddle_minutes::store::{
 use buzz_huddle_minutes::stt::{
     Fault, SpeechToText, SttError, SttErrorKind, SttOutput, SttRequest, TruthStt,
 };
+use buzz_huddle_minutes::tasks::TasksMode;
 use buzz_huddle_minutes::transcript::{SttInfo, Transcript};
 use buzz_huddle_minutes::vad::{SegmentPlan, SileroSettings, SileroVad};
 use buzz_huddle_minutes::voices::{run_command as run_voices, VoicesCommand};
@@ -176,6 +177,14 @@ enum Command {
         /// use it.
         #[arg(long, env = "BUZZ_MINUTES_CORRECT", value_enum, default_value_t = Switch::Off)]
         correct: Switch,
+        /// 요약·노션 페이지 뒤에 팀 task DB(노션)와 잇는다: off · append(확실한 짝 task 에 회의
+        /// 기록) · create(+ 짝 없는 확정 할 일을 새 task 로) · update(+ 종료일·작업상태 바꾸기).
+        /// --summary on, --notion on, --task-db 가 다 있어야 돈다(Gemini 를 회의마다 한 번 더 부른다).
+        #[arg(long, env = "BUZZ_MINUTES_TASKS", value_enum, default_value_t = TasksMode::Off)]
+        tasks: TasksMode,
+        /// 팀 task DB 의 노션 database id. 노션 토큰(NOTION_TOKEN)의 통합이 그 DB 에 연결돼 있어야 한다.
+        #[arg(long, env = "BUZZ_MINUTES_TASK_DB")]
+        task_db: Option<String>,
         /// 참석자 프로필 이름(kind 0)을 물을 릴레이 주소(예: https://buzz.a2d2lab.com).
         /// 회의록 봇 키(환경 변수 BUZZ_MINUTES_SCRIBE_NSEC)와 같이 있을 때만 묻고, 하나라도
         /// 없으면 pubkey 앞 8자를 보인다.
@@ -562,6 +571,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             summary_model,
             notion: notion_switch,
             correct: correct_switch,
+            tasks: tasks_mode,
+            task_db,
             relay_url,
             stt_fail_every,
             stt_fail_kind,
@@ -734,6 +745,31 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     tokens,
                     glossary: &glossary,
                 });
+            }
+            // 팀 task DB 연결: 요약과 같은 Gemini, 회의록 페이지와 같은 노션 토큰.
+            let (tasks_mode, tasks_note) = tasks_switch(
+                tasks_mode,
+                summary_switch,
+                notion_switch,
+                task_db.as_deref(),
+            );
+            if let Some(note) = tasks_note {
+                eprintln!("{note}");
+            }
+            if let (true, Some(tokens), Some(token), Some(db)) = (
+                tasks_mode != TasksMode::Off,
+                &summary_tokens,
+                &notion_token,
+                &task_db,
+            ) {
+                follow = follow.with_tasks(TasksStep::new(
+                    tasks_mode,
+                    &gemini_http,
+                    &gemini_settings,
+                    tokens,
+                    notion::NotionClient::new(&notion_http, &notion_settings, token)?,
+                    db.trim(),
+                ));
             }
             let follow = follow.any().then_some(&mut follow);
             let code = match (out, minutes_bucket, &gcs) {
@@ -921,6 +957,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     StatusArg::Done => notion::ProcessingStatus::Done,
                     StatusArg::Failed => notion::ProcessingStatus::Failed,
                 },
+                tail: &[],
             };
             // 실패해도 그때까지 만든 페이지·줄 id 를 찍는다.
             let mut report = notion::PublishReport::default();
@@ -1039,6 +1076,7 @@ async fn process_channels<H: MinutesHome>(
 ) -> ExitCode {
     let (mut failed, mut locked, mut unreadable_channels) = (0usize, 0usize, 0usize);
     let mut follow_failed = 0usize;
+    let mut tasks_failed = 0usize;
     let mut audio_kept = 0usize;
     let mut left: Option<(usize, usize)> = None;
     'channels: for (c, &(community, channel)) in run.channels.iter().enumerate() {
@@ -1110,8 +1148,12 @@ async fn process_channels<H: MinutesHome>(
                         eprintln!("  {}", people_line(report));
                     }
                     if let Some(usage) = &followed.summary_usage {
-                        eprintln!("  {}", usage_line(usage));
+                        eprintln!("  {}", usage_line("summary", usage));
                     }
+                    for line in tasks_lines(&followed) {
+                        eprintln!("  {line}");
+                    }
+                    tasks_failed += usize::from(followed.tasks_failed());
                     match count_follow_up(&followed, &mut failed, &mut follow_failed) {
                         true => return ExitCode::FAILURE,
                         false => continue,
@@ -1214,8 +1256,12 @@ async fn process_channels<H: MinutesHome>(
                     eprintln!("  {}", correct_line(made));
                 }
                 if let Some(usage) = &followed.summary_usage {
-                    eprintln!("  {}", usage_line(usage));
+                    eprintln!("  {}", usage_line("summary", usage));
                 }
+                for line in tasks_lines(&followed) {
+                    eprintln!("  {line}");
+                }
+                tasks_failed += usize::from(followed.tasks_failed());
                 if count_follow_up(&followed, &mut failed, &mut follow_failed) {
                     return ExitCode::FAILURE;
                 }
@@ -1241,6 +1287,10 @@ async fn process_channels<H: MinutesHome>(
     }
     if follow_failed > 0 {
         eprintln!("{follow_failed} meeting(s) with a correction, summary or Notion page failed (tried again next run)");
+    }
+    // task 연결의 실패는 회의록의 실패가 아니라 종료 코드에 넣지 않는다(경고만).
+    if tasks_failed > 0 {
+        eprintln!("warning: {tasks_failed} meeting(s) with task linking failed (not counted as failures; tried again next run)");
     }
     if failed > 0 || unreadable_channels > 0 || follow_failed > 0 {
         return ExitCode::FAILURE;
@@ -1276,8 +1326,9 @@ fn follow_line(followed: &FollowedUp) -> String {
         FollowStep::GaveUp => format!("given up earlier for this script ({given_up})"),
         FollowStep::Later(why) => format!("next run ({})", why.as_str()),
         FollowStep::Failed(error) => format!("failed: {error}"),
+        FollowStep::Skipped(why) => format!("skipped ({why})"),
     };
-    format!(
+    let mut line = format!(
         "correct {} | summary {} | notion {}",
         step(&followed.correct, "the summary and page use the original"),
         step(
@@ -1285,7 +1336,30 @@ fn follow_line(followed: &FollowedUp) -> String {
             "the page says 요약 실패, or keeps the summary made before the correction",
         ),
         step(&followed.notion, "")
-    )
+    );
+    // task 연결이 꺼져 있으면 줄은 예전 그대로다.
+    if followed.tasks != FollowStep::Off {
+        line.push_str(&format!(
+            " | tasks {}",
+            step(&followed.tasks, "no task links for this meeting")
+        ));
+    }
+    line
+}
+
+/// task 연결 줄들(수만: task 제목·사람 이름·pubkey 없음). 이번에 해 봤을 때만.
+fn tasks_lines(followed: &FollowedUp) -> Vec<String> {
+    let Some(report) = &followed.tasks_made else {
+        return Vec::new();
+    };
+    let mut lines = vec![report.to_string()];
+    if report.dropped.total() > 0 {
+        lines.push(report.dropped.to_string());
+    }
+    if let Some(usage) = &report.usage {
+        lines.push(usage_line("tasks", usage));
+    }
+    lines
 }
 
 /// 참석자 이름 묻기 결과 한 줄(수와 까닭의 종류만: 이름·pubkey 없음). pubkey 앞 8자로
@@ -1332,10 +1406,10 @@ fn correct_line(made: &CorrectReport) -> String {
     )
 }
 
-/// The summary's tokens and cost, numbers only.
-fn usage_line(usage: &summary::Usage) -> String {
+/// A Gemini step's tokens and cost (`summary`, `tasks`), numbers only.
+fn usage_line(step: &str, usage: &summary::Usage) -> String {
     format!(
-        "summary usage: input {} output {} thinking {} tokens in {} call(s){}, {:.1} s | cost {}",
+        "{step} usage: input {} output {} thinking {} tokens in {} call(s){}, {:.1} s | cost {}",
         usage.input_tokens,
         usage.output_tokens,
         usage.thinking_tokens,
@@ -1396,6 +1470,30 @@ impl SpeechToText for AnyStt {
                 words: None,
             }),
         }
+    }
+}
+
+/// task 연결 스위치: 요약과 노션 페이지가 켜져 있고 task DB 가 있을 때만 켠다. 아니면 끄고
+/// 회의록은 그대로 간다. 실행 처음에 찍을 줄도 돌려준다(꺼 둔 채면 없음). task DB id 는 찍지 않는다.
+fn tasks_switch(
+    mode: TasksMode,
+    summary: Switch,
+    notion: Switch,
+    task_db: Option<&str>,
+) -> (TasksMode, Option<String>) {
+    if mode == TasksMode::Off {
+        return (TasksMode::Off, None);
+    }
+    let why = if !matches!((summary, notion), (Switch::On, Switch::On)) {
+        Some("needs --summary on and --notion on")
+    } else if task_db.map(str::trim).is_none_or(str::is_empty) {
+        Some("BUZZ_MINUTES_TASK_DB is not set")
+    } else {
+        None
+    };
+    match why {
+        None => (mode, Some(format!("tasks: {mode}"))),
+        Some(why) => (TasksMode::Off, Some(format!("tasks: off ({why})"))),
     }
 }
 
@@ -1520,6 +1618,111 @@ mod tests {
         assert!(placeholder_allowed(false, None, Switch::On, Switch::Off, Switch::Off).is_err());
         assert!(placeholder_allowed(false, None, Switch::Off, Switch::On, Switch::Off).is_err());
         assert!(placeholder_allowed(false, None, Switch::Off, Switch::Off, Switch::On).is_err());
+    }
+
+    /// task 연결은 요약·노션 페이지가 켜져 있고 task DB 가 있을 때만 켜진다. 아니면 끄고 회의록은
+    /// 그대로 간다. 값은 환경 변수로도 받는다(배포).
+    #[test]
+    fn task_linking_needs_the_summary_the_page_and_a_db() {
+        use Switch::{Off, On};
+        let db = Some("3f162a7535ba80c984ece77366d3b5d5");
+        let mode = |mode, summary, notion, db| tasks_switch(mode, summary, notion, db).0;
+        assert_eq!(mode(TasksMode::Update, On, On, db), TasksMode::Update);
+        assert_eq!(mode(TasksMode::Append, On, On, db), TasksMode::Append);
+        assert_eq!(mode(TasksMode::Update, Off, On, db), TasksMode::Off);
+        assert_eq!(mode(TasksMode::Update, On, Off, db), TasksMode::Off);
+        assert_eq!(mode(TasksMode::Update, On, On, None), TasksMode::Off);
+        assert_eq!(mode(TasksMode::Update, On, On, Some("  ")), TasksMode::Off);
+        assert_eq!(mode(TasksMode::Off, On, On, db), TasksMode::Off);
+        // 실행 처음 줄: 켜졌는지·왜 꺼졌는지만, task DB id 는 안 찍는다. 꺼 둔 채면 줄도 없다.
+        assert_eq!(
+            tasks_switch(TasksMode::Append, On, On, db).1.as_deref(),
+            Some("tasks: append")
+        );
+        assert_eq!(
+            tasks_switch(TasksMode::Update, On, On, None).1.as_deref(),
+            Some("tasks: off (BUZZ_MINUTES_TASK_DB is not set)")
+        );
+        assert_eq!(tasks_switch(TasksMode::Off, On, On, db).1, None);
+        for note in [
+            tasks_switch(TasksMode::Update, On, On, db).1,
+            tasks_switch(TasksMode::Update, Off, On, db).1,
+        ] {
+            assert!(!note.unwrap().contains("3f162a75"), "no task db id in logs");
+        }
+
+        let with = |mode: &'static str| {
+            parse(&[
+                "--out",
+                "o",
+                "--stt-placeholder",
+                "--community",
+                "00000000-0000-0000-0000-000000000001",
+                "--channel",
+                "00000000-0000-0000-0000-000000000002",
+                "--tasks",
+                mode,
+                "--task-db",
+                "db",
+            ])
+        };
+        let Cli {
+            command: Command::Process { tasks, task_db, .. },
+        } = with("create").unwrap()
+        else {
+            panic!("process")
+        };
+        assert_eq!((tasks, task_db.as_deref()), (TasksMode::Create, Some("db")));
+        assert!(with("everything").is_err());
+    }
+
+    /// task 연결 줄에는 수만 찍힌다.
+    #[test]
+    fn task_lines_have_counts_only() {
+        let followed = FollowedUp {
+            correct: FollowStep::Off,
+            summary: FollowStep::AlreadyDone,
+            notion: FollowStep::AlreadyDone,
+            home_error: None,
+            summary_usage: None,
+            correct_made: None,
+            names: None,
+            notion_report: None,
+            tasks: FollowStep::Skipped("the meeting ended over 24 hours ago"),
+            tasks_made: Some(buzz_huddle_minutes::tasks::TasksReport {
+                sure: 2,
+                maybe: 1,
+                appended: 2,
+                created: 1,
+                due_changed: 1,
+                skipped: 1,
+                dropped: buzz_huddle_minutes::tasks::Dropped {
+                    negation: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            tasks_lines(&followed),
+            [
+                "tasks: matched 3 (sure 2, maybe 1), appended 2, created 1, due changed 1, status changed 0, skipped 1",
+                "tasks checks dropped: negation 1",
+            ]
+        );
+        assert!(follow_line(&followed)
+            .ends_with("| tasks skipped (the meeting ended over 24 hours ago)"));
+        // task 연결이 꺼져 있으면 줄은 예전 그대로다(「| tasks off」 를 붙이지 않는다).
+        let off = FollowedUp {
+            tasks: FollowStep::Off,
+            tasks_made: None,
+            ..followed
+        };
+        assert_eq!(
+            follow_line(&off),
+            "correct off | summary already done | notion already done"
+        );
+        assert!(tasks_lines(&off).is_empty());
     }
 
     /// 담당자 연결 DB 줄에는 수와 까닭의 종류만 찍힌다(줄 id·페이지 id 없음).
