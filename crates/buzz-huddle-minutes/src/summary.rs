@@ -863,7 +863,7 @@ fn has_rieul_final(c: char) -> bool {
 
 /// 맡겠다는 말인가: "할게요·볼게요·보낼게요·맡을게요"(ㄹ게/ㄹ께로 끝나는 말),
 /// "하겠습니다·맡겠습니다·드리겠습니다·보내겠습니다".
-fn is_commitment(text: &str) -> bool {
+pub(crate) fn is_commitment(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     let ends_with_promise = chars.windows(2).enumerate().any(|(i, pair)| {
         matches!(pair[1], '게' | '께')

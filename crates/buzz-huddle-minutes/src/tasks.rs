@@ -85,6 +85,12 @@ pub const HEDGES: [&str; 15] = [
 ];
 /// 낱말 하나로 있을 때만 망설임으로 세는 말.
 pub const HEDGE_WORDS: [&str; 2] = ["아마", "아마도"];
+/// 안·못이 든 보통 낱말. 붙여 쓴 부정(「금요일까지안돼요」)을 찾기 전에 지운다(「제안했던」·「잘못했던」이
+/// 부정으로 잡히지 않게).
+const WORDS_WITH_AN_MOT: [&str; 13] = [
+    "보안", "제안", "방안", "법안", "답안", "치안", "대안", "잘못", "안건", "안내", "안녕", "미안",
+    "편안",
+];
 /// 짧은 부정 「안」 바로 뒤에 붙어 부정이 되는 말의 첫 글자(「안 돼」·「안돼요」·「안 했어요」·
 /// 「안 가요」 …). 「보안·제안·안드로이드·안건·안내·안녕」처럼 낱말 속 「안」은 부정으로 안 센다.
 const AFTER_SHORT_NEGATION: [char; 39] = [
@@ -110,7 +116,8 @@ const MAX_SAID_PER_TASK: usize = 3;
 pub mod task_property {
     /// title
     pub const TITLE: &str = "기능";
-    /// status(운영 DB, 묶음 to_do·in_progress·complete). select 여도 읽고 쓴다: 실행 때 스키마
+    /// status(운영 DB 의 그룹은 To-do·In progress·Complete 차례. 코드는 그룹을 이름이 아니라 차례로
+    /// 본다: 완료 그룹은 맨 뒤 그룹). select 여도 읽고 쓴다: 실행 때 스키마
     /// 종류를 보고 필터·쓰기 꼴을 맞춘다.
     pub const STATUS: &str = "작업상태";
     /// people. 새 task 에만 쓴다(기존 task 의 담당자는 읽기만).
@@ -784,7 +791,9 @@ pub struct Dropped {
     /// 짝 시각이 그 회의 항목의 근거 시각이 아님.
     #[serde(default)]
     pub not_item_time: u64,
-    /// 확실한 짝인데 task 제목과 짝 항목 글이 낱말 하나 안 겹쳐 애매로 내림.
+    /// 확실한 짝인데 task 제목과 짝 항목 글이 안 겹쳐(흔한 말 하나뿐도) 애매로 내림. 버린 것이 아니라
+    /// 애매한 짝 수에 이미 들어 있어서 [`total`](Self::total)·「버린 것」 줄에는 안 넣고, 로그 줄에
+    /// `| made maybe N` 으로 따로 보인다.
     #[serde(default)]
     pub made_maybe: u64,
     /// 근거 시각이 원본 스크립트 줄에 없음.
@@ -819,7 +828,6 @@ impl Dropped {
         self.unknown_task
             + self.unknown_item
             + self.not_item_time
-            + self.made_maybe
             + self.no_line
             + self.bad_level
             + self.no_sure_link
@@ -842,7 +850,6 @@ impl fmt::Display for Dropped {
             ("unknown task", self.unknown_task),
             ("unknown item", self.unknown_item),
             ("not the item's time", self.not_item_time),
-            ("sure made maybe (no shared words)", self.made_maybe),
             ("no script line", self.no_line),
             ("bad level", self.bad_level),
             ("no sure link", self.no_sure_link),
@@ -908,15 +915,35 @@ impl<'a> Lines<'a> {
     /// 사람의 말이고, 같은 사람이 이어 말해도 다른 일 이야기일 수 있다(「로그인 오류 수정은요,」 +
     /// 「결제 쪽은 다 끝났어요.」).
     fn about_lines(&self, j: usize, keys: &[String]) -> Vec<usize> {
+        self.statement_lines(j)
+            .into_iter()
+            .filter(|&i| summary::shares_words(keys, self.lines[i].text))
+            .collect()
+    }
+
+    /// 근거 말의 줄: 근거 줄, 그리고 같은 사람이 이어 말한 바로 다음 줄(그 일 이야기인지는 안 본다).
+    fn statement_lines(&self, j: usize) -> Vec<usize> {
         let line = &self.lines[j];
         let next = self
             .lines
             .get(j + 1)
             .filter(|next| line.speaker.is_some() && next.speaker == line.speaker);
-        std::iter::once(j)
-            .chain(next.map(|_| j + 1))
-            .filter(|&i| summary::shares_words(keys, self.lines[i].text))
-            .collect()
+        std::iter::once(j).chain(next.map(|_| j + 1)).collect()
+    }
+
+    /// 그 줄들에서 읽은 날짜가 하나뿐이면 그 날짜(그 줄을 말한 날보다 앞이면 안 읽은 것으로 친다).
+    fn one_date(&self, rows: &[usize]) -> Option<NaiveDate> {
+        let reads: BTreeSet<NaiveDate> = rows
+            .iter()
+            .filter_map(|&i| {
+                let base = self.date(i)?;
+                summary::date_from_quote(self.lines[i].text, base).filter(|date| *date >= base)
+            })
+            .collect();
+        match (reads.len(), reads.first()) {
+            (1, Some(read)) => Some(*read),
+            _ => None,
+        }
     }
 
     /// 망설임·거절을 볼 범위: 근거 줄과 바로 다음 줄(누가 말했든: 바로 뒤 다른 사람의 거절도 본다).
@@ -965,8 +992,10 @@ fn forbidding(rest: &str) -> bool {
 
 /// 부정하거나 망설이는 말이 있나. 부정은 후보정의 [`NEGATIONS`] 를 쓰되 [`NEGATIONS_BY_WORD`] 는
 /// 낱말로 본다:
-/// - 「안」·「못」: 낱말이 「못」으로 시작하거나, 「안」 하나이거나, 「안」 바로 뒤에 동사가 붙은 꼴
-///   (「안돼요」, [`AFTER_SHORT_NEGATION`]). 「보안·제안·안드로이드·잘못된」은 아니다.
+/// - 「안」·「못」: 낱말이 「못」으로 시작하거나, 「안」 하나이거나, 「안」·「못」 바로 뒤에 동사가 붙은 꼴
+///   (낱말 첫머리든 가운데든: 「안돼요」·「금요일까지안돼요」·「QA안했어요」·「완료못했어요」,
+///   [`AFTER_SHORT_NEGATION`]). 안·못이 든 보통 낱말([`WORDS_WITH_AN_MOT`])은 먼저 지운다: 「보안·제안·
+///   안드로이드·잘못된」은 아니다.
 /// - 「없」: 바로 뒤가 「이」(「차질 없이·문제없이」)나 「애」(「없애기」)가 아닌 꼴(「없어요·없는데」).
 /// - 「지 마·지 말」: 「지」 바로 뒤나 다음 낱말이 「말다」의 꼴(「하지 마세요·하지말고」). 「금요일까지
 ///   마무리·말씀」은 아니다.
@@ -977,15 +1006,21 @@ pub fn hedged(text: &str) -> bool {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect();
+    // 안·못이 든 보통 낱말은 지운 글로 짧은 부정을 본다.
+    let cleaned = WORDS_WITH_AN_MOT
+        .iter()
+        .fold(text.to_string(), |text, word| text.replace(word, " "));
+    let cleaned_words: Vec<&str> = cleaned
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
     let short_negation = |word: &&str| {
-        let mut chars = word.chars();
-        match chars.next() {
-            Some('못') => true,
-            Some('안') => chars
-                .next()
-                .is_none_or(|next| AFTER_SHORT_NEGATION.contains(&next)),
-            _ => false,
-        }
+        let chars: Vec<char> = word.chars().collect();
+        chars.first() == Some(&'못')
+            || *word == "안"
+            || chars.windows(2).any(|pair| {
+                matches!(pair[0], '안' | '못') && AFTER_SHORT_NEGATION.contains(&pair[1])
+            })
     };
     let lacking = |word: &&str| {
         word.split('없')
@@ -1008,7 +1043,7 @@ pub fn hedged(text: &str) -> bool {
         .iter()
         .filter(|word| !NEGATIONS_BY_WORD.contains(word))
         .any(|word| text.contains(word))
-        || words.iter().any(short_negation)
+        || cleaned_words.iter().any(short_negation)
         || words.iter().any(lacking)
         || words.iter().enumerate().any(forbids)
         || words.iter().any(|word| HEDGE_WORDS.contains(word))
@@ -1054,7 +1089,7 @@ pub fn status_words(status: &str) -> &'static [&'static str] {
 /// 근거 말에 있으면 그 상태로는 제안만 하는 말(글자·숫자만, 작은 글자로 견준다). 우리 흐름은
 /// 개발 → Dev QA → Staging 배포예정 → Staging QA → Production 배포예정 → Production QA → 완료다.
 /// - 완료: 단계 말(「개발 끝났어요」·「QA 끝났어요」·「스테이징에 배포했어요」·「PR 머지했어요」는 중간
-///   단계 이야기다)과 아직 안 끝난 꼴(「끝났는지 볼게요」·「끝났으면」·「끝났을 거예요」·「완료 예정」).
+///   단계 이야기다). 아직 안 끝난 꼴은 모든 상태에 거는 [`not_yet`] 이 본다.
 /// - Dev QA: 뒤 단계 말. 「스테이징 QA 들어갔어요」의 QA 는 Dev QA 가 아니다.
 /// - 이름이 배포예정으로 끝나는 상태: QA 말. 「스테이징 QA 들어갔어요」는 Staging 배포예정이 아니다.
 pub fn status_stop_words(status: &str) -> &'static [&'static str] {
@@ -1072,12 +1107,6 @@ pub fn status_stop_words(status: &str) -> &'static [&'static str] {
             "pr",
             "머지",
             "merge",
-            "예정",
-            "할게",
-            "하겠",
-            "는지",
-            "으면",
-            "을거",
         ],
         "Dev QA" => &["스테이징", "staging", "프로덕션", "production", "운영"],
         _ if status.ends_with("배포예정") => &QA_WORDS,
@@ -1085,13 +1114,54 @@ pub fn status_stop_words(status: &str) -> &'static [&'static str] {
     }
 }
 
+/// 아직 안 한 일·묻는 말·가정하는 말인가(때·말투). 이 꼴이면 어느 상태로든 실제로 바꾸지 않는다
+/// (「스테이징 QA 예정이에요」는 지금 Staging QA 가 아니다). 이름이 배포예정으로 끝나는 상태는 「예정」이
+/// 상태 뜻 그 자체라 「예정」만 안 본다.
+/// - 「예정」, 가정 「으면·다면」(「끝났으면·완료됐다면」), 해야 함 「어야」와 「~야 하다·되다」(「끝났어야·
+///   QA 해야 해요·배포해야 돼요」), 그럴 수도 「을 수도」, 물음 「나요」(물음표가 없어도: 「끝났나요」)
+/// - 약속: 요약이 담당자 수락을 볼 때 쓰는 꼴 그대로(「할게요·볼게요·하겠습니다」,
+///   [`summary::is_commitment`])
+/// - 물음 「ㄴ지」: ㄴ 받침 글자 바로 뒤 「지」(「끝났는지·예정인지·했는지」)
+/// - 앞일 「ㄹ 거」: ㄹ 받침 글자 바로 뒤 「거」(「끝났을 거·들어갈 거」)
+///
+/// 받침 없는 가정 「면」(「들어가면·되면」)은 「화면」과 갈라지지 않아 안 본다.
+fn not_yet(status: &str, statement: &str) -> bool {
+    let squashed = summary::squash(statement);
+    let chars: Vec<char> = squashed.chars().collect();
+    // 받침 번호(0xAC00 부터 28 씩): ㄴ 4, ㄹ 8.
+    let ends_then = |last: u32, next: char| {
+        chars.windows(2).any(|pair| {
+            pair[1] == next
+                && ('가'..='힣').contains(&pair[0])
+                && (u32::from(pair[0]) - 0xAC00) % 28 == last
+        })
+    };
+    (!status.ends_with("배포예정") && squashed.contains("예정"))
+        || ["으면", "다면", "어야", "을수도", "나요"]
+            .iter()
+            .any(|word| squashed.contains(word))
+        || chars.windows(2).any(|pair| {
+            pair[0] == '야'
+                && matches!(
+                    pair[1],
+                    '해' | '하' | '할' | '했' | '돼' | '되' | '될' | '됐' | '지'
+                )
+        })
+        || summary::is_commitment(statement)
+        || ends_then(4, '지')
+        || ends_then(8, '거')
+}
+
 /// 근거 말이 그 상태를 말하나: 그 상태의 말이 있고([`status_words`], 이름이 QA 로 끝나면
-/// [`QA_WORDS`] 도) 막는 말이 없다([`status_stop_words`]).
+/// [`QA_WORDS`] 도), 아직 안 한 꼴이 아니고([`not_yet`]), 막는 말이 없다([`status_stop_words`]).
 fn says_status(status: &str, statement: &str) -> bool {
     let squashed = summary::squash(statement);
     let has = |words: &[&str]| words.iter().any(|word| squashed.contains(word));
     let qa = !status.ends_with("QA") || has(&QA_WORDS);
-    has(status_words(status)) && qa && !has(status_stop_words(status))
+    has(status_words(status))
+        && qa
+        && !not_yet(status, statement)
+        && !has(status_stop_words(status))
 }
 
 /// 상태가 앞으로 가나. 차례는 노션이 주는 그룹 차례(할 일 → 진행 중 → 완료)에 그 그룹 안 차례
@@ -1139,6 +1209,25 @@ fn similar_task<'t>(tasks: &'t [OpenTask], title: &str) -> Option<&'t OpenTask> 
         })
         .min_by_key(|(shared, _)| std::cmp::Reverse(*shared))
         .map(|(_, task)| task)
+}
+
+/// task 일에 흔한 말(낱말 앞 두 글자). 확실한 짝인지 볼 때 이 말은 몇 개가 겹치든 겹침으로 안 센다.
+const COMMON_TASK_WORDS: [&str; 31] = [
+    "수정", "개선", "화면", "기능", "오류", "추가", "작업", "확인", "처리", "관련", "문제", "변경",
+    "적용", "정리", "검토", "테스", "업데", "개발", "구현", "연동", "개편", "버그", "에러", "이슈",
+    "대응", "지원", "작성", "진행", "준비", "배포", "설정",
+];
+
+/// 확실한 짝으로 둘 만큼 task 제목과 짝 항목 글이 겹치나: 흔한 말([`COMMON_TASK_WORDS`])이 아닌
+/// 낱말(앞 두 글자, 끝말이 붙어도 같다)이 하나라도 겹친다. 흔한 말은 몇 개가 겹치든 안 센다: 「결제 화면
+/// 수정」 ↔ 「로그인 화면 수정」은 「화면·수정」이 겹쳐도 같은 일이라는 근거가 안 된다. 그래서 제목이 흔한
+/// 말로만 된 task(「기능 추가」)는 늘 애매로 내려간다(task 에는 안 쓰고 회의록 링크만 다는 쪽).
+fn shares_task_words(title: &str, item: &str) -> bool {
+    let theirs: BTreeSet<String> = summary::word_keys(title).into_iter().collect();
+    let ours: BTreeSet<String> = summary::word_keys(item).into_iter().collect();
+    theirs
+        .intersection(&ours)
+        .any(|key| !COMMON_TASK_WORDS.contains(&key.as_str()))
 }
 
 /// 같은 task 로 모인 짝들.
@@ -1195,12 +1284,7 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
         };
         // 확실한 짝이라도 task 제목과 짝 항목 글이 낱말 하나 안 겹치면 애매로 내린다(엉뚱한 task 에
         // 기록이 붙지 않게). 낱말은 앞 두 글자로 맞대서 끝말이 붙어도 겹친다.
-        if sure
-            && !summary::shares_words(
-                &summary::word_keys(&input.tasks[task].title),
-                item_text(summary, item),
-            )
-        {
+        if sure && !shares_task_words(&input.tasks[task].title, item_text(summary, item)) {
             sure = false;
             dropped.made_maybe += 1;
         }
@@ -1275,16 +1359,11 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             dropped.not_about += 1;
             continue;
         }
-        let reads: BTreeSet<NaiveDate> = about
-            .iter()
-            .filter_map(|&i| {
-                let base = lines.date(i)?;
-                summary::date_from_quote(lines.lines[i].text, base).filter(|date| *date >= base)
-            })
-            .collect();
-        let read = match (reads.len(), reads.first()) {
-            (1, Some(read)) => Some(*read),
-            _ => None,
+        // 그 일 이야기 줄에서 못 읽고 같은 사람이 이어 말한 다른 줄에서만 읽히면, 조용히 버리지 않고
+        // 「기한 제안」으로 남긴다(칸은 안 바꾸고, 사람이 놓친 것을 본다).
+        let (read, other_line) = match lines.one_date(&about) {
+            Some(read) => (Some(read), false),
+            None => (lines.one_date(&lines.statement_lines(j)), true),
         };
         let claimed = summary::parse_claimed_due(&change.due).map(|(day, _)| day);
         let (Some(read), Some(claimed)) = (read, claimed) else {
@@ -1302,7 +1381,7 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
             continue;
         }
         due.entry(task).or_insert(Change {
-            suggest: open.due_end.is_some() || current.contains('T'),
+            suggest: other_line || open.due_end.is_some() || current.contains('T'),
             from: current,
             to: read.format("%Y-%m-%d").to_string(),
             ms: lines.lines[j].start_ms,
@@ -1750,6 +1829,7 @@ impl fmt::Display for TasksReport {
         )?;
         for (name, n) in [
             ("suggested", self.suggested),
+            ("made maybe", self.dropped.made_maybe as usize),
             ("changed meanwhile", self.changed_meanwhile),
             ("already there", self.already_there),
             ("task gone", self.gone),
@@ -2422,7 +2502,8 @@ pub(crate) mod tests {
             .map(|(name, id)| json!({ "id": id, "name": name }))
             .collect();
         // 받은 차례 그대로(option_ids 차례는 선택지 목록 차례와 다를 수 있다: 진행 중 그룹은
-        // 「개발-토의필요」로 시작하지만 선택지 목록에서는 「기획(A2D2)」가 먼저다).
+        // 「개발-토의필요」로 시작하지만 선택지 목록에서는 「기획(A2D2)」가 먼저다). 선택지·그룹 차례와
+        // 그룹 이름(To-do·In progress·Complete)은 운영 task DB 를 2026-10-13 에 읽은 그대로다.
         let group = |names: &[&str]| -> Vec<String> {
             names
                 .iter()
@@ -3068,14 +3149,16 @@ pub(crate) mod tests {
         let plan = check_meeting(&lines, "견적서 자동화 공유", 5_000, &answer(9_000), &open());
         assert_eq!(plan.tasks[0].due, None);
         assert_eq!(plan.dropped.not_about, 1);
-        // 같은 사람이 이어 말해도 그 줄에 그 일 낱말이 없으면 받지 않는다(다른 일 이야기일 수 있다).
+        // 같은 사람이 이어 말해도 그 줄에 그 일 낱말이 없으면 실제로 바꾸지 않는다(다른 일 이야기일 수
+        // 있다). 놓치지 않게 「기한 제안」으로만 남긴다.
         let same = [
             (5_000, A, "견적서 자동화 진행 상황 공유할게요."),
             (9_000, A, "금요일까지 끝낼게요."),
         ];
         let plan = check_meeting(&same, "견적서 자동화 공유", 5_000, &answer(5_000), &open());
-        assert_eq!(plan.tasks[0].due, None);
-        assert_eq!(plan.dropped.date_not_in_words, 1);
+        let due = plan.tasks[0].due.clone().unwrap();
+        assert_eq!((due.to.as_str(), due.suggest), ("2026-10-16", true));
+        assert_eq!(plan.dropped.date_not_in_words, 0);
         // 이어 말한 줄이 그 일 이야기면 받는다.
         let named = [
             (5_000, A, "견적서 자동화 진행 상황 공유할게요."),
@@ -3287,6 +3370,10 @@ pub(crate) mod tests {
             "문제없이 금요일에 배포할게요",
             "중복 없애기는 금요일까지 할게요",
             "마지막 화면은 금요일까지 할게요",
+            "보안 점검 금요일까지 할게요",
+            "제안서 금요일까지 드릴게요",
+            "제안했던 대로 금요일까지 할게요",
+            "잘못했던 거 금요일까지 고칠게요",
         ] {
             assert!(!hedged(fine), "{fine}");
         }
@@ -3307,6 +3394,9 @@ pub(crate) mod tests {
             "하지말자",
             "시간이 없어요",
             "아직 사람이 없는데",
+            "견적서 자동화는 금요일까지안돼요",
+            "스테이징 QA안했어요",
+            "로그인 오류 수정 완료못했어요",
         ] {
             assert!(hedged(negated), "{negated}");
         }
@@ -3552,6 +3642,44 @@ pub(crate) mod tests {
         assert_eq!(maybe, ["task-1"]);
         assert_eq!(plan.dropped.made_maybe, 1);
         assert_eq!(writes(&plan, TasksMode::Update), [Write::Maybe]);
+        // 내린 짝은 애매한 짝 수에만 든다(버린 수에 두 번 세지 않는다). 로그 줄에 따로 보인다.
+        let mut report = TasksReport::default();
+        report.plan(&plan);
+        assert_eq!((report.maybe, report.skipped), (1, 0));
+        assert!(report.to_string().contains("| made maybe 1"), "{report}");
+        assert!(!plan.dropped.to_string().contains("maybe"));
+    }
+
+    /// 흔한 말은 몇 개가 겹치든 확실한 짝의 근거로 안 센다(「결제 화면 수정」 ↔ 「로그인 화면 수정」).
+    /// 흔하지 않은 말이 하나라도 겹치면 확실로 남는다(「로그인 화면 수정」 ↔ 「로그인할 때 에러」의 「로그」).
+    #[test]
+    fn common_words_are_not_enough_for_a_sure_link() {
+        assert!(!shares_task_words("결제 화면 수정", "로그인 화면 개선"));
+        assert!(!shares_task_words("결제 화면 수정", "로그인 화면 수정"));
+        assert!(!shares_task_words("기능 추가", "알림 기능 추가"));
+        // task DB 이름이 「AiLex 제품 내부 개발」이라 「개발」이 제일 흔하다.
+        assert!(!shares_task_words("로그인 개발", "결제 개발"));
+        assert!(!shares_task_words("결제 모듈 개발", "로그인 개발 마무리"));
+        assert!(!shares_task_words("문서 작성", "회의록 작성"));
+        assert!(shares_task_words("로그인 화면 수정", "로그인할 때 에러"));
+        assert!(shares_task_words(
+            "로그인 오류 수정",
+            "로그인할 때 에러 고치기"
+        ));
+        let mut tasks = open();
+        tasks[0].title = "결제 화면 수정".into();
+        let answer = json!({
+            "links": [link_d1("K1", 1_000)],
+            "due_changes": [], "status_changes": [], "new_tasks": []
+        });
+        let lines = [(1_000, A, "로그인 화면 개선은 다음 주에 봐요.")];
+        let plan = check_meeting(&lines, "로그인 화면 개선", 1_000, &answer, &tasks);
+        assert!(plan.tasks.is_empty());
+        assert_eq!(plan.dropped.made_maybe, 1);
+        // 흔하지 않은 말(「로그」)이 겹치면 확실로 남는다.
+        tasks[0].title = "로그인 화면 수정".into();
+        let plan = check_meeting(&lines, "로그인 화면 개선", 1_000, &answer, &tasks);
+        assert_eq!(plan.tasks.len(), 1);
     }
 
     /// 휴지통에 든 task 는 진행 중 task 로 읽지 않는다.
@@ -3577,8 +3705,12 @@ pub(crate) mod tests {
             assert_eq!(plan.tasks[0].status, None, "{words}");
             assert_eq!(plan.dropped.negation, 1, "{words}");
         }
-        // 낱말로만 보는 다른 검사에는 안 걸린다(그래서 완료에만 글자로 본다).
-        assert!(!hedged("로그인 오류 수정은 완료안됐어요."));
+        // 완료만은 안·못을 글자로도 본다: 보통 낱말 속 「보안」에도 걸려 하나 덜 바꾼다(다른 검사는 안 걸린다).
+        let lines = [(1_000, A, "로그인 오류 수정 보안 패치까지 다 완료했어요.")];
+        assert!(!hedged(lines[0].2));
+        let plan = check_meeting(&lines, "로그인 오류 수정 완료", 1_000, &answer, &open());
+        assert_eq!(plan.tasks[0].status, None);
+        assert_eq!(plan.dropped.negation, 1);
         let lines = [(1_000, A, "로그인 오류 수정은 다 완료했어요.")];
         let plan = check_meeting(&lines, "로그인 오류 수정 완료", 1_000, &answer, &open());
         assert!(!plan.tasks[0].status.as_ref().unwrap().suggest);
@@ -3634,8 +3766,26 @@ pub(crate) mod tests {
             (7_000, A, "결제 화면은 금요일까지 할게요."),
         ];
         let plan = check_meeting(&lines, "견적서 자동화", 5_000, &due, &open());
-        assert_eq!(plan.tasks[0].due, None);
-        assert_eq!(plan.dropped.date_not_in_words, 1);
+        let change = plan.tasks[0].due.clone().unwrap();
+        assert!(change.suggest, "{change:?}");
+        assert_eq!(writes(&plan, TasksMode::Update), [Write::Append(0)]);
+        // 「로그인 오류 수정은요,」 + 「금요일까지 할게요.」 → K2 기한은 제안으로 남는다.
+        let due = json!({
+            "links": [link_d1("K2", 1_000)],
+            "due_changes": [{ "task": "K2", "due": "2026-10-16", "ms": 1_000 }],
+            "status_changes": [], "new_tasks": []
+        });
+        let lines = [
+            (1_000, A, "로그인 오류 수정은요,"),
+            (3_000, A, "금요일까지 할게요."),
+        ];
+        let plan = check_meeting(&lines, "로그인 오류 수정", 1_000, &due, &open());
+        let change = plan.tasks[0].due.clone().unwrap();
+        assert_eq!((change.to.as_str(), change.suggest), ("2026-10-16", true));
+        assert_eq!(
+            change_line(Write::Due(0), &change),
+            "기한 제안: 없음 → 10/16 (근거 [00:01])"
+        );
     }
 
     /// 완료 그룹(노션 그룹의 맨 뒤)의 task 는 이름이 「완료」가 아니어도 읽지 않는다.
@@ -3712,5 +3862,76 @@ pub(crate) mod tests {
         assert!(plan.creates.is_empty());
         let task_4 = plan.maybe.iter().filter(|maybe| maybe.id == "task-4");
         assert_eq!(task_4.count(), 1);
+    }
+
+    /// 때·말투 막는 말(예정·약속·물음·앞일·가정)은 완료만이 아니라 모든 상태에 건다. 배포예정은 「예정」이
+    /// 상태 뜻 그 자체라 「예정」만 뺀다.
+    #[test]
+    fn talk_of_what_is_not_done_yet_only_suggests() {
+        assert!(!says_status("Staging QA", "스테이징 QA 예정이에요"));
+        assert!(says_status("Staging 배포예정", "스테이징 배포 예정이에요"));
+        assert!(!says_status(
+            "Staging 배포예정",
+            "스테이징 배포 예정인지 볼게요"
+        ));
+        for (status, words) in [
+            ("Dev QA", "QA 들어갈 거예요"),
+            ("Dev QA", "QA 할게요"),
+            ("Dev QA", "QA 들어갔는지 확인 부탁드려요"),
+            ("Staging QA", "스테이징 QA 들어가셨으면 좋겠어요"),
+            ("Production QA", "프로덕션 QA 하겠습니다"),
+            ("Staging 배포예정", "스테이징 배포 예정인지 확인 부탁드려요"),
+            ("Production 배포예정", "운영 배포 할게요"),
+        ] {
+            assert!(!says_status(status, words), "{status}: {words}");
+        }
+        // 이미 한 말은 그대로 바꾼다.
+        for (status, words) in [
+            ("Dev QA", "QA 들어갔어요"),
+            ("Staging QA", "스테이징 QA 시작했어요"),
+            ("Production 배포예정", "운영 배포 예정이에요"),
+        ] {
+            assert!(says_status(status, words), "{status}: {words}");
+        }
+        // 검사 전체로: 지금 Dev QA 인 task 에 「스테이징 QA 예정이에요」 → Staging QA 는 제안만.
+        let lines = [(1_000, A, "로그인 오류 수정은 스테이징 QA 예정이에요.")];
+        let answer = k2_status_answer("Staging QA");
+        let plan = check_meeting(&lines, "로그인 오류 수정 QA", 1_000, &answer, &open());
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
+    }
+
+    /// 붙여 쓴 부정은 완료만이 아니라 기한·모든 상태에서 버린다.
+    #[test]
+    fn a_glued_negation_drops_any_change() {
+        let due = json!({
+            "links": [link_d1("K1", 5_000)],
+            "due_changes": [{ "task": "K1", "due": "2026-10-16", "ms": 5_000 }],
+            "status_changes": [], "new_tasks": []
+        });
+        let lines = [(5_000, A, "견적서 자동화는 금요일까지안돼요.")];
+        let plan = check_meeting(&lines, "견적서 자동화", 5_000, &due, &open());
+        assert_eq!(plan.tasks[0].due, None);
+        assert_eq!(plan.dropped.negation, 1);
+        let lines = [(1_000, A, "로그인 오류 수정은 스테이징 QA안했어요.")];
+        let answer = k2_status_answer("Staging QA");
+        let plan = check_meeting(&lines, "로그인 오류 수정 QA", 1_000, &answer, &open());
+        assert_eq!(plan.tasks[0].status, None);
+        assert_eq!(plan.dropped.negation, 1);
+    }
+
+    /// 완료를 막는 때·말투 말(다면·어야·을 수도·나요)은 모든 상태에 건다.
+    #[test]
+    fn maybe_and_must_and_questions_only_suggest() {
+        for words in [
+            "완료됐다면",
+            "끝났어야 해요",
+            "벌써 끝났어야 정상이에요",
+            "완료됐을 수도 있어요",
+            "끝났나요",
+        ] {
+            assert!(!says_status("완료", words), "{words}");
+        }
+        assert!(!says_status("Staging QA", "스테이징 QA 들어갔나요"));
+        assert!(!says_status("Dev QA", "QA 해야 해요"));
     }
 }
