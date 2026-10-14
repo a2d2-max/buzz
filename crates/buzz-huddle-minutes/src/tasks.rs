@@ -1211,24 +1211,22 @@ fn similar_task<'t>(tasks: &'t [OpenTask], title: &str) -> Option<&'t OpenTask> 
         .map(|(_, task)| task)
 }
 
-/// task 일에 흔한 말(낱말 앞 두 글자). 확실한 짝인지 볼 때 이것 하나만 겹쳐서는 겹침으로 안 친다.
+/// task 일에 흔한 말(낱말 앞 두 글자). 확실한 짝인지 볼 때 이 말은 몇 개가 겹치든 겹침으로 안 센다.
 const COMMON_TASK_WORDS: [&str; 17] = [
     "수정", "개선", "화면", "기능", "오류", "추가", "작업", "확인", "처리", "관련", "문제", "변경",
     "적용", "정리", "검토", "테스", "업데",
 ];
 
-/// 확실한 짝으로 둘 만큼 task 제목과 짝 항목 글이 겹치나: 낱말(앞 두 글자, 끝말이 붙어도 같다)이
-/// 하나라도 겹치되, 겹친 것이 흔한 말([`COMMON_TASK_WORDS`]) 하나뿐이면 안 친다(「결제 화면 수정」 ↔
-/// 「로그인 화면 개선」은 「화면」뿐이라 애매로 내린다).
+/// 확실한 짝으로 둘 만큼 task 제목과 짝 항목 글이 겹치나: 흔한 말([`COMMON_TASK_WORDS`])이 아닌
+/// 낱말(앞 두 글자, 끝말이 붙어도 같다)이 하나라도 겹친다. 흔한 말은 몇 개가 겹치든 안 센다: 「결제 화면
+/// 수정」 ↔ 「로그인 화면 수정」은 「화면·수정」이 겹쳐도 같은 일이라는 근거가 안 된다. 그래서 제목이 흔한
+/// 말로만 된 task(「기능 추가」)는 늘 애매로 내려간다(task 에는 안 쓰고 회의록 링크만 다는 쪽).
 fn shares_task_words(title: &str, item: &str) -> bool {
     let theirs: BTreeSet<String> = summary::word_keys(title).into_iter().collect();
     let ours: BTreeSet<String> = summary::word_keys(item).into_iter().collect();
-    let shared: Vec<&String> = theirs.intersection(&ours).collect();
-    match shared[..] {
-        [] => false,
-        [only] => !COMMON_TASK_WORDS.contains(&only.as_str()),
-        _ => true,
-    }
+    theirs
+        .intersection(&ours)
+        .any(|key| !COMMON_TASK_WORDS.contains(&key.as_str()))
 }
 
 /// 같은 task 로 모인 짝들.
@@ -3651,16 +3649,18 @@ pub(crate) mod tests {
         assert!(!plan.dropped.to_string().contains("maybe"));
     }
 
-    /// 흔한 말 하나만 겹치면(「결제 화면 수정」 ↔ 「로그인 화면 개선」의 「화면」) 확실한 짝으로 안 본다.
+    /// 흔한 말은 몇 개가 겹치든 확실한 짝의 근거로 안 센다(「결제 화면 수정」 ↔ 「로그인 화면 수정」).
+    /// 흔하지 않은 말이 하나라도 겹치면 확실로 남는다(「로그인 화면 수정」 ↔ 「로그인할 때 에러」의 「로그」).
     #[test]
-    fn one_common_word_is_not_enough_for_a_sure_link() {
+    fn common_words_are_not_enough_for_a_sure_link() {
         assert!(!shares_task_words("결제 화면 수정", "로그인 화면 개선"));
+        assert!(!shares_task_words("결제 화면 수정", "로그인 화면 수정"));
+        assert!(!shares_task_words("기능 추가", "알림 기능 추가"));
+        assert!(shares_task_words("로그인 화면 수정", "로그인할 때 에러"));
         assert!(shares_task_words(
             "로그인 오류 수정",
             "로그인할 때 에러 고치기"
         ));
-        // 둘 이상 겹치면(흔한 말이어도) 겹침으로 친다.
-        assert!(shares_task_words("결제 화면 오류", "로그인 화면 오류"));
         let mut tasks = open();
         tasks[0].title = "결제 화면 수정".into();
         let answer = json!({
