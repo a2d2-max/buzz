@@ -7,6 +7,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
+mod huddle_recording;
+
+pub use huddle_recording::{HuddleRecordingConfig, HuddleRecordingMode};
+
 /// Default maximum inbound WebSocket frame size in bytes.
 ///
 /// Must comfortably exceed accepted event content sizes after Nostr JSON and
@@ -251,6 +255,10 @@ pub struct Config {
     /// Same strict opt-in as `BUZZ_MESH`; default off means inbound reliable
     /// streams are accepted, logged, and closed (no session consumer yet).
     pub mesh_demo_echo: bool,
+
+    /// Huddle recorder (`BUZZ_HUDDLE_RECORDING*`). Off by default; when off
+    /// no recorder object exists and huddle audio is unchanged.
+    pub huddle_recording: HuddleRecordingConfig,
 
     /// Optional hex-encoded pubkey of the relay owner.
     /// When set, this pubkey is automatically bootstrapped into `relay_members`
@@ -769,6 +777,8 @@ impl Config {
         let mesh_demo_echo = std::env::var("BUZZ_MESH_DEMO_ECHO")
             .map(|v| v.eq_ignore_ascii_case("on") || v == "true" || v == "1")
             .unwrap_or(false);
+
+        let huddle_recording = HuddleRecordingConfig::from_lookup(|name| std::env::var(name).ok())?;
 
         let allow_nip_oa_auth = std::env::var("BUZZ_ALLOW_NIP_OA_AUTH")
             .map(|v| v == "true" || v == "1")
@@ -1300,6 +1310,7 @@ impl Config {
             huddle_audio_available,
             mesh,
             mesh_demo_echo,
+            huddle_recording,
             relay_owner_pubkey,
             relay_operator_api_origin,
             relay_operator_pubkeys,
@@ -1502,6 +1513,11 @@ mod tests {
         assert!(
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
+        );
+        assert_eq!(
+            config.huddle_recording.mode,
+            HuddleRecordingMode::Off,
+            "huddle recording must be opt-in"
         );
     }
 

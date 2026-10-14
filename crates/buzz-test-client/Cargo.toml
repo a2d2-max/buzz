@@ -38,6 +38,9 @@ chrono = { workspace = true }
 s3 = { version = "0.37", package = "rust-s3", default-features = false, features = ["tokio-rustls-tls", "fail-on-err", "tags"] }
 buzz-media = { workspace = true }
 buzz-sdk = { workspace = true }
+# Huddle e2e example: encodes test speech exactly like the desktop (48 kHz
+# mono Opus, 20 ms frames). Same version as buzz-huddle-minutes.
+opus = "0.3"
 
 [[bin]]
 name = "buzz-test-cli"

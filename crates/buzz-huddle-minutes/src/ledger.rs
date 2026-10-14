@@ -1,0 +1,457 @@
+//! What was already paid for: every transcription outcome of a meeting,
+//! kept beside its script so a rerun never sends a finished piece again.
+//!
+//! One JSON line per event, appended as it happens, so a crash or a stop on
+//! an auth error keeps everything before it:
+//!
+//! ```text
+//! {"kind":"run","number":2}       (written when run 2 finished transcribing)
+//! {"kind":"done","key":"…","text":"…","billed_seconds":3}
+//! {"kind":"done","key":"…","text":"…","billed_seconds":3,"words":[{"start_ms":0,"end_ms":420,"text":"…"}]}
+//! {"kind":"rejected","key":"…","code":"…"}
+//! ```
+//!
+//! A transient failure is not written: the next run sends that piece again.
+//! The file holds transcribed text, so it is written 0600 like the script.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::io::Write;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::stt::Word;
+
+/// A finished piece.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Transcribed.
+    Done {
+        /// The text.
+        text: String,
+        /// Seconds the engine billed for it.
+        billed_seconds: u64,
+        /// The words and their times, when they were asked for (a piece that
+        /// may hold several speakers); `None` when they were not.
+        words: Option<Vec<Word>>,
+    },
+    /// The engine refused this audio; sending it again will not help.
+    Rejected {
+        /// Engine error code.
+        code: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Line {
+    Run {
+        number: u32,
+    },
+    Done {
+        key: String,
+        text: String,
+        billed_seconds: u64,
+        // Older lines have none; lines without word times stay as they were.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        words: Option<Vec<Word>>,
+    },
+    Rejected {
+        key: String,
+        code: String,
+    },
+}
+
+/// Where a meeting's outcomes are kept: a local file ([`SttLedger`]) or
+/// Cloud Storage ([`crate::gcs_minutes::GcsLedger`]). Everything already
+/// recorded is read when the ledger is opened; [`record`](Ledger::record)
+/// and [`finish_run`](Ledger::finish_run) are durable when they return.
+pub trait Ledger {
+    /// Runs that went through the whole transcription step.
+    fn runs(&self) -> u32;
+    /// Entries that could not be read back (a torn write).
+    fn unreadable_lines(&self) -> u64;
+    /// What is known about the piece with `key`.
+    fn outcome(&self, key: &str) -> Option<&Outcome>;
+    /// Record a finished piece.
+    fn record(
+        &mut self,
+        key: &str,
+        outcome: Outcome,
+    ) -> impl Future<Output = std::io::Result<()>> + Send;
+    /// Note that run `number` went through the whole transcription step.
+    fn finish_run(&mut self, number: u32) -> impl Future<Output = std::io::Result<()>> + Send;
+}
+
+impl Ledger for SttLedger {
+    fn runs(&self) -> u32 {
+        SttLedger::runs(self)
+    }
+
+    fn unreadable_lines(&self) -> u64 {
+        SttLedger::unreadable_lines(self)
+    }
+
+    fn outcome(&self, key: &str) -> Option<&Outcome> {
+        SttLedger::outcome(self, key)
+    }
+
+    fn record(
+        &mut self,
+        key: &str,
+        outcome: Outcome,
+    ) -> impl Future<Output = std::io::Result<()>> + Send {
+        std::future::ready(SttLedger::record(self, key, outcome))
+    }
+
+    fn finish_run(&mut self, number: u32) -> impl Future<Output = std::io::Result<()>> + Send {
+        std::future::ready(SttLedger::finish_run(self, number))
+    }
+}
+
+/// Transcription outcomes of one meeting in a local file, and how many runs
+/// it has had.
+#[derive(Debug, Default)]
+pub struct SttLedger {
+    outcomes: HashMap<String, Outcome>,
+    runs: u32,
+    unreadable_lines: u64,
+    file: Option<std::fs::File>,
+}
+
+impl SttLedger {
+    /// A ledger that lives only in memory (tests, one-off runs).
+    pub fn in_memory() -> Self {
+        Self::default()
+    }
+
+    /// The ledger at `path`: earlier outcomes are read back, new ones are
+    /// appended. Created 0600 when missing. A line that cannot be read (a
+    /// crash in the middle of a write) is skipped and counted.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let parsed = parse_lines(&text);
+        let mut ledger = Self {
+            outcomes: parsed.outcomes,
+            runs: parsed.runs,
+            unreadable_lines: parsed.unreadable_lines,
+            file: None,
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        // A torn last line must not swallow the next one.
+        if !text.is_empty() && !text.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+        ledger.file = Some(file);
+        Ok(ledger)
+    }
+
+    fn append(&mut self, line: String) -> std::io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            let mut text = line;
+            text.push('\n');
+            // One write per line: a crash leaves at most one torn line.
+            file.write_all(text.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Runs that went through the whole transcription step. A run that
+    /// stopped on an auth error, crashed, or failed before transcribing is
+    /// not counted.
+    pub fn runs(&self) -> u32 {
+        self.runs
+    }
+
+    /// Lines that could not be read back.
+    pub fn unreadable_lines(&self) -> u64 {
+        self.unreadable_lines
+    }
+
+    /// Note that run `number` went through the whole transcription step.
+    pub fn finish_run(&mut self, number: u32) -> std::io::Result<()> {
+        self.append(run_line(number))?;
+        self.runs = self.runs.max(number);
+        Ok(())
+    }
+
+    /// What is known about the piece with `key`.
+    pub fn outcome(&self, key: &str) -> Option<&Outcome> {
+        self.outcomes.get(key)
+    }
+
+    /// Record a finished piece.
+    pub fn record(&mut self, key: &str, outcome: Outcome) -> std::io::Result<()> {
+        self.append(outcome_line(key, &outcome))?;
+        self.outcomes.insert(key.to_string(), outcome);
+        Ok(())
+    }
+}
+
+/// Outcomes, finished runs and unreadable lines of ledger text.
+#[derive(Debug, Default)]
+pub(crate) struct Parsed {
+    pub(crate) outcomes: HashMap<String, Outcome>,
+    pub(crate) runs: u32,
+    pub(crate) unreadable_lines: u64,
+}
+
+/// Read ledger text (one JSON line per event). A line that cannot be read
+/// is skipped and counted.
+pub(crate) fn parse_lines(text: &str) -> Parsed {
+    let mut parsed = Parsed::default();
+    for line in text.lines() {
+        match serde_json::from_str::<Line>(line) {
+            Ok(Line::Run { number }) => parsed.runs = parsed.runs.max(number),
+            Ok(Line::Done {
+                key,
+                text,
+                billed_seconds,
+                words,
+            }) => {
+                parsed.outcomes.insert(
+                    key,
+                    Outcome::Done {
+                        text,
+                        billed_seconds,
+                        words,
+                    },
+                );
+            }
+            Ok(Line::Rejected { key, code }) => {
+                parsed.outcomes.insert(key, Outcome::Rejected { code });
+            }
+            Err(_) => parsed.unreadable_lines += 1,
+        }
+    }
+    parsed
+}
+
+/// The ledger line of a finished piece (no newline).
+pub(crate) fn outcome_line(key: &str, outcome: &Outcome) -> String {
+    let line = match outcome {
+        Outcome::Done {
+            text,
+            billed_seconds,
+            words,
+        } => Line::Done {
+            key: key.to_string(),
+            text: text.clone(),
+            billed_seconds: *billed_seconds,
+            words: words.clone(),
+        },
+        Outcome::Rejected { code } => Line::Rejected {
+            key: key.to_string(),
+            code: code.clone(),
+        },
+    };
+    // Plain strings and numbers: serializing cannot fail.
+    serde_json::to_string(&line).unwrap_or_default()
+}
+
+/// The ledger line of a finished run (no newline).
+pub(crate) fn run_line(number: u32) -> String {
+    serde_json::to_string(&Line::Run { number }).unwrap_or_default()
+}
+
+/// Format of [`piece_key`]; part of every settings version.
+pub const LEDGER_KEY_FORMAT: &str = "huddle-minutes-ledger-key/1";
+
+/// Key of one piece (hex sha256): the settings version, who, where it was
+/// cut (the audio sent, ms on the meeting clock), and the recorded Opus
+/// frames inside that stretch with their places. It is made from what was
+/// recorded, not from decoded audio, so as long as the cut lands in the
+/// same place another CPU, decoder or resampler gives the same key. The cut
+/// itself comes from speech detection on decoded audio: if a change moves
+/// it, the key changes and that piece is sent again. Other settings give
+/// another key too.
+///
+/// The same key means the same sound sent: the audio is the decoded track
+/// between those bounds. Telling speakers apart and dropping leaked sound
+/// only move or drop bounds, so their settings are not in the key (turning
+/// them on or off re-sends only pieces whose bounds moved). Anything that
+/// changes the sound itself before transcription (noise removal, level
+/// matching, …) must put its settings into the key.
+pub fn piece_key(
+    version: &str,
+    speaker: &str,
+    start_ms: u64,
+    end_ms: u64,
+    frames: &[(u64, [u8; 16])],
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [version, speaker] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(start_ms.to_be_bytes());
+    hasher.update(end_ms.to_be_bytes());
+    hasher.update((frames.len() as u64).to_be_bytes());
+    for (t_ms, digest) in frames {
+        hasher.update(t_ms.to_be_bytes());
+        hasher.update(digest);
+    }
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FRAMES: [(u64, [u8; 16]); 2] = [(0, [1; 16]), (20, [2; 16])];
+
+    #[test]
+    fn a_reopened_ledger_remembers_runs_and_outcomes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("m.stt.jsonl");
+        let done = piece_key("v1", "aa", 0, 1_000, &FRAMES);
+        let with_words = piece_key("v1", "aa", 1_000, 2_000, &FRAMES);
+        let refused = piece_key("v1", "aa", 2_000, 3_000, &FRAMES);
+        let words = || {
+            vec![
+                Word {
+                    start_ms: 0,
+                    end_ms: 300,
+                    text: "두".into(),
+                },
+                Word {
+                    start_ms: 300,
+                    end_ms: 800,
+                    text: "말".into(),
+                },
+            ]
+        };
+        {
+            let mut ledger = SttLedger::open(&path).expect("open");
+            assert_eq!(ledger.runs(), 0);
+            ledger
+                .record(
+                    &done,
+                    Outcome::Done {
+                        text: "말".into(),
+                        billed_seconds: 1,
+                        words: None,
+                    },
+                )
+                .expect("record");
+            ledger
+                .record(
+                    &with_words,
+                    Outcome::Done {
+                        text: "두 말".into(),
+                        billed_seconds: 2,
+                        words: Some(words()),
+                    },
+                )
+                .expect("record");
+            ledger
+                .record(
+                    &refused,
+                    Outcome::Rejected {
+                        code: "HTTP 400".into(),
+                    },
+                )
+                .expect("record");
+            ledger.finish_run(1).expect("run");
+        }
+        // A torn last line from a crash is skipped, not fatal.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        file.write_all(b"{\"kind\":\"done\",\"ke").expect("write");
+        drop(file);
+
+        let mut ledger = SttLedger::open(&path).expect("reopen");
+        assert_eq!(ledger.runs(), 1);
+        assert_eq!(ledger.unreadable_lines(), 1);
+        assert_eq!(
+            ledger.outcome(&done),
+            Some(&Outcome::Done {
+                text: "말".into(),
+                billed_seconds: 1,
+                words: None,
+            })
+        );
+        assert_eq!(
+            ledger.outcome(&with_words),
+            Some(&Outcome::Done {
+                text: "두 말".into(),
+                billed_seconds: 2,
+                words: Some(words()),
+            })
+        );
+        assert!(matches!(
+            ledger.outcome(&refused),
+            Some(Outcome::Rejected { .. })
+        ));
+        ledger.finish_run(2).expect("run");
+        drop(ledger);
+        // The run after the torn line is on a line of its own.
+        let ledger = SttLedger::open(&path).expect("reopen");
+        assert_eq!(ledger.runs(), 2);
+        assert_eq!(ledger.unreadable_lines(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// A line written before word times existed reads back with no words,
+    /// and an outcome without words is written exactly as such a line.
+    #[test]
+    fn lines_without_words_stay_as_they_were() {
+        let old = r#"{"kind":"done","key":"k","text":"말","billed_seconds":1}"#;
+        let parsed = parse_lines(old);
+        assert_eq!(parsed.unreadable_lines, 0);
+        let outcome = parsed.outcomes["k"].clone();
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "말".into(),
+                billed_seconds: 1,
+                words: None,
+            }
+        );
+        assert_eq!(outcome_line("k", &outcome), old);
+    }
+
+    /// The key is made of settings, speaker, cut and recorded frames —
+    /// there is no audio input to change with a CPU or a library — and
+    /// changes when any of those change.
+    #[test]
+    fn the_key_follows_settings_cut_and_recorded_frames() {
+        let key = piece_key("v1", "aa", 0, 1_000, &FRAMES);
+        assert_eq!(key, piece_key("v1", "aa", 0, 1_000, &FRAMES));
+        // A hash: the pubkey is not readable in it.
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(key, piece_key("v2", "aa", 0, 1_000, &FRAMES));
+        assert_ne!(key, piece_key("v1", "bb", 0, 1_000, &FRAMES));
+        assert_ne!(key, piece_key("v1", "aa", 0, 1_001, &FRAMES));
+        assert_ne!(key, piece_key("v1", "aa", 0, 1_000, &FRAMES[..1]));
+        let mut other = FRAMES;
+        other[1].1[0] ^= 1;
+        assert_ne!(key, piece_key("v1", "aa", 0, 1_000, &other));
+        // Version and speaker are length-prefixed: no ambiguity.
+        assert_ne!(
+            piece_key("v1a", "a", 0, 1_000, &FRAMES),
+            piece_key("v1", "aa", 0, 1_000, &FRAMES)
+        );
+    }
+}
