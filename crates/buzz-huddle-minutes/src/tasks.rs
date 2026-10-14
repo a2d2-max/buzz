@@ -110,7 +110,8 @@ const MAX_SAID_PER_TASK: usize = 3;
 pub mod task_property {
     /// title
     pub const TITLE: &str = "기능";
-    /// status(운영 DB, 묶음 to_do·in_progress·complete). select 여도 읽고 쓴다: 실행 때 스키마
+    /// status(운영 DB 의 그룹은 To-do·In progress·Complete 차례. 코드는 그룹을 이름이 아니라 차례로
+    /// 본다: 완료 그룹은 맨 뒤 그룹). select 여도 읽고 쓴다: 실행 때 스키마
     /// 종류를 보고 필터·쓰기 꼴을 맞춘다.
     pub const STATUS: &str = "작업상태";
     /// people. 새 task 에만 쓴다(기존 task 의 담당자는 읽기만).
@@ -1054,7 +1055,7 @@ pub fn status_words(status: &str) -> &'static [&'static str] {
 /// 근거 말에 있으면 그 상태로는 제안만 하는 말(글자·숫자만, 작은 글자로 견준다). 우리 흐름은
 /// 개발 → Dev QA → Staging 배포예정 → Staging QA → Production 배포예정 → Production QA → 완료다.
 /// - 완료: 단계 말(「개발 끝났어요」·「QA 끝났어요」·「스테이징에 배포했어요」·「PR 머지했어요」는 중간
-///   단계 이야기다)과 아직 안 끝난 꼴(「끝났는지 볼게요」·「끝났으면」·「끝났을 거예요」·「완료 예정」).
+///   단계 이야기다). 아직 안 끝난 꼴은 모든 상태에 거는 [`not_yet`] 이 본다.
 /// - Dev QA: 뒤 단계 말. 「스테이징 QA 들어갔어요」의 QA 는 Dev QA 가 아니다.
 /// - 이름이 배포예정으로 끝나는 상태: QA 말. 「스테이징 QA 들어갔어요」는 Staging 배포예정이 아니다.
 pub fn status_stop_words(status: &str) -> &'static [&'static str] {
@@ -1072,12 +1073,6 @@ pub fn status_stop_words(status: &str) -> &'static [&'static str] {
             "pr",
             "머지",
             "merge",
-            "예정",
-            "할게",
-            "하겠",
-            "는지",
-            "으면",
-            "을거",
         ],
         "Dev QA" => &["스테이징", "staging", "프로덕션", "production", "운영"],
         _ if status.ends_with("배포예정") => &QA_WORDS,
@@ -1085,13 +1080,44 @@ pub fn status_stop_words(status: &str) -> &'static [&'static str] {
     }
 }
 
+/// 아직 안 한 일·묻는 말·가정하는 말인가(때·말투). 이 꼴이면 어느 상태로든 실제로 바꾸지 않는다
+/// (「스테이징 QA 예정이에요」는 지금 Staging QA 가 아니다). 이름이 배포예정으로 끝나는 상태는 「예정」이
+/// 상태 뜻 그 자체라 「예정」만 안 본다.
+/// - 「예정」, 가정 「으면」(「끝났으면」)
+/// - 약속: 요약이 담당자 수락을 볼 때 쓰는 꼴 그대로(「할게요·볼게요·하겠습니다」,
+///   [`summary::is_commitment`])
+/// - 물음 「ㄴ지」: ㄴ 받침 글자 바로 뒤 「지」(「끝났는지·예정인지·했는지」)
+/// - 앞일 「ㄹ 거」: ㄹ 받침 글자 바로 뒤 「거」(「끝났을 거·들어갈 거」)
+///
+/// 받침 없는 가정 「면」(「들어가면·되면」)은 「화면」과 갈라지지 않아 안 본다.
+fn not_yet(status: &str, statement: &str) -> bool {
+    let squashed = summary::squash(statement);
+    let chars: Vec<char> = squashed.chars().collect();
+    // 받침 번호(0xAC00 부터 28 씩): ㄴ 4, ㄹ 8.
+    let ends_then = |last: u32, next: char| {
+        chars.windows(2).any(|pair| {
+            pair[1] == next
+                && ('가'..='힣').contains(&pair[0])
+                && (u32::from(pair[0]) - 0xAC00) % 28 == last
+        })
+    };
+    (!status.ends_with("배포예정") && squashed.contains("예정"))
+        || squashed.contains("으면")
+        || summary::is_commitment(statement)
+        || ends_then(4, '지')
+        || ends_then(8, '거')
+}
+
 /// 근거 말이 그 상태를 말하나: 그 상태의 말이 있고([`status_words`], 이름이 QA 로 끝나면
-/// [`QA_WORDS`] 도) 막는 말이 없다([`status_stop_words`]).
+/// [`QA_WORDS`] 도), 아직 안 한 꼴이 아니고([`not_yet`]), 막는 말이 없다([`status_stop_words`]).
 fn says_status(status: &str, statement: &str) -> bool {
     let squashed = summary::squash(statement);
     let has = |words: &[&str]| words.iter().any(|word| squashed.contains(word));
     let qa = !status.ends_with("QA") || has(&QA_WORDS);
-    has(status_words(status)) && qa && !has(status_stop_words(status))
+    has(status_words(status))
+        && qa
+        && !not_yet(status, statement)
+        && !has(status_stop_words(status))
 }
 
 /// 상태가 앞으로 가나. 차례는 노션이 주는 그룹 차례(할 일 → 진행 중 → 완료)에 그 그룹 안 차례
@@ -2422,7 +2448,8 @@ pub(crate) mod tests {
             .map(|(name, id)| json!({ "id": id, "name": name }))
             .collect();
         // 받은 차례 그대로(option_ids 차례는 선택지 목록 차례와 다를 수 있다: 진행 중 그룹은
-        // 「개발-토의필요」로 시작하지만 선택지 목록에서는 「기획(A2D2)」가 먼저다).
+        // 「개발-토의필요」로 시작하지만 선택지 목록에서는 「기획(A2D2)」가 먼저다). 선택지·그룹 차례와
+        // 그룹 이름(To-do·In progress·Complete)은 운영 task DB 를 2026-10-13 에 읽은 그대로다.
         let group = |names: &[&str]| -> Vec<String> {
             names
                 .iter()
@@ -3712,5 +3739,41 @@ pub(crate) mod tests {
         assert!(plan.creates.is_empty());
         let task_4 = plan.maybe.iter().filter(|maybe| maybe.id == "task-4");
         assert_eq!(task_4.count(), 1);
+    }
+
+    /// 때·말투 막는 말(예정·약속·물음·앞일·가정)은 완료만이 아니라 모든 상태에 건다. 배포예정은 「예정」이
+    /// 상태 뜻 그 자체라 「예정」만 뺀다.
+    #[test]
+    fn talk_of_what_is_not_done_yet_only_suggests() {
+        assert!(!says_status("Staging QA", "스테이징 QA 예정이에요"));
+        assert!(says_status("Staging 배포예정", "스테이징 배포 예정이에요"));
+        assert!(!says_status(
+            "Staging 배포예정",
+            "스테이징 배포 예정인지 볼게요"
+        ));
+        for (status, words) in [
+            ("Dev QA", "QA 들어갈 거예요"),
+            ("Dev QA", "QA 할게요"),
+            ("Dev QA", "QA 들어갔는지 확인 부탁드려요"),
+            ("Staging QA", "스테이징 QA 들어가셨으면 좋겠어요"),
+            ("Production QA", "프로덕션 QA 하겠습니다"),
+            ("Staging 배포예정", "스테이징 배포 예정인지 확인 부탁드려요"),
+            ("Production 배포예정", "운영 배포 할게요"),
+        ] {
+            assert!(!says_status(status, words), "{status}: {words}");
+        }
+        // 이미 한 말은 그대로 바꾼다.
+        for (status, words) in [
+            ("Dev QA", "QA 들어갔어요"),
+            ("Staging QA", "스테이징 QA 시작했어요"),
+            ("Production 배포예정", "운영 배포 예정이에요"),
+        ] {
+            assert!(says_status(status, words), "{status}: {words}");
+        }
+        // 검사 전체로: 지금 Dev QA 인 task 에 「스테이징 QA 예정이에요」 → Staging QA 는 제안만.
+        let lines = [(1_000, A, "로그인 오류 수정은 스테이징 QA 예정이에요.")];
+        let answer = k2_status_answer("Staging QA");
+        let plan = check_meeting(&lines, "로그인 오류 수정 QA", 1_000, &answer, &open());
+        assert!(plan.tasks[0].status.as_ref().unwrap().suggest);
     }
 }
