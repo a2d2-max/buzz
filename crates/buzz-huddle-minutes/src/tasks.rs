@@ -1212,9 +1212,10 @@ fn similar_task<'t>(tasks: &'t [OpenTask], title: &str) -> Option<&'t OpenTask> 
 }
 
 /// task 일에 흔한 말(낱말 앞 두 글자). 확실한 짝인지 볼 때 이 말은 몇 개가 겹치든 겹침으로 안 센다.
-const COMMON_TASK_WORDS: [&str; 17] = [
+const COMMON_TASK_WORDS: [&str; 31] = [
     "수정", "개선", "화면", "기능", "오류", "추가", "작업", "확인", "처리", "관련", "문제", "변경",
-    "적용", "정리", "검토", "테스", "업데",
+    "적용", "정리", "검토", "테스", "업데", "개발", "구현", "연동", "개편", "버그", "에러", "이슈",
+    "대응", "지원", "작성", "진행", "준비", "배포", "설정",
 ];
 
 /// 확실한 짝으로 둘 만큼 task 제목과 짝 항목 글이 겹치나: 흔한 말([`COMMON_TASK_WORDS`])이 아닌
@@ -3656,6 +3657,10 @@ pub(crate) mod tests {
         assert!(!shares_task_words("결제 화면 수정", "로그인 화면 개선"));
         assert!(!shares_task_words("결제 화면 수정", "로그인 화면 수정"));
         assert!(!shares_task_words("기능 추가", "알림 기능 추가"));
+        // task DB 이름이 「AiLex 제품 내부 개발」이라 「개발」이 제일 흔하다.
+        assert!(!shares_task_words("로그인 개발", "결제 개발"));
+        assert!(!shares_task_words("결제 모듈 개발", "로그인 개발 마무리"));
+        assert!(!shares_task_words("문서 작성", "회의록 작성"));
         assert!(shares_task_words("로그인 화면 수정", "로그인할 때 에러"));
         assert!(shares_task_words(
             "로그인 오류 수정",
