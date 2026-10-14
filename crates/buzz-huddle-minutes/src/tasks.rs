@@ -791,7 +791,9 @@ pub struct Dropped {
     /// 짝 시각이 그 회의 항목의 근거 시각이 아님.
     #[serde(default)]
     pub not_item_time: u64,
-    /// 확실한 짝인데 task 제목과 짝 항목 글이 낱말 하나 안 겹쳐 애매로 내림.
+    /// 확실한 짝인데 task 제목과 짝 항목 글이 안 겹쳐(흔한 말 하나뿐도) 애매로 내림. 버린 것이 아니라
+    /// 애매한 짝 수에 이미 들어 있어서 [`total`](Self::total)·「버린 것」 줄에는 안 넣고, 로그 줄에
+    /// `| made maybe N` 으로 따로 보인다.
     #[serde(default)]
     pub made_maybe: u64,
     /// 근거 시각이 원본 스크립트 줄에 없음.
@@ -826,7 +828,6 @@ impl Dropped {
         self.unknown_task
             + self.unknown_item
             + self.not_item_time
-            + self.made_maybe
             + self.no_line
             + self.bad_level
             + self.no_sure_link
@@ -849,7 +850,6 @@ impl fmt::Display for Dropped {
             ("unknown task", self.unknown_task),
             ("unknown item", self.unknown_item),
             ("not the item's time", self.not_item_time),
-            ("sure made maybe (no shared words)", self.made_maybe),
             ("no script line", self.no_line),
             ("bad level", self.bad_level),
             ("no sure link", self.no_sure_link),
@@ -1211,6 +1211,26 @@ fn similar_task<'t>(tasks: &'t [OpenTask], title: &str) -> Option<&'t OpenTask> 
         .map(|(_, task)| task)
 }
 
+/// task 일에 흔한 말(낱말 앞 두 글자). 확실한 짝인지 볼 때 이것 하나만 겹쳐서는 겹침으로 안 친다.
+const COMMON_TASK_WORDS: [&str; 17] = [
+    "수정", "개선", "화면", "기능", "오류", "추가", "작업", "확인", "처리", "관련", "문제", "변경",
+    "적용", "정리", "검토", "테스", "업데",
+];
+
+/// 확실한 짝으로 둘 만큼 task 제목과 짝 항목 글이 겹치나: 낱말(앞 두 글자, 끝말이 붙어도 같다)이
+/// 하나라도 겹치되, 겹친 것이 흔한 말([`COMMON_TASK_WORDS`]) 하나뿐이면 안 친다(「결제 화면 수정」 ↔
+/// 「로그인 화면 개선」은 「화면」뿐이라 애매로 내린다).
+fn shares_task_words(title: &str, item: &str) -> bool {
+    let theirs: BTreeSet<String> = summary::word_keys(title).into_iter().collect();
+    let ours: BTreeSet<String> = summary::word_keys(item).into_iter().collect();
+    let shared: Vec<&String> = theirs.intersection(&ours).collect();
+    match shared[..] {
+        [] => false,
+        [only] => !COMMON_TASK_WORDS.contains(&only.as_str()),
+        _ => true,
+    }
+}
+
 /// 같은 task 로 모인 짝들.
 struct Group {
     task: usize,
@@ -1265,12 +1285,7 @@ pub fn check_answer(answer: &str, input: &CheckInput<'_>) -> Result<Plan, Summar
         };
         // 확실한 짝이라도 task 제목과 짝 항목 글이 낱말 하나 안 겹치면 애매로 내린다(엉뚱한 task 에
         // 기록이 붙지 않게). 낱말은 앞 두 글자로 맞대서 끝말이 붙어도 겹친다.
-        if sure
-            && !summary::shares_words(
-                &summary::word_keys(&input.tasks[task].title),
-                item_text(summary, item),
-            )
-        {
+        if sure && !shares_task_words(&input.tasks[task].title, item_text(summary, item)) {
             sure = false;
             dropped.made_maybe += 1;
         }
@@ -1815,6 +1830,7 @@ impl fmt::Display for TasksReport {
         )?;
         for (name, n) in [
             ("suggested", self.suggested),
+            ("made maybe", self.dropped.made_maybe as usize),
             ("changed meanwhile", self.changed_meanwhile),
             ("already there", self.already_there),
             ("task gone", self.gone),
@@ -3627,6 +3643,38 @@ pub(crate) mod tests {
         assert_eq!(maybe, ["task-1"]);
         assert_eq!(plan.dropped.made_maybe, 1);
         assert_eq!(writes(&plan, TasksMode::Update), [Write::Maybe]);
+        // 내린 짝은 애매한 짝 수에만 든다(버린 수에 두 번 세지 않는다). 로그 줄에 따로 보인다.
+        let mut report = TasksReport::default();
+        report.plan(&plan);
+        assert_eq!((report.maybe, report.skipped), (1, 0));
+        assert!(report.to_string().contains("| made maybe 1"), "{report}");
+        assert!(!plan.dropped.to_string().contains("maybe"));
+    }
+
+    /// 흔한 말 하나만 겹치면(「결제 화면 수정」 ↔ 「로그인 화면 개선」의 「화면」) 확실한 짝으로 안 본다.
+    #[test]
+    fn one_common_word_is_not_enough_for_a_sure_link() {
+        assert!(!shares_task_words("결제 화면 수정", "로그인 화면 개선"));
+        assert!(shares_task_words(
+            "로그인 오류 수정",
+            "로그인할 때 에러 고치기"
+        ));
+        // 둘 이상 겹치면(흔한 말이어도) 겹침으로 친다.
+        assert!(shares_task_words("결제 화면 오류", "로그인 화면 오류"));
+        let mut tasks = open();
+        tasks[0].title = "결제 화면 수정".into();
+        let answer = json!({
+            "links": [link_d1("K1", 1_000)],
+            "due_changes": [], "status_changes": [], "new_tasks": []
+        });
+        let lines = [(1_000, A, "로그인 화면 개선은 다음 주에 봐요.")];
+        let plan = check_meeting(&lines, "로그인 화면 개선", 1_000, &answer, &tasks);
+        assert!(plan.tasks.is_empty());
+        assert_eq!(plan.dropped.made_maybe, 1);
+        // 흔하지 않은 말(「로그」)이 겹치면 확실로 남는다.
+        tasks[0].title = "로그인 화면 수정".into();
+        let plan = check_meeting(&lines, "로그인 화면 개선", 1_000, &answer, &tasks);
+        assert_eq!(plan.tasks.len(), 1);
     }
 
     /// 휴지통에 든 task 는 진행 중 task 로 읽지 않는다.
