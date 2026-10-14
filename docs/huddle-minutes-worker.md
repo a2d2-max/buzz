@@ -376,7 +376,8 @@ rm {out}/{첫 세션 id}.summary-failed.json
   `reading the task data source`·`checking the task db columns`·`reading open tasks`·`reading a task before changing it`·
   `changing a task's due date`·`changing a task's status`·`reading a task page`·`appending a record to a task`·
   `looking for a task this meeting made`·`creating a task`·`checking the task db after a task was not found`·
-  `reading the minutes page`·`adding the maybe links to the minutes page` 열네 가지 중 하나다. 통합에 task DB 를 연결해 둔 뒤에도 403 이 나면 권한이 아니라 그 요청 쪽 까닭(그 페이지만의 제한
+  `reading the minutes page`·`adding the maybe links to the minutes page`·
+  `checking the minutes db after the minutes page was not found` 열다섯 가지 중 하나다. 통합에 task DB 를 연결해 둔 뒤에도 403 이 나면 권한이 아니라 그 요청 쪽 까닭(그 페이지만의 제한
   등)으로 본다. 노션의 404 `object_not_found` 는 「없음」과 「통합에 공유 안 됨」 둘 다다(노션 문서). task 페이지 쓰기의
   400·404 는 위 "쓰기"처럼 그 task 만 건너뛴다: 지워졌거나 통합이 못 보는 곳으로 옮겨진 task 는 다시 해도 안 되고, 실패로
   치면 같은 404 를 실행마다 되풀이하며 그 회의의 다른 task 쓰기까지 막는다. 통합 연결이 통째로 끊긴 것과는 이렇게 가른다
@@ -384,7 +385,8 @@ rm {out}/{첫 세션 id}.summary-failed.json
   - 실행 처음: 쓰기보다 먼저 하는 실행마다의 task DB 칸 읽기가 404 로 실패해서 단계 실패로 남고 다음 실행에 다시 한다.
   - 한 실행 도중(칸을 읽은 뒤): task 쪽 쓰기(칸 바꾸기·기록·이 회의가 만든 task 찾기·만들기)가 404 면 task DB data source
     를 한 번 더 읽는다. 그것도 못 읽으면 `checking the task db after a task was not found` 로 단계 실패, 읽히면 그 task 만
-    지워진 것이다(`task gone`).
+    지워진 것이다(`task gone`). 회의록 페이지의 「관련 있을 수 있는 task」 절 쓰기가 404 면 같은 방식으로 회의록 data
+    source 를 한 번 더 읽는다(`checking the minutes db after the minutes page was not found`).
 - **오래된 회의**: 회의가 끝난 지 24시간 넘었으면 task 연결을 안 한다(읽지도 묻지도 쓰지도 않고 남은 일로도 안 친다).
   칸을 바꾸고 기록을 못 붙인 task 의 기록만은 예외다(위 "쓰기"). 스위치를 처음 켰을 때 녹음이 남은 지난 14일 회의들이
   지금 task 의 기한·상태를 덮어쓰지 않게 하려는 것이다. 그래서 켜기 **24시간보다 전에** 끝난 회의는 잇지 않는다. 켜기 전
@@ -982,8 +984,9 @@ DER 은 여유 구간 없이(collar 0), 회의실 트랙에서 잰다. 놓침·�
   - 실제 노션에서 `관련 노션 페이지`(url)의 `contains` 찾기와 `작업상태`(status)의 `does_not_equal` 필터가 가짜 노션과
     같이 도는지는 아직 확인하지 않았다(가짜 노션으로만 시험. 운영 첫 `append` 실행으로 본다).
   - 켜기 24시간보다 전에 끝난 회의는 잇지 않는다. 지난 회의를 잇고 싶으면 따로 정해야 한다.
-  - 회의록 페이지 404(「관련 있을 수 있는 task」 절)는 다시 읽기 없이 같은 `task gone` 칸에 센다. task DB 쪽 404(이 회의가
-    만든 task 찾기·만들기)도 data source 가 읽히면 `task gone` 으로 센다.
+  - 회의록 페이지 404(「관련 있을 수 있는 task」 절)도 회의록 data source 가 읽히면 같은 `task gone` 칸에 센다(이름은 task
+    지만 회의록 페이지 몫도 센다). task DB 쪽 404(이 회의가 만든 task 찾기·만들기)도 data source 가 읽히면 `task gone` 으로
+    센다.
   - `운영 QA` 처럼 「운영」 뒤에 「배포」가 없는 말은 Production 말로 안 친다(Production 말은 프로덕션·production·운영 배포).
     그때는 제안만이다.
   - 휴지통에 든 task 는 계획 때 읽기와 칸 바꾸기 직전 읽기에서 `in_trash` 로 알아보고 건너뛴다. 계획 뒤에 휴지통에 든

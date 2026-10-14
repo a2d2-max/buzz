@@ -1631,7 +1631,9 @@ mod tests {
     use crate::notion::tests::{
         fake_notion, minutes_pages, plan_for, plan_in, settings_for as notion_settings, FakeNotion,
     };
-    use crate::notion::{minutes_property, people_property, NotionSettings};
+    use crate::notion::{
+        minutes_property, people_property, NotionSettings, MINUTES_DATA_SOURCE_ID,
+    };
     use crate::pipeline::{MinutesSettings, SttPolicy};
     use crate::profiles::tests::{profile_event, source_for as profile_source};
     use crate::profiles::NamesTrouble;
@@ -5163,6 +5165,53 @@ mod tests {
             "2026-10-16"
         );
         assert_eq!((link.records("task-1"), link.records("task-2")), (1, 1));
+    }
+
+    /// 회의록 절을 붙일 회의록 페이지가 404 면 회의록 data source 를 한 번 더 읽는다. 그것도 못 읽으면
+    /// (통합이 회의록 DB 를 못 봄) gone 으로 굳히지 않고 단계 실패로 두어 다음에 다시 하고, 읽히면 그
+    /// 페이지만 지워진 것으로 보고 건너뛴다.
+    #[tokio::test]
+    async fn a_minutes_db_out_of_sight_is_tried_again_not_skipped() {
+        let link = linking().await;
+        link.world.state.lock().unwrap().failing_paths = vec!["pages/task-1".into()];
+        let first = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(&first.tasks, "while changing a task's due date"),
+            "{first:?}"
+        );
+        // 회의록 페이지가 사라졌고, 회의록 data source 도 못 읽는다(가짜 노션은 처음부터 안 둔다).
+        let minutes = link.minutes_id();
+        {
+            let mut state = link.world.state.lock().unwrap();
+            state.failing_paths.clear();
+            state.pages.retain(|page| page.id != minutes);
+            assert!(!state.data_sources.contains_key(MINUTES_DATA_SOURCE_ID));
+        }
+        link.world.advance(FIRST_BACKOFF);
+        let second = link.follow(TasksMode::Update).await;
+        assert!(
+            failed_with(
+                &second.tasks,
+                "while checking the minutes db after the minutes page was not found"
+            ),
+            "{second:?}"
+        );
+        let ledger = link.ledger();
+        assert!(!ledger.finished);
+        assert_eq!(ledger.outcome(tasks::Write::Maybe), None);
+        // 회의록 DB 는 보이고 페이지만 지워졌으면 그 절만 건너뛰고 끝낸다.
+        link.world.state.lock().unwrap().data_sources.insert(
+            MINUTES_DATA_SOURCE_ID.into(),
+            json!({ "object": "data_source", "id": MINUTES_DATA_SOURCE_ID, "properties": {} }),
+        );
+        link.world.advance(MAX_BACKOFF);
+        let third = link.follow(TasksMode::Update).await;
+        assert_eq!(third.tasks, Step::Done, "{third:?}");
+        assert_eq!(third.tasks_made.unwrap().gone, 1);
+        assert_eq!(
+            link.ledger().outcome(tasks::Write::Maybe),
+            Some(Outcome::Gone)
+        );
     }
 
     /// 노션의 404 는 「없음」과 「통합이 못 봄」 둘 다다. task 하나가 404 면 지워진 것으로 보고 그 task

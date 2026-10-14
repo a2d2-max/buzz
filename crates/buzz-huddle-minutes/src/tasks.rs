@@ -1983,9 +1983,9 @@ fn settle(doing: &'static str) -> impl FnOnce(NotionError) -> Result<Outcome, Ta
 /// 바로 앞에서 지금 값을 다시 읽어, 계획 뒤에 사람이 바꿨으면 덮어쓰지 않는다. `link_template` 은
 /// 근거 시각의 재생 링크 모양.
 ///
-/// task 쪽 쓰기가 404(task gone)면 task DB data source 를 한 번 더 읽는다. 노션의 404 는 「없음」과
-/// 「통합이 못 봄」 둘 다라서, data source 도 못 읽으면(통합 연결이 끊김) gone 으로 굳히지 않고 실패로
-/// 돌려준다(다음 실행에 다시).
+/// 쓰기가 404(gone)면 그 페이지가 든 data source(task 쪽은 task DB, 회의록 절은 회의록 DB)를 한 번 더
+/// 읽는다. 노션의 404 는 「없음」과 「통합이 못 봄」 둘 다라서, data source 도 못 읽으면(통합 연결이
+/// 끊김) gone 으로 굳히지 않고 실패로 돌려준다(다음 실행에 다시).
 pub async fn apply(
     client: &mut NotionClient<'_>,
     ledger: &mut TasksLedger,
@@ -1995,11 +1995,22 @@ pub async fn apply(
     report: &mut TasksReport,
 ) -> Result<Outcome, TaskDbError> {
     let outcome = write_one(client, ledger, schema, write, link_template, report).await?;
-    if outcome == Outcome::Gone && write != Write::Maybe {
+    if outcome == Outcome::Gone {
+        // 그 페이지가 든 data source(회의록 절이면 회의록 DB)를 한 번 더 읽어 「없음」과 「못 봄」을 가른다.
+        let (source, doing) = match write {
+            Write::Maybe => (
+                client.settings().minutes_data_source_id.clone(),
+                "checking the minutes db after the minutes page was not found",
+            ),
+            _ => (
+                schema.data_source_id.clone(),
+                "checking the task db after a task was not found",
+            ),
+        };
         client
-            .get(&format!("/v1/data_sources/{}", schema.data_source_id))
+            .get(&format!("/v1/data_sources/{source}"))
             .await
-            .map_err(at("checking the task db after a task was not found"))?;
+            .map_err(at(doing))?;
     }
     count(report, write, outcome);
     Ok(outcome)
