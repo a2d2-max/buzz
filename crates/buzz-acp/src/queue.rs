@@ -1580,6 +1580,16 @@ fn append_project_home(s: &mut String, channel_info: Option<&PromptChannelInfo>,
     ));
 }
 
+/// Append a `Session author: …` field when the scope is bound to one person
+/// (`author` session policy). The value is the triggering event's author pubkey
+/// as lowercase hex, produced by the harness from the signed event — it is not
+/// untrusted text and needs no escaping.
+fn append_session_author(s: &mut String, scope: &SessionScope) {
+    if let Some(author) = scope.author() {
+        s.push_str(&format!("\nSession author: {author}"));
+    }
+}
+
 /// Format a `<context>` section from the resolved session scope and turn routing.
 ///
 /// `reply_anchor` is the pre-resolved `--reply-to` target for this turn (see
@@ -1635,9 +1645,10 @@ fn format_context_hints(
         let mut s = format!(
             "Scope: dm\n\
              Session scope: dm conversation\n\
-             Channel: {channel_display}\n\
-             {ctx_hint}"
+             Channel: {channel_display}"
         );
+        append_session_author(&mut s, scope);
+        s.push_str(&format!("\n{ctx_hint}"));
         // If this is a DM reply, include thread structural info as supplementary.
         if let Some(ref root) = thread_tags.root_event_id {
             s.push_str(&format!("\nThread root: {root}"));
@@ -1674,6 +1685,7 @@ fn format_context_hints(
              Session scope: {session_scope}\n\
              Channel: {channel_display}"
         );
+        append_session_author(&mut s, scope);
         append_channel_description(&mut s, channel_info);
         append_project_home(&mut s, channel_info, channel_id);
         s.push_str(&format!("\nThread root: {root}"));
@@ -3982,7 +3994,11 @@ mod tests {
                 "reply".into(),
             ]],
         );
-        for policy in [SessionPolicy::Channel, SessionPolicy::Thread] {
+        for policy in [
+            SessionPolicy::Channel,
+            SessionPolicy::Thread,
+            SessionPolicy::Author,
+        ] {
             for is_dm in [false, true] {
                 for (event, is_reply) in [(&top, false), (&reply, true)] {
                     let batch = FlushBatch {
@@ -4018,7 +4034,7 @@ mod tests {
                         if is_dm {
                             assert!(prompt.contains("Session scope: dm conversation"));
                             assert!(prompt.contains("Scope: dm"));
-                        } else if policy == SessionPolicy::Thread {
+                        } else if policy != SessionPolicy::Channel {
                             assert!(prompt.contains("Session scope: thread"));
                             assert!(prompt.contains("Scope: thread"));
                             assert!(prompt.contains(&format!("Thread root: {root}")));
@@ -4031,6 +4047,16 @@ mod tests {
                             } else {
                                 "Scope: channel"
                             }));
+                        }
+                        // Only the author policy binds the session to a person,
+                        // and then the bound pubkey is the event author's.
+                        assert_eq!(
+                            prompt.contains("Session author: "),
+                            policy == SessionPolicy::Author
+                        );
+                        if policy == SessionPolicy::Author {
+                            assert!(prompt
+                                .contains(&format!("Session author: {}", event.pubkey.to_hex())));
                         }
                         assert_eq!(
                             prompt.contains("This is a new top-level message"),

@@ -377,7 +377,11 @@ pub struct CliArgs {
     /// How ACP provider sessions are scoped in channels.
     /// channel (default): one provider session per channel (legacy behavior).
     /// thread: each canonical channel thread gets an isolated provider session;
-    /// direct messages stay conversation-scoped either way. Ships as `channel`
+    /// direct messages stay conversation-scoped either way.
+    /// author: like thread, but the session also belongs to one person — every
+    /// (thread, author pubkey) pair in a channel and every (conversation, author)
+    /// pair in a DM gets its own session, so two people in one thread or one
+    /// group DM no longer share a session. Ships as `channel`
     /// so thread scoping can be canaried and rolled back without code changes.
     #[arg(
         long,
@@ -415,6 +419,15 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MAX_TURNS_PER_SESSION", default_value_t = 0,
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
+
+    /// Maximum cached provider sessions per worker. When a turn needs a new
+    /// session and the worker already caches this many, the least recently
+    /// used idle session is dropped first, so that scope's next turn starts
+    /// from a fresh session. Keeps thread/author scoping from growing the
+    /// session map without bound. 0 = unlimited (legacy behavior).
+    #[arg(long, env = "BUZZ_ACP_MAX_SESSIONS_PER_AGENT", default_value_t = 0,
+          value_parser = clap::value_parser!(u32))]
+    pub max_sessions_per_agent: u32,
 
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
@@ -595,6 +608,9 @@ pub struct Config {
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Maximum cached sessions per worker; LRU idle sessions are dropped beyond
+    /// it. 0 = unlimited.
+    pub max_sessions_per_agent: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -1208,6 +1224,7 @@ impl Config {
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
+            max_sessions_per_agent: args.max_sessions_per_agent,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1252,7 +1269,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} claim={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} claim={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} max_sessions_per_agent={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1270,6 +1287,7 @@ impl Config {
             self.ignore_self,
             self.context_message_limit,
             self.max_turns_per_session,
+            self.max_sessions_per_agent,
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
@@ -1589,6 +1607,7 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_sessions_per_agent: 0,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,
@@ -2731,6 +2750,31 @@ channels = "ALL"
             "thread",
         ]);
         assert_eq!(args.session_policy, crate::scope::SessionPolicy::Thread);
+    }
+
+    #[test]
+    fn test_session_policy_author_flag_parses() {
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &"0".repeat(64),
+            "--session-policy=author",
+        ]);
+        assert_eq!(args.session_policy, crate::scope::SessionPolicy::Author);
+        assert_eq!(args.session_policy.to_string(), "author");
+    }
+
+    #[test]
+    fn test_max_sessions_per_agent_defaults_to_unlimited_and_parses() {
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &"0".repeat(64)]);
+        assert_eq!(args.max_sessions_per_agent, 0);
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &"0".repeat(64),
+            "--max-sessions-per-agent=12",
+        ]);
+        assert_eq!(args.max_sessions_per_agent, 12);
     }
 
     #[test]
