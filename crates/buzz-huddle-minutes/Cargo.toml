@@ -1,0 +1,44 @@
+[package]
+name = "buzz-huddle-minutes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Huddle minutes worker: rebuilds per-speaker audio from huddle recordings, cuts speech segments, splits shared (room) tracks by speaker, transcribes them and writes huddle-transcript/2"
+
+[[bin]]
+name = "buzz-huddle-minutes"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+# kind 번호(NIP-29 채널 메타데이터 등)를 저장소 한 곳에서 가져온다.
+buzz-core = { workspace = true }
+buzz-gcp = { workspace = true }
+buzz-huddle-recording = { workspace = true }
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+futures-util = { workspace = true }
+hex = { workspace = true }
+nostr = { workspace = true }
+opus = "0.3"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sherpa-onnx = "1.13.4"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+# 프로필 이름 NFC 맞추기(Cargo.lock 에 이미 있는 판).
+unicode-normalization = "0.1"
+uuid = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+# 릴레이가 /query 에서 부르는 NIP-98 검사 함수로 우리 헤더를 시험한다.
+buzz-auth = { workspace = true }
+buzz-gcp = { workspace = true, features = ["fake"] }
+tempfile = "3"

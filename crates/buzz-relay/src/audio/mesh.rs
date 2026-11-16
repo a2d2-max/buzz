@@ -248,6 +248,14 @@ impl MeshAudioRouter {
         prefixed.extend_from_slice(rest);
         let prefixed = prefixed.freeze();
 
+        // Huddle recording: on the owner pod this datagram is a remote
+        // participant's own frame (non-owner → owner), which never passes
+        // `broadcast_frame`, so it is recorded here. On a mirror pod (owner
+        // elsewhere) it is the owner's fan-out of audio the owner already
+        // recorded; recording it again would store the same sound twice.
+        if dgram.fenced.owner_runtime_id == self.local_runtime_id {
+            room.record_mesh_ingress(author_index, rest);
+        }
         room.deliver_prefixed(author_index, prefixed);
         verdict
     }

@@ -1,0 +1,65 @@
+# 회의록 작업기 이미지를 만들고 확인한 뒤 Artifact Registry 에 올린다.
+# 배포는 하지 않는다. build-image.sh 가 깨끗한 소스와 함께 이 파일을 넘긴다.
+# 셸 변수는 Cloud Build 치환과 겹치지 않게 $$ 로 쓴다.
+#   _IMAGE       asia-northeast3-docker.pkg.dev/a2d2-lab/services/a2d2-huddle-minutes
+#   _TAG         빌드한 커밋(짧은 해시)
+#   _SOURCE_SHA  빌드한 커밋(전체 해시)
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    env: ["DOCKER_BUILDKIT=1"]
+    args:
+      - build
+      - --file=deploy/a2d2/huddle-minutes/Dockerfile
+      - --tag=${_IMAGE}:${_TAG}
+      - --build-arg=BUZZ_SOURCE_SHA=${_SOURCE_SHA}
+      - .
+
+  # 받은 이미지에서 실행 파일이 돈다.
+  - id: smoke-help
+    name: gcr.io/cloud-builders/docker
+    args: ["run", "--rm", "${_IMAGE}:${_TAG}", "--help"]
+
+  # 빠진 공유 라이브러리가 없고, sherpa-onnx·onnxruntime 은 정적 링크다.
+  - id: smoke-libraries
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        docker run --rm --entrypoint ldd ${_IMAGE}:${_TAG} /usr/local/bin/buzz-huddle-minutes | tee /workspace/ldd.txt
+        if grep -q 'not found' /workspace/ldd.txt; then echo 'missing shared library'; exit 1; fi
+        if grep -Eiq 'sherpa|onnxruntime' /workspace/ldd.txt; then echo 'sherpa-onnx is not static'; exit 1; fi
+        grep -q 'libopus' /workspace/ldd.txt
+
+  # 모델 셋이 제자리에 models.rs 의 sha256 으로 있고, 실행 사용자는 root 가 아니다.
+  # 네트워크를 끄고 fetch-models 를 돌린다: 다 맞으면 아무것도 안 받고 끝나고,
+  # 하나라도 없거나 다르면 받으려다 실패한다.
+  - id: smoke-model-and-user
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        docker run --rm --network none ${_IMAGE}:${_TAG} fetch-models --cache /opt/huddle-minutes/cache
+        docker run --rm --entrypoint ls ${_IMAGE}:${_TAG} -l /opt/huddle-minutes/cache/models
+        uid="$$(docker run --rm --entrypoint id ${_IMAGE}:${_TAG} -u)"
+        echo "uid=$$uid"
+        test "$$uid" != 0
+        docker run --rm ${_IMAGE}:${_TAG} process --help >/dev/null
+
+images:
+  - ${_IMAGE}:${_TAG}
+
+substitutions:
+  _IMAGE: asia-northeast3-docker.pkg.dev/a2d2-lab/services/a2d2-huddle-minutes
+  _TAG: ""
+  _SOURCE_SHA: ""
+
+options:
+  machineType: E2_HIGHCPU_32
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 3600s

@@ -87,6 +87,12 @@ run_unit_tests() {
   run_test_step "buzz-voice tests" \
     cargo test -p buzz-voice --lib -- --nocapture
 
+  run_test_step "buzz-huddle-minutes tests" \
+    cargo test -p buzz-huddle-minutes -- --nocapture
+
+  run_test_step "buzz-gcp tests" \
+    cargo test -p buzz-gcp -- --nocapture
+
   run_test_step "buzz-cli tests" \
     cargo test -p buzz-cli -- --nocapture
 

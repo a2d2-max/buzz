@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
+use super::recorder::{HuddleRecorder, RoomRecorder};
+
 /// A connected audio peer.
 pub struct AudioPeer {
     /// Nostr pubkey hex.
@@ -229,11 +231,23 @@ pub struct Room {
     /// Ordered authoritative roster mutations. Lag is recoverable from
     /// [`Self::roster_snapshot`], so the owner never blocks admission.
     roster_tx: broadcast::Sender<RosterDelta>,
+    /// Huddle recorder handle; `None` when recording is off. Fed only by
+    /// owner-assigned admissions, their removals, and owner-side fan-out, so a
+    /// mesh mirror never opens a recording session.
+    recorder: Option<RoomRecorder>,
 }
 
 impl Room {
     /// Create an empty room for the given community-local channel.
     pub fn new(community_id: CommunityId, channel_id: Uuid) -> Self {
+        Self::with_recorder(community_id, channel_id, None)
+    }
+
+    pub(crate) fn with_recorder(
+        community_id: CommunityId,
+        channel_id: Uuid,
+        recorder: Option<RoomRecorder>,
+    ) -> Self {
         let (roster_tx, _) = broadcast::channel(64);
         Self {
             community_id,
@@ -241,7 +255,14 @@ impl Room {
             peers: DashMap::new(),
             guard: std::sync::Mutex::new(AdmissionGuard::new()),
             roster_tx,
+            recorder,
         }
+    }
+
+    /// True when this room feeds the huddle recorder.
+    #[cfg(test)]
+    pub(crate) fn is_recording(&self) -> bool {
+        self.recorder.is_some()
     }
 
     /// Mark the room as ended. After this returns, no new `add_peer` can
@@ -325,6 +346,11 @@ impl Room {
                 protocol_version: requested_version,
             },
         );
+        // Owner-assigned admission: the only kind that opens or extends a
+        // recording session (mirror admissions use `add_peer_at_index`).
+        if let Some(recorder) = &self.recorder {
+            recorder.joined(peer_index, epoch, &pubkey, requested_version);
+        }
         g.roster_revision = g.roster_revision.wrapping_add(1);
         let revision = g.roster_revision;
         let delta = RosterDelta {
@@ -409,6 +435,9 @@ impl Room {
             return None;
         };
         let (_, peer) = self.peers.remove(&peer_id)?;
+        if let Some(recorder) = &self.recorder {
+            recorder.left(peer.peer_index, peer.epoch);
+        }
         g.active_indices.remove(&peer.peer_index);
         g.roster_revision = g.roster_revision.wrapping_add(1);
         let delta = RosterDelta {
@@ -434,6 +463,9 @@ impl Room {
         let mut g = self.guard.lock().ok()?;
         let (_, peer) = self.peers.remove(&peer_id)?;
         let peer_index = peer.peer_index;
+        if let Some(recorder) = &self.recorder {
+            recorder.left(peer_index, peer.epoch);
+        }
         g.active_indices.remove(&peer_index);
         g.roster_revision = g.roster_revision.wrapping_add(1);
         let delta = RosterDelta {
@@ -468,6 +500,10 @@ impl Room {
             Some(p) => (p.peer_index, p.epoch, p.protocol_version),
             None => return,
         };
+        if let Some(recorder) = &self.recorder {
+            // Bounded enqueue only; never waits on the recorder.
+            recorder.frame(sender_index, sender_epoch, frame.clone());
+        }
 
         let prefix_len = if protocol_version >= 3 { 2 } else { 1 };
         let mut prefixed = bytes::BytesMut::with_capacity(prefix_len + frame.len());
@@ -501,6 +537,48 @@ impl Room {
                 continue;
             }
             let _ = entry.audio_tx.try_send(prefixed.clone());
+        }
+    }
+
+    /// Record a remote participant's frame that reached this pod *as the
+    /// huddle owner* over the mesh. `after_index` is the datagram payload
+    /// after its leading `peer_index`: `[epoch][client frame]` for protocol
+    /// v3, the bare client frame for v1/v2. This is the cross-pod twin of the
+    /// recording in [`Self::broadcast_frame`]; the owner's fan-out of these
+    /// frames goes through [`Self::deliver_prefixed`], which itself never
+    /// records because a mirror pod uses it too.
+    pub fn record_mesh_ingress(&self, author_index: u8, after_index: &[u8]) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        let Some((room_epoch, protocol_version)) = self
+            .peers
+            .iter()
+            .find(|peer| peer.peer_index == author_index)
+            .map(|peer| (peer.epoch, peer.protocol_version))
+        else {
+            return;
+        };
+        let (epoch, client_frame) = if protocol_version >= 3 {
+            match after_index.split_first() {
+                Some((&epoch, client_frame)) => (epoch, client_frame),
+                None => return,
+            }
+        } else {
+            (room_epoch, after_index)
+        };
+        recorder.frame(author_index, epoch, Bytes::copy_from_slice(client_frame));
+    }
+
+    /// Hand the recorder the parent channel the join path verified
+    /// (`lifecycle_parent_id`). For a non-ephemeral channel that id is the
+    /// channel itself, which is not a parent and is not recorded.
+    pub fn note_parent_channel(&self, lifecycle_parent_id: Uuid) {
+        if lifecycle_parent_id == self.channel_id {
+            return;
+        }
+        if let Some(recorder) = &self.recorder {
+            recorder.parent_channel(lifecycle_parent_id);
         }
     }
 
@@ -573,6 +651,9 @@ impl Room {
 /// Global registry of active audio rooms.
 pub struct AudioRoomManager {
     rooms: DashMap<(CommunityId, Uuid), Arc<Room>>,
+    /// Huddle recorder, installed once at startup only when recording is on.
+    /// Empty means rooms are built without a recorder handle.
+    recorder: std::sync::OnceLock<Arc<HuddleRecorder>>,
 }
 
 impl AudioRoomManager {
@@ -580,7 +661,23 @@ impl AudioRoomManager {
     pub fn new() -> Self {
         Self {
             rooms: DashMap::new(),
+            recorder: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the huddle recorder. Rooms created afterwards record; call it
+    /// before serving traffic. Fails (returning the recorder) if one is
+    /// already installed.
+    pub fn install_recorder(
+        &self,
+        recorder: Arc<HuddleRecorder>,
+    ) -> Result<(), Arc<HuddleRecorder>> {
+        self.recorder.set(recorder)
+    }
+
+    /// The installed huddle recorder, if recording is on.
+    pub fn recorder(&self) -> Option<&Arc<HuddleRecorder>> {
+        self.recorder.get()
     }
 
     /// Get an existing room or create a new one.
@@ -591,7 +688,13 @@ impl AudioRoomManager {
     pub fn get_or_create(&self, community_id: CommunityId, channel_id: Uuid) -> Arc<Room> {
         self.rooms
             .entry((community_id, channel_id))
-            .or_insert_with(|| Arc::new(Room::new(community_id, channel_id)))
+            .or_insert_with(|| {
+                let recorder = self
+                    .recorder
+                    .get()
+                    .map(|recorder| recorder.attach(community_id, channel_id));
+                Arc::new(Room::with_recorder(community_id, channel_id, recorder))
+            })
             .clone()
     }
 

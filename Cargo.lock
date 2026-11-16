@@ -471,6 +471,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "audiopus_sys"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62314a1546a2064e033665d658e88c620a62904be945f8147e6b16c3db9f8651"
+dependencies = [
+ "cmake",
+ "log",
+ "pkg-config",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1185,6 +1196,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-gcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "buzz-gcp",
+ "bytes",
+ "chrono",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-huddle-minutes"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "buzz-auth",
+ "buzz-core",
+ "buzz-gcp",
+ "buzz-huddle-recording",
+ "chrono",
+ "clap",
+ "fs2",
+ "futures-util",
+ "hex",
+ "nostr 0.44.7",
+ "opus",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sherpa-onnx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "unicode-normalization",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-huddle-recording"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-media"
 version = "0.1.0"
 dependencies = [
@@ -1329,6 +1398,7 @@ dependencies = [
  "buzz-datastore-tracing",
  "buzz-db",
  "buzz-deletion",
+ "buzz-huddle-recording",
  "buzz-media",
  "buzz-pubsub",
  "buzz-relay-mesh",
@@ -1452,6 +1522,7 @@ dependencies = [
  "futures-util",
  "hex",
  "nostr 0.44.7",
+ "opus",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "rust-s3",
@@ -6565,6 +6636,15 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "opus"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d3809943dff6fbad5f0484449ea26bdb9cb7d8efdf26ed50d3c7f227f69eb5c"
+dependencies = [
+ "audiopus_sys",
+]
 
 [[package]]
 name = "ordered-float"
