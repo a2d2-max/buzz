@@ -3150,6 +3150,7 @@ async fn tokio_main() -> Result<()> {
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
+        max_sessions_per_agent: config.max_sessions_per_agent,
         permission_mode: config.permission_mode,
         agent_keys: config.keys.clone(),
         agent_owner_pubkey: startup_owner
@@ -3754,7 +3755,7 @@ async fn tokio_main() -> Result<()> {
                                             .await,
                                         &buzz_event.event,
                                     );
-                                    let fired = signal_in_flight_task_for_scope(
+                                    let fired = signal_in_flight_tasks_for_surface(
                                         &mut pool,
                                         &scope,
                                         ControlSignal::Cancel,
@@ -3806,7 +3807,7 @@ async fn tokio_main() -> Result<()> {
                                             .await,
                                         &buzz_event.event,
                                     );
-                                    let fired = signal_in_flight_task_for_scope(
+                                    let fired = signal_in_flight_tasks_for_surface(
                                         &mut pool,
                                         &scope,
                                         ControlSignal::Rotate,
@@ -3819,7 +3820,7 @@ async fn tokio_main() -> Result<()> {
                                         );
                                     } else {
                                         let invalidated =
-                                            pool.invalidate_scope_session(&scope);
+                                            pool.invalidate_surface_sessions(&scope);
                                         tracing::info!(
                                             channel_id = %buzz_event.channel_id,
                                             scope = %scope.telemetry_label(),
@@ -4627,6 +4628,43 @@ fn signal_in_flight_task_for_scope(
         }
     }
     false
+}
+
+/// Send `mode` to every in-flight task on the same conversation surface as
+/// `scope` (same channel and thread root, any author). Owner controls
+/// (`!cancel`, `!rotate`) use this so that under the `author` session policy a
+/// control addressed to a thread reaches each person's session in it; under
+/// `channel`/`thread` policy the surface holds at most one scope, so this is
+/// byte-for-byte [`signal_in_flight_task_for_scope`]. Mid-turn steers keep the
+/// scope-exact function — a steer must never merge one person's event into
+/// another person's session. Returns `true` if at least one signal was sent.
+fn signal_in_flight_tasks_for_surface(
+    pool: &mut AgentPool,
+    scope: &scope::SessionScope,
+    mode: ControlSignal,
+) -> bool {
+    let mut fired = false;
+    for meta in pool.task_map_mut().values_mut() {
+        let Some(target) = meta.scope.as_ref() else {
+            continue;
+        };
+        if !target.same_surface(scope) {
+            continue;
+        }
+        let Some(tx) = meta.control_tx.take() else {
+            continue;
+        };
+        tracing::info!(
+            channel = %scope.channel_id(),
+            scope = %scope.telemetry_label(),
+            target = %target.telemetry_label(),
+            ?mode,
+            "control signal sent to in-flight task (same thread surface)"
+        );
+        let _ = tx.send(mode.clone());
+        fired = true;
+    }
+    fired
 }
 
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
@@ -6564,6 +6602,54 @@ mod owner_control_command_tests {
             &thread_scope(ch, &"c".repeat(64)),
             ControlSignal::Steer
         ));
+    }
+
+    #[tokio::test]
+    async fn surface_signal_reaches_every_author_in_thread_but_steer_stays_exact() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let ch = Uuid::new_v4();
+        let root = "a".repeat(64);
+        let mk = |root: &str, who: &str| scope::SessionScope::AuthorThread {
+            channel_id: ch,
+            root_event_id: root.to_string(),
+            author: who.repeat(64),
+        };
+        let alice = mk(&root, "1");
+        let bob = mk(&root, "2");
+        let other = mk(&"b".repeat(64), "1");
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel();
+        let (tx_b, rx_b) = tokio::sync::oneshot::channel();
+        let (tx_o, mut rx_o) = tokio::sync::oneshot::channel();
+        insert_task_meta(&mut pool, 0, alice.clone(), tx_a);
+        insert_task_meta(&mut pool, 1, bob.clone(), tx_b);
+        insert_task_meta(&mut pool, 2, other.clone(), tx_o);
+
+        // An owner control in the thread reaches both people's sessions...
+        assert!(signal_in_flight_tasks_for_surface(
+            &mut pool,
+            &alice,
+            ControlSignal::Cancel
+        ));
+        assert_eq!(rx_a.await.unwrap(), ControlSignal::Cancel);
+        assert_eq!(rx_b.await.unwrap(), ControlSignal::Cancel);
+        // ...but not the sibling thread.
+        assert!(rx_o.try_recv().is_err());
+
+        // A scope-exact steer for a new person in the sibling thread must not
+        // touch the other person's in-flight task there.
+        let carol = mk(&"b".repeat(64), "3");
+        assert!(!signal_in_flight_task_for_scope(
+            &mut pool,
+            &carol,
+            ControlSignal::Steer
+        ));
+        assert!(rx_o.try_recv().is_err());
+        assert!(signal_in_flight_task_for_scope(
+            &mut pool,
+            &other,
+            ControlSignal::Steer
+        ));
+        assert_eq!(rx_o.await.unwrap(), ControlSignal::Steer);
     }
 
     // Fix #1: a thread must not get a second provider session when the worker
@@ -9438,6 +9524,7 @@ mod build_mcp_servers_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_sessions_per_agent: 0,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -9665,6 +9752,7 @@ mod error_outcome_emission_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_sessions_per_agent: 0,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,

@@ -141,6 +141,9 @@ pub struct SessionState {
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
+    /// session scope → last time a turn used its session. Drives LRU eviction
+    /// when `max_sessions_per_agent` caps the session map.
+    pub last_used: HashMap<SessionScope, std::time::Instant>,
 }
 
 impl SessionState {
@@ -165,7 +168,42 @@ impl SessionState {
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
+        self.last_used.remove(scope);
         self.sessions.remove(scope).is_some()
+    }
+
+    /// Record that `scope`'s session carried a turn just now (LRU bookkeeping
+    /// for the per-worker session cap).
+    pub fn touch(&mut self, scope: &SessionScope) {
+        self.last_used
+            .insert(scope.clone(), std::time::Instant::now());
+    }
+
+    /// Enforce the per-worker session cap before a new session for `incoming`
+    /// is created: drop least-recently-used cached sessions (never `incoming`
+    /// itself) until fewer than `cap` remain. Sessions that were never touched
+    /// count as oldest. `cap == 0` disables the cap. Returns the evicted scopes
+    /// so the caller can log them.
+    pub fn evict_for_cap(&mut self, cap: u32, incoming: &SessionScope) -> Vec<SessionScope> {
+        let mut evicted = Vec::new();
+        if cap == 0 {
+            return evicted;
+        }
+        let cap = cap as usize;
+        while self.sessions.len() >= cap {
+            let victim = self
+                .sessions
+                .keys()
+                .filter(|s| *s != incoming)
+                .min_by_key(|s| self.last_used.get(*s).copied())
+                .cloned();
+            let Some(victim) = victim else {
+                break;
+            };
+            self.invalidate_scope(&victim);
+            evicted.push(victim);
+        }
+        evicted
     }
 
     /// Invalidate every session scope belonging to `channel_id` (channel-wide
@@ -179,6 +217,7 @@ impl SessionState {
             .chain(self.core_sections.keys())
             .chain(self.canvas_sections.keys())
             .chain(self.deliveries.keys())
+            .chain(self.last_used.keys())
             .filter(|s| s.channel_id() == *channel_id)
             .cloned()
             .collect::<HashSet<_>>()
@@ -203,6 +242,7 @@ impl SessionState {
         self.core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
+        self.last_used.clear();
     }
 
     pub(crate) fn mark_scope_delivery_success(
@@ -224,6 +264,7 @@ impl SessionState {
             || self.core_sections.keys().any(matches)
             || self.canvas_sections.keys().any(matches)
             || self.deliveries.keys().any(matches)
+            || self.last_used.keys().any(matches)
     }
 }
 
@@ -791,6 +832,9 @@ pub struct PromptContext {
     pub context_message_limit: u32,
     /// Max turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Max cached sessions per worker; LRU idle sessions are dropped beyond
+    /// it before a new one is created. 0 = unlimited.
+    pub max_sessions_per_agent: u32,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Agent identity — used to derive the NIP-AE conversation key at
@@ -1135,6 +1179,33 @@ impl AgentPool {
         }
         self.session_owners.remove(scope);
         self.held_since.remove(scope);
+        count
+    }
+
+    /// Invalidate every cached session on the same conversation surface as
+    /// `scope` (same channel and thread root, any author). Under
+    /// `channel`/`thread` policy this is exactly
+    /// [`invalidate_scope_session`](Self::invalidate_scope_session); under
+    /// `author` policy an owner's idle `!rotate` in a thread must rotate every
+    /// person's session in that thread, not only the owner's own. Returns the
+    /// number of (worker, scope) sessions dropped.
+    pub fn invalidate_surface_sessions(&mut self, scope: &SessionScope) -> usize {
+        let targets: Vec<SessionScope> = self
+            .agents
+            .iter()
+            .flatten()
+            .flat_map(|agent| agent.state.sessions.keys())
+            .chain(self.session_owners.keys())
+            .chain(self.held_since.keys())
+            .filter(|s| s.same_surface(scope))
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut count = 0;
+        for target in targets {
+            count += self.invalidate_scope_session(&target);
+        }
         count
     }
 
@@ -2361,9 +2432,19 @@ pub async fn run_prompt_task(
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(scope) => {
             let cid = &scope.channel_id();
-            if let Some(sid) = agent.state.sessions.get(scope) {
-                (sid.clone(), false)
+            if let Some(sid) = agent.state.sessions.get(scope).cloned() {
+                agent.state.touch(scope);
+                (sid, false)
             } else {
+                for victim in agent.state.evict_for_cap(ctx.max_sessions_per_agent, scope) {
+                    tracing::info!(
+                        target: "pool::session",
+                        cap = ctx.max_sessions_per_agent,
+                        evicted = %victim.telemetry_label(),
+                        incoming = %scope.telemetry_label(),
+                        "session cap reached — dropped least recently used session"
+                    );
+                }
                 // The title includes channel and, for thread sessions, the
                 // canonical root prefix so sibling sessions are distinguishable.
                 // DMs, unresolved, and unnamed channels omit the channel name.
@@ -2388,6 +2469,7 @@ pub async fn run_prompt_task(
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
+                        agent.state.touch(scope);
                         agent
                             .state
                             .deliveries
@@ -5230,6 +5312,109 @@ mod tests {
     /// (equivalent to the pre-thread-scoping channel key).
     fn conv(channel_id: Uuid) -> SessionScope {
         SessionScope::Conversation { channel_id }
+    }
+
+    #[test]
+    fn invalidate_surface_sessions_drops_every_author_in_the_thread_only() {
+        let ch = Uuid::new_v4();
+        let root = "a".repeat(64);
+        let mk = |root: &str, who: &str| SessionScope::AuthorThread {
+            channel_id: ch,
+            root_event_id: root.to_string(),
+            author: who.repeat(64),
+        };
+        let a = mk(&root, "1");
+        let b = mk(&root, "2");
+        let other = mk(&"b".repeat(64), "1");
+        let mut pool = AgentPool::from_slots(vec![]);
+        pool.record_scope_owner(a.clone(), 0);
+        pool.record_scope_owner(b.clone(), 1);
+        pool.record_scope_owner(other.clone(), 0);
+        // Three distinct scopes in the channel → channel-only control is ambiguous.
+        assert!(pool.channel_control_is_ambiguous(ch));
+        // No worker holds a session, so nothing is "dropped", but the two
+        // same-thread owner entries go away and the sibling thread stays.
+        assert_eq!(pool.invalidate_surface_sessions(&a), 0);
+        assert!(!pool.channel_control_is_ambiguous(ch));
+        assert!(pool.held_since_contains(&other) || !pool.held_since_contains(&a));
+        pool.record_scope_owner(a.clone(), 0);
+        assert!(pool.channel_control_is_ambiguous(ch));
+        pool.invalidate_surface_sessions(&other);
+        // Only `a` remains.
+        assert!(!pool.channel_control_is_ambiguous(ch));
+    }
+
+    #[test]
+    fn session_cap_zero_never_evicts() {
+        let mut s = SessionState::default();
+        for _ in 0..5 {
+            let scope = conv(Uuid::new_v4());
+            s.sessions.insert(scope.clone(), "sid".into());
+            s.touch(&scope);
+        }
+        let incoming = conv(Uuid::new_v4());
+        assert!(s.evict_for_cap(0, &incoming).is_empty());
+        assert_eq!(s.sessions.len(), 5);
+    }
+
+    #[test]
+    fn session_cap_evicts_least_recently_used_and_spares_incoming() {
+        let mut s = SessionState::default();
+        let oldest = conv(Uuid::new_v4());
+        let middle = conv(Uuid::new_v4());
+        let newest = conv(Uuid::new_v4());
+        let now = std::time::Instant::now();
+        for (scope, age) in [(&oldest, 30u64), (&middle, 20), (&newest, 10)] {
+            s.sessions.insert(scope.clone(), format!("sid-{age}"));
+            s.turn_counts.insert(scope.clone(), 1);
+            s.deliveries
+                .insert(scope.clone(), ChannelDeliveryState::default());
+            s.last_used
+                .insert(scope.clone(), now - Duration::from_secs(age));
+        }
+        // Cap 3 with 3 cached: creating a 4th must drop exactly the oldest.
+        let incoming = conv(Uuid::new_v4());
+        let evicted = s.evict_for_cap(3, &incoming);
+        assert_eq!(evicted, vec![oldest.clone()]);
+        assert!(!s.sessions.contains_key(&oldest));
+        assert!(!s.turn_counts.contains_key(&oldest));
+        assert!(!s.deliveries.contains_key(&oldest));
+        assert!(!s.last_used.contains_key(&oldest));
+        assert!(s.sessions.contains_key(&middle));
+        assert!(s.sessions.contains_key(&newest));
+        assert_eq!(s.sessions.len(), 2);
+
+        // A session that was never touched counts as the oldest of all.
+        let untouched = conv(Uuid::new_v4());
+        s.sessions.insert(untouched.clone(), "sid-untouched".into());
+        let evicted = s.evict_for_cap(3, &incoming);
+        assert_eq!(evicted, vec![untouched]);
+
+        // Cap 1 keeps only the newest; the incoming scope is never a victim
+        // even when it is already cached.
+        s.sessions.insert(incoming.clone(), "sid-incoming".into());
+        s.last_used
+            .insert(incoming.clone(), now - Duration::from_secs(100));
+        let evicted = s.evict_for_cap(1, &incoming);
+        assert_eq!(evicted.len(), 2);
+        assert!(!evicted.contains(&incoming));
+        assert_eq!(s.sessions.len(), 1);
+        assert!(s.sessions.contains_key(&incoming));
+    }
+
+    #[test]
+    fn invalidate_paths_clear_last_used() {
+        let ch = Uuid::new_v4();
+        let mut s = SessionState::default();
+        let scope = conv(ch);
+        s.sessions.insert(scope.clone(), "sid".into());
+        s.touch(&scope);
+        assert!(s.has_channel_state(&ch));
+        s.invalidate_channel(&ch);
+        assert!(!s.has_channel_state(&ch));
+        s.touch(&scope);
+        s.invalidate_all();
+        assert!(s.last_used.is_empty());
     }
 
     fn test_mcp_server() -> McpServer {
@@ -8964,6 +9149,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             ),
             context_message_limit: 0,
             max_turns_per_session: 0,
+            max_sessions_per_agent: 0,
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,

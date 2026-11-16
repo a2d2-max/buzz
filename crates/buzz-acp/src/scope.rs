@@ -16,6 +16,10 @@
 //! | Repeated mention in the same thread | reuse that thread scope                 |
 //! | Direct message                      | `Conversation(channel_id)`              |
 //!
+//! Under [`SessionPolicy::Author`] every row above additionally carries the
+//! triggering event's author pubkey, so two people addressing the agent in the
+//! same thread (or the same group DM) talk to two separate sessions.
+//!
 //! Under [`SessionPolicy::Channel`] (the current default / rollback path) every
 //! surface collapses to `Conversation(channel_id)`, preserving today's
 //! channel-keyed behavior exactly.
@@ -39,6 +43,11 @@ pub enum SessionPolicy {
     /// Thread-scoped: each canonical channel thread gets an isolated provider
     /// session. DMs remain conversation-scoped.
     Thread,
+    /// Per-person: like `thread`, but the session key also carries the author
+    /// pubkey of the triggering event. In channels every (thread, author) pair
+    /// is its own session; in DMs every (conversation, author) pair is, so a
+    /// group DM no longer merges several people into one session.
+    Author,
 }
 
 impl SessionPolicy {
@@ -48,6 +57,7 @@ impl SessionPolicy {
         let session_model = match self {
             Self::Channel => include_str!("session_model_channel.md"),
             Self::Thread => include_str!("session_model_thread.md"),
+            Self::Author => include_str!("session_model_author.md"),
         };
         format!("{}\n\n{}", base_prompt.trim_end(), session_model.trim_end())
     }
@@ -58,6 +68,7 @@ impl std::fmt::Display for SessionPolicy {
         match self {
             Self::Channel => f.write_str("channel"),
             Self::Thread => f.write_str("thread"),
+            Self::Author => f.write_str("author"),
         }
     }
 }
@@ -78,6 +89,19 @@ pub enum SessionScope {
         channel_id: Uuid,
         root_event_id: String,
     },
+    /// One person's conversation within a channel or DM, keyed by the author
+    /// pubkey (64-char lowercase hex). Produced for DMs under
+    /// [`SessionPolicy::Author`].
+    AuthorConversation { channel_id: Uuid, author: String },
+    /// One person's view of a single canonical thread, keyed by the thread
+    /// root and the author pubkey. Produced for channel events under
+    /// [`SessionPolicy::Author`]. Behaves like [`Thread`](Self::Thread) for
+    /// every thread-aware consumer (`root_event_id`, `is_thread`).
+    AuthorThread {
+        channel_id: Uuid,
+        root_event_id: String,
+        author: String,
+    },
 }
 
 impl SessionScope {
@@ -87,6 +111,18 @@ impl SessionScope {
         match self {
             Self::Conversation { channel_id } => *channel_id,
             Self::Thread { channel_id, .. } => *channel_id,
+            Self::AuthorConversation { channel_id, .. } => *channel_id,
+            Self::AuthorThread { channel_id, .. } => *channel_id,
+        }
+    }
+
+    /// The author pubkey (lowercase hex) this scope is bound to, or `None` for
+    /// scopes that are not per-person.
+    pub fn author(&self) -> Option<&str> {
+        match self {
+            Self::Conversation { .. } | Self::Thread { .. } => None,
+            Self::AuthorConversation { author, .. } => Some(author),
+            Self::AuthorThread { author, .. } => Some(author),
         }
     }
 
@@ -94,14 +130,16 @@ impl SessionScope {
     /// or `None` for a conversation scope.
     pub fn root_event_id(&self) -> Option<&str> {
         match self {
-            Self::Conversation { .. } => None,
-            Self::Thread { root_event_id, .. } => Some(root_event_id),
+            Self::Conversation { .. } | Self::AuthorConversation { .. } => None,
+            Self::Thread { root_event_id, .. } | Self::AuthorThread { root_event_id, .. } => {
+                Some(root_event_id)
+            }
         }
     }
 
     /// True when this scope is thread-scoped (not conversation-scoped).
     pub fn is_thread(&self) -> bool {
-        matches!(self, Self::Thread { .. })
+        matches!(self, Self::Thread { .. } | Self::AuthorThread { .. })
     }
 
     /// Derive the scope for an admitted event.
@@ -114,6 +152,10 @@ impl SessionScope {
     /// 3. Under [`SessionPolicy::Thread`], a channel event with a NIP-10 root
     ///    tag scopes to that canonical root; a top-level mention (no thread
     ///    tags) opens a new thread rooted at the triggering event id.
+    /// 4. Under [`SessionPolicy::Author`], the same resolution runs and the
+    ///    result additionally carries the event author's pubkey: DMs become
+    ///    [`AuthorConversation`](Self::AuthorConversation) and channel events
+    ///    become [`AuthorThread`](Self::AuthorThread).
     ///
     /// Thread roots are resolved with [`parse_thread_tags`], i.e. Buzz's shared
     /// [`buzz_core::nip10`] canonical-root rules — a malformed marker id is
@@ -129,18 +171,44 @@ impl SessionScope {
     /// sessions, affinity, delivery ledgers). `nostr::EventId::to_hex()` is
     /// already lowercase, so the top-level path is unaffected.
     pub fn derive(policy: SessionPolicy, channel_id: Uuid, is_dm: bool, event: &Event) -> Self {
+        // `PublicKey::to_hex()` is already lowercase; normalize anyway so the
+        // key never depends on the upstream formatting.
+        let author =
+            (policy == SessionPolicy::Author).then(|| event.pubkey.to_hex().to_ascii_lowercase());
+
         if is_dm || policy == SessionPolicy::Channel {
-            return Self::Conversation { channel_id };
+            return match author {
+                Some(author) => Self::AuthorConversation { channel_id, author },
+                None => Self::Conversation { channel_id },
+            };
         }
 
         let root_event_id = match parse_thread_tags(event).root_event_id {
             Some(root) => root,
             None => event.id.to_hex(),
         };
-        Self::Thread {
-            channel_id,
-            root_event_id: root_event_id.to_ascii_lowercase(),
+        let root_event_id = root_event_id.to_ascii_lowercase();
+        match author {
+            Some(author) => Self::AuthorThread {
+                channel_id,
+                root_event_id,
+                author,
+            },
+            None => Self::Thread {
+                channel_id,
+                root_event_id,
+            },
         }
+    }
+
+    /// True when `other` names the same conversation surface as `self`: the
+    /// same channel and the same thread root (or both conversation-level),
+    /// ignoring any per-author binding. Under `channel`/`thread` policy this
+    /// is plain equality; under `author` policy it groups the per-person
+    /// sessions of one thread, so an owner control (`!cancel`, `!rotate`)
+    /// addressed to a thread reaches every person's session in it.
+    pub fn same_surface(&self, other: &SessionScope) -> bool {
+        self.channel_id() == other.channel_id() && self.root_event_id() == other.root_event_id()
     }
 
     /// A compact, log-friendly label for telemetry (e.g. `conversation` or
@@ -151,6 +219,19 @@ impl SessionScope {
             Self::Thread { root_event_id, .. } => {
                 let short: String = root_event_id.chars().take(8).collect();
                 format!("thread:{short}")
+            }
+            Self::AuthorConversation { author, .. } => {
+                let who: String = author.chars().take(8).collect();
+                format!("conversation@{who}")
+            }
+            Self::AuthorThread {
+                root_event_id,
+                author,
+                ..
+            } => {
+                let short: String = root_event_id.chars().take(8).collect();
+                let who: String = author.chars().take(8).collect();
+                format!("thread:{short}@{who}")
             }
         }
     }
@@ -182,7 +263,11 @@ mod tests {
     fn session_model_is_appended_once_and_matches_policy() {
         let base = include_str!("base_prompt.md");
         assert!(!base.contains("## Session Model"));
-        for policy in [SessionPolicy::Channel, SessionPolicy::Thread] {
+        for policy in [
+            SessionPolicy::Channel,
+            SessionPolicy::Thread,
+            SessionPolicy::Author,
+        ] {
             let prompt = policy.append_session_model(base);
             assert!(prompt.starts_with(base.trim_end()));
             assert_eq!(prompt.matches("## Session Model").count(), 1);
@@ -201,6 +286,11 @@ mod tests {
                 SessionPolicy::Thread => {
                     assert!(prompt.contains("each thread gets its own"));
                     assert!(prompt.contains("sibling channel thread"));
+                    assert!(!prompt.contains("one per-channel session"));
+                }
+                SessionPolicy::Author => {
+                    assert!(prompt.contains("each (thread, person) pair gets its own"));
+                    assert!(prompt.contains("Session author"));
                     assert!(!prompt.contains("one per-channel session"));
                 }
             }
@@ -384,6 +474,190 @@ mod tests {
         assert_eq!(thread.root_event_id(), Some(root.as_str()));
         assert!(thread.is_thread());
         assert_eq!(thread.telemetry_label(), "thread:abcdef01");
+    }
+
+    /// Build a signed event from a specific key with the given NIP-10 tags.
+    fn event_from(keys: &Keys, tags: Vec<Vec<String>>) -> Event {
+        let tags: Vec<nostr::Tag> = tags
+            .into_iter()
+            .map(|t| nostr::Tag::parse(t).expect("valid tag"))
+            .collect();
+        EventBuilder::new(Kind::Custom(9), "hello")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn author_policy_dm_is_per_person_conversation() {
+        let ch = Uuid::new_v4();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let root = "a".repeat(64);
+        let reply_tags = || {
+            vec![
+                vec!["e".into(), root.clone(), String::new(), "root".into()],
+                vec!["e".into(), "b".repeat(64), String::new(), "reply".into()],
+            ]
+        };
+        let a1 = SessionScope::derive(SessionPolicy::Author, ch, true, &event_from(&alice, vec![]));
+        let a2 = SessionScope::derive(
+            SessionPolicy::Author,
+            ch,
+            true,
+            &event_from(&alice, reply_tags()),
+        );
+        let b = SessionScope::derive(
+            SessionPolicy::Author,
+            ch,
+            true,
+            &event_from(&bob, reply_tags()),
+        );
+        assert_eq!(
+            a1,
+            SessionScope::AuthorConversation {
+                channel_id: ch,
+                author: alice.public_key().to_hex(),
+            }
+        );
+        // Thread tags inside a DM do not split one person's conversation.
+        assert_eq!(a1, a2);
+        // A second person in the same (group) DM gets a separate session.
+        assert_ne!(a1, b);
+        assert_eq!(b.author(), Some(bob.public_key().to_hex().as_str()));
+        assert!(!a1.is_thread());
+        assert_eq!(a1.root_event_id(), None);
+        assert_eq!(a1.channel_id(), ch);
+    }
+
+    #[test]
+    fn author_policy_channel_thread_is_per_person_and_per_root() {
+        let ch = Uuid::new_v4();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let root = "c".repeat(64);
+        let reply = |keys: &Keys| {
+            event_from(
+                keys,
+                vec![
+                    vec![
+                        "e".into(),
+                        root.to_ascii_uppercase(),
+                        String::new(),
+                        "root".into(),
+                    ],
+                    vec!["e".into(), "d".repeat(64), String::new(), "reply".into()],
+                ],
+            )
+        };
+        let a1 = SessionScope::derive(SessionPolicy::Author, ch, false, &reply(&alice));
+        let a2 = SessionScope::derive(SessionPolicy::Author, ch, false, &reply(&alice));
+        let b = SessionScope::derive(SessionPolicy::Author, ch, false, &reply(&bob));
+        assert_eq!(
+            a1,
+            SessionScope::AuthorThread {
+                channel_id: ch,
+                root_event_id: root.clone(),
+                author: alice.public_key().to_hex(),
+            }
+        );
+        // Same person, same thread → same session (root normalized to lowercase).
+        assert_eq!(a1, a2);
+        // Another person in the same thread → a distinct session.
+        assert_ne!(a1, b);
+        // Thread-aware consumers see the same root either way.
+        assert_eq!(a1.root_event_id(), b.root_event_id());
+        assert_eq!(a1.root_event_id(), Some(root.as_str()));
+        assert!(a1.is_thread());
+        assert_eq!(a1.author(), Some(alice.public_key().to_hex().as_str()));
+
+        // A top-level mention opens a per-person thread rooted at the trigger.
+        let top = event_from(&alice, vec![]);
+        let scope = SessionScope::derive(SessionPolicy::Author, ch, false, &top);
+        assert_eq!(
+            scope,
+            SessionScope::AuthorThread {
+                channel_id: ch,
+                root_event_id: top.id.to_hex(),
+                author: alice.public_key().to_hex(),
+            }
+        );
+    }
+
+    #[test]
+    fn author_policy_labels_and_non_author_scopes_have_no_author() {
+        let ch = Uuid::new_v4();
+        let root = "abcdef0123456789".repeat(4);
+        let who = "0123456789abcdef".repeat(4);
+        let conv = SessionScope::AuthorConversation {
+            channel_id: ch,
+            author: who.clone(),
+        };
+        assert_eq!(conv.telemetry_label(), "conversation@01234567");
+        let thread = SessionScope::AuthorThread {
+            channel_id: ch,
+            root_event_id: root.clone(),
+            author: who.clone(),
+        };
+        assert_eq!(thread.telemetry_label(), "thread:abcdef01@01234567");
+        assert_eq!(SessionScope::Conversation { channel_id: ch }.author(), None);
+        assert_eq!(
+            SessionScope::Thread {
+                channel_id: ch,
+                root_event_id: root,
+            }
+            .author(),
+            None
+        );
+        assert_eq!(SessionPolicy::Author.to_string(), "author");
+    }
+
+    #[test]
+    fn same_surface_ignores_author_but_not_root_or_channel() {
+        let ch = Uuid::new_v4();
+        let root = "a".repeat(64);
+        let alice = "1".repeat(64);
+        let bob = "2".repeat(64);
+        let plain = SessionScope::Thread {
+            channel_id: ch,
+            root_event_id: root.clone(),
+        };
+        let a = SessionScope::AuthorThread {
+            channel_id: ch,
+            root_event_id: root.clone(),
+            author: alice.clone(),
+        };
+        let b = SessionScope::AuthorThread {
+            channel_id: ch,
+            root_event_id: root.clone(),
+            author: bob.clone(),
+        };
+        assert!(a.same_surface(&b));
+        assert!(a.same_surface(&plain));
+        assert!(plain.same_surface(&plain));
+        assert!(!a.same_surface(&SessionScope::AuthorThread {
+            channel_id: ch,
+            root_event_id: "b".repeat(64),
+            author: alice.clone(),
+        }));
+        assert!(!a.same_surface(&SessionScope::AuthorThread {
+            channel_id: Uuid::new_v4(),
+            root_event_id: root.clone(),
+            author: alice.clone(),
+        }));
+        // Conversation-level scopes group by channel only.
+        let conv = SessionScope::Conversation { channel_id: ch };
+        let conv_a = SessionScope::AuthorConversation {
+            channel_id: ch,
+            author: alice,
+        };
+        let conv_b = SessionScope::AuthorConversation {
+            channel_id: ch,
+            author: bob,
+        };
+        assert!(conv_a.same_surface(&conv_b));
+        assert!(conv_a.same_surface(&conv));
+        assert!(!conv_a.same_surface(&a));
     }
 
     #[test]
